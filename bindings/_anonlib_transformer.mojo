@@ -1,0 +1,3722 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 the authors. Part of anonlib, DOI-WITHHELD
+"""CPython boundary for the transformer (Llama-shaped decoder) block lane.
+
+A FIFTEENTH extension module, and a separate one on purpose, for the
+reason `bindings/_anonlib_estimators.mojo`'s header gives: an
+independently changing binding must not become a merge point. This file
+gives the certified transformer block (profile
+`anonlib.identical.transformer.fp32.v1`, forward clause (a) and clause
+(d) recorded on THREE columns 2026-08-28, the same card bytes on Apple,
+NVIDIA and AMD -- `transformer/README.md`'s status block) its first
+Python symbol: before it the lane exported nothing an outside consumer
+could import.
+
+THE BINDING CALLS THE CERTIFIED ENTRY POINT AND NOTHING ELSE. Every call
+below goes through `llama_decoder_layer_forward`
+(`transformer/impl/llama/modeling_llama.mojo`) --
+the SAME function `transformer/checks/transformer_check.mojo` gates
+(through its planted twin, with the plant OFF). NO arithmetic is
+respelled in this file: a binding-side copy of any seam would be a
+second spelling of a pinned rounding, which is the drift the whole lane
+exists to forbid. The decode entry point is the contract's own
+construction -- the block forward at `l = 1` with the KV cache carried
+and `pos0 = cached_tokens` (contract section 7.2, ONE SPELLING FOR BOTH
+PATHS) -- with no arithmetic of its own.
+
+THE TWO-LIST ABI IS DEVIATION 791'S, ADOPTED, NOT RE-DECIDED. Each entry
+point takes exactly TWO Python lists, `addrs` (every NumPy buffer
+address, in an exact order written in each docstring and mirrored at the
+`_transformer_impl.py` call site) and `params` (the scalars), because
+`PythonModuleBuilder.def_function` stops elaborating above roughly nine
+arguments (MEASURED 2026-09-01, `bindings/_anonlib_gp.mojo`'s header)
+and `transformer_forward` carries thirteen addresses. Every array whose
+address goes into `addrs` MUST be bound to a Python local for the
+duration of the call: an address inside a list keeps nothing alive
+(`python/anonlib/_arrays.py`).
+
+DEVIATION 795 -- THE TRANSFORMER SURFACE'S OWN DEPARTURES, IN ONE BLOCK.
+
+  (i) A POINTER-ABI SURFACE WHERE UPSTREAM HAS ONLY TORCH MODULES.
+  Upstream's only Python face for this block is `LlamaDecoderLayer`, an
+  `nn.Module` over torch tensors, autograd and a `DynamicCache` object.
+  This surface is bare float32 buffer addresses plus packed scalars into
+  the certified Mojo entry point, torch-free by design (the package's
+  standing shape, mamba DEVIATIONS 791/792 applied to this lane): the
+  consumer's job is cross-checking bits, and a torch dependency on the
+  checking side would put the reference's own arithmetic inside the
+  instrument.
+
+  (ii) THE STATE IS THE KV CACHE, CROSSING AS TWO CALLER-OWNED
+  FULL-CAPACITY BUFFERS PACKED AT THE USED STRIDE, PLUS ONE INTEGER.
+  DEVIATION 792's caller-owned-buffers rule extends here with a twist
+  none of the mamba states has: `LlamaKVCache` is PACKED at stride `s`
+  (the USED length), not at stride `s_max` (DEVIATION 1022 -- the stage
+  card records `[B, n_kv, S, head_dim]` and the packed used region IS
+  that array), so the caller's `k_cache`/`v_cache` buffers are FLAT
+  capacity buffers of `B * n_kv * max_tokens * head_dim` floats whose
+  first `B * n_kv * cached_tokens * head_dim` elements are the cache at
+  stride `cached_tokens`. Both are READ at entry and WRITTEN BACK whole
+  before return, so the caller's bytes round-trip exactly; zeros in,
+  with `cached_tokens = 0`, is a fresh sequence. `cached_tokens` is the
+  one integer piece of state and crosses as a params scalar IN and as
+  the return value OUT (mamba2 `buf_len`'s shape). `max_tokens` (the
+  capacity, `s_max`) is a params scalar too, because the packing stride
+  and every refusal about growth are functions of it.
+
+  (iii) THE ROTARY TABLE AND THE ATTENTION SCALE USE FROZEN CONSTANTS,
+  NEVER PARAMETERS. rms eps (1e-6, bits
+  0x358637BD) and rope theta (10000.0, bits 0x461C4000) are contract
+  section 3 FROZEN constants, imported from
+  `transformer/checks/transformer_fixture.mojo` (the fixture is their
+  bit authority); changing either is a v2 profile, not a knob. The
+  rotary table is `LlamaRopeTable(ctx, dims, ROPE_THETA, max_tokens)`,
+  computed on-device exactly as the lane's own check driver builds it.
+  Legacy entry points rebuild it per call. The Python-owned session reuses
+  it only for an exactly matching workspace configuration; S6-S8 are pure
+  functions of (theta, head_dim, position). The ownership and refresh rules
+  are under OWNERSHIP AND REFRESH below.
+
+  (iv) WHAT IS REFUSED HERE, AND WHAT GOES DOWN UNJUDGED (DEVIATION
+  793's split, applied). Refused HERE: a null address, an
+  `addrs`/`params` list of the wrong length, and a `cached_tokens`
+  outside `[0, max_tokens]` -- each means the two sides of THIS boundary
+  disagree and no lane refusal exists for it. Everything else goes down
+  UNJUDGED so the lane's own refusals stay reachable from Python: the
+  five divisibility rules are `LlamaDims.validate`'s (refused by name in
+  Mojo), capacity growth past `max_tokens` and the 8192 absolute-
+  position ceiling (DEVIATION 812) are `llama_decoder_layer_forward`'s
+  and `LlamaKVCache`'s, and non-finite inputs are refused BY NAME on the
+  device path (`llama_refuse_bad_call` for x/rope/cache per call;
+  weights once at upload, DEVIATION 1875). The dtype refusals (float32
+  ONLY) live in `_transformer_impl.py`, because dtype is a NumPy
+  property this side cannot see.
+
+  (v) BLAST RADIUS. This file, `python/anonlib/_transformer_impl.py`,
+  `python/anonlib/transformer.py` and
+  `python/anonlib/tests/test_transformer_surface.py`. The lane's
+  kernels, oracle, gates and contract are untouched. Since 2026-09-09
+  the BACKWARD (`autograd/kernels/transformer.mojo`) is on
+  this surface too, as `transformer_backward`, IDENTICAL tier only, and
+  `window` (sliding-window causal attention with a ring KV cache) is
+  the tenth forward scalar.
+
+THE TIER SEMANTICS ARE THE BUILD'S, NOT THIS FILE'S. The numeric
+mode (fast / identical) is a compile-time define
+(`checks/numerics.mojo`), one binary per tier under
+`python/anonlib/[<tier>/]_anonlib_transformer.so`;
+`transformer_numeric_mode` below is the read-back
+`_transformer_impl.py` cross-checks so a wrong-arm measurement cannot be
+correctly labelled by accident.
+
+THE GIL is released around every device call, and nothing inside a
+`GILReleased` block touches a `PythonObject`.
+
+RUN LEDGER. First compiled 2026-09-02 on the Apple M4 (all three
+tiers); the window and backward entry points first compiled and ran
+on an NVIDIA L40S 2026-09-09 (identical tier), Apple RUN OWED. Build:
+`bash bindings/build_transformer.sh` (per tier via
+ANONLIB_NUMERIC_MODE); gate:
+`cd python && python3 -m anonlib.tests.test_transformer_surface`.
+"""
+
+# DEVIATION 2486: shared byte-preserving host copies.
+from bindings.hostptr import f32_ptr, read_f32, copy_f32, i8_ptr, i32_ptr
+# lane/lowbit-blocks (2026-09-29): the block under numeric_profile="fixed15_v1".
+from transformer.impl.llama.int15_block import (
+    Int15Planes,
+    LlamaInt15Stage,
+    LlamaInt15Weights,
+    llama_int15_proj,
+)
+from gemm.checks.gemm_int15 import (
+    INT15_PIECE_SABOTAGE,
+    INT15_QUANT_SABOTAGE,
+    INT15_SABOTAGE,
+)
+from gemm.checks.gemm_int15_epilogue import INT15_EPILOGUE_SABOTAGE
+from std.os import abort
+from std.python import Python, PythonObject
+from std.python._cpython import GILReleased
+from std.python.bindings import PythonModuleBuilder
+
+from max.gpu.host import DeviceBuffer, DeviceContext
+from std.memory import bitcast, memcpy
+from std.os import getenv
+from std.time import perf_counter_ns
+from std.sys.compile import is_defined
+from checks.kernel_matrix import COLUMN_NVIDIA, TARGET_COLUMN
+
+from core.identity_trace import IdentityTrace
+from core.device_scan import device_first_nonfinite
+from std.gpu import block_idx, thread_idx
+from std.memory import stack_allocation
+from max.gpu.memory import AddressSpace
+from max.gpu.sync import barrier
+from checks.numerics import GLOBAL_NUMERIC_MODE, NUMERIC_IDENTICAL
+from training.neural_identical_experiments import IDN_SAMBA_FORWARD_TAPE
+from core.neural_context import neural_ctx
+# One process-lifetime DeviceContext per binding and tier (core/neural_context.mojo).
+comptime _NEURAL_CTX = "MojoNeuralTransformerContextIdentical" if GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL else "MojoNeuralTransformerContextFast"
+from checks.vendor import COMPILED_VENDOR
+from gemm.checks.gemm_backward import ANY_BWD_SABOTAGE as GEMM_ANY_BWD_SABOTAGE
+from gemm.checks.gemm_identical import ANY_SABOTAGE as GEMM_ANY_SABOTAGE
+
+# The two FROZEN arithmetic constants, from their bit authority
+# (`transformer_fixture.mojo` cross-checks both against their hex bits in
+# `profile_constants_are_intact`). The binding importing from
+# `transformer/checks/` is the mamba binding's own precedent (it imports
+# `mamba_fixture`'s constants); it is the IMPL file that may not
+# (`modeling_llama.mojo`'s "no fixture type crosses this boundary").
+from transformer.checks.transformer_fixture import RMS_EPS, ROPE_THETA
+
+# `_upload`/`_download` by their underscore names is DEVIATION 1112's
+# settled pattern (`transformer_check.mojo` imports the same pair).
+from transformer.impl.llama.fused_attention import (
+    fused_forward_supported_head_dim,
+)
+from transformer.impl.llama.modeling_llama import (
+    ATTN_PATH_EAGER,
+    BLOCK_ANY_SABOTAGE,
+    PLANT_AT_NONE,
+    attention_path_choice,
+    LlamaDeviceStages,
+    LlamaDeviceWeights,
+    LlamaDims,
+    LlamaKVCache,
+    LlamaRopeTable,
+    _download,
+    _upload,
+    llama_decoder_layer_forward,
+)
+from autograd.kernels.transformer import (
+    BWD_ANY_SABOTAGE,
+    LlamaBackwardStages,
+)
+# The session and saved-tape backwards below run on the autograd tape.
+# TOMBSTONE: ANONLIB_AUTOGRAD_TRANSFORMER(_OFF) (PROMOTED, hand arm deleted) deleted 2026-10-19 by dd4194a23; code recoverable at dd4194a23^.
+# Restore: git apply experiments/removed/ANONLIB_AUTOGRAD_TRANSFORMER.patch
+from autograd.rules_transformer import llama_decoder_layer_backward, llama_decoder_layer_backward_autograd
+# lane ag-tm-timing: the launch profile the backward timing entries read.
+from sequence.launch_profile import launch_profile_level, launch_profile_reset, launch_profile_snapshot
+# lane/block-options (2026-09-17): the block options record and the two
+# tails. `transformer/block_options.mojo` is the order's authority; the
+# docstrings below repeat it word for word because a binding docstring is
+# what the Python side is written against.
+from transformer.block_options import (
+    BLOCK_OPTION_ADDRS,
+    BLOCK_OPTION_PARAMS,
+    BlockOptions,
+)
+from transformer.impl.llama.modeling_llama import _zeros as _llama_zeros
+# lane/py-lm (2026-09-28): the resident CausalLM decode session runs the
+# stack's three non-block steps on the kernels `training/samba_ops.mojo`
+# calls for them (embedding gather, llama RMSNorm, the identical GEMM at
+# OP_NT), so its bits are the per-call route's.
+from embedding.checks.embedding_identical import identical_embedding_forward_into
+from embedding.checks.embedding_oracle import EmbConfig
+from gemm.neural_dispatch import identical_gemm_into, identical_gemm_workspace_max_floats
+from gemm.experiments.neural_switches import ROLE_HEAD
+from gemm.contract import OP_NT
+from transformer.impl.llama.modeling_llama import llama_rms_norm
+from std.math import isfinite
+# lane afn-attn (2026-10-03): ANONLIB_AFN_ATTN_ARENA, FAST + Apple only
+# (AFN_ATTN_ARENA is False on every other build, so these are never called).
+from core.device_arena import arena_begin, arena_end, arena_release
+from transformer.impl.llama.afn_apple_fast import AFN_ATTN_ARENA, afn_flash_call_count
+
+
+# ===========================================================================
+# THE TWO OPTION TAILS (lane/block-options, 2026-09-17).
+#
+# Every forward entry point below accepts its OLD address and params lists
+# (every option at its default, the code path that existed before this
+# lane) OR the old lists with these tails appended, and refuses any other
+# length by name. The Python side sends the tails only for a non-default
+# record, so a default block reaches the old lengths exactly.
+#
+#   params tail, 17 ints, appended after the entry's own scalars:
+#     +0  rope_theta_bits            Float32 bits of the RoPE base
+#     +1  rope_scaling               0 none, 1 linear, 2 llama3
+#     +2  rope_factor_bits           Float32 bits
+#     +3  rope_low_freq_factor_bits  Float32 bits (llama3)
+#     +4  rope_high_freq_factor_bits Float32 bits (llama3)
+#     +5  rope_original_max_positions  int (llama3)
+#     +6  rope_dim                   int, 0 = head_dim
+#     +7  max_positions              int, the declared ceiling (8192 default)
+#     +8  qkv_bias                   0 / 1
+#     +9  o_bias                     0 / 1
+#     +10 norm_kind                  0 rmsnorm, 1 layernorm, 2 rmsnorm_offset
+#     +11 norm_eps_bits              Float32 bits
+#     +12 norm_bias                  0 / 1
+#     +13 mlp_kind                   0 swiglu, 1 gelu, 2 gelu_tanh, 3 geglu, 4 geglu_tanh
+#     +14 mlp_bias                   0 / 1
+#     +15 qk_norm                    0 / 1
+#     +16 attn_softcap_bits          Float32 bits, 0 = none
+#
+#   addrs tail, 11 addresses (0 = absent), appended after the entry's own:
+#     +0  q_proj.bias                +1 k_proj.bias        +2 v_proj.bias
+#     +3  o_proj.bias                +4 input_layernorm.bias
+#     +5  post_attention_layernorm.bias                    +6 up_proj.bias
+#     +7  down_proj.bias             +8 gate_proj.bias
+#     +9  q_norm.weight              +10 k_norm.weight
+#
+# With an ungated MLP (mlp_kind 1 or 2) the base list's gate_proj.weight
+# slot carries 0. A present tensor whose flag is off, an absent one whose
+# flag is on, and every unsupported combination are refused BY NAME in
+# `LlamaDeviceWeights`' options constructor and `BlockOptions.validate`.
+# ===========================================================================
+
+
+def _read_params(params: PythonObject, base: Int, what: String) raises -> List[Int]:
+    """The entry's scalars, `base` of them or `base + BLOCK_OPTION_PARAMS`."""
+    var n = len(params)
+    if n != base and n != base + BLOCK_OPTION_PARAMS:
+        raise Error(
+            what
+            + ": params must contain "
+            + String(base)
+            + " values, or "
+            + String(base)
+            + " + "
+            + String(BLOCK_OPTION_PARAMS)
+            + " with the block options tail, got "
+            + String(n)
+        )
+    var p = List[Int]()
+    for i in range(n):  # small-loop(n: block scalar params, base plus the 17 option tail): validated count of launch parameters, not data
+        p.append(Int(py=params[i]))
+    return p^
+
+
+def _read_addrs_tail(
+    addrs: PythonObject, base: Int, what: String
+) raises -> List[Int]:
+    """The entry's addresses, `base` or `base + BLOCK_OPTION_ADDRS` of them,
+    returned as exactly `base + BLOCK_OPTION_ADDRS` (zeros where the tail
+    was not sent). Null checks are the CALLER's, per slot, because the
+    gate slot may legitimately be 0 under an ungated MLP."""
+    var n = len(addrs)
+    if n != base and n != base + BLOCK_OPTION_ADDRS:
+        raise Error(
+            what
+            + ": addrs must contain "
+            + String(base)
+            + " addresses, or "
+            + String(base)
+            + " + "
+            + String(BLOCK_OPTION_ADDRS)
+            + " with the block options tail, got "
+            + String(n)
+        )
+    var a = List[Int]()
+    for i in range(n):  # small-loop(n: block buffer addresses, base plus the 11 option tail): validated count of tensor addresses, not data
+        a.append(Int(py=addrs[i]))
+    while len(a) < base + BLOCK_OPTION_ADDRS:
+        a.append(0)
+    return a^
+
+
+def _optional_upload(
+    ctx: DeviceContext, addr: Int, n: Int, on: Bool, name: String, what: String,
+) raises -> DeviceBuffer[DType.float32]:
+    """One optional tensor: uploaded at its length when its flag is on,
+    a one-element placeholder otherwise; a presence/flag mismatch is refused
+    by the tensor's name HERE, before any device work."""
+    if on:
+        if addr == 0:
+            raise Error(
+                what + ": " + name + " is required by its option and its"
+                " address is null"
+            )
+        return _upload_addr(ctx, addr, n)
+    if addr != 0:
+        raise Error(
+            what + ": " + name + " was passed but its option is off; pass"
+            " the option or drop the tensor"
+        )
+    return _llama_zeros[False](ctx, 1)
+
+
+def _f32_ptr(addr: Int) raises -> MutPointer[Float32, MutUntrackedOrigin]:
+    return f32_ptr(addr)
+
+
+def _read_f32(addr: Int, n: Int) raises -> List[Float32]:
+    return read_f32(addr, n)
+
+
+def _write_f32(addr: Int, values: List[Float32]) raises:
+    copy_f32(values.unsafe_ptr(), _f32_ptr(addr), len(values))
+
+
+def _upload_addr[wait: Bool = True](
+    ctx: DeviceContext, addr: Int, n: Int
+) raises -> DeviceBuffer[DType.float32]:
+    """Copy a live caller buffer, synchronizing before its borrow ends.
+
+    IDENTICAL uses DeviceContext's ordinary host-pointer transfer directly.
+    Other modes and the diagnostic legacy flag retain pinned staging.
+    `wait=False` (lane/neural-apple, 2026-09-28; the direct path only) leaves
+    the copy in flight: the caller's array outlives the call, every reader
+    is enqueued after it on the same in-order `ctx`, and the caller waits
+    before it returns.
+    """
+    var p = _f32_ptr(addr)
+    var n_buf = n
+    if n_buf < 1:
+        n_buf = 1
+    var dev = ctx.enqueue_create_buffer[DType.float32](n_buf)
+    comptime if GLOBAL_NUMERIC_MODE <= NUMERIC_IDENTICAL and not is_defined["ANONLIB_TRANSFORMER_LEGACY_CALLER_TRANSFER"]():
+        if n > 0:
+            ctx.enqueue_copy(dst_buf=dev, src_ptr=p)
+            comptime if wait:
+                ctx.synchronize()
+            return dev^
+    var host = ctx.enqueue_create_host_buffer[DType.float32](n_buf)
+    ctx.synchronize()
+    if n > 0:
+        memcpy(dest=host.unsafe_ptr(), src=p, count=n)
+    ctx.enqueue_copy(dst_buf=dev, src_ptr=host.unsafe_ptr())
+    ctx.synchronize()
+    _ = host^
+    return dev^
+
+
+def _download_addr[wait: Bool = True](
+    ctx: DeviceContext, mut buf: DeviceBuffer[DType.float32], n: Int, addr: Int
+) raises:
+    """Copy the first `n` elements into a live caller buffer.
+
+    IDENTICAL avoids pinned staging and its memcpy. With wait=False, the
+    caller must retain both full-buffer owners until a final completion wait.
+    Temporary views and legacy staging always finish before their owners die.
+    """
+    var p = _f32_ptr(addr)
+    comptime if GLOBAL_NUMERIC_MODE <= NUMERIC_IDENTICAL and not is_defined["ANONLIB_TRANSFORMER_LEGACY_CALLER_TRANSFER"]():
+        if n == len(buf):
+            ctx.enqueue_copy(dst_ptr=p, src_buf=buf)
+            comptime if wait:
+                ctx.synchronize()
+        else:
+            var direct_view = buf.create_sub_buffer[DType.float32](0, n)
+            ctx.enqueue_copy(dst_ptr=p, src_buf=direct_view)
+            ctx.synchronize()
+            _ = direct_view^
+        return
+    var host = ctx.enqueue_create_host_buffer[DType.float32](n)
+    ctx.synchronize()
+    if n == len(buf):
+        ctx.enqueue_copy(dst_ptr=host.unsafe_ptr(), src_buf=buf)
+    else:
+        var view = buf.create_sub_buffer[DType.float32](0, n)
+        ctx.enqueue_copy(dst_ptr=host.unsafe_ptr(), src_buf=view)
+        ctx.synchronize()
+        _ = view^
+    ctx.synchronize()
+    memcpy(dest=p, src=host.unsafe_ptr(), count=n)
+    _ = host^
+
+
+def _btick(on: Bool, mut t: Int, name: String):
+    if not on:
+        return
+    var now = Int(perf_counter_ns())
+    print(
+        "timing " + name + " " + String(Float64(now - t) / 1000000.0) + " ms"
+    )
+    t = now
+
+
+def transformer_flash_call_count_binding(grouped: PythonObject) raises -> PythonObject:
+    return PythonObject(afn_flash_call_count(Bool(py=grouped)))
+
+
+# TOMBSTONE: ANONLIB_IDN_ATTN_SOFTMAX=2 (slower) deleted 2026-10-10 by c1bf9d832; code recoverable at ca25d9321.
+# Restore: git apply experiments/removed/ANONLIB_IDN_ATTN_SOFTMAX-arm2.patch
+
+
+def transformer_attention_profile_binding() raises -> PythonObject:
+    """Exact attention graph for this native binary's ordinary fp32 model path."""
+    return PythonObject(String("attention-eager.fp32.v1"))
+
+
+def transformer_numeric_mode_binding() raises -> PythonObject:
+    """THE BUILD'S TIER, as the `NUMERIC_*` code itself: 0 FAST, 1
+    IDENTICAL. The same shape as `mamba_numeric_mode`
+    and for the same reason: `_transformer_impl.py` reads it once and
+    refuses to run if the binary it loaded disagrees with the mode the
+    package asked for."""
+    return PythonObject(GLOBAL_NUMERIC_MODE)
+
+
+def transformer_vendor_binding() raises -> PythonObject:
+    """'metal', 'cuda', 'hip' or 'none' -- the accelerator API this
+    binary was compiled for, folded in from `checks/vendor.mojo`. The
+    answer comes from the binary that actually loaded, never from the
+    directory it sat in."""
+    return PythonObject(String(COMPILED_VENDOR))
+
+
+# ===========================================================================
+# The block: profile anonlib.identical.transformer.fp32.v1
+# ===========================================================================
+
+
+def transformer_lean_stages(hd: Int) -> Bool:
+    """Whether this call may skip the `[B, n_heads, L, S]` attention stage
+    allocations: the fused attention path will be attempted (FAST or
+    IDENTICAL build, supported head_dim, not forced eager) and the trace is off here
+    always. The eager fallback grows the buffers on demand."""
+    if not fused_forward_supported_head_dim(hd):
+        return False
+    return attention_path_choice(PLANT_AT_NONE) != ATTN_PATH_EAGER
+
+
+def _load_transformer_weights[wait: Bool = True](
+    ctx: DeviceContext, dims: LlamaDims, a: List[Int],
+    opts: BlockOptions = BlockOptions(), tail: List[Int] = List[Int](),
+) raises -> LlamaDeviceWeights:
+    """One-call uploads; IDENTICAL skips intermediate host weight Lists.
+    Mutable caller arrays are reread and refused on every call as before.
+
+    lane/block-options: `opts` and `tail` (the eleven optional addresses,
+    zeros where absent) select the options constructor. At the DEFAULT
+    record with an all-zero tail this is the code that was here before,
+    upload for upload, so a default block's weights take the old path.
+    """
+    var dm = dims.d_model
+    var qw = dims.q_width()
+    var kw = dims.kv_width()
+    var it = dims.intermediate
+    var hd = dims.head_dim
+    var extended = not opts.is_default()
+    for i in range(len(tail)):  # small-loop(tail: the 11 optional block addresses): checks address presence, not data
+        if tail[i] != 0:
+            extended = True
+    if not extended:
+        if a[7] == 0:
+            raise Error(
+                "transformer: gate_proj.weight address is null (the default"
+                " options carry a gated MLP)"
+            )
+        comptime if GLOBAL_NUMERIC_MODE <= NUMERIC_IDENTICAL and not is_defined["ANONLIB_TRANSFORMER_LEGACY_WEIGHT_COPY"]():
+            return LlamaDeviceWeights(
+                ctx, dims, RMS_EPS,
+                _upload_addr[wait](ctx, a[1], dm),
+                _upload_addr[wait](ctx, a[2], dm),
+                _upload_addr[wait](ctx, a[3], qw * dm),
+                _upload_addr[wait](ctx, a[4], kw * dm),
+                _upload_addr[wait](ctx, a[5], kw * dm),
+                _upload_addr[wait](ctx, a[6], dm * qw),
+                _upload_addr[wait](ctx, a[7], it * dm),
+                _upload_addr[wait](ctx, a[8], it * dm),
+                _upload_addr[wait](ctx, a[9], dm * it),
+            )
+        else:
+            return LlamaDeviceWeights(
+                ctx, dims, RMS_EPS,
+                _read_f32(a[1], dm),
+                _read_f32(a[2], dm),
+                _read_f32(a[3], qw * dm),
+                _read_f32(a[4], kw * dm),
+                _read_f32(a[5], kw * dm),
+                _read_f32(a[6], dm * qw),
+                _read_f32(a[7], it * dm),
+                _read_f32(a[8], it * dm),
+                _read_f32(a[9], dm * it),
+            )
+    # The options constructor. `opts.validate` fires inside it by name.
+    var what = String("transformer options")
+    var t = tail.copy()
+    while len(t) < BLOCK_OPTION_ADDRS:
+        t.append(0)
+    var w_gate: DeviceBuffer[DType.float32]
+    if opts.gated():
+        if a[7] == 0:
+            raise Error(what + ": gate_proj.weight address is null (a gated MLP needs it)")
+        w_gate = _upload_addr[wait](ctx, a[7], it * dm)
+    else:
+        if a[7] != 0:
+            raise Error(
+                what + ": gate_proj.weight was passed but the MLP is ungated"
+                " (mlp gelu / gelu_tanh); drop it or pick a gated form"
+            )
+        w_gate = _llama_zeros[False](ctx, 1)
+    return LlamaDeviceWeights(
+        ctx, dims, opts,
+        _upload_addr[wait](ctx, a[1], dm),
+        _upload_addr[wait](ctx, a[2], dm),
+        _upload_addr[wait](ctx, a[3], qw * dm),
+        _upload_addr[wait](ctx, a[4], kw * dm),
+        _upload_addr[wait](ctx, a[5], kw * dm),
+        _upload_addr[wait](ctx, a[6], dm * qw),
+        w_gate^,
+        _upload_addr[wait](ctx, a[8], it * dm),
+        _upload_addr[wait](ctx, a[9], dm * it),
+        _optional_upload(ctx, t[0], qw, opts.qkv_bias, "q_proj.bias", what),
+        _optional_upload(ctx, t[1], kw, opts.qkv_bias, "k_proj.bias", what),
+        _optional_upload(ctx, t[2], kw, opts.qkv_bias, "v_proj.bias", what),
+        _optional_upload(ctx, t[3], dm, opts.o_bias, "o_proj.bias", what),
+        _optional_upload(ctx, t[4], dm, opts.norm_bias, "input_layernorm.bias", what),
+        _optional_upload(ctx, t[5], dm, opts.norm_bias, "post_attention_layernorm.bias", what),
+        _optional_upload(ctx, t[6], it, opts.mlp_bias, "up_proj.bias", what),
+        _optional_upload(ctx, t[7], dm, opts.mlp_bias, "down_proj.bias", what),
+        _optional_upload(ctx, t[8], it, opts.has_gate_bias(), "gate_proj.bias", what),
+        _optional_upload(ctx, t[9], hd, opts.qk_norm, "q_norm.weight", what),
+        _optional_upload(ctx, t[10], hd, opts.qk_norm, "k_norm.weight", what),
+    )
+
+
+def _tail_of(a: List[Int], base: Int) -> List[Int]:
+    """The eleven optional addresses out of a base + tail list (zeros when
+    the list is the base alone)."""
+    var t = List[Int]()
+    for i in range(BLOCK_OPTION_ADDRS):
+        if base + i < len(a):
+            t.append(a[base + i])
+        else:
+            t.append(0)
+    return t^
+
+
+def _check_base_addrs(a: List[Int], slots: List[Int], what: String) raises:
+    """Null refusals for the base slots a caller must fill (the gate slot is
+    checked by `_load_transformer_weights` against the MLP form)."""
+    for i in range(len(slots)):  # small-loop(slots: a handful of base address slots): null checks on addresses, not data
+        if a[slots[i]] == 0:
+            raise Error(what + ": null buffer address at slot " + String(slots[i]))
+
+
+def _lean_for(hd: Int, opts: BlockOptions) -> Bool:
+    """`transformer_lean_stages`, and never lean under a softcap, which
+    forces the eager kernels (DEVIATION 2947); the eager fallback would
+    grow a lean struct anyway, so this is a cost choice, not a correctness
+    one."""
+    if opts.has_softcap():
+        return False
+    return transformer_lean_stages(hd)
+
+
+def _lean_for_w(hd: Int, w: LlamaDeviceWeights) -> Bool:
+    """`_lean_for` for weights that may carry the profile's planes: never
+    lean under `fixed15_v1`, as `_transformer_run_session_int15` builds its
+    stages (lane/lowbit-default: the resident sessions under the profile)."""
+    if w.int15:
+        return False
+    return _lean_for(hd, w.opts)
+
+
+def _workspace_key(
+    b: Int, l: Int, dims: LlamaDims, smax: Int, window: Int, lean: Bool,
+    opts: BlockOptions,
+) -> List[Int]:
+    """The retained workspace's identity: the shape, and the whole options
+    record (a different theta or rope_dim is a different rotary table)."""
+    var key: List[Int] = [b, l, dims.d_model, dims.n_heads, dims.n_kv,
+                          dims.head_dim, dims.intermediate, smax, window, Int(lean)]
+    var tail = opts.to_params()
+    for i in range(len(tail)):  # small-loop(tail: the 17 block option params): builds a cache key, not data
+        key.append(tail[i])
+    return key^
+
+
+struct TransformerWorkspace(Movable):
+    var key: List[Int]
+    var kv: LlamaKVCache
+    var rope: LlamaRopeTable
+    var stages: LlamaDeviceStages
+    var x: DeviceBuffer[DType.float32]
+    #: ANONLIB_AFN_ATTN_ARENA (FAST + Apple): the arena the workspace's
+    #: buffers are views of; -1 (no arena) on every other build.
+    var arena_id: Int
+
+    def __init__(out self, ctx: DeviceContext, dims: LlamaDims,
+                 b: Int, l: Int, smax: Int, window: Int, lean: Bool,
+                 opts: BlockOptions) raises:
+        self.key = _workspace_key(b, l, dims, smax, window, lean, opts)
+        self.arena_id = -1
+        comptime if AFN_ATTN_ARENA:
+            # lane afn-attn: every buffer below (cache, rope, ~30 stages, x)
+            # is a sub-buffer view of the arena's chunks (core/device_arena),
+            # so a Metal launch pays for a few live allocations, not ~35.
+            # `_zeros`/`_upload` take the views while the arena is active.
+            self.arena_id = arena_begin()
+        self.kv = LlamaKVCache(ctx, b, dims, smax, window, opts.max_positions)
+        # The table from the record: DEVIATIONS 2930-2933 and 2948; the
+        # default record is `LlamaRopeTable(ctx, dims, ROPE_THETA, smax)`.
+        self.rope = LlamaRopeTable(ctx, dims, opts, smax)
+        self.stages = LlamaDeviceStages(ctx, b, l, smax, dims, window, lean=lean)
+        comptime if AFN_ATTN_ARENA:
+            self.x = _llama_zeros(ctx, b * l * dims.d_model)
+            arena_end(self.arena_id)
+        else:
+            self.x = ctx.enqueue_create_buffer[DType.float32](b * l * dims.d_model)
+
+    def __deinit__(deinit self):
+        """ANONLIB_AFN_ATTN_ARENA: the arena's chunks go back to the pool
+        (not freed; the views in this struct's fields die right after this
+        body). Nothing on every other build."""
+        comptime if AFN_ATTN_ARENA:
+            try:
+                arena_release(self.arena_id)
+            except:
+                pass
+
+    def retained_bytes(self) -> Int:
+        var cells = len(self.x) + len(self.kv.k) + len(self.kv.v)
+        cells += len(self.rope.inv_freq) + len(self.rope.cos) + len(self.rope.sin)
+        cells += len(self.stages.gemm_workspace.buffer)
+        cells += len(self.stages.norm1_sumsq)
+        cells += len(self.stages.norm1_out)
+        cells += len(self.stages.q_proj)
+        cells += len(self.stages.k_proj)
+        cells += len(self.stages.v_proj)
+        cells += len(self.stages.q_rope)
+        cells += len(self.stages.k_rope)
+        cells += len(self.stages.k_cache)
+        cells += len(self.stages.v_cache)
+        cells += len(self.stages.scores)
+        cells += len(self.stages.masked)
+        cells += len(self.stages.amax)
+        cells += len(self.stages.aexp)
+        cells += len(self.stages.denom)
+        cells += len(self.stages.weights)
+        cells += len(self.stages.ctxv)
+        cells += len(self.stages.o_proj)
+        cells += len(self.stages.residual1)
+        cells += len(self.stages.norm2_sumsq)
+        cells += len(self.stages.norm2_out)
+        cells += len(self.stages.gate_proj)
+        cells += len(self.stages.up_proj)
+        cells += len(self.stages.silu_out)
+        cells += len(self.stages.gated)
+        cells += len(self.stages.down_proj)
+        cells += len(self.stages.residual2)
+        cells += len(self.stages.qbh)
+        cells += len(self.stages.kbh)
+        cells += len(self.stages.sbh)
+        return cells * 4
+
+    def matches(self, key: List[Int]) -> Bool:
+        if len(key) != len(self.key):
+            return False
+        for i in range(len(key)):  # small-loop(key: shape and option entries of the workspace key): compares cache keys, not data
+            if key[i] != self.key[i]:
+                return False
+        return True
+
+
+struct TransformerBackwardWorkspace(Movable):
+    """The retained half of `transformer_session_backward`: the backward
+    stages for one shape and the device copy of grad_output. The forward
+    half is the session's `TransformerWorkspace` (stages, cache, rope, x)
+    at `smax = L`."""
+    var key: List[Int]
+    var bst: LlamaBackwardStages
+    var d_out: DeviceBuffer[DType.float32]
+
+    def __init__(out self, ctx: DeviceContext, dims: LlamaDims, b: Int, l: Int,
+                 window: Int, lean: Bool) raises:
+        self.key = [b, l, dims.d_model, dims.n_heads, dims.n_kv, dims.head_dim,
+                    dims.intermediate, window, Int(lean)]
+        self.bst = LlamaBackwardStages(ctx, b, l, l, dims, lean=lean)
+        self.d_out = ctx.enqueue_create_buffer[DType.float32](b * l * dims.d_model)
+
+    def matches(self, key: List[Int]) -> Bool:
+        if len(key) != len(self.key):
+            return False
+        for i in range(len(key)):  # small-loop(key: nine shape entries of the backward key): compares cache keys, not data
+            if key[i] != self.key[i]:
+                return False
+        return True
+
+
+from training.neural_attention_owner import BorrowedAttentionTape
+from transformer.experiments.profile import transformer_arithmetic_profile, transformer_arithmetic_profile_changed
+
+
+struct TransformerSession(Movable, Writable):
+    """One Python-owned context/workspace; no retained host pointers or
+    float32 weights. Under `numeric_profile="fixed15_v1"` it RETAINS the
+    block's seven projection planes on the device (`planes`, keyed by
+    their addresses and the shape): those arrays are private to the Python
+    block, made once at its construction and never exposed or written, so
+    unlike a caller's float32 array their address is their version."""
+    var ctx: Optional[DeviceContext]
+    var workspace: Optional[TransformerWorkspace]
+    var planes: Optional[LlamaInt15Weights]
+    var planes_key: List[Int]
+    var weights: Optional[LlamaDeviceWeights]
+    """lane/neural-net-experiment (2026-09-30): the block's float32 weights
+    RETAINED on the device across calls. A Python address is still not a
+    version: `weights_host` keeps the exact bytes that were uploaded, and
+    every call compares the caller's arrays against them bit for bit
+    (`_weights_same_bits`) before reusing the device copy. Changed bytes are
+    copied into the SAME device buffers (no reallocation) and revalidated by
+    the constructor's own `_validate_finite`; a different shape or options
+    record rebuilds. Default-record blocks only: an options block (`extended`)
+    keeps the per-call upload."""
+    var weights_key: List[Int]
+    var weights_host: List[Float32]
+    var weight_uploads: Int
+    var weight_recopies: Int
+    var weight_reuses: Int
+    var backward: Optional[TransformerBackwardWorkspace]
+    """lane/neural-net-experiment: the zero-state prefill backward's stages
+    and its grad_output buffer, retained across `transformer_session_backward`
+    calls the way the byte trainer retains `tr.backward[layer]` across steps
+    (no reset exists or is needed: every cell the backward reads it wrote
+    this call). Dropped with the forward workspace under the same budget."""
+    var backward_workspaces: Int
+    var tape: Optional[BorrowedAttentionTape]
+    var tape_generation: Int
+    var busy: Bool
+    var closed: Bool
+    var contexts: Int
+    var workspaces: Int
+
+    def __init__(out self):
+        self.ctx = Optional[DeviceContext]()
+        self.workspace = Optional[TransformerWorkspace]()
+        self.planes = Optional[LlamaInt15Weights]()
+        self.planes_key = List[Int]()
+        self.weights = Optional[LlamaDeviceWeights]()
+        self.weights_key = List[Int]()
+        self.weights_host = List[Float32]()
+        self.weight_uploads = 0
+        self.weight_recopies = 0
+        self.weight_reuses = 0
+        self.backward = Optional[TransformerBackwardWorkspace]()
+        self.backward_workspaces = 0
+        self.tape = None
+        self.tape_generation = 1
+        self.busy = False
+        self.closed = False
+        self.contexts = 0
+        self.workspaces = 0
+
+    def write_to(self, mut writer: Some[Writer]):
+        writer.write("TransformerSession")
+
+    def write_repr_to(self, mut writer: Some[Writer]):
+        writer.write("TransformerSession")
+
+    def __deinit__(deinit self):
+        # Same teardown order as ByteLMSession (DEVIATION 2520): buffer
+        # destruction enqueues frees, which must drain before context death.
+        _ = self.tape^
+        _ = self.backward^
+        _ = self.workspace^
+        _ = self.planes^
+        _ = self.weights^
+        if self.ctx:
+            try:
+                self.ctx.value().synchronize()
+            except:
+                pass
+        _ = self.ctx^
+
+    def invalidate_tape(mut self) raises:
+        # Ordinary calls with no explicit tape retain their previous launch
+        # and synchronization schedule; only live tape owners need fences.
+        if self.tape:
+            if self.ctx:
+                self.ctx.value().synchronize()
+            self.tape = None
+            if self.ctx:
+                self.ctx.value().synchronize()
+        self.tape_generation += 1
+
+    def clear(mut self) raises:
+        self.invalidate_tape()
+        if self.ctx:
+            self.ctx.value().synchronize()
+        self.backward = None
+        self.workspace = None
+        self.planes = None
+        self.planes_key = List[Int]()
+        self.weights = None
+        self.weights_key = List[Int]()
+        self.weights_host = List[Float32]()
+        if self.ctx:
+            self.ctx.value().synchronize()
+
+
+def _weights_key(dims: LlamaDims, opts: BlockOptions) -> List[Int]:
+    """The retained weights' identity: the shape and the options record."""
+    var key: List[Int] = [dims.d_model, dims.n_heads, dims.n_kv, dims.head_dim,
+                          dims.intermediate]
+    var tail = opts.to_params()
+    for i in range(len(tail)):  # small-loop(tail: the 17 block option params): builds a cache key, not data
+        key.append(tail[i])
+    return key^
+
+
+def _base_weight_lens(dims: LlamaDims) -> List[Int]:
+    """Element counts of the nine base weights in slot order 1..9."""
+    var dm = dims.d_model
+    var qw = dims.q_width()
+    var kw = dims.kv_width()
+    var it = dims.intermediate
+    var lens: List[Int] = [dm, dm, qw * dm, kw * dm, kw * dm, dm * qw,
+                           it * dm, it * dm, dm * it]
+    return lens^
+
+
+def _weights_same_bits(a: List[Int], host: List[Float32], lens: List[Int]) raises -> Bool:
+    """Whether the caller's nine base arrays hold exactly the bytes in
+    `host` (their concatenation in slot order): an integer compare of the
+    bit patterns, eight lanes at a time (`-0.0` and `+0.0` differ, NaN
+    payloads differ, as they must for a version check)."""
+    comptime W = 8
+    var off = 0
+    for s in range(9):
+        var n = lens[s]
+        var p = _f32_ptr(a[s + 1])
+        var hp = host.unsafe_ptr()
+        var i = 0
+        var body = n - n % W
+        while i < body:
+            var x = bitcast[DType.uint32, W](p.unsafe_load[width=W](i))
+            var y = bitcast[DType.uint32, W](hp.unsafe_load[width=W](off + i))
+            if (x ^ y).reduce_or() != UInt32(0):
+                return False
+            i += W
+        while i < n:
+            if bitcast[DType.uint32](p.unsafe_load(i)) != bitcast[DType.uint32](hp.unsafe_load(off + i)):
+                return False
+            i += 1
+        off += n
+    return True
+
+
+def _weights_host_copy(a: List[Int], lens: List[Int]) raises -> List[Float32]:
+    """The nine base arrays' bytes, concatenated in slot order."""
+    var total = 0
+    for s in range(9):
+        total += lens[s]
+    var out = List[Float32](length=total, fill=Float32(0))
+    var off = 0
+    for s in range(9):
+        var n = lens[s]
+        if n > 0:
+            memcpy(dest=out.unsafe_ptr() + off, src=_f32_ptr(a[s + 1]), count=n)
+        off += n
+    return out^
+
+
+def _weights_recopy(ctx: DeviceContext, mut w: LlamaDeviceWeights, a: List[Int], lens: List[Int]) raises:
+    """Changed caller bytes into the RETAINED device buffers, slot order,
+    one wait, then the constructor's own refusal of non-finite weights
+    (DEVIATION 1875's order and names)."""
+    ctx.enqueue_copy(dst_buf=w.norm1_w, src_ptr=_f32_ptr(a[1]))
+    ctx.enqueue_copy(dst_buf=w.norm2_w, src_ptr=_f32_ptr(a[2]))
+    ctx.enqueue_copy(dst_buf=w.w_q, src_ptr=_f32_ptr(a[3]))
+    ctx.enqueue_copy(dst_buf=w.w_k, src_ptr=_f32_ptr(a[4]))
+    ctx.enqueue_copy(dst_buf=w.w_v, src_ptr=_f32_ptr(a[5]))
+    ctx.enqueue_copy(dst_buf=w.w_o, src_ptr=_f32_ptr(a[6]))
+    ctx.enqueue_copy(dst_buf=w.w_gate, src_ptr=_f32_ptr(a[7]))
+    ctx.enqueue_copy(dst_buf=w.w_up, src_ptr=_f32_ptr(a[8]))
+    ctx.enqueue_copy(dst_buf=w.w_down, src_ptr=_f32_ptr(a[9]))
+    ctx.synchronize()
+    _ = lens
+    w._validate_finite(ctx)
+
+
+def _stage_reset_on() -> Bool:
+    """`ANONLIB_TRANSFORMER_STAGE_RESET=0` skips the thirty zero-fills a
+    reused workspace gets before each call. Bit-safe only if every cell a
+    call reads it also wrote this call; the identity gate decides."""
+    return String(getenv("ANONLIB_TRANSFORMER_STAGE_RESET")) != "0"
+
+
+def _session_retain_cap_bytes() -> Int:
+    """Retained workspace budget per session: `ANONLIB_TRANSFORMER_RETAIN_MB`
+    (an integer, MiB), default 512. Was a fixed 64 MiB, which the board's
+    block shape (B1 L2048 DM384 FF1024: about 87 MiB of lean stages) exceeded
+    on every call, so the whole workspace was rebuilt per call."""
+    var cap_mb = 512
+    var s = String(getenv("ANONLIB_TRANSFORMER_RETAIN_MB"))
+    if s != "":
+        try:
+            cap_mb = Int(atol(s))
+        except:
+            cap_mb = 512
+    if cap_mb < 0:
+        cap_mb = 0
+    return cap_mb * 1024 * 1024
+
+
+def _session_weights(
+    mut session: TransformerSession, dims: LlamaDims,
+    a: List[Int], opts: BlockOptions, tail: List[Int],
+) raises:
+    """Leave `session.weights` holding this call's weights: the retained
+    device copy when the caller's bytes equal the ones uploaded, a recopy
+    into the retained buffers when they differ, a fresh upload otherwise.
+    Options blocks (a non-default record or any tail address) take the
+    per-call upload as before; nothing is retained for them."""
+    session.invalidate_tape()
+    ref ctx = session.ctx.value()
+    var extended = not opts.is_default()
+    for i in range(len(tail)):  # small-loop(tail: the 11 optional block addresses): checks address presence, not data
+        if tail[i] != 0:
+            extended = True
+    # ANONLIB_TRANSFORMER_RETAIN_WEIGHTS=0: the per-call upload for every
+    # block (the A/B against the byte compare; measured 0.3 ms per call on
+    # an L40S, where the upload it replaces was already cheap).
+    if String(getenv("ANONLIB_TRANSFORMER_RETAIN_WEIGHTS")) == "0":
+        extended = True
+    if extended:
+        session.weights = None
+        session.weights_key = List[Int]()
+        session.weights_host = List[Float32]()
+        session.weights = _load_transformer_weights(ctx, dims, a, opts, tail)
+        session.weight_uploads += 1
+        return
+    var key = _weights_key(dims, opts)
+    var lens = _base_weight_lens(dims)
+    var same_key = False
+    if session.weights:
+        same_key = len(session.weights_key) == len(key)
+        if same_key:
+            for i in range(len(key)):  # small-loop(key: shape and option entries of the weights key): compares cache keys, not data
+                if key[i] != session.weights_key[i]:
+                    same_key = False
+    if same_key:
+        if _weights_same_bits(a, session.weights_host, lens):
+            session.weight_reuses += 1
+            return
+        # Bytes moved: copy them into the retained buffers. A refusal below
+        # leaves the session without weights (the next call uploads anew).
+        var fresh = _weights_host_copy(a, lens)
+        try:
+            ref retained = session.weights.value()
+            _weights_recopy(ctx, retained, a, lens)
+        except error:
+            session.weights = None
+            session.weights_key = List[Int]()
+            session.weights_host = List[Float32]()
+            raise error
+        session.weights_host = fresh^
+        session.weight_recopies += 1
+        return
+    session.weights = None
+    session.weights_key = List[Int]()
+    session.weights_host = List[Float32]()
+    var host = _weights_host_copy(a, lens)
+    session.weights = _load_transformer_weights(ctx, dims, a, opts, tail)
+    session.weights_key = key^
+    session.weights_host = host^
+    session.weight_uploads += 1
+
+
+# TOMBSTONE: ANONLIB_IDN_ATTN_DEFER_REGIME (loser: transformer-forward 1.376) deleted 2026-10-11 by 68d9654bb; code recoverable at 68d9654bb^.
+# Restore: git apply experiments/removed/ANONLIB_IDN_ATTN_DEFER_REGIME.patch
+# TOMBSTONE: ANONLIB_IDN_TF_SESSION_LEAN (loser: transformer-forward 1.350) deleted 2026-10-11 by 68d9654bb; code recoverable at 68d9654bb^.
+# Restore: git apply experiments/removed/ANONLIB_IDN_TF_SESSION_LEAN.patch
+def _transformer_run_session[discard_cache: Bool = False, retain_tape: Bool = False](
+    mut session: TransformerSession, a: List[Int], b: Int, l: Int,
+    dm: Int, nh: Int, nkv: Int, hd: Int, it: Int,
+    smax: Int, s0: Int, window: Int, opts: BlockOptions,
+) raises -> Int:
+    """`discard_cache` (lane/neural-net-experiment): the stateless prefill on
+    the session -- the caller passes no cache (slots 10 and 11 are 0), the
+    retained cache buffers are zero-filled on the device (the bytes a fresh
+    `LlamaKVCache` holds), nothing is uploaded or downloaded for it, and
+    `s0` is 0. Same kernels, same launches, same order."""
+    var dims = LlamaDims(dm, nh, nkv, hd, it)
+    dims.validate()
+    opts.validate(hd)
+    if s0 < 0 or s0 > smax:
+        raise Error(String("transformer: cached_tokens must be in [0, ")
+            + String(smax) + "] (the cache capacity, max_tokens), got "
+            + String(s0) + "; the two sides of this boundary disagree about the state")
+    if window < 0:
+        raise Error("transformer: window must be >= 0 (0 = full causal)")
+    if not session.ctx:
+        session.ctx = neural_ctx[_NEURAL_CTX]()
+        session.contexts += 1
+    var ton = String(getenv("ANONLIB_TRANSFORMER_TIMING")) != ""
+    var tk = Int(perf_counter_ns())
+    var lean = _lean_for(hd, opts)
+    var key = _workspace_key(b, l, dims, smax, window, lean, opts)
+    var reused = False
+    if session.workspace:
+        reused = session.workspace.value().matches(key)
+    if not reused:
+        session.ctx.value().synchronize()
+        session.workspace = None
+        session.ctx.value().synchronize()
+    # Reread the caller's weights on EVERY call; a Python address is not a
+    # version. The device copy is reused only when the bytes are the same
+    # (`_session_weights`), recopied in place when they moved.
+    _session_weights(session, dims, a, opts, _tail_of(a, 13))
+    ref ctx = session.ctx.value()
+    ref w = session.weights.value()
+    _btick(ton, tk, "surface.weights_up")
+    if not reused:
+        session.workspace = TransformerWorkspace(ctx, dims, b, l, smax, window, lean, opts)
+        session.workspaces += 1
+    ref ws = session.workspace.value()
+    if reused and _stage_reset_on():
+        ws.stages.reset(ctx)
+    comptime if discard_cache:
+        if s0 != 0:
+            raise Error("transformer: a discarded cache starts at cached_tokens 0")
+        # The bytes a fresh `LlamaKVCache` holds, on the device, no upload.
+        # TOMBSTONE: ANONLIB_IDN_TF_SESSION_LEAN (loser: transformer-forward 1.350) deleted 2026-10-11 by 68d9654bb; code recoverable at 68d9654bb^.
+        # Restore: git apply experiments/removed/ANONLIB_IDN_TF_SESSION_LEAN.patch
+        ws.kv.k.enqueue_fill(Float32(0.0))
+        ws.kv.v.enqueue_fill(Float32(0.0))
+    else:
+        # Host cache state is authoritative on EVERY call, including resets and
+        # same-address edits. Copy into retained allocations, never trust a pointer.
+        ctx.enqueue_copy(dst_buf=ws.kv.k, src_ptr=_f32_ptr(a[10]))
+        ctx.enqueue_copy(dst_buf=ws.kv.v, src_ptr=_f32_ptr(a[11]))
+    ctx.enqueue_copy(dst_buf=ws.x, src_ptr=_f32_ptr(a[0]))
+    comptime if not AFN_ATTN_ARENA:
+        ctx.synchronize()
+    # ANONLIB_AFN_ATTN_ARENA: no wait here. The uploads and the forward's
+    # launches are in order on the one stream, and the caller's host arrays
+    # outlive the call (the download wait below drains everything).
+    ws.kv.s = s0
+    _btick(ton, tk, "surface.cache_stages_x_up")
+    # TOMBSTONE: ANONLIB_IDN_ATTN_DEFER_REGIME (loser: transformer-forward 1.376) deleted 2026-10-11 by 68d9654bb; code recoverable at 68d9654bb^.
+    # Restore: git apply experiments/removed/ANONLIB_IDN_ATTN_DEFER_REGIME.patch
+    var trace = IdentityTrace.disabled()
+    # forward_only: no backward reads this entry's stages.
+    llama_decoder_layer_forward(ctx, ws.stages, ws.kv, ws.rope, w, ws.x,
+                                b, l, s0, trace, String("py"), forward_only=not retain_tape)
+    _btick(ton, tk, "surface.forward")
+    # One wait for the downloads (the fresh entry's pattern): every owner
+    # stays alive through it.
+    _download_addr[False](ctx, ws.stages.residual2, b * l * dm, a[12])
+    comptime if not discard_cache:
+        _download_addr[False](ctx, ws.kv.k, len(ws.kv.k), a[10])
+        _download_addr[False](ctx, ws.kv.v, len(ws.kv.v), a[11])
+    ctx.synchronize()
+    _btick(ton, tk, "surface.outputs_down")
+    var result = ws.kv.s
+    # Bound retained device-buffer storage per model. Large legal calls still
+    # run, but release their workspace after completion rather than pinning it.
+    var retain = retain_tape or ws.retained_bytes() <= _session_retain_cap_bytes()
+    if not retain:
+        session.workspace = None
+        ctx.synchronize()
+    return result
+
+
+
+struct TransformerForwardTape(Movable, Writable):
+    """NI36/48 single-use owner of input, weight snapshots and saved stages.
+
+    The session is private to this tape: no future model call can overwrite
+    it, so pointer equality is never used as a content-generation guarantee.
+    It is retained through backward or close, including calls over the normal
+    inference cache-retention budget. Peak tape memory belongs to the caller.
+    """
+    var session: TransformerSession
+    var shape: List[Int]
+    var consumed: Bool
+    var busy: Bool
+
+    def __init__(out self, shape: List[Int]):
+        self.session = TransformerSession()
+        self.shape = shape.copy()
+        self.consumed = False
+        self.busy = False
+
+    def write_to(self, mut writer: Some[Writer]):
+        writer.write("TransformerForwardTape")
+
+    def write_repr_to(self, mut writer: Some[Writer]):
+        writer.write("TransformerForwardTape")
+
+    def close(mut self) raises:
+        self.consumed = True
+        self.session.clear()
+        self.session.ctx = None
+
+
+def transformer_forward_tape_enabled_binding() -> PythonObject:
+    return PythonObject(IDN_SAMBA_FORWARD_TAPE)
+
+
+def transformer_forward_tape_binding(addrs: PythonObject, params: PythonObject) raises -> PythonObject:
+    """[x, nine weights, y], [B,L,dm,nh,nkv,hd,it,window] -> owned tape."""
+    comptime if not IDN_SAMBA_FORWARD_TAPE:
+        raise Error("transformer forward tape: IDENTICAL opt-in is disabled")
+    var incoming = _read_addrs_tail(addrs, 11, String("transformer_forward_tape"))
+    # _read_addrs_tail always returns 11 + BLOCK_OPTION_ADDRS slots (zeros
+    # where no options tail was sent), so the old `len(incoming) != 11` test
+    # refused every call. Default options means the tail slots are all zero.
+    for i in range(11, len(incoming)):  # small-loop(incoming: the block options tail slots): validated tensor addresses, not data
+        if incoming[i] != 0:
+            raise Error("transformer forward tape: default options only (no block options tail)")
+    var p = _read_params(params, 8, String("transformer_forward_tape"))
+    if len(p) != 8:
+        raise Error("transformer forward tape: expected 8 shape scalars")
+    for i in range(11):  # metadata: fixed input/output pointer list
+        if incoming[i] == 0:
+            raise Error("transformer forward tape: null address at slot " + String(i))
+    var a = List[Int]()
+    for i in range(10):  # metadata: x and the nine weights
+        a.append(incoming[i])
+    a.append(0)
+    a.append(0)
+    a.append(incoming[10])
+    var tape = TransformerForwardTape(p)
+    with GILReleased(Python()):
+        try:
+            _ = _transformer_run_session[True, True](tape.session, a,
+                p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[1], 0, p[7], BlockOptions())
+        except error:
+            tape.close()
+            raise error
+    return PythonObject(alloc=tape^)
+
+
+def _transformer_saved_backward(mut tape: TransformerForwardTape, a: List[Int]) raises:
+    ref p = tape.shape
+    var b = p[0]
+    var l = p[1]
+    var dm = p[2]
+    var dims = LlamaDims(dm, p[3], p[4], p[5], p[6])
+    ref session = tape.session
+    if not session.ctx or not session.workspace or not session.weights:
+        raise Error("transformer forward tape: saved owner is unavailable")
+    ref ctx = session.ctx.value()
+    ref ws = session.workspace.value()
+    ref w = session.weights.value()
+    var bw = TransformerBackwardWorkspace(ctx, dims, b, l, p[7], transformer_lean_stages(p[5]))
+    ctx.enqueue_copy(dst_buf=bw.d_out, src_ptr=_f32_ptr(a[0]))
+    ctx.synchronize()
+    var off = IdentityTrace.disabled()
+    # Reuse the real saved forward; no weight upload or forward recompute.
+    # The stage order and fan-in sums are owned by the autograd tape
+    # (autograd/rules_transformer.mojo).
+    # TOMBSTONE: ANONLIB_AUTOGRAD_TRANSFORMER(_OFF) (PROMOTED, hand arm deleted) deleted 2026-10-19 by dd4194a23; code recoverable at dd4194a23^.
+    # Restore: git apply experiments/removed/ANONLIB_AUTOGRAD_TRANSFORMER.patch
+    llama_decoder_layer_backward_autograd(ctx, bw.bst, ws.stages, w,
+        ws.rope.cos, ws.rope.sin, ws.x, bw.d_out, b, l, 0, off, String("saved"))
+    _download_addr[False](ctx, bw.bst.d_x, b * l * dm, a[1])
+    _download_addr[False](ctx, bw.bst.dw_norm1, dm, a[2])
+    _download_addr[False](ctx, bw.bst.dw_norm2, dm, a[3])
+    _download_addr[False](ctx, bw.bst.dw_q, dims.q_width() * dm, a[4])
+    _download_addr[False](ctx, bw.bst.dw_k, dims.kv_width() * dm, a[5])
+    _download_addr[False](ctx, bw.bst.dw_v, dims.kv_width() * dm, a[6])
+    _download_addr[False](ctx, bw.bst.dw_o, dm * dims.q_width(), a[7])
+    _download_addr[False](ctx, bw.bst.dw_gate, p[6] * dm, a[8])
+    _download_addr[False](ctx, bw.bst.dw_up, p[6] * dm, a[9])
+    _download_addr[False](ctx, bw.bst.dw_down, dm * p[6], a[10])
+    ctx.synchronize()
+
+
+def transformer_backward_tape_binding(tape: PythonObject, addrs: PythonObject) raises -> PythonObject:
+    comptime if not IDN_SAMBA_FORWARD_TAPE:
+        raise Error("transformer backward tape: IDENTICAL opt-in is disabled")
+    var owner = tape.downcast_value_ptr[TransformerForwardTape]()
+    if owner[].busy or owner[].consumed:
+        raise Error("transformer forward tape: busy, closed or already consumed")
+    var a = _read_addrs_tail(addrs, 11, String("transformer_backward_tape"))
+    # _read_addrs_tail pads to 11 + BLOCK_OPTION_ADDRS slots, so the old
+    # `len(a) != 11` test refused every call (the forward tape entry had the
+    # same fault). The backward takes no options: the tail must be zero.
+    for i in range(11, len(a)):  # small-loop(a: the block options tail slots): validated tensor addresses, not data
+        if a[i] != 0:
+            raise Error("transformer backward tape: expected dy and ten outputs, no block options tail")
+    for i in range(11):
+        if a[i] == 0:
+            raise Error("transformer backward tape: null address at slot " + String(i))
+    owner[].busy = True
+    owner[].consumed = True
+    try:
+        with GILReleased(Python()):
+            try:
+                _transformer_saved_backward(owner[], a)
+            except error:
+                owner[].close()
+                raise error
+            owner[].close()
+    except error:
+        owner[].busy = False
+        raise error
+    owner[].busy = False
+    return PythonObject(0)
+
+
+def transformer_close_tape_binding(tape: PythonObject) raises -> PythonObject:
+    var owner = tape.downcast_value_ptr[TransformerForwardTape]()
+    if owner[].busy:
+        raise Error("transformer forward tape: busy")
+    with GILReleased(Python()):
+        owner[].close()
+    return PythonObject(0)
+
+def transformer_session_forward_fresh_binding(
+    session: PythonObject, addrs: PythonObject, params: PythonObject,
+) raises -> PythonObject:
+    """`transformer_session_forward` for a STATELESS prefill (lane/neural-net-
+    experiment, 2026-09-30): the same 13 (+11) addresses with the cache slots
+    10 and 11 ZERO, the same 10 (+17) params with `smax = L` and
+    `cached_tokens = 0`. The cache is the session's retained buffers,
+    zero-filled on the device; nothing of it crosses the host boundary. This
+    is `transformer_forward_fresh` on a session: weights retained across
+    calls (`_session_weights`), workspace retained under the budget."""
+    var owner = session.downcast_value_ptr[TransformerSession]()
+    if owner[].busy or owner[].closed:
+        raise Error("transformer: session is busy or closed")
+    var a = _read_addrs_tail(addrs, 13, String("transformer_session_forward_fresh"))
+    _check_base_addrs(a, [0, 1, 2, 3, 4, 5, 6, 8, 9, 12], String("transformer_session_forward_fresh"))
+    var p = _read_params(params, 10, String("transformer_session_forward_fresh"))
+    var opts = BlockOptions.from_params(p, 10)
+    owner[].busy = True
+    var result = 0
+    try:
+        with GILReleased(Python()):
+            try:
+                result = _transformer_run_session[True](owner[], a,
+                    p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8], p[9], opts)
+            except error:
+                owner[].clear()
+                raise error
+    except error:
+        owner[].busy = False
+        raise error
+    owner[].busy = False
+    return PythonObject(result)
+
+
+def _transformer_run_session_backward(
+    mut session: TransformerSession, a: List[Int], b: Int, l: Int,
+    dm: Int, nh: Int, nkv: Int, hd: Int, it: Int, window: Int,
+) raises:
+    """`_transformer_backward_run` on the session (lane/neural-net-experiment,
+    2026-09-30): the same forward from a zero cache at positions [0, L) and
+    the same backward on its stages, with the weights retained
+    (`_session_weights`), the forward workspace retained at `smax = L`, the
+    backward stages and the grad_output buffer retained, and the cache
+    zero-filled on the device. Same kernels, same launches, same order;
+    the ten gradients are written into the caller's buffers as before."""
+    var dims = LlamaDims(dm, nh, nkv, hd, it)
+    dims.validate()
+    if window < 0:
+        raise Error("transformer backward: window must be >= 0")
+    var opts = BlockOptions()
+    var qw = dims.q_width()
+    var kw = dims.kv_width()
+    var m = b * l
+    if not session.ctx:
+        session.ctx = neural_ctx[_NEURAL_CTX]()
+        session.contexts += 1
+    var ton = String(getenv("ANONLIB_TRANSFORMER_TIMING")) != ""
+    var tk = Int(perf_counter_ns())
+    var lean = transformer_lean_stages(hd)
+    # Weights: reused when the bytes are the same, recopied when they moved.
+    _session_weights(session, dims, a, opts, List[Int]())
+    ref ctx = session.ctx.value()
+    ref w = session.weights.value()
+    _btick(ton, tk, "surface.weights_up")
+    # The forward half at smax = L (the fresh-prefill shape).
+    var key = _workspace_key(b, l, dims, l, window, lean, opts)
+    var reused = False
+    if session.workspace:
+        reused = session.workspace.value().matches(key)
+    if not reused:
+        ctx.synchronize()
+        session.workspace = None
+        ctx.synchronize()
+        session.workspace = TransformerWorkspace(ctx, dims, b, l, l, window, lean, opts)
+        session.workspaces += 1
+    ref ws = session.workspace.value()
+    if reused and _stage_reset_on():
+        ws.stages.reset(ctx)
+    # The backward half.
+    var bkey: List[Int] = [b, l, dm, nh, nkv, hd, it, window, Int(lean)]
+    var breused = False
+    if session.backward:
+        breused = session.backward.value().matches(bkey)
+    if not breused:
+        ctx.synchronize()
+        session.backward = None
+        ctx.synchronize()
+        session.backward = TransformerBackwardWorkspace(ctx, dims, b, l, window, lean)
+        session.backward_workspaces += 1
+    ref bw = session.backward.value()
+    # Inputs: x and grad_output into retained buffers; the cache is the
+    # fresh zeros a `LlamaKVCache` holds.
+    ws.kv.k.enqueue_fill(Float32(0.0))
+    ws.kv.v.enqueue_fill(Float32(0.0))
+    ws.kv.s = 0
+    ctx.enqueue_copy(dst_buf=ws.x, src_ptr=_f32_ptr(a[0]))
+    ctx.enqueue_copy(dst_buf=bw.d_out, src_ptr=_f32_ptr(a[10]))
+    ctx.synchronize()
+    _btick(ton, tk, "surface.inputs_up")
+    var off = IdentityTrace.disabled()
+    llama_decoder_layer_forward(
+        ctx, ws.stages, ws.kv, ws.rope, w, ws.x, b, l, 0, off, String("pyf")
+    )
+    _btick(ton, tk, "surface.forward")
+    var offb = IdentityTrace.disabled()
+    # TOMBSTONE: ANONLIB_AUTOGRAD_TRANSFORMER(_OFF) (PROMOTED, hand arm deleted) deleted 2026-10-19 by dd4194a23; code recoverable at dd4194a23^.
+    # Restore: git apply experiments/removed/ANONLIB_AUTOGRAD_TRANSFORMER.patch
+    llama_decoder_layer_backward_autograd(
+        ctx, bw.bst, ws.stages, w, ws.rope.cos, ws.rope.sin, ws.x, bw.d_out,
+        b, l, 0, offb, String("pyb"),
+    )
+    _btick(ton, tk, "surface.backward")
+    _download_addr[False](ctx, bw.bst.d_x, m * dm, a[11])
+    _download_addr[False](ctx, bw.bst.dw_norm1, dm, a[12])
+    _download_addr[False](ctx, bw.bst.dw_norm2, dm, a[13])
+    _download_addr[False](ctx, bw.bst.dw_q, qw * dm, a[14])
+    _download_addr[False](ctx, bw.bst.dw_k, kw * dm, a[15])
+    _download_addr[False](ctx, bw.bst.dw_v, kw * dm, a[16])
+    _download_addr[False](ctx, bw.bst.dw_o, dm * qw, a[17])
+    _download_addr[False](ctx, bw.bst.dw_gate, it * dm, a[18])
+    _download_addr[False](ctx, bw.bst.dw_up, it * dm, a[19])
+    _download_addr[False](ctx, bw.bst.dw_down, dm * it, a[20])
+    ctx.synchronize()
+    _btick(ton, tk, "surface.outputs_down")
+    # The same budget as the forward path, on the forward half's count
+    # (the backward half is of the same order); both go together.
+    if ws.retained_bytes() > _session_retain_cap_bytes():
+        session.backward = None
+        session.workspace = None
+        ctx.synchronize()
+
+
+def transformer_session_backward_binding(
+    session: PythonObject, addrs: PythonObject, params: PythonObject,
+) raises -> PythonObject:
+    """`transformer_backward` on a session (lane/neural-net-experiment):
+    the same twenty-one addresses and eight scalars, word for word, the
+    weights, workspace and backward stages retained across calls."""
+    var owner = session.downcast_value_ptr[TransformerSession]()
+    if owner[].busy or owner[].closed:
+        raise Error("transformer: session is busy or closed")
+    if len(addrs) != 21 or len(params) != 8:
+        raise Error(
+            "transformer backward: expected 21 addresses and 8 scalars (B,"
+            " L, d_model, n_heads, n_kv_heads, head_dim, intermediate,"
+            " window)"
+        )
+    var a = List[Int]()
+    for i in range(21):
+        var address = Int(py=addrs[i])
+        if address == 0:
+            raise Error(
+                "transformer backward: null buffer address at slot "
+                + String(i)
+            )
+        a.append(address)
+    var b = Int(py=params[0])
+    var l = Int(py=params[1])
+    var dm = Int(py=params[2])
+    var nh = Int(py=params[3])
+    var nkv = Int(py=params[4])
+    var hd = Int(py=params[5])
+    var it = Int(py=params[6])
+    var window = Int(py=params[7])
+    owner[].busy = True
+    try:
+        with GILReleased(Python()):
+            try:
+                _transformer_run_session_backward(owner[], a, b, l, dm, nh, nkv, hd, it, window)
+            except error:
+                owner[].clear()
+                raise error
+    except error:
+        owner[].busy = False
+        raise error
+    owner[].busy = False
+    return PythonObject(0)
+
+
+# ===========================================================================
+# BACKWARD TIMING ENTRIES (lane ag-tm-timing, 2026-10-19). Measurement only:
+# tools/transformer_tape_arm_check.py --time N calls these to time the tape
+# backward (the hand arm, -D ANONLIB_AUTOGRAD_TRANSFORMER_OFF, is deleted). The
+# inputs and weights are uploaded once before the first clock; each timed
+# call brackets only the launches (device sync before and after), so the
+# clock is kernel-only. Call 0 is the warm-up and
+# is returned like the rest; the caller drops it. Same kernels, same
+# launches, same order as `_transformer_run_session_backward` and
+# `_transformer_saved_backward`; no bits move.
+#
+# Return list: [autograd (always 1, tape), launches, t...]. `launches` is
+# the process-wide launch profile's total over the LAST timed call when
+# ANONLIB_AG_PROFILE is set (-1 otherwise); it counts the launches that go
+# through DeviceExec only (kernels enqueued on the context directly are not
+# counted).
+
+
+def _tm_profile_launches() raises -> Int:
+    var p = launch_profile_snapshot()
+    var total = 0
+    for i in range(len(p.ops)):  # driver-loop: over profiled operation codes
+        total += p.op_launches[i]
+    return total
+
+
+def _transformer_session_backward_time(
+    mut session: TransformerSession, a: List[Int], b: Int, l: Int,
+    dm: Int, nh: Int, nkv: Int, hd: Int, it: Int, window: Int, calls: Int,
+) raises -> List[Int]:
+    """[autograd, launches, fwd_ns_0, bwd_ns_0, ..., fwd_ns_n, bwd_ns_n]:
+    calls + 1 forward-from-zero-cache + backward calls on device-resident
+    inputs; the last call's ten gradients go to a[11..20]."""
+    var dims = LlamaDims(dm, nh, nkv, hd, it)
+    dims.validate()
+    if window < 0:
+        raise Error("transformer backward time: window must be >= 0")
+    if calls < 1:
+        raise Error("transformer backward time: the call count must be >= 1")
+    var opts = BlockOptions()
+    var qw = dims.q_width()
+    var kw = dims.kv_width()
+    var m = b * l
+    if not session.ctx:
+        session.ctx = neural_ctx[_NEURAL_CTX]()
+        session.contexts += 1
+    var lean = transformer_lean_stages(hd)
+    _session_weights(session, dims, a, opts, List[Int]())
+    ref ctx = session.ctx.value()
+    ref w = session.weights.value()
+    var ws = TransformerWorkspace(ctx, dims, b, l, l, window, lean, opts)
+    var bw = TransformerBackwardWorkspace(ctx, dims, b, l, window, lean)
+    ctx.enqueue_copy(dst_buf=ws.x, src_ptr=_f32_ptr(a[0]))
+    ctx.enqueue_copy(dst_buf=bw.d_out, src_ptr=_f32_ptr(a[10]))
+    ctx.synchronize()
+    var out = List[Int]()
+    # Slot 0 is always 1 (tape): the hand arm is deleted; the slot keeps the
+    # return shape tools/transformer_tape_arm_check.py reads.
+    out.append(1)
+    out.append(-1)
+    var prof = launch_profile_level() > 0
+    for k in range(calls + 1):  # driver-loop: over timed calls
+        # The per-call resets `_transformer_run_session_backward` does on a
+        # reused workspace, outside the clock.
+        ws.kv.k.enqueue_fill(Float32(0.0))
+        ws.kv.v.enqueue_fill(Float32(0.0))
+        ws.kv.s = 0
+        if k > 0 and _stage_reset_on():
+            ws.stages.reset(ctx)
+        ctx.synchronize()
+        if prof and k == calls:
+            launch_profile_reset()
+        var t0 = Int(perf_counter_ns())
+        var off = IdentityTrace.disabled()
+        llama_decoder_layer_forward(
+            ctx, ws.stages, ws.kv, ws.rope, w, ws.x, b, l, 0, off, String("pyf")
+        )
+        ctx.synchronize()
+        var t1 = Int(perf_counter_ns())
+        var offb = IdentityTrace.disabled()
+        # TOMBSTONE: ANONLIB_AUTOGRAD_TRANSFORMER(_OFF) (PROMOTED, hand arm deleted) deleted 2026-10-19 by dd4194a23; code recoverable at dd4194a23^.
+        # Restore: git apply experiments/removed/ANONLIB_AUTOGRAD_TRANSFORMER.patch
+        llama_decoder_layer_backward_autograd(
+            ctx, bw.bst, ws.stages, w, ws.rope.cos, ws.rope.sin, ws.x, bw.d_out,
+            b, l, 0, offb, String("pyb"),
+        )
+        ctx.synchronize()
+        var t2 = Int(perf_counter_ns())
+        out.append(t1 - t0)
+        out.append(t2 - t1)
+        if prof and k == calls:
+            out[1] = _tm_profile_launches()
+    _download_addr[False](ctx, bw.bst.d_x, m * dm, a[11])
+    _download_addr[False](ctx, bw.bst.dw_norm1, dm, a[12])
+    _download_addr[False](ctx, bw.bst.dw_norm2, dm, a[13])
+    _download_addr[False](ctx, bw.bst.dw_q, qw * dm, a[14])
+    _download_addr[False](ctx, bw.bst.dw_k, kw * dm, a[15])
+    _download_addr[False](ctx, bw.bst.dw_v, kw * dm, a[16])
+    _download_addr[False](ctx, bw.bst.dw_o, dm * qw, a[17])
+    _download_addr[False](ctx, bw.bst.dw_gate, it * dm, a[18])
+    _download_addr[False](ctx, bw.bst.dw_up, it * dm, a[19])
+    _download_addr[False](ctx, bw.bst.dw_down, dm * it, a[20])
+    ctx.synchronize()
+    _ = ws^
+    _ = bw^
+    return out^
+
+
+def transformer_session_backward_time_binding(
+    session: PythonObject, addrs: PythonObject, params: PythonObject,
+) raises -> PythonObject:
+    """`transformer_session_backward`'s 21 addresses; its 8 scalars plus the
+    number of timed calls N. Returns [autograd, launches, then forward and
+    backward nanoseconds for N + 1 calls, the first a warm-up]."""
+    var owner = session.downcast_value_ptr[TransformerSession]()
+    if owner[].busy or owner[].closed:
+        raise Error("transformer: session is busy or closed")
+    if len(addrs) != 21 or len(params) != 9:
+        raise Error("transformer backward time: expected 21 addresses and 9 scalars")
+    var a = List[Int]()
+    for i in range(21):  # metadata: fixed pointer list
+        var address = Int(py=addrs[i])
+        if address == 0:
+            raise Error("transformer backward time: null buffer address at slot " + String(i))
+        a.append(address)
+    var p = List[Int]()
+    for i in range(9):  # metadata: fixed scalar list
+        p.append(Int(py=params[i]))
+    owner[].busy = True
+    var stamps = List[Int]()
+    try:
+        with GILReleased(Python()):
+            try:
+                stamps = _transformer_session_backward_time(owner[], a,
+                    p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8])
+            except error:
+                owner[].clear()
+                raise error
+    except error:
+        owner[].busy = False
+        raise error
+    owner[].busy = False
+    var out = Python.list()
+    for i in range(len(stamps)):  # small-loop(stamps: one clock reading per timed call): measurement timestamps, not model data
+        out.append(PythonObject(stamps[i]))
+    return out
+
+
+def _transformer_saved_backward_timed(mut tape: TransformerForwardTape, a: List[Int]) raises -> Int:
+    """`_transformer_saved_backward` with dy uploaded and the backward
+    workspace built before the clock; returns the backward's nanoseconds
+    (device sync before and after)."""
+    ref p = tape.shape
+    var b = p[0]
+    var l = p[1]
+    var dm = p[2]
+    var dims = LlamaDims(dm, p[3], p[4], p[5], p[6])
+    ref session = tape.session
+    if not session.ctx or not session.workspace or not session.weights:
+        raise Error("transformer forward tape: saved owner is unavailable")
+    ref ctx = session.ctx.value()
+    ref ws = session.workspace.value()
+    ref w = session.weights.value()
+    var bw = TransformerBackwardWorkspace(ctx, dims, b, l, p[7], transformer_lean_stages(p[5]))
+    ctx.enqueue_copy(dst_buf=bw.d_out, src_ptr=_f32_ptr(a[0]))
+    ctx.synchronize()
+    var off = IdentityTrace.disabled()
+    var t0 = Int(perf_counter_ns())
+    # TOMBSTONE: ANONLIB_AUTOGRAD_TRANSFORMER(_OFF) (PROMOTED, hand arm deleted) deleted 2026-10-19 by dd4194a23; code recoverable at dd4194a23^.
+    # Restore: git apply experiments/removed/ANONLIB_AUTOGRAD_TRANSFORMER.patch
+    llama_decoder_layer_backward_autograd(ctx, bw.bst, ws.stages, w,
+        ws.rope.cos, ws.rope.sin, ws.x, bw.d_out, b, l, 0, off, String("saved"))
+    ctx.synchronize()
+    var ns = Int(perf_counter_ns()) - t0
+    _download_addr[False](ctx, bw.bst.d_x, b * l * dm, a[1])
+    _download_addr[False](ctx, bw.bst.dw_norm1, dm, a[2])
+    _download_addr[False](ctx, bw.bst.dw_norm2, dm, a[3])
+    _download_addr[False](ctx, bw.bst.dw_q, dims.q_width() * dm, a[4])
+    _download_addr[False](ctx, bw.bst.dw_k, dims.kv_width() * dm, a[5])
+    _download_addr[False](ctx, bw.bst.dw_v, dims.kv_width() * dm, a[6])
+    _download_addr[False](ctx, bw.bst.dw_o, dm * dims.q_width(), a[7])
+    _download_addr[False](ctx, bw.bst.dw_gate, p[6] * dm, a[8])
+    _download_addr[False](ctx, bw.bst.dw_up, p[6] * dm, a[9])
+    _download_addr[False](ctx, bw.bst.dw_down, dm * p[6], a[10])
+    ctx.synchronize()
+    _ = bw^
+    return ns
+
+
+def transformer_backward_tape_time_binding(addrs: PythonObject, params: PythonObject) raises -> PythonObject:
+    """22 addresses: `transformer_forward_tape`'s 11 (x, nine weights, y),
+    then `transformer_backward_tape`'s 11 (dy, ten gradients); its 8 shape
+    scalars plus N. Runs N + 1 saved forwards (untimed) each followed by a
+    timed saved backward. Returns [autograd, launches, N + 1 backward
+    nanoseconds, the first a warm-up]."""
+    comptime if not IDN_SAMBA_FORWARD_TAPE:
+        raise Error("transformer backward tape time: IDENTICAL opt-in is disabled")
+    if len(addrs) != 22 or len(params) != 9:
+        raise Error("transformer backward tape time: expected 22 addresses and 9 scalars")
+    var fa = List[Int]()
+    var ba = List[Int]()
+    for i in range(22):  # metadata: fixed pointer list
+        var address = Int(py=addrs[i])
+        if address == 0:
+            raise Error("transformer backward tape time: null address at slot " + String(i))
+        if i < 10:
+            fa.append(address)
+        elif i == 10:
+            fa.append(0)
+            fa.append(0)
+            fa.append(address)
+        else:
+            ba.append(address)
+    var p = List[Int]()
+    for i in range(8):  # metadata: fixed scalar list
+        p.append(Int(py=params[i]))
+    var calls = Int(py=params[8])
+    if calls < 1:
+        raise Error("transformer backward tape time: the call count must be >= 1")
+    var out = Python.list()
+    # Slot 0 is always 1 (tape); see _transformer_session_backward_time.
+    out.append(PythonObject(1))
+    var stamps = List[Int]()
+    var launches = -1
+    with GILReleased(Python()):
+        var prof = launch_profile_level() > 0
+        for k in range(calls + 1):  # driver-loop: over timed calls
+            var tape = TransformerForwardTape(p)
+            try:
+                _ = _transformer_run_session[True, True](tape.session, fa,
+                    p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[1], 0, p[7], BlockOptions())
+                if prof and k == calls:
+                    launch_profile_reset()
+                stamps.append(_transformer_saved_backward_timed(tape, ba))
+                if prof and k == calls:
+                    launches = _tm_profile_launches()
+            except error:
+                tape.close()
+                raise error
+            tape.close()
+    out.append(PythonObject(launches))
+    for i in range(len(stamps)):  # small-loop(stamps: one clock reading per timed call): measurement timestamps, not model data
+        out.append(PythonObject(stamps[i]))
+    return out
+
+
+def transformer_session_create_binding() raises -> PythonObject:
+    return PythonObject(alloc=TransformerSession())
+
+
+def transformer_session_close_binding(session: PythonObject) raises -> PythonObject:
+    var owner = session.downcast_value_ptr[TransformerSession]()
+    if owner[].busy:
+        raise Error("transformer: session is busy")
+    owner[].closed = True
+    owner[].clear()
+    owner[].ctx = None
+    return PythonObject(0)
+
+
+def transformer_session_info_binding(session: PythonObject) raises -> PythonObject:
+    var owner = session.downcast_value_ptr[TransformerSession]()
+    if owner[].busy:
+        raise Error("transformer: session is busy")
+    var out = Python.list()
+    out.append(PythonObject(owner[].contexts))
+    out.append(PythonObject(owner[].workspaces))
+    out.append(PythonObject(owner[].closed))
+    var retained_bytes = 0
+    if owner[].workspace:
+        retained_bytes = owner[].workspace.value().retained_bytes()
+    out.append(PythonObject(retained_bytes))
+    return out
+
+
+def transformer_session_forward_binding(
+    session: PythonObject, addrs: PythonObject, params: PythonObject,
+) raises -> PythonObject:
+    var owner = session.downcast_value_ptr[TransformerSession]()
+    if owner[].busy or owner[].closed:
+        raise Error("transformer: session is busy or closed")
+    # `transformer_forward`'s lists, with or without the two option tails
+    # (the header of this section); the same contract word for word.
+    var a = _read_addrs_tail(addrs, 13, String("transformer_forward"))
+    _check_base_addrs(a, [0, 1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12], String("transformer_forward"))
+    var p = _read_params(params, 10, String("transformer_forward"))
+    var opts = BlockOptions.from_params(p, 10)
+    owner[].busy = True
+    var result = 0
+    try:
+        with GILReleased(Python()):
+            try:
+                result = _transformer_run_session(owner[], a,
+                    p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8], p[9], opts)
+            except error:
+                # A failed call must not leave partially written scratch or
+                # queued references for the next caller. Caller arrays are
+                # still owned by its Python frame during this drain.
+                owner[].clear()
+                raise error
+    except error:
+        owner[].busy = False
+        raise error
+    owner[].busy = False
+    return PythonObject(result)
+
+
+# ===========================================================================
+# THE PROFILE ENTRY (lane/lowbit-blocks, 2026-09-29): numeric_profile="fixed15_v1"
+#
+# `transformer_session_forward_int15(session, addrs, params)`. The float32
+# entries above keep their lists word for word; this one is separate.
+#   addrs, exactly 45: the 13 of `transformer_forward` with the seven
+#     projection slots (3..9) ZERO (never read), then the 11-address options
+#     tail (always sent), then 21 plane addresses, three per projection in
+#     the order q, k, v, o, gate, up, down: `hi` (int8, rows x cols), `lo`
+#     (int8, rows x cols), `exponents` (int32, rows). An ungated MLP sends
+#     zeros for gate's three.
+#   params, exactly 27: the 10 of `transformer_forward`, then the 17-int
+#     options tail (always sent).
+# The planes are uploaded on the session's first call and kept (the session
+# struct's docstring says why that is sound here). Norms, biases, the cache
+# and x are read per call as in the float32 entries.
+# ===========================================================================
+
+comptime INT15_ENTRY_ADDRS = 13 + BLOCK_OPTION_ADDRS + 21
+comptime INT15_ENTRY_PARAMS = 10 + BLOCK_OPTION_PARAMS
+
+
+def _upload_i8(ctx: DeviceContext, addr: Int, n: Int) raises -> DeviceBuffer[DType.int8]:
+    var dev = ctx.enqueue_create_buffer[DType.int8](n)
+    ctx.enqueue_copy(dst_buf=dev, src_ptr=i8_ptr(addr))
+    return dev^
+
+
+def _upload_i32(ctx: DeviceContext, addr: Int, n: Int) raises -> DeviceBuffer[DType.int32]:
+    var dev = ctx.enqueue_create_buffer[DType.int32](n)
+    ctx.enqueue_copy(dst_buf=dev, src_ptr=i32_ptr(addr))
+    return dev^
+
+
+def _upload_planes_one(
+    ctx: DeviceContext, a: List[Int], at: Int, rows: Int, cols: Int, name: String
+) raises -> Int15Planes:
+    if a[at] == 0 or a[at + 1] == 0 or a[at + 2] == 0:
+        raise Error("transformer_session_forward_int15: " + name + " planes have a null address")
+    return Int15Planes(
+        _upload_i8(ctx, a[at], rows * cols), _upload_i8(ctx, a[at + 1], rows * cols),
+        _upload_i32(ctx, a[at + 2], rows), rows, cols,
+    )
+
+
+def _upload_planes(
+    ctx: DeviceContext, dims: LlamaDims, opts: BlockOptions, a: List[Int], base: Int
+) raises -> LlamaInt15Weights:
+    var dm = dims.d_model
+    var qw = dims.q_width()
+    var kw = dims.kv_width()
+    var it = dims.intermediate
+    var gated = opts.gated()
+    var gate: Int15Planes
+    if gated:
+        gate = _upload_planes_one(ctx, a, base + 12, it, dm, "gate_proj")
+    else:
+        if a[base + 12] != 0 or a[base + 13] != 0 or a[base + 14] != 0:
+            raise Error("transformer_session_forward_int15: gate_proj planes were passed but the MLP is ungated")
+        gate = Int15Planes(
+            ctx.enqueue_create_buffer[DType.int8](1), ctx.enqueue_create_buffer[DType.int8](1),
+            ctx.enqueue_create_buffer[DType.int32](1), 1, 1,
+        )
+    var out = LlamaInt15Weights(
+        _upload_planes_one(ctx, a, base + 0, qw, dm, "q_proj"),
+        _upload_planes_one(ctx, a, base + 3, kw, dm, "k_proj"),
+        _upload_planes_one(ctx, a, base + 6, kw, dm, "v_proj"),
+        _upload_planes_one(ctx, a, base + 9, dm, qw, "o_proj"),
+        gate^,
+        _upload_planes_one(ctx, a, base + 15, it, dm, "up_proj"),
+        _upload_planes_one(ctx, a, base + 18, dm, it, "down_proj"),
+        gated,
+    )
+    ctx.synchronize()
+    out.check_shapes(dm, qw, kw, it)
+    return out^
+
+
+def _transformer_run_session_int15(
+    mut session: TransformerSession, a: List[Int], b: Int, l: Int,
+    dm: Int, nh: Int, nkv: Int, hd: Int, it: Int,
+    smax: Int, s0: Int, window: Int, opts: BlockOptions,
+) raises -> Int:
+    """`_transformer_run_session` under the profile: the same stages, cache
+    handling and downloads, with the weights' seven projections as the
+    session's retained planes."""
+    session.invalidate_tape()
+    var dims = LlamaDims(dm, nh, nkv, hd, it)
+    dims.validate()
+    opts.validate(hd)
+    if s0 < 0 or s0 > smax:
+        raise Error(String("transformer: cached_tokens must be in [0, ")
+            + String(smax) + "] (the cache capacity, max_tokens), got "
+            + String(s0) + "; the two sides of this boundary disagree about the state")
+    if window < 0:
+        raise Error("transformer: window must be >= 0 (0 = full causal)")
+    for i in range(3, 10):
+        if a[i] != 0:
+            raise Error(
+                "transformer_session_forward_int15: float32 projection slot "
+                + String(i) + " must be 0 under the profile (the planes are the weights)"
+            )
+    if not session.ctx:
+        session.ctx = neural_ctx[_NEURAL_CTX]()
+        session.contexts += 1
+    ref ctx = session.ctx.value()
+    var pbase = 13 + BLOCK_OPTION_ADDRS
+    var pkey: List[Int] = [dm, nh, nkv, hd, it, Int(opts.gated())]
+    for i in range(21):
+        pkey.append(a[pbase + i])
+    var same = Bool(session.planes) and len(session.planes_key) == len(pkey)
+    if same:
+        for i in range(len(pkey)):  # small-loop(pkey: six shapes plus 21 plane addresses): compares cache keys, not data
+            if pkey[i] != session.planes_key[i]:
+                same = False
+    if not same:
+        ctx.synchronize()
+        session.planes = None
+        session.planes = Optional[LlamaInt15Weights](_upload_planes(ctx, dims, opts, a, pbase))
+        session.planes_key = pkey^
+    var lean = False
+    var key = _workspace_key(b, l, dims, smax, window, lean, opts)
+    var reused = False
+    if session.workspace:
+        reused = session.workspace.value().matches(key)
+    if not reused:
+        ctx.synchronize()
+        session.workspace = None
+        ctx.synchronize()
+    var what = String("transformer_session_forward_int15")
+    var t = _tail_of(a, 13)
+    var w = LlamaDeviceWeights(
+        ctx, dims, opts,
+        _upload_addr(ctx, a[1], dm),
+        _upload_addr(ctx, a[2], dm),
+        session.planes.value().copy(),
+        _optional_upload(ctx, t[0], dims.q_width(), opts.qkv_bias, "q_proj.bias", what),
+        _optional_upload(ctx, t[1], dims.kv_width(), opts.qkv_bias, "k_proj.bias", what),
+        _optional_upload(ctx, t[2], dims.kv_width(), opts.qkv_bias, "v_proj.bias", what),
+        _optional_upload(ctx, t[3], dm, opts.o_bias, "o_proj.bias", what),
+        _optional_upload(ctx, t[4], dm, opts.norm_bias, "input_layernorm.bias", what),
+        _optional_upload(ctx, t[5], dm, opts.norm_bias, "post_attention_layernorm.bias", what),
+        _optional_upload(ctx, t[6], it, opts.mlp_bias, "up_proj.bias", what),
+        _optional_upload(ctx, t[7], dm, opts.mlp_bias, "down_proj.bias", what),
+        _optional_upload(ctx, t[8], it, opts.has_gate_bias(), "gate_proj.bias", what),
+        _optional_upload(ctx, t[9], hd, opts.qk_norm, "q_norm.weight", what),
+        _optional_upload(ctx, t[10], hd, opts.qk_norm, "k_norm.weight", what),
+    )
+    if not reused:
+        session.workspace = TransformerWorkspace(ctx, dims, b, l, smax, window, lean, opts)
+        session.workspaces += 1
+    ref ws = session.workspace.value()
+    if reused:
+        ws.stages.reset(ctx)
+    ctx.enqueue_copy(dst_buf=ws.kv.k, src_ptr=_f32_ptr(a[10]))
+    ctx.enqueue_copy(dst_buf=ws.kv.v, src_ptr=_f32_ptr(a[11]))
+    ctx.enqueue_copy(dst_buf=ws.x, src_ptr=_f32_ptr(a[0]))
+    ctx.synchronize()
+    ws.kv.s = s0
+    var trace = IdentityTrace.disabled()
+    llama_decoder_layer_forward(ctx, ws.stages, ws.kv, ws.rope, w, ws.x,
+                                b, l, s0, trace, String("py"))
+    _download_addr(ctx, ws.stages.residual2, b * l * dm, a[12])
+    _download_addr(ctx, ws.kv.k, len(ws.kv.k), a[10])
+    _download_addr(ctx, ws.kv.v, len(ws.kv.v), a[11])
+    var result = ws.kv.s
+    var retain = ws.retained_bytes() <= 64 * 1024 * 1024
+    _ = w^
+    ctx.synchronize()
+    if not retain:
+        session.workspace = None
+        ctx.synchronize()
+    return result
+
+
+def transformer_session_forward_int15_binding(
+    session: PythonObject, addrs: PythonObject, params: PythonObject,
+) raises -> PythonObject:
+    var owner = session.downcast_value_ptr[TransformerSession]()
+    if owner[].busy or owner[].closed:
+        raise Error("transformer: session is busy or closed")
+    var what = String("transformer_session_forward_int15")
+    if len(addrs) != INT15_ENTRY_ADDRS:
+        raise Error(what + ": addrs must contain " + String(INT15_ENTRY_ADDRS) + " addresses, got " + String(len(addrs)))
+    if len(params) != INT15_ENTRY_PARAMS:
+        raise Error(what + ": params must contain " + String(INT15_ENTRY_PARAMS) + " values, got " + String(len(params)))
+    var a = List[Int]()
+    for i in range(len(addrs)):  # small-loop(addrs: INT15_ENTRY_ADDRS validated tensor addresses): reads pointer list, not data
+        a.append(Int(py=addrs[i]))
+    _check_base_addrs(a, [0, 1, 2, 10, 11, 12], what)
+    var p = _read_params(params, 10, what)
+    var opts = BlockOptions.from_params(p, 10)
+    owner[].busy = True
+    var result = 0
+    try:
+        with GILReleased(Python()):
+            try:
+                result = _transformer_run_session_int15(owner[], a,
+                    p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8], p[9], opts)
+            except error:
+                owner[].clear()
+                raise error
+    except error:
+        owner[].busy = False
+        raise error
+    owner[].busy = False
+    return PythonObject(result)
+
+
+def _transformer_run[discard_cache: Bool = False](
+    a: List[Int],
+    b: Int,
+    l: Int,
+    dm: Int,
+    nh: Int,
+    nkv: Int,
+    hd: Int,
+    it: Int,
+    smax: Int,
+    s0: Int,
+    window: Int,
+    opts: BlockOptions,
+) raises -> Int:
+    """The GIL-free half of the two entry points: everything after the
+    `PythonObject`s have been read. Builds the device weights, uploads
+    the caller's cache state, runs THE certified entry point once, and
+    writes the output and the post-call state back into the caller's
+    buffers. Returns the post-call `cached_tokens` (DEVIATION 795(ii):
+    the one integer piece of the state).
+
+    `opts` (lane/block-options) is the record decoded from the params
+    tail; `a` is the 13 base addresses plus the 11-address tail (zeros
+    where absent).
+
+    `[[mojo-buffer-freed-at-last-use]]`: every device buffer below is
+    still alive when `llama_decoder_layer_forward` returns because that
+    function synchronizes before it does, and the explicit transfers at
+    the end hold them past the last download anyway."""
+    # LlamaDims.validate REFUSES the five divisibility rules by name
+    # (d_model == n_heads*head_dim, n_heads % n_kv == 0, head_dim even,
+    # positivity) -- reached BEFORE any buffer size below is computed
+    # from them, which is why nothing here pre-judges the shape.
+    var dims = LlamaDims(dm, nh, nkv, hd, it)
+    dims.validate()
+    opts.validate(hd)
+    if s0 < 0 or s0 > smax:
+        raise Error(
+            String("transformer: cached_tokens must be in [0, ")
+            + String(smax)
+            + "] (the cache capacity, max_tokens), got "
+            + String(s0)
+            + "; the two sides of this boundary disagree about the state"
+        )
+
+    if window < 0:
+        raise Error("transformer: window must be >= 0 (0 = full causal)")
+    # The caller's cache buffers: `smax` slots for the linear cache, a ring
+    # of `window` slots per (batch, kv head) under a sliding window.
+    var cap = smax
+    if window > 0:
+        cap = window
+    var cache_n = b * nkv * cap * hd
+
+    var ctx = neural_ctx[_NEURAL_CTX]()
+    var ton = String(getenv("ANONLIB_TRANSFORMER_TIMING")) != ""
+    var tk = Int(perf_counter_ns())
+    # Host weights THROUGH the lane's own struct (its length table is the
+    # reference shape authority, and its constructor is where the weights
+    # are refused non-finite ONCE, DEVIATION 1875); values arrive as
+    # given bits, unjudged.
+    var w = _load_transformer_weights[False](ctx, dims, a, opts, _tail_of(a, 13))
+    # The caller's cache over the fresh zeros. LlamaKVCache's own
+    # constructor refuses b <= 0, smax <= 0 and smax > max_positions (the
+    # absolute-position ceiling, DEVIATION 812's 8192 at the default
+    # record, DEVIATION 2933) BY NAME before the uploads below. Zeros in
+    # with s0 == 0 IS a fresh sequence; anything else is a carried one,
+    # packed at stride s0 (DEVIATION 795(ii)).
+    _btick(ton, tk, "surface.weights_up")
+    var kv = LlamaKVCache(ctx, b, dims, smax, window, opts.max_positions)
+    comptime if not discard_cache:
+        kv.k = _upload_addr[False](ctx, a[10], cache_n)
+        kv.v = _upload_addr[False](ctx, a[11], cache_n)
+    kv.s = s0
+    # Per call, from the record (DEVIATION 795(iii) at the default record:
+    # the FROZEN theta). p_max is the cache capacity: pos0 + l <= kv.s_max
+    # <= p_max holds for every legal call, so the table always covers the
+    # absolute positions used.
+    var rope = LlamaRopeTable(ctx, dims, opts, smax)
+    var stages = LlamaDeviceStages(
+        ctx, b, l, smax, dims, window, lean=_lean_for(hd, opts)
+    )
+    var dx = _upload_addr[False](ctx, a[0], b * l * dm)
+    _btick(ton, tk, "surface.cache_stages_x_up")
+
+    var trace = IdentityTrace.disabled()
+    # pos0 = s0: DEVIATION 1028 (cache slot j IS absolute position j)
+    # refuses any other value, and this surface has no other value to
+    # offer. Prefill, chunked continuation and decode are all this one
+    # call; capacity growth past smax is refused by name downstream.
+    llama_decoder_layer_forward(
+        ctx, stages, kv, rope, w, dx, b, l, s0, trace, String("py"),
+        forward_only=True,
+    )
+
+    # The block output is residual2 (contract section 2's
+    # `residual2 + mlp(...)`, stage `residual2.out`), and the cache goes
+    # back to its owner whole -- the full capacity buffer, so the bytes
+    # round-trip exactly whatever the used stride is.
+    _btick(ton, tk, "surface.forward")
+    # One wait for the three downloads (lane/neural-apple, 2026-09-28): the
+    # owners stay alive through it.
+    _download_addr[False](ctx, stages.residual2, b * l * dm, a[12])
+    comptime if not discard_cache:
+        _download_addr[False](ctx, kv.k, cache_n, a[10])
+        _download_addr[False](ctx, kv.v, cache_n, a[11])
+    ctx.synchronize()
+    _btick(ton, tk, "surface.outputs_down")
+    var out_len = kv.s
+    _ = w^
+    _ = kv^
+    _ = rope^
+    _ = stages^
+    _ = dx^
+    # Keep the context alive until every device allocation is destroyed
+    # (DEVIATION 1946) AND drain the frees those destructions enqueued
+    # before it goes (DEVIATION 2520, extended by DEVIATION 3010). Without
+    # this drain the MAX runtime allocator's lock stays held for the whole
+    # PROCESS and the next GPU allocation anywhere in it never returns:
+    # measured as `verify --all` walking 47 lanes and then stopping dead at
+    # `transformer-bf16w`, the first lane to allocate after this one's
+    # context died.
+    ctx.synchronize()
+    _ = ctx^
+    return out_len
+
+
+def _transformer_addrs(addrs: PythonObject, what: String) raises -> List[Int]:
+    """The thirteen base addresses, or the thirteen plus the eleven-address
+    options tail (this file's tail section), returned as twenty-four with
+    zeros where the tail was not sent."""
+    if len(addrs) != 13 and len(addrs) != 13 + BLOCK_OPTION_ADDRS:
+        raise Error(
+            what
+            + ": addrs must contain 13 addresses (x,"
+            " input_layernorm.weight, post_attention_layernorm.weight,"
+            " q_proj.weight, k_proj.weight, v_proj.weight, o_proj.weight,"
+            " gate_proj.weight, up_proj.weight, down_proj.weight, k_cache,"
+            " v_cache, y_out), optionally followed by the 11-address block"
+            " options tail, got "
+            + String(len(addrs))
+        )
+    return _read_addrs_tail(addrs, 13, what)
+
+
+def transformer_forward_fresh_binding(
+    addrs: PythonObject, params: PythonObject,
+) raises -> PythonObject:
+    """Stateless prefill: original zero device cache, only y is returned.
+
+    Eleven pointers: x, nine weights, y. Eight scalars: B, L, d_model,
+    n_heads, n_kv_heads, head_dim, intermediate, window. Capacity remains
+    L (or a window-sized ring), exactly as Python allocate_state(B, L).
+    The zero sentinel cache pointers never reach a transfer in this arm.
+
+    lane/block-options: or 11 + 11 pointers and 8 + 17 scalars, the two
+    option tails appended (this file's tail section, word for word). The
+    gate_proj.weight pointer (slot 7) is 0 under an ungated MLP.
+    """
+    var what = String("transformer_forward_fresh")
+    var raw = _read_addrs_tail(addrs, 11, what)
+    var p = _read_params(params, 8, what)
+    var opts = BlockOptions.from_params(p, 8)
+    # Into `transformer_forward`'s 13 + 11 layout: x, nine weights, the
+    # two absent cache slots, y, then the tail.
+    var a = List[Int]()
+    for i in range(10):
+        a.append(raw[i])
+    a.append(0)
+    a.append(0)
+    a.append(raw[10])
+    for i in range(BLOCK_OPTION_ADDRS):
+        a.append(raw[11 + i])
+    _check_base_addrs(a, [0, 1, 2, 3, 4, 5, 6, 8, 9], what)
+    if a[12] == 0:
+        raise Error("transformer_forward_fresh: null output address")
+    var b = p[0]
+    var l = p[1]
+    var dm = p[2]
+    var nh = p[3]
+    var nkv = p[4]
+    var hd = p[5]
+    var it = p[6]
+    var window = p[7]
+    if b <= 0 or l <= 0:
+        raise Error("transformer_forward_fresh: B and L must be positive")
+    var out_len = 0
+    with GILReleased(Python()):
+        out_len = _transformer_run[True](a, b, l, dm, nh, nkv, hd, it, l, 0, window, opts)
+    return PythonObject(out_len)
+
+
+def transformer_forward_binding(
+    addrs: PythonObject,
+    params: PythonObject,
+) raises -> PythonObject:
+    """One transformer block call: prefill from the state the caller
+    hands in -- fresh (zero caches, cached_tokens 0) or resumed (a
+    carried cache: chunked-prefill continuation) -- any B and L that fit
+    the capacity. Returns the post-call `cached_tokens`.
+
+    `addrs` is the THIRTEEN buffer addresses, in this exact order
+    (mirrored in `python/anonlib/_transformer_impl.py`; QW =
+    n_heads*head_dim = d_model, KW = n_kv_heads*head_dim, IT =
+    intermediate_size, SMAX = max_tokens):
+
+        0  x                                B * L * d_model float32, read
+        1  input_layernorm.weight           d_model, read
+        2  post_attention_layernorm.weight  d_model, read
+        3  q_proj.weight                    QW * d_model, read (torch
+                                             [out, in]; OP_NT reads it)
+        4  k_proj.weight                    KW * d_model, read
+        5  v_proj.weight                    KW * d_model, read
+        6  o_proj.weight                    d_model * QW, read
+        7  gate_proj.weight                 IT * d_model, read
+        8  up_proj.weight                   IT * d_model, read
+        9  down_proj.weight                 d_model * IT, read
+       10  k_cache                          B * n_kv * SMAX * head_dim,
+                                             READ AND WRITTEN (state;
+                                             PACKED at stride
+                                             cached_tokens, DEVIATION
+                                             795(ii))
+       11  v_cache                          B * n_kv * SMAX * head_dim,
+                                             READ AND WRITTEN (state)
+       12  y_out                            B * L * d_model, WRITTEN (the
+                                             block output, both residual
+                                             adds included -- contract
+                                             section 2)
+
+    `params` is, in this exact order:
+
+        0  B
+        1  L
+        2  d_model        must equal n_heads*head_dim; refused otherwise
+                           BY NAME in Mojo (LlamaDims.validate)
+        3  n_heads
+        4  n_kv_heads     n_heads % n_kv_heads must be 0 (GQA admitted,
+                           contract DEVIATION 813)
+        5  head_dim       must be even (RoPE pairs halves)
+        6  intermediate   intermediate_size, > 0
+        7  max_tokens     the cache capacity s_max; cached_tokens + L
+                           past it, and any value over 8192 (DEVIATION
+                           812's ceiling), are refused by name in Mojo
+        8  cached_tokens  the carried cache's used length; 0 for a
+                           fresh sequence
+        9  window         0 for full causal attention; W > 0 for sliding-
+                           window causal attention (query p sees keys
+                           [max(0, p-W+1), p]) with k_cache/v_cache a
+                           RING of B * n_kv * W * head_dim floats, slot
+                           = position % W
+
+    Profile constants (rms eps 1e-6, rope theta 10000.0, eager attention,
+    the causal mask value, no biases, silu -- contract section 3) are NOT
+    parameters: changing one is a v2 profile, not a knob. There is no
+    bias address and no dropout: the profile REFUSES both by absence."""
+    var a = _transformer_addrs(addrs, String("transformer_forward"))
+    _check_base_addrs(a, [0, 1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12], String("transformer_forward"))
+    if len(params) != 10 and len(params) != 10 + BLOCK_OPTION_PARAMS:
+        raise Error(
+            "transformer_forward: params must contain 10 values (B, L,"
+            " d_model, n_heads, n_kv_heads, head_dim, intermediate,"
+            " max_tokens, cached_tokens, window), optionally followed by"
+            " the 17-value block options tail, got "
+            + String(len(params))
+        )
+    var p = _read_params(params, 10, String("transformer_forward"))
+    var opts = BlockOptions.from_params(p, 10)
+    var b = p[0]
+    var l = p[1]
+    var dm = p[2]
+    var nh = p[3]
+    var nkv = p[4]
+    var hd = p[5]
+    var it = p[6]
+    var smax = p[7]
+    var s0 = p[8]
+    var window = p[9]
+    var out_len = 0
+    with GILReleased(Python()):
+        out_len = _transformer_run(
+            a, b, l, dm, nh, nkv, hd, it, smax, s0, window, opts
+        )
+    return PythonObject(out_len)
+
+
+def transformer_decode_step_binding(
+    addrs: PythonObject,
+    params: PythonObject,
+) raises -> PythonObject:
+    """One decode token: the profile's spelling -- the block forward at
+    L = 1 with the KV cache carried and `pos0 = cached_tokens` (contract
+    section 7.2: ONE SPELLING FOR BOTH PATHS is what makes clause (d),
+    decode == prefill bitwise, a theorem the gate verifies rather than a
+    coincidence it hopes for), with NO arithmetic of its own. There is
+    deliberately no second entry path to drift.
+
+    `addrs`: the same THIRTEEN as `transformer_forward` with L = 1
+    shapes (x and y_out are B * d_model). `params`: 0 B, 1 d_model,
+    2 n_heads, 3 n_kv_heads, 4 head_dim, 5 intermediate, 6 max_tokens,
+    7 cached_tokens, 8 window. Returns the post-call cached_tokens."""
+    var a = _transformer_addrs(addrs, String("transformer_decode_step"))
+    _check_base_addrs(a, [0, 1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12], String("transformer_decode_step"))
+    if len(params) != 9 and len(params) != 9 + BLOCK_OPTION_PARAMS:
+        raise Error(
+            "transformer_decode_step: params must contain 9 values (B,"
+            " d_model, n_heads, n_kv_heads, head_dim, intermediate,"
+            " max_tokens, cached_tokens, window), optionally followed by"
+            " the 17-value block options tail, got "
+            + String(len(params))
+        )
+    var p = _read_params(params, 9, String("transformer_decode_step"))
+    var opts = BlockOptions.from_params(p, 9)
+    var b = p[0]
+    var dm = p[1]
+    var nh = p[2]
+    var nkv = p[3]
+    var hd = p[4]
+    var it = p[5]
+    var smax = p[6]
+    var s0 = p[7]
+    var window = p[8]
+    var out_len = 0
+    with GILReleased(Python()):
+        out_len = _transformer_run(
+            a, b, 1, dm, nh, nkv, hd, it, smax, s0, window, opts
+        )
+    return PythonObject(out_len)
+
+
+# ===========================================================================
+# The resident decode session (DEVIATION 2940, lane/infer-speed-neural,
+# 2026-09-17): device-owned weights, KV cache, rotary table and L = 1 stages
+# that live across decode steps.
+#
+# WHY IT CANNOT MOVE A BIT. Every step calls `llama_decoder_layer_forward`,
+# THE certified entry point, at `l = 1` and `pos0 = kv.s`, on the same
+# structs the per-call entry builds: `LlamaDeviceWeights` from the same nine
+# uploads, `LlamaKVCache` from the same cache bytes, `LlamaRopeTable` at the
+# same `(theta, head_dim, s_max)`, `LlamaDeviceStages` at `(B, 1, s_max,
+# window)`. What differs is LIFETIME: the per-call entry constructs all of
+# that per token and tears it down; the session constructs it once. Stage
+# reuse across calls is `training/byte_lm.mojo::ByteTrainer`'s settled
+# pattern (its `forward` stages are reused on every training step) and every
+# stage the block reads it writes first in the same call. No arithmetic is
+# respelled here; the only new device operations are transfers.
+#
+# OWNERSHIP AND REFRESH. The
+# session COPIES the weights and the cache at `open`; edits to the caller's
+# arrays after that are NOT observed until `close` and a new `open`
+# (weights) or `load_state` (cache). The caller's cache buffers are STALE
+# while the session is open and become current at `export_state` or `close`.
+# The Python owner (`_transformer_impl.py::TransformerDecodeSession`) marks
+# the state object resident so the per-call `forward`/`step` refuse it until
+# it is synced back.
+#
+# NOT `TransformerSession` above (`transformer_session_*`): that one is the
+# per-call route's retained context and workspace, holding no weights and
+# no authoritative cache (both reread every call). This one owns the weights
+# and the cache for the life of the session. The entry points are
+# `transformer_decode_session_*` so both are exported from one binding.
+# ===========================================================================
+
+
+struct TransformerDecodeSession(Movable, Writable):
+    """Python-owned device lifetime for one block's decode. No global
+    handles and no retained host pointers: every caller buffer is read or
+    written inside the call that names it."""
+
+    var ctx: Optional[DeviceContext]
+    var w: Optional[LlamaDeviceWeights]
+    var kv: Optional[LlamaKVCache]
+    var rope: Optional[LlamaRopeTable]
+    var stages: Optional[LlamaDeviceStages]
+    var dx: Optional[DeviceBuffer[DType.float32]]
+    var b: Int
+    var dm: Int
+    var nh: Int
+    var nkv: Int
+    var hd: Int
+    var it: Int
+    var smax: Int
+    var window: Int
+    var busy: Bool
+    var usable: Bool
+
+    def __init__(out self):
+        self.ctx = Optional[DeviceContext]()
+        self.w = Optional[LlamaDeviceWeights]()
+        self.kv = Optional[LlamaKVCache]()
+        self.rope = Optional[LlamaRopeTable]()
+        self.stages = Optional[LlamaDeviceStages]()
+        self.dx = Optional[DeviceBuffer[DType.float32]]()
+        self.b = 0
+        self.dm = 0
+        self.nh = 0
+        self.nkv = 0
+        self.hd = 0
+        self.it = 0
+        self.smax = 0
+        self.window = 0
+        self.busy = False
+        self.usable = True
+
+    def write_to(self, mut writer: Some[Writer]):
+        writer.write("TransformerDecodeSession")
+
+    def write_repr_to(self, mut writer: Some[Writer]):
+        writer.write("TransformerDecodeSession")
+
+    def is_open(self) -> Bool:
+        return Bool(self.ctx) and Bool(self.kv)
+
+    def release(mut self):
+        """Buffers die before their context, and the frees they enqueue
+        drain before the context goes (DEVIATION 2520's ordering)."""
+        self.stages = None
+        self.dx = None
+        self.rope = None
+        self.kv = None
+        self.w = None
+        if self.ctx:
+            try:
+                self.ctx.value().synchronize()
+            except:
+                pass
+        self.ctx = None
+
+    def __deinit__(deinit self):
+        self.release()
+
+    def close(mut self) raises:
+        if self.busy:
+            raise Error("transformer decode session: busy")
+        self.usable = False
+        self.release()
+
+
+def _require_session_open(s: TransformerDecodeSession) raises:
+    if s.busy:
+        raise Error("transformer decode session: busy")
+    if not s.is_open():
+        raise Error("transformer decode session: not open (transformer_decode_session_open first)")
+    if not s.usable:
+        raise Error("transformer decode session: lost after a failed call; close it and open a new one")
+
+
+def _session_open_run(
+    mut s: TransformerDecodeSession, a: List[Int], b: Int, dm: Int, nh: Int, nkv: Int,
+    hd: Int, it: Int, smax: Int, s0: Int, window: Int, opts: BlockOptions,
+) raises -> Int:
+    """The GIL-free half of `transformer_decode_session_open`: one context, the nine
+    weight uploads, the cache uploads over fresh zeros, the rotary table at
+    `smax`, the L = 1 stages and the resident x buffer. `a` is the
+    `transformer_forward` 13 + 11 layout with slots 0 and 12 unused."""
+    var dims = LlamaDims(dm, nh, nkv, hd, it)
+    dims.validate()
+    opts.validate(hd)
+    if s0 < 0 or s0 > smax:
+        raise Error(
+            String("transformer decode session: cached_tokens must be in [0, ") + String(smax)
+            + "], got " + String(s0))
+    if window < 0:
+        raise Error("transformer decode session: window must be >= 0 (0 = full causal)")
+    var cap = smax
+    if window > 0:
+        cap = window
+    var cache_n = b * nkv * cap * hd
+    s.ctx = neural_ctx[_NEURAL_CTX]()
+    s.w = _load_transformer_weights(s.ctx.value(), dims, a, opts, _tail_of(a, 13))
+    var kv = LlamaKVCache(s.ctx.value(), b, dims, smax, window, opts.max_positions)
+    kv.k = _upload_addr(s.ctx.value(), a[10], cache_n)
+    kv.v = _upload_addr(s.ctx.value(), a[11], cache_n)
+    kv.s = s0
+    s.kv = kv^
+    s.rope = LlamaRopeTable(s.ctx.value(), dims, opts, smax)
+    s.stages = LlamaDeviceStages(s.ctx.value(), b, 1, smax, dims, window, lean=_lean_for_w(hd, s.w.value()))
+    s.dx = s.ctx.value().enqueue_create_buffer[DType.float32](b * dm)
+    s.ctx.value().synchronize()
+    s.b = b
+    s.dm = dm
+    s.nh = nh
+    s.nkv = nkv
+    s.hd = hd
+    s.it = it
+    s.smax = smax
+    s.window = window
+    return s0
+
+
+def _session_open_run_int15(
+    mut s: TransformerDecodeSession, a: List[Int], b: Int, dm: Int, nh: Int, nkv: Int,
+    hd: Int, it: Int, smax: Int, s0: Int, window: Int, opts: BlockOptions,
+) raises -> Int:
+    """`_session_open_run` under numeric_profile="fixed15_v1"
+    (lane/lowbit-default): the weights are the profile constructor's, with
+    the seven projections as the planes `a` carries after the options tail
+    (`_upload_planes`, the layout of `transformer_session_forward_int15`),
+    uploaded ONCE here and resident for the session's life. Every later
+    step and forward runs `llama_decoder_layer_forward` on them exactly as
+    `_transformer_run_session_int15` does, so the bytes are the per-call
+    profile entry's."""
+    var dims = LlamaDims(dm, nh, nkv, hd, it)
+    dims.validate()
+    opts.validate(hd)
+    if s0 < 0 or s0 > smax:
+        raise Error(
+            String("transformer decode session: cached_tokens must be in [0, ") + String(smax)
+            + "], got " + String(s0))
+    if window < 0:
+        raise Error("transformer decode session: window must be >= 0 (0 = full causal)")
+    for i in range(3, 10):
+        if a[i] != 0:
+            raise Error(
+                "transformer_decode_session_open_int15: float32 projection slot "
+                + String(i) + " must be 0 under the profile (the planes are the weights)"
+            )
+    var cap = smax
+    if window > 0:
+        cap = window
+    var cache_n = b * nkv * cap * hd
+    s.ctx = neural_ctx[_NEURAL_CTX]()
+    ref ctx = s.ctx.value()
+    var what = String("transformer_decode_session_open_int15")
+    var t = _tail_of(a, 13)
+    var planes = _upload_planes(ctx, dims, opts, a, 13 + BLOCK_OPTION_ADDRS)
+    s.w = LlamaDeviceWeights(
+        ctx, dims, opts,
+        _upload_addr(ctx, a[1], dm),
+        _upload_addr(ctx, a[2], dm),
+        planes^,
+        _optional_upload(ctx, t[0], dims.q_width(), opts.qkv_bias, "q_proj.bias", what),
+        _optional_upload(ctx, t[1], dims.kv_width(), opts.qkv_bias, "k_proj.bias", what),
+        _optional_upload(ctx, t[2], dims.kv_width(), opts.qkv_bias, "v_proj.bias", what),
+        _optional_upload(ctx, t[3], dm, opts.o_bias, "o_proj.bias", what),
+        _optional_upload(ctx, t[4], dm, opts.norm_bias, "input_layernorm.bias", what),
+        _optional_upload(ctx, t[5], dm, opts.norm_bias, "post_attention_layernorm.bias", what),
+        _optional_upload(ctx, t[6], it, opts.mlp_bias, "up_proj.bias", what),
+        _optional_upload(ctx, t[7], dm, opts.mlp_bias, "down_proj.bias", what),
+        _optional_upload(ctx, t[8], it, opts.has_gate_bias(), "gate_proj.bias", what),
+        _optional_upload(ctx, t[9], hd, opts.qk_norm, "q_norm.weight", what),
+        _optional_upload(ctx, t[10], hd, opts.qk_norm, "k_norm.weight", what),
+    )
+    var kv = LlamaKVCache(ctx, b, dims, smax, window, opts.max_positions)
+    kv.k = _upload_addr(ctx, a[10], cache_n)
+    kv.v = _upload_addr(ctx, a[11], cache_n)
+    kv.s = s0
+    s.kv = kv^
+    s.rope = LlamaRopeTable(ctx, dims, opts, smax)
+    s.stages = LlamaDeviceStages(ctx, b, 1, smax, dims, window, lean=False)
+    s.dx = ctx.enqueue_create_buffer[DType.float32](b * dm)
+    ctx.synchronize()
+    s.b = b
+    s.dm = dm
+    s.nh = nh
+    s.nkv = nkv
+    s.hd = hd
+    s.it = it
+    s.smax = smax
+    s.window = window
+    return s0
+
+
+def _session_step_run(mut s: TransformerDecodeSession, px: Int, py: Int) raises -> Int:
+    """One decode token on the resident structs: x in, the block output
+    out, the cache advanced on the device. ONE completion wait, after the
+    output copy is enqueued; the caller's x stays live for the call."""
+    ref ctx = s.ctx.value()
+    var n = s.b * s.dm
+    ctx.enqueue_copy(dst_buf=s.dx.value(), src_ptr=_f32_ptr(px))
+    var trace = IdentityTrace.disabled()
+    var pos0 = s.kv.value().s
+    llama_decoder_layer_forward(
+        ctx, s.stages.value(), s.kv.value(), s.rope.value(), s.w.value(), s.dx.value(),
+        s.b, 1, pos0, trace, String("py.session"))
+    if n != len(s.stages.value().residual2):
+        raise Error("transformer decode session: the L = 1 stages hold a different output length")
+    ctx.enqueue_copy(dst_ptr=_f32_ptr(py), src_buf=s.stages.value().residual2)
+    ctx.synchronize()
+    return s.kv.value().s
+
+
+def _session_forward_run(mut s: TransformerDecodeSession, px: Int, py: Int, l: Int) raises -> Int:
+    """`l` tokens per row on the resident weights and cache (a prefill or a
+    chunked continuation), with call-shaped stages built for this call
+    alone. The same entry point at `l`, so the bytes are `transformer_forward`'s."""
+    ref ctx = s.ctx.value()
+    var dims = LlamaDims(s.dm, s.nh, s.nkv, s.hd, s.it)
+    var n = s.b * l * s.dm
+    var stages = LlamaDeviceStages(ctx, s.b, l, s.smax, dims, s.window, lean=_lean_for_w(s.hd, s.w.value()))
+    var dx = _upload_addr(ctx, px, n)
+    var trace = IdentityTrace.disabled()
+    var pos0 = s.kv.value().s
+    llama_decoder_layer_forward(
+        ctx, stages, s.kv.value(), s.rope.value(), s.w.value(), dx, s.b, l, pos0, trace,
+        String("py.session.forward"))
+    _download_addr(ctx, stages.residual2, n, py)
+    _ = stages^
+    _ = dx^
+    return s.kv.value().s
+
+
+def _session_export_run(mut s: TransformerDecodeSession, pk: Int, pv: Int) raises -> Int:
+    ref ctx = s.ctx.value()
+    var cap = s.smax
+    if s.window > 0:
+        cap = s.window
+    var cache_n = s.b * s.nkv * cap * s.hd
+    _download_addr(ctx, s.kv.value().k, cache_n, pk)
+    _download_addr(ctx, s.kv.value().v, cache_n, pv)
+    return s.kv.value().s
+
+
+def _session_load_run(mut s: TransformerDecodeSession, pk: Int, pv: Int, s0: Int) raises -> Int:
+    if s0 < 0 or s0 > s.smax:
+        raise Error(
+            String("transformer decode session: cached_tokens must be in [0, ") + String(s.smax)
+            + "], got " + String(s0))
+    ref ctx = s.ctx.value()
+    var cap = s.smax
+    if s.window > 0:
+        cap = s.window
+    var cache_n = s.b * s.nkv * cap * s.hd
+    s.kv.value().k = _upload_addr(ctx, pk, cache_n)
+    s.kv.value().v = _upload_addr(ctx, pv, cache_n)
+    s.kv.value().s = s0
+    return s0
+
+
+def transformer_decode_session_create_binding() raises -> PythonObject:
+    """A closed session. Creation performs no GPU operation."""
+    return PythonObject(alloc=TransformerDecodeSession())
+
+
+def transformer_decode_session_open_binding(
+    session: PythonObject, addrs: PythonObject, params: PythonObject,
+) raises -> PythonObject:
+    """Open a closed session on a block and a carried cache. `addrs` is
+    ELEVEN addresses: the nine weights in `transformer_forward`'s order
+    (slots 1 to 9 there), then k_cache and v_cache. `params` is NINE
+    scalars: B, d_model, n_heads, n_kv_heads, head_dim, intermediate,
+    max_tokens, cached_tokens, window. Everything is COPIED to the device;
+    later edits to the caller's arrays are not observed. Returns
+    cached_tokens. Refused on an open session."""
+    var owner = session.downcast_value_ptr[TransformerDecodeSession]()
+    var what = String("transformer_decode_session_open")
+    if (len(addrs) != 11 and len(addrs) != 11 + BLOCK_OPTION_ADDRS) or (
+        len(params) != 9 and len(params) != 9 + BLOCK_OPTION_PARAMS
+    ):
+        raise Error(
+            "transformer_decode_session_open: expected 11 addresses and 9"
+            " scalars, each optionally followed by its block options tail"
+        )
+    if owner[].busy:
+        raise Error("transformer decode session: busy")
+    if owner[].is_open():
+        raise Error("transformer decode session: already open; close it first")
+    # lane/block-options: into `transformer_forward`'s 13 + 11 layout;
+    # slot 0 (x) and slot 12 (y) are not part of an open.
+    var raw = _read_addrs_tail(addrs, 11, what)
+    var a = List[Int]()
+    a.append(0)
+    for i in range(11):
+        a.append(raw[i])
+    a.append(0)
+    for i in range(BLOCK_OPTION_ADDRS):
+        a.append(raw[11 + i])
+    _check_base_addrs(a, [1, 2, 3, 4, 5, 6, 8, 9, 10, 11], what)
+    var p = _read_params(params, 9, what)
+    var opts = BlockOptions.from_params(p, 9)
+    var b = p[0]
+    var dm = p[1]
+    var nh = p[2]
+    var nkv = p[3]
+    var hd = p[4]
+    var it = p[5]
+    var smax = p[6]
+    var s0 = p[7]
+    var window = p[8]
+    if b <= 0:
+        raise Error("transformer_decode_session_open: B must be positive")
+    owner[].busy = True
+    owner[].usable = False
+    var out_len = 0
+    try:
+        with GILReleased(Python()):
+            out_len = _session_open_run(owner[], a, b, dm, nh, nkv, hd, it, smax, s0, window, opts)
+    except error:
+        owner[].busy = False
+        owner[].release()
+        raise error
+    owner[].busy = False
+    owner[].usable = True
+    return PythonObject(out_len)
+
+
+def transformer_decode_session_open_int15_binding(
+    session: PythonObject, addrs: PythonObject, params: PythonObject,
+) raises -> PythonObject:
+    """`transformer_decode_session_open` under numeric_profile="fixed15_v1"
+    (lane/lowbit-default, 2026-09-29). `addrs` is EXACTLY 11 + the 11-address
+    options tail + 21: the open's eleven with the seven projection slots
+    ZERO (never read), the options tail (always sent), then the planes,
+    three per projection in the order q, k, v, o, gate, up, down (`hi`,
+    `lo`, `exponents`; zeros for gate under an ungated MLP). `params` is
+    EXACTLY the open's nine scalars and the 17-int options tail. The planes
+    are COPIED to the device once and stay there; every other entry of the
+    session (step, forward, export, load, close, `causal_lm_session_run`)
+    is the float32 session's own."""
+    var owner = session.downcast_value_ptr[TransformerDecodeSession]()
+    var what = String("transformer_decode_session_open_int15")
+    if len(addrs) != 11 + BLOCK_OPTION_ADDRS + 21 or len(params) != 9 + BLOCK_OPTION_PARAMS:
+        raise Error(
+            what + ": expected " + String(11 + BLOCK_OPTION_ADDRS + 21) + " addresses and "
+            + String(9 + BLOCK_OPTION_PARAMS) + " scalars, got " + String(len(addrs)) + " and "
+            + String(len(params))
+        )
+    if owner[].busy:
+        raise Error("transformer decode session: busy")
+    if owner[].is_open():
+        raise Error("transformer decode session: already open; close it first")
+    var raw = List[Int]()
+    for i in range(len(addrs)):  # small-loop(addrs: validated decode tensor addresses, 11 plus 11 plus 21): reads pointer list, not data
+        raw.append(Int(py=addrs[i]))
+    # into `transformer_forward`'s 13 + 11 layout, then the 21 planes
+    var a = List[Int]()
+    a.append(0)
+    for i in range(11):
+        a.append(raw[i])
+    a.append(0)
+    for i in range(BLOCK_OPTION_ADDRS + 21):  # small-loop(BLOCK_OPTION_ADDRS: 11 option addresses plus 21 planes): reorders pointer list, not data
+        a.append(raw[11 + i])
+    _check_base_addrs(a, [1, 2, 10, 11], what)
+    var p = _read_params(params, 9, what)
+    var opts = BlockOptions.from_params(p, 9)
+    if p[0] <= 0:
+        raise Error(what + ": B must be positive")
+    owner[].busy = True
+    owner[].usable = False
+    var out_len = 0
+    try:
+        with GILReleased(Python()):
+            out_len = _session_open_run_int15(
+                owner[], a, p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8], opts)
+    except error:
+        owner[].busy = False
+        owner[].release()
+        raise error
+    owner[].busy = False
+    owner[].usable = True
+    return PythonObject(out_len)
+
+
+def transformer_decode_session_step_binding(
+    session: PythonObject, addrs: PythonObject, params: PythonObject,
+) raises -> PythonObject:
+    """One decode token on an open session: `addrs` = [x, y_out], both
+    B * d_model float32; `params` = [cached_tokens], the caller's belief of
+    the resident position, refused on a mismatch so a step can never run
+    against a state the caller does not think it holds. Returns the
+    post-call cached_tokens. A failed call marks the session lost."""
+    var owner = session.downcast_value_ptr[TransformerDecodeSession]()
+    if len(addrs) != 2 or len(params) != 1:
+        raise Error("transformer_decode_session_step: expected 2 addresses and 1 scalar")
+    var px = Int(py=addrs[0])
+    var py = Int(py=addrs[1])
+    if px == 0 or py == 0:
+        raise Error("transformer_decode_session_step: null buffer address")
+    var claimed = Int(py=params[0])
+    _require_session_open(owner[])
+    if owner[].kv.value().s != claimed:
+        raise Error(
+            String("transformer decode session: the caller believes cached_tokens = ") + String(claimed)
+            + " but the resident cache holds " + String(owner[].kv.value().s))
+    owner[].busy = True
+    var out_len = 0
+    try:
+        with GILReleased(Python()):
+            out_len = _session_step_run(owner[], px, py)
+    except error:
+        owner[].busy = False
+        owner[].usable = False
+        raise error
+    owner[].busy = False
+    return PythonObject(out_len)
+
+
+def transformer_decode_session_forward_binding(
+    session: PythonObject, addrs: PythonObject, params: PythonObject,
+) raises -> PythonObject:
+    """`L` tokens per row on an open session (a prefill or a chunked
+    continuation of the resident cache): `addrs` = [x, y_out], both
+    B * L * d_model float32; `params` = [L, cached_tokens]. Returns the
+    post-call cached_tokens."""
+    var owner = session.downcast_value_ptr[TransformerDecodeSession]()
+    if len(addrs) != 2 or len(params) != 2:
+        raise Error("transformer_decode_session_forward: expected 2 addresses and 2 scalars")
+    var px = Int(py=addrs[0])
+    var py = Int(py=addrs[1])
+    if px == 0 or py == 0:
+        raise Error("transformer_decode_session_forward: null buffer address")
+    var l = Int(py=params[0])
+    var claimed = Int(py=params[1])
+    if l <= 0:
+        raise Error("transformer_decode_session_forward: L must be positive")
+    _require_session_open(owner[])
+    if owner[].kv.value().s != claimed:
+        raise Error(
+            String("transformer decode session: the caller believes cached_tokens = ") + String(claimed)
+            + " but the resident cache holds " + String(owner[].kv.value().s))
+    owner[].busy = True
+    var out_len = 0
+    try:
+        with GILReleased(Python()):
+            out_len = _session_forward_run(owner[], px, py, l)
+    except error:
+        owner[].busy = False
+        owner[].usable = False
+        raise error
+    owner[].busy = False
+    return PythonObject(out_len)
+
+
+def transformer_decode_session_export_state_binding(
+    session: PythonObject, addrs: PythonObject,
+) raises -> PythonObject:
+    """Copy the resident cache into the caller's buffers: `addrs` =
+    [k_cache, v_cache], each the full capacity buffer. Returns
+    cached_tokens. The session stays open."""
+    var owner = session.downcast_value_ptr[TransformerDecodeSession]()
+    if len(addrs) != 2:
+        raise Error("transformer_decode_session_export_state: expected 2 addresses")
+    var pk = Int(py=addrs[0])
+    var pv = Int(py=addrs[1])
+    if pk == 0 or pv == 0:
+        raise Error("transformer_decode_session_export_state: null buffer address")
+    _require_session_open(owner[])
+    owner[].busy = True
+    var out_len = 0
+    try:
+        with GILReleased(Python()):
+            out_len = _session_export_run(owner[], pk, pv)
+    except error:
+        owner[].busy = False
+        owner[].usable = False
+        raise error
+    owner[].busy = False
+    return PythonObject(out_len)
+
+
+def transformer_decode_session_load_state_binding(
+    session: PythonObject, addrs: PythonObject, params: PythonObject,
+) raises -> PythonObject:
+    """Replace the resident cache with the caller's bytes: `addrs` =
+    [k_cache, v_cache]; `params` = [cached_tokens]. The explicit refresh
+    for the state half; the weight half is close and open."""
+    var owner = session.downcast_value_ptr[TransformerDecodeSession]()
+    if len(addrs) != 2 or len(params) != 1:
+        raise Error("transformer_decode_session_load_state: expected 2 addresses and 1 scalar")
+    var pk = Int(py=addrs[0])
+    var pv = Int(py=addrs[1])
+    if pk == 0 or pv == 0:
+        raise Error("transformer_decode_session_load_state: null buffer address")
+    var s0 = Int(py=params[0])
+    _require_session_open(owner[])
+    owner[].busy = True
+    var out_len = 0
+    try:
+        with GILReleased(Python()):
+            out_len = _session_load_run(owner[], pk, pv, s0)
+    except error:
+        owner[].busy = False
+        owner[].usable = False
+        raise error
+    owner[].busy = False
+    return PythonObject(out_len)
+
+
+def transformer_decode_session_info_binding(session: PythonObject) raises -> PythonObject:
+    """[open, usable, cached_tokens, B, max_tokens, window] as ints."""
+    var owner = session.downcast_value_ptr[TransformerDecodeSession]()
+    var out = Python.list()
+    var is_open = owner[].is_open()
+    var held = 0
+    if is_open:
+        held = owner[].kv.value().s
+    out.append(PythonObject(1 if is_open else 0))
+    out.append(PythonObject(1 if owner[].usable else 0))
+    out.append(PythonObject(held))
+    out.append(PythonObject(owner[].b))
+    out.append(PythonObject(owner[].smax))
+    out.append(PythonObject(owner[].window))
+    return out
+
+
+def transformer_decode_session_close_binding(session: PythonObject) raises -> PythonObject:
+    """Release every device buffer and the context. The caller's cache
+    buffers are NOT written here; export_state first if the bytes matter."""
+    var owner = session.downcast_value_ptr[TransformerDecodeSession]()
+    owner[].close()
+    return PythonObject(0)
+
+
+# ===========================================================================
+# The block backward: a zero-state prefill's VJP, IDENTICAL tier only.
+# ===========================================================================
+
+
+# ===========================================================================
+# THE RESIDENT CAUSAL LM DECODE SESSION (lane/py-lm, 2026-09-28)
+#
+# `CausalLM.generate` ran one binding call per layer per token, and every one
+# of them uploaded that layer's weights and its whole KV cache and downloaded
+# the cache again; the embedding table and the head crossed every token too
+# (`_anonlib_training`'s embedding_forward / linear_forward), and the full
+# logits came down for a Python argmax. This session holds the embedding,
+# the final norm weight and the head on the device, and one call runs a
+# whole stack of open `TransformerDecodeSession`s (DEVIATION 2940: weights,
+# KV cache, rotary table and L = 1 stages already resident) for a prompt and
+# then a block of greedy tokens, returning the ids.
+#
+# NO NEW ARITHMETIC. Per token: `identical_embedding_forward_into` (what
+# `samba_embedding_forward_host` runs), each layer's
+# `llama_decoder_layer_forward` exactly as `_session_step_run` /
+# `_session_forward_run` run it, `llama_rms_norm` over the same M rows
+# (`samba_rms_norm_forward_host`), `identical_gemm_into` at OP_NT over the
+# same M, N, K (`samba_linear_forward_host`; the plan is chosen from M, so M
+# is kept: B * L at the prompt, B per decode token). The greedy pick is the
+# host scan `models/causal_lm.py::_argmax_last` spells: over the last
+# position's row, from index 0, a strict `>` (ties keep the lowest index, a
+# NaN never replaces, a NaN at index 0 stays). The refusals of the per-call
+# route that can fire mid-stack are restated on downloaded copies: a
+# non-finite final block output (the norm's input scan) and a non-finite
+# normed row (the head's input scan), in their words.
+# ===========================================================================
+
+
+struct CausalLMSession(Movable, Writable):
+    var ctx: Optional[DeviceContext]
+    var embed: Optional[DeviceBuffer[DType.float32]]
+    var norm: Optional[DeviceBuffer[DType.float32]]
+    var head: Optional[DeviceBuffer[DType.float32]]
+    # lane/lowbit-default: the head under numeric_profile="fixed15_v1", its
+    # planes resident, and the profile's per-call scratch
+    var head15: Optional[Int15Planes]
+    var st15: Optional[LlamaInt15Stage]
+    var tied: Bool
+    var b: Int
+    var v: Int
+    var d: Int
+    var eps: Float32
+    var busy: Bool
+    var usable: Bool
+
+    def __init__(out self):
+        self.ctx = Optional[DeviceContext]()
+        self.embed = Optional[DeviceBuffer[DType.float32]]()
+        self.norm = Optional[DeviceBuffer[DType.float32]]()
+        self.head = Optional[DeviceBuffer[DType.float32]]()
+        self.head15 = Optional[Int15Planes]()
+        self.st15 = Optional[LlamaInt15Stage]()
+        self.tied = False
+        self.b = 0
+        self.v = 0
+        self.d = 0
+        self.eps = Float32(0.0)
+        self.busy = False
+        self.usable = True
+
+    def write_to(self, mut writer: Some[Writer]):
+        writer.write("CausalLMSession")
+
+    def write_repr_to(self, mut writer: Some[Writer]):
+        writer.write("CausalLMSession")
+
+    def is_open(self) -> Bool:
+        return Bool(self.ctx) and Bool(self.embed)
+
+    def release(mut self):
+        self.st15 = None
+        self.head15 = None
+        self.head = None
+        self.norm = None
+        self.embed = None
+        if self.ctx:
+            try:
+                self.ctx.value().synchronize()
+            except:
+                pass
+        self.ctx = None
+
+    def __deinit__(deinit self):
+        self.release()
+
+
+def _lm_refuse_nonfinite_device(
+    ctx: DeviceContext, name: String, mut buf: DeviceBuffer[DType.float32], n: Int,
+) raises:
+    """The non-finite refusal on the device copy (cpu2-l11-neural): one
+    `device_first_nonfinite` scan, one integer read back, the same message."""
+    var bad = device_first_nonfinite(ctx, buf, n)
+    if bad >= 0:
+        raise Error("anonlib samba ops: non-finite " + name + " at flat index " + String(bad))
+
+
+comptime _LM_ARGMAX_TPB = 256
+"""Threads per row of the greedy pick: one block per batch row."""
+comptime _LM_ARGMAX_NONE: Int32 = 2147483647
+
+
+@always_inline
+def _lm_order_key(value: Float32) -> UInt32:
+    """An unsigned key whose order is the float order (by bits, never a
+    float compare: Metal flushes compare operands). -0.0 is keyed as +0.0,
+    so equal floats get equal keys and the host loop's `>` is matched for
+    every non-NaN value, subnormals included."""
+    var bits = bitcast[DType.uint32](value)
+    if (bits & UInt32(0x7FFFFFFF)) == UInt32(0):
+        bits = UInt32(0)
+    if (bits & UInt32(0x80000000)) != UInt32(0):
+        return ~bits
+    return bits | UInt32(0x80000000)
+
+
+def _lm_last_argmax_kernel(
+    logits: MutPointer[Float32, MutAnyOrigin],
+    next_ids: MutPointer[Int32, MutAnyOrigin],
+    out_ids: MutPointer[Int32, MutAnyOrigin],
+    cur_l_in: Int32,
+    v_in: Int32,
+    n_steps_in: Int32,
+    step_in: Int32,
+):
+    """cpu2-l11-neural (2026-10-04): the greedy pick of `_lm_run` on the
+    device. Block `r` reads row r's LAST position of `logits` ([b, cur_l,
+    v]) and writes the first (lowest-index) maximum to `next_ids[r]` (the
+    next step's input id) and `out_ids[r * n_steps + step]`. The host loop
+    it replaces kept the lowest index of the maximum under `>`; an integer
+    (key, index) minimum-index reduction picks the same index for every
+    non-NaN row, on every vendor and at any block size."""
+    var keys = stack_allocation[
+        _LM_ARGMAX_TPB, Scalar[DType.uint32], address_space = AddressSpace.SHARED
+    ]()
+    var idxs = stack_allocation[
+        _LM_ARGMAX_TPB, Scalar[DType.int32], address_space = AddressSpace.SHARED
+    ]()
+    var r = Int(block_idx.x)
+    var tid = Int(thread_idx.x)
+    var v = Int(v_in)
+    var cur_l = Int(cur_l_in)
+    var base = (r * cur_l + cur_l - 1) * v
+    var best_k = UInt32(0)
+    var best_i = _LM_ARGMAX_NONE
+    var c = tid
+    while c < v:
+        var k = _lm_order_key(logits.unsafe_load(base + c))
+        if best_i == _LM_ARGMAX_NONE or k > best_k:
+            best_k = k
+            best_i = Int32(c)
+        c += _LM_ARGMAX_TPB
+    keys.unsafe_store(tid, best_k)
+    idxs.unsafe_store(tid, best_i)
+    barrier()
+    var active = _LM_ARGMAX_TPB // 2
+    while active > 0:
+        if tid < active:
+            var oi = idxs.unsafe_load(tid + active)
+            var ok = keys.unsafe_load(tid + active)
+            var mi = idxs.unsafe_load(tid)
+            var mk = keys.unsafe_load(tid)
+            if oi != _LM_ARGMAX_NONE and (mi == _LM_ARGMAX_NONE or ok > mk or (ok == mk and oi < mi)):
+                keys.unsafe_store(tid, ok)
+                idxs.unsafe_store(tid, oi)
+        barrier()
+        active = active // 2
+    if tid == 0:
+        var best = idxs.unsafe_load(0)
+        next_ids.unsafe_store(r, best)
+        out_ids.unsafe_store(r * Int(n_steps_in) + Int(step_in), best)
+
+
+def _lm_open_run(mut s: CausalLMSession, pe: Int, pn: Int, ph: Int, b: Int, v: Int, d: Int, eps: Float32) raises:
+    if b < 1 or v < 1 or d < 1:
+        raise Error("causal_lm_session_open: B, vocab and d_model must be positive")
+    if not isfinite(eps) or eps < Float32(0.0):
+        raise Error("anonlib samba ops: rms_norm eps must be finite and >= 0")
+    s.ctx = neural_ctx[_NEURAL_CTX]()
+    s.embed = _upload_addr(s.ctx.value(), pe, v * d)
+    s.norm = _upload_addr(s.ctx.value(), pn, d)
+    s.tied = ph == 0
+    if not s.tied:
+        s.head = _upload_addr(s.ctx.value(), ph, v * d)
+    # cpu2-l11-neural (2026-10-04): the weight refusals scan the uploaded
+    # copies on the device (same first flat index, same words); the entry
+    # releases the session on the raise.
+    _lm_refuse_nonfinite_device(s.ctx.value(), "embedding weight", s.embed.value(), v * d)
+    _lm_refuse_nonfinite_device(s.ctx.value(), "rms_norm weight", s.norm.value(), d)
+    if not s.tied:
+        _lm_refuse_nonfinite_device(s.ctx.value(), "linear weight", s.head.value(), v * d)
+    s.ctx.value().synchronize()
+    s.b = b
+    s.v = v
+    s.d = d
+    s.eps = eps
+
+
+def _lm_open_run_int15(
+    mut s: CausalLMSession, pe: Int, pn: Int, planes: List[Int], b: Int, v: Int, d: Int, eps: Float32,
+) raises:
+    """`_lm_open_run` under numeric_profile="fixed15_v1" (lane/lowbit-default):
+    the embedding and the final norm as there, and the head as its planes
+    (`planes` = [hi, lo, exponents] of the head, tied or not, as
+    `CausalLM` made them with `anonlib.linalg.quantize_int15`), resident.
+    The head product is then `llama_int15_proj`: the parallel quantizer on
+    the normed rows and `identical_gemm_int15_planes_into`, the calls
+    `anonlib.linalg.matmul_int15` makes on the per-layer route."""
+    if b < 1 or v < 1 or d < 1:
+        raise Error("causal_lm_session_open: B, vocab and d_model must be positive")
+    if not isfinite(eps) or eps < Float32(0.0):
+        raise Error("anonlib samba ops: rms_norm eps must be finite and >= 0")
+    s.ctx = neural_ctx[_NEURAL_CTX]()
+    ref ctx = s.ctx.value()
+    s.embed = _upload_addr(ctx, pe, v * d)
+    s.norm = _upload_addr(ctx, pn, d)
+    # cpu2-l11-neural: device refusals of the uploaded copies (see `_lm_open_run`).
+    _lm_refuse_nonfinite_device(ctx, "embedding weight", s.embed.value(), v * d)
+    _lm_refuse_nonfinite_device(ctx, "rms_norm weight", s.norm.value(), d)
+    s.tied = False
+    var a: List[Int] = [planes[0], planes[1], planes[2]]
+    s.head15 = _upload_planes_one(ctx, a, 0, v, d, "head")
+    s.st15 = LlamaInt15Stage(ctx)
+    ctx.synchronize()
+    s.b = b
+    s.v = v
+    s.d = d
+    s.eps = eps
+
+
+def _lm_layers_run(
+    ctx: DeviceContext, layers: List[Int], mut x: DeviceBuffer[DType.float32], b: Int, l: Int,
+) raises:
+    """Every layer in order on `x` ([b * l * d], overwritten with the stack's
+    output): at l = 1 on the session's own L = 1 stages and resident x buffer
+    (`_session_step_run`), otherwise on call-shaped stages
+    (`_session_forward_run`)."""
+    for i in range(len(layers)):
+        var sp = MutPointer[TransformerDecodeSession, MutUntrackedOrigin](unsafe_from_address=layers[i])
+        var trace = IdentityTrace.disabled()
+        var pos0 = sp[].kv.value().s
+        if l == 1:
+            ctx.enqueue_copy(dst_buf=sp[].dx.value(), src_buf=x)
+            llama_decoder_layer_forward(
+                ctx, sp[].stages.value(), sp[].kv.value(), sp[].rope.value(), sp[].w.value(),
+                sp[].dx.value(), sp[].b, 1, pos0, trace, String("py.session"))
+            ctx.enqueue_copy(dst_buf=x, src_buf=sp[].stages.value().residual2)
+        else:
+            var dims = LlamaDims(sp[].dm, sp[].nh, sp[].nkv, sp[].hd, sp[].it)
+            var stages = LlamaDeviceStages(ctx, sp[].b, l, sp[].smax, dims, sp[].window,
+                                           lean=_lean_for_w(sp[].hd, sp[].w.value()))
+            var dx = ctx.enqueue_create_buffer[DType.float32](b * l * sp[].dm)
+            ctx.enqueue_copy(dst_buf=dx, src_buf=x)
+            llama_decoder_layer_forward(
+                ctx, stages, sp[].kv.value(), sp[].rope.value(), sp[].w.value(), dx, sp[].b, l,
+                pos0, trace, String("py.session.forward"))
+            ctx.enqueue_copy(dst_buf=x, src_buf=stages.residual2)
+            ctx.synchronize()
+            _ = stages^
+            _ = dx^
+
+
+def _lm_run(
+    mut s: CausalLMSession, layers: List[Int], p_ids: Int, p_out: Int, p_logits: Int,
+    l: Int, n_steps: Int,
+) raises:
+    ref ctx = s.ctx.value()
+    var b = s.b
+    var d = s.d
+    var v = s.v
+    var emb_cfg = EmbConfig.llama(v, d)
+    var ids_i32 = MutPointer[Int32, MutUntrackedOrigin](unsafe_from_address=p_ids)
+    var out_i32 = MutPointer[Int32, MutUntrackedOrigin](unsafe_from_address=p_out)
+    # cpu2-l11-neural (2026-10-04): the greedy pick runs on the device
+    # (`_lm_last_argmax_kernel`), and its ids feed the next step from
+    # `next_ids` without a host round trip; the [b, n_steps] ids and (when
+    # asked) the last step's last-position logits come down once, at the end.
+    var ids0 = ctx.enqueue_create_buffer[DType.int32](b * l)
+    ctx.enqueue_copy(dst_buf=ids0, src_ptr=ids_i32)
+    var next_ids = ctx.enqueue_create_buffer[DType.int32](b)
+    var out_dev = ctx.enqueue_create_buffer[DType.int32](b * n_steps)
+    var cur_l = l
+    for step in range(n_steps):
+        var m = b * cur_l
+        var x = ctx.enqueue_create_buffer[DType.float32](m * d)
+        if step == 0:
+            identical_embedding_forward_into(ctx, x, s.embed.value(), ids0, m, emb_cfg)
+        else:
+            identical_embedding_forward_into(ctx, x, s.embed.value(), next_ids, m, emb_cfg)
+        _lm_layers_run(ctx, layers, x, b, cur_l)
+        var sumsq = ctx.enqueue_create_buffer[DType.float32](m)
+        var hn = ctx.enqueue_create_buffer[DType.float32](m * d)
+        llama_rms_norm(ctx, sumsq, hn, x, s.norm.value(), m, d, s.eps)
+        var logits = ctx.enqueue_create_buffer[DType.float32](m * v)
+        var ws_n = 1
+        if not s.head15:
+            ws_n = identical_gemm_workspace_max_floats(m, v, d)
+        var ws = ctx.enqueue_create_buffer[DType.float32](ws_n)
+        if s.head15:
+            llama_int15_proj(ctx, s.st15.value(), logits, hn, s.head15.value(), m, v, d)
+        elif s.tied:
+            identical_gemm_into[ROLE=ROLE_HEAD](ctx, logits, hn, s.embed.value(), ws, m, v, d, OP_NT)
+        else:
+            identical_gemm_into[ROLE=ROLE_HEAD](ctx, logits, hn, s.head.value(), ws, m, v, d, OP_NT)
+        # lane cgr4-download-loop: the two refusals scan on the device (the
+        # first index by an integer minimum), not two m x d downloads walked
+        # on the host
+        var bad_x = device_first_nonfinite(ctx, x, m * d)
+        if bad_x >= 0:
+            raise Error("anonlib samba ops: non-finite rms_norm input at flat index " + String(bad_x))
+        var bad_hn = device_first_nonfinite(ctx, hn, m * d)
+        if bad_hn >= 0:
+            raise Error("anonlib samba ops: non-finite linear input at flat index " + String(bad_hn))
+        ctx.enqueue_function[_lm_last_argmax_kernel](
+            logits.unsafe_ptr(), next_ids.unsafe_ptr(), out_dev.unsafe_ptr(),
+            Int32(cur_l), Int32(v), Int32(n_steps), Int32(step),
+            grid_dim=(b, 1, 1), block_dim=(_LM_ARGMAX_TPB, 1, 1),
+        )
+        var rows = List[DeviceBuffer[DType.float32]]()
+        if p_logits != 0 and step == n_steps - 1:
+            var lp = _f32_ptr(p_logits)
+            for r in range(b):
+                rows.append(logits.create_sub_buffer[DType.float32]((r * cur_l + cur_l - 1) * v, v))
+                ctx.enqueue_copy(dst_ptr=lp + r * v, src_buf=rows[r])
+        ctx.synchronize()
+        _ = rows^
+        _ = x^
+        _ = sumsq^
+        _ = hn^
+        _ = logits^
+        _ = ws^
+        cur_l = 1
+    ctx.enqueue_copy(dst_ptr=out_i32, src_buf=out_dev)
+    ctx.synchronize()
+    _ = ids0^
+    _ = next_ids^
+    _ = out_dev^
+
+
+def causal_lm_session_create_binding() raises -> PythonObject:
+    """A closed session. Creation performs no GPU operation."""
+    return PythonObject(alloc=CausalLMSession())
+
+
+def causal_lm_session_open_binding(
+    session: PythonObject, addrs: PythonObject, params: PythonObject,
+) raises -> PythonObject:
+    """`addrs` = [embed (V * D f32), norm (D f32), head (V * D f32, or 0 for a
+    head tied to the embedding)]; `params` = [B, V, D, eps (float)]. Every
+    tensor is COPIED to the device; later edits are not observed."""
+    var owner = session.downcast_value_ptr[CausalLMSession]()
+    if len(addrs) != 3 or len(params) != 4:
+        raise Error("causal_lm_session_open: expected 3 addresses and 4 scalars")
+    if owner[].busy:
+        raise Error("causal lm session: busy")
+    if owner[].is_open():
+        raise Error("causal lm session: already open; close it first")
+    var pe = Int(py=addrs[0])
+    var pn = Int(py=addrs[1])
+    var ph = Int(py=addrs[2])
+    if pe == 0 or pn == 0:
+        raise Error("causal_lm_session_open: null buffer address")
+    var b = Int(py=params[0])
+    var v = Int(py=params[1])
+    var d = Int(py=params[2])
+    var eps = Float32(Float64(py=params[3]))
+    owner[].busy = True
+    try:
+        with GILReleased(Python()):
+            _lm_open_run(owner[], pe, pn, ph, b, v, d, eps)
+    except error:
+        owner[].busy = False
+        owner[].release()
+        raise error
+    owner[].busy = False
+    owner[].usable = True
+    return PythonObject(0)
+
+
+def causal_lm_session_open_int15_binding(
+    session: PythonObject, addrs: PythonObject, params: PythonObject,
+) raises -> PythonObject:
+    """`causal_lm_session_open` under numeric_profile="fixed15_v1"
+    (lane/lowbit-default, 2026-09-29): `addrs` = [embed (V * D f32), norm
+    (D f32), head hi (V * D int8), head lo (V * D int8), head exponents (V
+    int32)], the head's planes whether or not it is tied; `params` = [B, V,
+    D, eps (float)]. Every tensor is COPIED to the device."""
+    var owner = session.downcast_value_ptr[CausalLMSession]()
+    if len(addrs) != 5 or len(params) != 4:
+        raise Error("causal_lm_session_open_int15: expected 5 addresses and 4 scalars")
+    if owner[].busy:
+        raise Error("causal lm session: busy")
+    if owner[].is_open():
+        raise Error("causal lm session: already open; close it first")
+    var pe = Int(py=addrs[0])
+    var pn = Int(py=addrs[1])
+    var planes: List[Int] = [Int(py=addrs[2]), Int(py=addrs[3]), Int(py=addrs[4])]
+    if pe == 0 or pn == 0 or planes[0] == 0 or planes[1] == 0 or planes[2] == 0:
+        raise Error("causal_lm_session_open_int15: null buffer address")
+    var b = Int(py=params[0])
+    var v = Int(py=params[1])
+    var d = Int(py=params[2])
+    var eps = Float32(Float64(py=params[3]))
+    owner[].busy = True
+    try:
+        with GILReleased(Python()):
+            _lm_open_run_int15(owner[], pe, pn, planes, b, v, d, eps)
+    except error:
+        owner[].busy = False
+        owner[].release()
+        raise error
+    owner[].busy = False
+    owner[].usable = True
+    return PythonObject(0)
+
+
+def causal_lm_session_run_binding(
+    session: PythonObject, layers: PythonObject, addrs: PythonObject, params: PythonObject,
+) raises -> PythonObject:
+    """One call for a prompt and a block of greedy tokens. `layers` is the
+    stack's open `TransformerDecodeSession`s in order, all at the same
+    cached length. `addrs` = [ids_in (B * L int32), ids_out (B * n_steps
+    int32, row-major), logits_out (B * V f32 of the LAST pass's last
+    position, or 0)]; `params` = [L, n_steps, cached_tokens]. The first
+    pass runs the L prompt tokens; each later pass feeds back the previous
+    pick. Returns the post-call cached_tokens. A failed call marks this
+    session and every layer session lost."""
+    var owner = session.downcast_value_ptr[CausalLMSession]()
+    if len(addrs) != 3 or len(params) != 3:
+        raise Error("causal_lm_session_run: expected 3 addresses and 3 scalars")
+    if owner[].busy:
+        raise Error("causal lm session: busy")
+    if not owner[].is_open():
+        raise Error("causal lm session: not open (causal_lm_session_open first)")
+    if not owner[].usable:
+        raise Error("causal lm session: lost after a failed call; close it and open a new one")
+    var p_ids = Int(py=addrs[0])
+    var p_out = Int(py=addrs[1])
+    var p_logits = Int(py=addrs[2])
+    if p_ids == 0 or p_out == 0:
+        raise Error("causal_lm_session_run: null buffer address")
+    var l = Int(py=params[0])
+    var n_steps = Int(py=params[1])
+    var claimed = Int(py=params[2])
+    if l < 1 or n_steps < 1:
+        raise Error("causal_lm_session_run: L and n_steps must be positive")
+    var ptrs = List[Int]()
+    var n_layers = Int(py=len(layers))
+    if n_layers < 1:
+        raise Error("causal_lm_session_run: no layers")
+    for i in range(n_layers):  # small-loop(n_layers: decoder layers of the model): one session pointer per layer, not data
+        var sp = layers[i].downcast_value_ptr[TransformerDecodeSession]()
+        _require_session_open(sp[])
+        if sp[].b != owner[].b or sp[].dm != owner[].d:
+            raise Error("causal_lm_session_run: layer " + String(i) + " holds B = " + String(sp[].b)
+                + ", d_model = " + String(sp[].dm) + "; the session has B = " + String(owner[].b)
+                + ", d_model = " + String(owner[].d))
+        if sp[].kv.value().s != claimed:
+            raise Error(String("transformer decode session: the caller believes cached_tokens = ")
+                + String(claimed) + " but layer " + String(i) + " holds " + String(sp[].kv.value().s))
+        if sp[].kv.value().s + l + n_steps - 1 > sp[].smax:
+            raise Error("causal_lm_session_run: " + String(l + n_steps - 1) + " more positions do not fit the "
+                + String(sp[].smax) + "-token cache")
+        ptrs.append(Int(sp))
+    for i in range(n_layers):
+        var sp = MutPointer[TransformerDecodeSession, MutUntrackedOrigin](unsafe_from_address=ptrs[i])
+        sp[].busy = True
+    owner[].busy = True
+    try:
+        with GILReleased(Python()):
+            _lm_run(owner[], ptrs, p_ids, p_out, p_logits, l, n_steps)
+    except error:
+        for i in range(n_layers):
+            var sp = MutPointer[TransformerDecodeSession, MutUntrackedOrigin](unsafe_from_address=ptrs[i])
+            sp[].busy = False
+            sp[].usable = False
+        owner[].busy = False
+        owner[].usable = False
+        raise error
+    var result = 0
+    for i in range(n_layers):
+        var sp = MutPointer[TransformerDecodeSession, MutUntrackedOrigin](unsafe_from_address=ptrs[i])
+        sp[].busy = False
+        result = sp[].kv.value().s
+    owner[].busy = False
+    return PythonObject(result)
+
+
+def causal_lm_session_close_binding(session: PythonObject) raises -> PythonObject:
+    var owner = session.downcast_value_ptr[CausalLMSession]()
+    if owner[].busy:
+        raise Error("causal lm session: busy")
+    owner[].usable = False
+    owner[].release()
+    return PythonObject(0)
+
+
+def _transformer_backward_run(
+    a: List[Int],
+    b: Int,
+    l: Int,
+    dm: Int,
+    nh: Int,
+    nkv: Int,
+    hd: Int,
+    it: Int,
+    window: Int,
+) raises:
+    """Forward from a zero cache at positions [0, L), then
+    `llama_decoder_layer_backward` on the saved stages; the ten gradients
+    are written into the caller's buffers. The forward is recomputed here
+    rather than taken from a previous call because the lane's backward
+    reads the forward's DEVICE stages (`LlamaDeviceStages`) and those are
+    not part of the Python-visible state."""
+    var dims = LlamaDims(dm, nh, nkv, hd, it)
+    dims.validate()
+    if window < 0:
+        raise Error("transformer backward: window must be >= 0")
+    var qw = dims.q_width()
+    var kw = dims.kv_width()
+    var m = b * l
+    var ctx = neural_ctx[_NEURAL_CTX]()
+    var ton = String(getenv("ANONLIB_TRANSFORMER_TIMING")) != ""
+    var tk = Int(perf_counter_ns())
+    var w = _load_transformer_weights(ctx, dims, a)
+    var kv = LlamaKVCache(ctx, b, dims, l, window)
+    var rope = LlamaRopeTable(ctx, dims, ROPE_THETA, l)
+    var lean = transformer_lean_stages(hd)
+    var stages = LlamaDeviceStages(ctx, b, l, l, dims, window, lean=lean)
+    var dx = _upload_addr(ctx, a[0], m * dm)
+    _btick(ton, tk, "surface.inputs_up")
+    var off = IdentityTrace.disabled()
+    llama_decoder_layer_forward(
+        ctx, stages, kv, rope, w, dx, b, l, 0, off, String("pyf")
+    )
+    _btick(ton, tk, "surface.forward")
+    var bst = LlamaBackwardStages(ctx, b, l, l, dims, lean=lean)
+    var d_out = _read_f32(a[10], m * dm)
+    var offb = IdentityTrace.disabled()
+    llama_decoder_layer_backward(
+        ctx, bst, stages, w, rope.cos, rope.sin, dx, d_out, b, l, 0,
+        offb, String("pyb"),
+    )
+    _btick(ton, tk, "surface.backward")
+    # All ten sources remain owned by bst, and destinations by the Python
+    # frame. Queue their copies together and wait before either owner dies.
+    _download_addr[False](ctx, bst.d_x, m * dm, a[11])
+    _download_addr[False](ctx, bst.dw_norm1, dm, a[12])
+    _download_addr[False](ctx, bst.dw_norm2, dm, a[13])
+    _download_addr[False](ctx, bst.dw_q, qw * dm, a[14])
+    _download_addr[False](ctx, bst.dw_k, kw * dm, a[15])
+    _download_addr[False](ctx, bst.dw_v, kw * dm, a[16])
+    _download_addr[False](ctx, bst.dw_o, dm * qw, a[17])
+    _download_addr[False](ctx, bst.dw_gate, it * dm, a[18])
+    _download_addr[False](ctx, bst.dw_up, it * dm, a[19])
+    _download_addr[False](ctx, bst.dw_down, dm * it, a[20])
+    ctx.synchronize()
+    _btick(ton, tk, "surface.outputs_down")
+    _ = bst^
+    _ = stages^
+    _ = w^
+    _ = kv^
+    _ = rope^
+    _ = dx^
+    # The `synchronize()` above drained the OUTPUT COPIES; these six
+    # destructions enqueue the frees, and those must drain too before the
+    # context is destroyed (DEVIATION 2520, extended by DEVIATION 3010).
+    ctx.synchronize()
+    _ = ctx^
+
+
+def transformer_backward_binding(
+    addrs: PythonObject,
+    params: PythonObject,
+) raises -> PythonObject:
+    """The zero-state prefill VJP of one block call, IDENTICAL tier only.
+
+    `addrs` is TWENTY-ONE addresses: 0 x (B*L*d_model), 1-9 the nine
+    weights in `transformer_forward`'s order, 10 grad_output (B*L*d_model),
+    11 grad_x (B*L*d_model, WRITTEN), 12-20 the nine weight gradients in
+    the same order and shapes as the weights (WRITTEN). `params`: 0 B,
+    1 L, 2 d_model, 3 n_heads, 4 n_kv_heads, 5 head_dim, 6 intermediate,
+    7 window. The activation gradients are the lane's pinned chains; every
+    weight gradient is a sum over this call's B*L tokens."""
+    if len(addrs) != 21 or len(params) != 8:
+        raise Error(
+            "transformer backward: expected 21 addresses and 8 scalars (B,"
+            " L, d_model, n_heads, n_kv_heads, head_dim, intermediate,"
+            " window)"
+        )
+    var a = List[Int]()
+    for i in range(21):
+        var address = Int(py=addrs[i])
+        if address == 0:
+            raise Error(
+                "transformer backward: null buffer address at slot "
+                + String(i)
+            )
+        a.append(address)
+    var b = Int(py=params[0])
+    var l = Int(py=params[1])
+    var dm = Int(py=params[2])
+    var nh = Int(py=params[3])
+    var nkv = Int(py=params[4])
+    var hd = Int(py=params[5])
+    var it = Int(py=params[6])
+    var window = Int(py=params[7])
+    if b <= 0 or l <= 0 or dm <= 0:
+        raise Error("transformer backward: B, L and d_model must be positive")
+    with GILReleased(Python()):
+        _transformer_backward_run(a, b, l, dm, nh, nkv, hd, it, window)
+    return PythonObject(0)
+
+
+
+def transformer_session_discard_tape_binding(session: PythonObject,ticket: PythonObject) raises -> PythonObject:
+    var owner = session.downcast_value_ptr[TransformerSession]()
+    if owner[].busy:
+        raise Error("transformer tape: session is busy")
+    if len(ticket) != 2:
+        raise Error("transformer tape: owner and epoch required")
+    var cookie = Int(py=ticket[0])
+    var epoch = Int(py=ticket[1])
+    if cookie != Int(owner):
+        raise Error("transformer tape: foreign session")
+    # Closing an older ticket cannot discard a newer forward in this session.
+    if not owner[].closed and epoch == owner[].tape_generation:
+        owner[].invalidate_tape()
+    return PythonObject(0)
+
+
+def transformer_session_invalidate_tape_binding(session: PythonObject) raises -> PythonObject:
+    var owner = session.downcast_value_ptr[TransformerSession]()
+    if owner[].busy or owner[].closed:
+        raise Error("transformer tape: session is busy or closed")
+    owner[].invalidate_tape()
+    return PythonObject(0)
+
+
+def transformer_arithmetic_profile_changed_binding() raises -> PythonObject:
+    return PythonObject(Int(transformer_arithmetic_profile_changed()))
+
+
+def transformer_arithmetic_profile_binding() raises -> PythonObject:
+    return PythonObject(transformer_arithmetic_profile())
+
+
+def transformer_session_forward_tape_binding(
+    session: PythonObject, addrs: PythonObject, params: PythonObject,
+) raises -> PythonObject:
+    """11 buffers x/9 weights/y; ten scalars shape/window/budget/cost.
+
+    Returns native session cookie, epoch, retained flag, counted stage bytes.
+    Copies finish before return. The weight snapshot belongs to this epoch;
+    any subsequent session operation invalidates the unconsumed ticket.
+    """
+    var owner = session.downcast_value_ptr[TransformerSession]()
+    if owner[].busy or owner[].closed:
+        raise Error("transformer tape: session is busy or closed")
+    if GLOBAL_NUMERIC_MODE != NUMERIC_IDENTICAL:
+        raise Error("transformer tape: IDENTICAL only")
+    if len(addrs) != 11 or len(params) != 10:
+        raise Error("transformer tape: expected 11 addresses and 10 scalars")
+    var a = List[Int]()
+    var p = List[Int]()
+    for i in range(11):
+        var address = Int(py=addrs[i])
+        if address == 0:
+            raise Error("transformer tape: null buffer address")
+        a.append(address)
+    for i in range(10):
+        p.append(Int(py=params[i]))
+    if p[0] <= 0 or p[1] <= 0 or p[7] < 0 or p[8] < 0 or p[9] < 0:
+        raise Error("transformer tape: invalid shape/window/activation budget/cost")
+    owner[].busy = True
+    try:
+        with GILReleased(Python()):
+            try:
+                var dims = LlamaDims(p[2],p[3],p[4],p[5],p[6])
+                dims.validate()
+                if not owner[].ctx:
+                    owner[].ctx = neural_ctx[_NEURAL_CTX]()
+                    owner[].contexts += 1
+                var opts = BlockOptions()
+                _session_weights(owner[],dims,a,opts,List[Int]())
+                ref ctx = owner[].ctx.value()
+                ref w = owner[].weights.value()
+                var input = _upload_addr(ctx,a[0],p[0]*p[1]*p[2])
+                owner[].tape = BorrowedAttentionTape(ctx,w,input^,p[0],p[1],p[7],owner[].tape_generation)
+                ref tape = owner[].tape.value()
+                _download_addr(ctx,tape.stages.value().residual2,p[0]*p[1]*p[2],a[10])
+                tape.seal(ctx,p[8],p[9])
+            except error:
+                owner[].clear()
+                raise error
+    except error:
+        owner[].busy = False
+        raise error
+    owner[].busy = False
+    var ticket = Python.list()
+    ticket.append(PythonObject(Int(owner)))
+    ticket.append(PythonObject(owner[].tape_generation))
+    ticket.append(PythonObject(Int(owner[].tape.value().retained)))
+    ticket.append(PythonObject(owner[].tape.value().retained_bytes))
+    return ticket
+
+
+def transformer_session_backward_tape_binding(
+    session: PythonObject, addrs: PythonObject, ticket: PythonObject,
+) raises -> PythonObject:
+    """Eleven addresses: dy, dx, norm1,norm2,Q,K,V,O,gate,up,down gradients."""
+    var owner = session.downcast_value_ptr[TransformerSession]()
+    if owner[].busy or owner[].closed:
+        raise Error("transformer tape: session is busy or closed")
+    if len(addrs) != 11 or len(ticket) != 2:
+        raise Error("transformer tape backward: expected 11 addresses and owner/epoch")
+    var cookie = Int(py=ticket[0])
+    var generation = Int(py=ticket[1])
+    if cookie != Int(owner) or generation != owner[].tape_generation or not owner[].tape:
+        raise Error("transformer tape: stale, foreign or already consumed ticket")
+    var a = List[Int]()
+    for i in range(11):
+        var address = Int(py=addrs[i])
+        if address == 0:
+            raise Error("transformer tape backward: null buffer address")
+        a.append(address)
+    owner[].busy = True
+    try:
+        with GILReleased(Python()):
+            try:
+                ref ctx = owner[].ctx.value()
+                ref tape = owner[].tape.value()
+                var dims = tape.dims.copy()
+                var dm = dims.d_model
+                var qw = dims.q_width()
+                var kw = dims.kv_width()
+                var it = dims.intermediate
+                var m = tape.b*tape.l
+                var dy = _upload_addr(ctx,a[0],m*dm)
+                var bst = LlamaBackwardStages(ctx,tape.b,tape.l,tape.l,dims,lean=True)
+                tape.backward_into(ctx,owner[].weights.value(),bst,dy,generation,
+                    owner[].tape_generation,owner[].tape_generation,owner[].tape_generation)
+                _download_addr[False](ctx,bst.d_x,m*dm,a[1])
+                _download_addr[False](ctx,bst.dw_norm1,dm,a[2])
+                _download_addr[False](ctx,bst.dw_norm2,dm,a[3])
+                _download_addr[False](ctx,bst.dw_q,qw*dm,a[4])
+                _download_addr[False](ctx,bst.dw_k,kw*dm,a[5])
+                _download_addr[False](ctx,bst.dw_v,kw*dm,a[6])
+                _download_addr[False](ctx,bst.dw_o,dm*qw,a[7])
+                _download_addr[False](ctx,bst.dw_gate,it*dm,a[8])
+                _download_addr[False](ctx,bst.dw_up,it*dm,a[9])
+                _download_addr[False](ctx,bst.dw_down,dm*it,a[10])
+                ctx.synchronize()
+                owner[].tape = None
+                owner[].tape_generation += 1
+                ctx.synchronize()
+            except error:
+                owner[].clear()
+                raise error
+    except error:
+        owner[].busy = False
+        raise error
+    owner[].busy = False
+    return PythonObject(0)
+
+
+@export
+def PyInit__anonlib_transformer() abi("C") -> PythonObject:
+    # FAST AND IDENTICAL (lane neural, 2026-09-27). This lane was
+    # IDENTICAL-only from 2026-09-10 because its fused kernels were once gated
+    # on IDENTICAL and the lower tiers fell back to slower unfused arms. Those
+    # fallbacks are gone: FAST runs the same kernels and the same launches with
+    # the pins in checks/numerics.mojo compiled to the free schedule. FAST
+    # promises quality, never bits.
+    # DEVIATION 793's last clause, applied here: a sabotage arm exists to
+    # be run by a gate and to FAIL; a Python surface that quietly served
+    # one would be a wrong answer wearing a green label. Refuse to exist
+    # instead.
+    comptime if (
+        BLOCK_ANY_SABOTAGE
+        or BWD_ANY_SABOTAGE
+        or GEMM_ANY_BWD_SABOTAGE
+        or GEMM_ANY_SABOTAGE
+        or INT15_SABOTAGE
+        or INT15_PIECE_SABOTAGE
+        or INT15_QUANT_SABOTAGE
+        or INT15_EPILOGUE_SABOTAGE
+    ):
+        abort(
+            String(
+                "_anonlib_transformer: refusing to initialize -- a"
+                " sabotage arm is compiled into this binary. Sabotage"
+                " defines are for the lane gates (transformer/checks/),"
+                " never for a shipped binding; rebuild with"
+                " bash bindings/build_transformer.sh and no"
+                " ANONLIB_TRANSFORMER_SABOTAGE_*,"
+                " ANONLIB_BATCHINV_SABOTAGE_* or GEMM sabotage define."
+            )
+        )
+    try:
+        var m = PythonModuleBuilder("_anonlib_transformer")
+        m.def_function[transformer_session_discard_tape_binding]("transformer_session_discard_tape")
+        m.def_function[transformer_session_invalidate_tape_binding]("transformer_session_invalidate_tape")
+        m.def_function[transformer_arithmetic_profile_changed_binding]("transformer_arithmetic_profile_changed")
+        m.def_function[transformer_arithmetic_profile_binding]("transformer_arithmetic_profile")
+        m.def_function[transformer_session_forward_tape_binding]("transformer_session_forward_tape")
+        m.def_function[transformer_session_backward_tape_binding]("transformer_session_backward_tape")
+        m.def_function[transformer_vendor_binding]("transformer_vendor")
+        m.def_function[transformer_flash_call_count_binding]("transformer_flash_call_count")
+        m.def_function[transformer_numeric_mode_binding](
+            "transformer_numeric_mode"
+        )
+        m.def_function[transformer_attention_profile_binding]("transformer_attention_profile")
+        m.def_function[transformer_forward_binding]("transformer_forward")
+        _ = m.add_type[TransformerSession]("_TransformerSession")
+        m.def_function[transformer_session_create_binding]("transformer_session_create")
+        m.def_function[transformer_session_close_binding]("transformer_session_close")
+        m.def_function[transformer_session_info_binding]("transformer_session_info")
+        m.def_function[transformer_session_forward_binding]("transformer_session_forward")
+        # lane/neural-net-experiment: the stateless prefill on a session.
+        m.def_function[transformer_session_forward_fresh_binding]("transformer_session_forward_fresh")
+        m.def_function[transformer_session_backward_binding]("transformer_session_backward")
+        # lane/lowbit-blocks: numeric_profile="fixed15_v1".
+        m.def_function[transformer_session_forward_int15_binding]("transformer_session_forward_int15")
+        # NVIDIA's full public A/B gate admits discarded-cache prefill.
+        # Apple retains its prior default until separately priced; the explicit
+        # force flag remains available for its completed arithmetic gate.
+        comptime if GLOBAL_NUMERIC_MODE <= NUMERIC_IDENTICAL and (is_defined["ANONLIB_TRANSFORMER_FRESH_PREFILL"]() or (TARGET_COLUMN == COLUMN_NVIDIA and not is_defined["ANONLIB_TRANSFORMER_LEGACY_FRESH_PREFILL"]())):
+            m.def_function[transformer_forward_fresh_binding]("transformer_forward_fresh")
+        m.def_function[transformer_decode_step_binding](
+            "transformer_decode_step"
+        )
+        m.def_function[transformer_backward_binding]("transformer_backward")
+        _ = m.add_type[TransformerForwardTape]("_TransformerForwardTape")
+        m.def_function[transformer_forward_tape_enabled_binding]("transformer_forward_tape_enabled")
+        m.def_function[transformer_forward_tape_binding]("transformer_forward_tape")
+        m.def_function[transformer_backward_tape_binding]("transformer_backward_tape")
+        m.def_function[transformer_close_tape_binding]("transformer_close_tape")
+        # lane ag-tm-timing: the backward timing entries (measurement only).
+        m.def_function[transformer_session_backward_time_binding]("transformer_session_backward_time")
+        m.def_function[transformer_backward_tape_time_binding]("transformer_backward_tape_time")
+        # DEVIATION 2940: the resident decode session.
+        _ = m.add_type[TransformerDecodeSession]("_TransformerDecodeSession")
+        m.def_function[transformer_decode_session_create_binding]("transformer_decode_session_create")
+        m.def_function[transformer_decode_session_open_binding]("transformer_decode_session_open")
+        # lane/lowbit-default: the resident sessions under numeric_profile="fixed15_v1".
+        m.def_function[transformer_decode_session_open_int15_binding]("transformer_decode_session_open_int15")
+        m.def_function[transformer_decode_session_step_binding]("transformer_decode_session_step")
+        m.def_function[transformer_decode_session_forward_binding]("transformer_decode_session_forward")
+        m.def_function[transformer_decode_session_export_state_binding]("transformer_decode_session_export_state")
+        m.def_function[transformer_decode_session_load_state_binding]("transformer_decode_session_load_state")
+        m.def_function[transformer_decode_session_info_binding]("transformer_decode_session_info")
+        m.def_function[transformer_decode_session_close_binding]("transformer_decode_session_close")
+        # lane/py-lm: the resident CausalLM decode session.
+        _ = m.add_type[CausalLMSession]("_CausalLMSession")
+        m.def_function[causal_lm_session_create_binding]("causal_lm_session_create")
+        m.def_function[causal_lm_session_open_binding]("causal_lm_session_open")
+        m.def_function[causal_lm_session_open_int15_binding]("causal_lm_session_open_int15")
+        m.def_function[causal_lm_session_run_binding]("causal_lm_session_run")
+        m.def_function[causal_lm_session_close_binding]("causal_lm_session_close")
+        return m.finalize()
+    except e:
+        abort(String("failed to create _anonlib_transformer: ", e))

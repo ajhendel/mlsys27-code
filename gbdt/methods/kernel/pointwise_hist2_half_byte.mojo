@@ -1,0 +1,234 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 the authors. Part of anonlib, DOI-WITHHELD
+"""The HALF-BYTE driver: 8 features of up to 16 bins per block.
+
+Reference: `catboost/cuda/methods/kernel/pointwise_hist2_half_byte.cu`
+(CatBoost `54a8143a`).
+
+`ComputeSplitPropertiesHalfByteImpl`. Same accumulator as the binary kernel
+(`TPointHistHalfByte`), same loop choice, and a writeback that reads the
+reduced block directly instead of summing over it:
+
+    binary      one value per feature      SUM over the 8 nibble values
+                at `FirstFoldIndex * 2`    whose bit is clear
+    half-byte   one value per (feature,    smem[fold * 16 + 2 * fid + w]
+                fold) at `(FirstFoldIndex
+                + fold) * 2`
+
+THE FOLD GUARD AND THE EPSILON GUARD ARE REDUNDANT WITH EACH OTHER, and
+that was measured rather than reasoned. CatBoost carries both (`:81`, `:83`):
+
+    if (fid < fCount && fold < feature[fid].Folds) {
+        const float result = smem[fold * 16 + 2 * fid + w];
+        if (abs(result) > 1e-20) { ... }
+    }
+
+The accumulator always builds 16 bins. A feature with 5 folds owns bins 0-4,
+and the histogram slot for its fold 5 belongs to the NEXT feature -- so
+without the fold guard it writes over its neighbour's head. But on
+well-formed data those overrun bins are EMPTY, the value is an exact zero,
+and the epsilon guard suppresses the write anyway.
+
+Measured against `checks/pointwise_small_bin_driver_check.mojo`:
+
+    fold guard removed        every gate green
+    epsilon guard removed     every gate green
+    BOTH removed              E1, 22 of 158 cells wrong
+
+So each guard alone is sufficient and neither is individually observable.
+Both are kept because the reference has both, and because the fold guard is
+the one that still holds if a feature's declared `Folds` ever disagrees with
+the bins its column actually contains -- which is a corruption the epsilon
+guard cannot see, since those bins would be non-zero.
+
+DEVIATION (arch): `use64BitLoad = IsFullPass` on the modern arm, as in the
+binary kernel.
+"""
+
+from std.gpu import block_dim, block_idx, grid_dim, thread_idx
+from std.math import abs
+from std.memory import stack_allocation, bitcast
+from std.atomic import Atomic, Ordering
+from max.gpu.memory import AddressSpace
+from max.gpu.sync import barrier
+
+from gbdt.methods.kernel.compute_point_hist2_loop import (
+    compute_histogram,
+    compute_histogram_2,
+)
+from gbdt.methods.kernel.split_properties_helpers import (
+    PW_PRIVATE_DOC_SLOTS,
+    pw_private_doc_slot,
+    shift_part_and_bin_sums_ptr,
+)
+from gbdt.methods.kernel.pointwise_hist2_half_byte_template import (
+    PW_HB_BLOCK,
+    PW_HB_SMEM_FLOATS,
+    PointHistHalfByte,
+    pw_hb_half_byte_slot,
+    PointHistHalfByteInt,
+    pw_hb_binary_sum_int,
+    PW_HB_FIXED,
+)
+from gbdt.methods.kernel.pointwise_hist2_one_byte_templ import PW_WRITE_EPS
+
+
+#: `feature += (blockIdx.x / M) * 8` (`:36`).
+comptime PW_HB_FEATURES_PER_BLOCK = 8
+
+
+def compute_split_properties_half_byte_kernel[
+    full_pass: Bool, m: Int
+](
+    feature_offset: MutPointer[UInt32, MutAnyOrigin],
+    feature_first_fold_index: MutPointer[UInt32, MutAnyOrigin],
+    feature_folds: MutPointer[UInt32, MutAnyOrigin],
+    f_count_in: Int32,
+    cindex: MutPointer[UInt32, MutAnyOrigin],
+    target: MutPointer[Float32, MutAnyOrigin],
+    weight: MutPointer[Float32, MutAnyOrigin],
+    indices: MutPointer[UInt32, MutAnyOrigin],
+    partition: MutPointer[UInt32, MutAnyOrigin],
+    bin_sums: MutPointer[Float32, MutAnyOrigin],
+    total_feature_count_in: Int32,
+    fixed_scale_p: MutPointer[Float32, MutAnyOrigin],
+    int_slot: Int32,
+    dither_ids: Optional[MutPointer[UInt32, MutAnyOrigin]] = None,
+):
+    """`ComputeSplitPropertiesHalfByteImpl` (`:23-94`), copied; under the
+    ordered tiers the fixed-point accumulator (`PointHistHalfByteInt`,
+    lane/neural-pass124)."""
+    # T5 drain (cpu3-gbdt-a): the fixed-point scale is a device word
+    # (the ordered fit forms it on the device); every thread loads it
+    var fixed_scale = fixed_scale_p.unsafe_load(0)
+    var tid = Int(thread_idx.x)
+    var total_feature_count = Int(total_feature_count_in)
+
+    var shifted = shift_part_and_bin_sums_ptr(
+        partition,
+        UInt32(grid_dim.z),
+        UInt32(block_idx.y),
+        UInt32(block_idx.z),
+        UInt32(grid_dim.y),
+        UInt32(total_feature_count),
+        full_pass,
+        2,
+    )
+    var part = Int(shifted.partition_offset)
+    var bin_sums_base = Int(shifted.bin_sums_offset)
+
+    var f_base = (Int(block_idx.x) // m) * PW_HB_FEATURES_PER_BLOCK
+    var f_count = Int(f_count_in) - f_base
+    if f_count > PW_HB_FEATURES_PER_BLOCK:
+        f_count = PW_HB_FEATURES_PER_BLOCK
+    if f_count <= 0:
+        return
+    var cindex_base = Int(feature_offset.unsafe_load(f_base))
+
+    var smem = stack_allocation[
+        PW_HB_SMEM_FLOATS, Float32, address_space = AddressSpace.SHARED
+    ]()
+
+    var part_size = Int(partition.unsafe_load(2 * part + 1))
+    var part_offset = Int(partition.unsafe_load(2 * part))
+    if part_size == 0:
+        return
+
+    var ci = cindex.unsafe_offset(cindex_base)
+    comptime if PW_HB_FIXED:
+        var smi = smem.unsafe_bitcast[Int32]()
+        var hi = PointHistHalfByteInt(smi, fixed_scale)
+        comptime if full_pass:
+            compute_histogram_2[PW_HB_BLOCK, 1, 1, m](
+                hi, indices, UInt32(part_offset), UInt32(part_size),
+                target, weight, ci,
+                dither_ids=dither_ids,
+            )
+        else:
+            compute_histogram[PW_HB_BLOCK, 1, 1, 1, m](
+                hi, indices, UInt32(part_offset), UInt32(part_size),
+                target, weight, ci,
+                dither_ids=dither_ids,
+            )
+        barrier()
+        var fid_i = tid // 32
+        var fold_i = (tid // 2) & 15
+        var w_i = tid & 1
+        if fid_i < f_count:
+            var folds_i = Int(feature_folds.unsafe_load(f_base + fid_i))
+            if fold_i < folds_i:
+                var q = smi.unsafe_load(pw_hb_half_byte_slot(fid_i, fold_i, w_i))
+                var at_i = (
+                    bin_sums_base
+                    + (Int(feature_first_fold_index.unsafe_load(f_base + fid_i)) + fold_i) * 2
+                    + w_i
+                )
+                comptime if m > 1:
+                    bin_sums.unsafe_store(
+                        pw_private_doc_slot[full_pass](at_i, Int(block_idx.x) % m, total_feature_count),
+                        bitcast[DType.float32](q),
+                    )
+                else:
+                    var val = Float32(Int(q)) / fixed_scale
+                    if abs(val) > PW_WRITE_EPS:
+                        bin_sums.unsafe_store(at_i, val)
+        return
+    var hist = PointHistHalfByte(smem)
+
+    comptime if full_pass:
+        compute_histogram_2[PW_HB_BLOCK, 1, 1, m](
+            hist, indices, UInt32(part_offset), UInt32(part_size),
+            target, weight, ci,
+            dither_ids=dither_ids,
+        )
+    else:
+        compute_histogram[PW_HB_BLOCK, 1, 1, 1, m](
+            hist, indices, UInt32(part_offset), UInt32(part_size),
+            target, weight, ci,
+            dither_ids=dither_ids,
+        )
+
+    barrier()  # theirs, `:78`
+
+    var fid = tid // 32
+    var fold = (tid // 2) & 15
+    var w = tid & 1
+
+    if fid < f_count:
+        var folds_here = Int(feature_folds.unsafe_load(f_base + fid))
+        if fold < folds_here:
+            var result = smem.unsafe_load(
+                pw_hb_half_byte_slot(fid, fold, w)
+            )
+            if abs(result) > PW_WRITE_EPS:
+                var at = (
+                    bin_sums_base
+                    + (
+                        Int(
+                            feature_first_fold_index.unsafe_load(
+                                f_base + fid
+                            )
+                        )
+                        + fold
+                    )
+                    * 2
+                    + w
+                )
+                comptime if m > 1 and PW_PRIVATE_DOC_SLOTS:
+                    # DEVIATION 2670 (opt-in): this document block's OWN
+                    # slot, a plain store; the launcher folds the M slots
+                    # into `binSums` in block order
+                    bin_sums.unsafe_store(
+                        pw_private_doc_slot[full_pass](
+                            at, Int(block_idx.x) % m, total_feature_count
+                        ),
+                        result,
+                    )
+                elif m > 1:
+                    # DEVIATION 1898: the reference's atomicAdd is relaxed; the non-
+                    # Apple Mojo default is seq_cst.
+                    _ = Atomic.fetch_add[ordering = Ordering.RELAXED](
+                        bin_sums.unsafe_offset(at), result
+                    )
+                else:
+                    bin_sums.unsafe_store(at, result)

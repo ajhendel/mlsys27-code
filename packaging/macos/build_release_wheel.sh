@@ -1,0 +1,680 @@
+#!/bin/sh
+# Build the macOS arm64 wheel: ten extensions per numeric tier, staged MAX
+# runtime, re-signed, packed.
+#
+# WHY STAGING IS NOT OPTIONAL. `otool -L` on the freshly built extension shows
+#
+#     @rpath/libKGENCompilerRTShared.dylib
+#     @rpath/libAsyncRTMojoBindings.dylib
+#
+# Those live in the pixi environment. A wheel that ships without them imports
+# fine on THIS machine, where the rpath still resolves, and fails on every
+# other with a dyld error naming a path the user has never heard of. That is
+# the worst kind of packaging bug: invisible to the person who built it.
+#
+# So they are copied next to the extension, the rpath is repointed at
+# @loader_path/.dylibs, and the result is re-signed -- macOS invalidates the
+# signature the moment install_name_tool rewrites a load command, and an
+# unsigned dylib is killed on load on Apple silicon rather than merely warned
+# about.
+set -eu
+
+BUILD_ONLY=0
+if [ "${1:-}" = --build-only ]; then
+    BUILD_ONLY=1
+    shift
+fi
+[ "$#" -eq 0 ] || { echo "usage: $0 [--build-only]" >&2; exit 2; }
+
+here=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
+cd "$here"
+
+ENV_LIB="$here/.pixi/envs/default/lib"
+PKG="$here/python/anonlib"
+DYLIBS="$PKG/.dylibs"
+STAMP=$(mktemp "${TMPDIR:-/tmp}/anonlib-release-stamp.XXXXXX")
+trap 'rm -f "$STAMP"' EXIT INT TERM
+
+# Refreshed every build. These are COPIES of the repository root's files, and
+# a stale copy in a published wheel is a wrong LICENSE or a wrong README on
+# PyPI. python/.gitignore keeps them out of the checkout.
+cp "$here/LICENSE" "$here/NOTICE" "$here/README.md" "$here/python/"
+# CITATION.cff goes INSIDE the package, not beside pyproject.toml: it is
+# shipped as package data so `pip install` carries the machine-readable
+# citation. Attribution that lives only in the git repository does not
+# travel with the artifact, and the third way people acquire this library
+# is neither a clone nor a pip install but a copied file.
+cp "$here/CITATION.cff" "$here/python/anonlib/"
+
+# EVERY EXTENSION IN THE WHEEL IS BUILT HERE. `pyproject.toml`'s
+# package-data globs `*.so`, so an extension that is NOT built here is not
+# absent from the wheel -- it is shipped STALE, whatever happens to be sitting
+# in the working tree from an earlier build. That is how `_anonlib.so` came
+# to ship an artifact predating `eval_x`/`eval_y`, where every `fit` raised
+# "takes 6 positional arguments but 8 were given", and how
+# `_anonlib_estimators.so` shipped as a ZERO-KERNEL artifact on 2026-08-22
+# while this file said "every extension" and built two of three.
+#
+# AS OF 2026-08-24 THE LIST IS TEN EXTENSIONS IN TWO NUMERIC MODES. The
+# FAST set lands at python/anonlib/*.so and the IDENTICAL set at
+# python/anonlib/identical/*.so; python/anonlib/_backend.py loads the
+# identical set when ANONLIB_NUMERIC_MODE=identical is set at import
+# (checks/numerics.mojo reads the build define). Both sets ship in ONE
+# wheel. The list below is THE list: bindings/build_*.sh that is not named
+# here does not ship, and a name here with no script fails the build.
+# 2026-08-24: five bindings were added at once (svm/isolation-forest,
+# solver/hierarchy, metrics/spectral, holtwinters/tsa, and the linalg GEMM
+# surface). They are listed here because a build script that is not named
+# here does not ship, and python/anonlib/_backend.py now knows all eleven.
+# 2026-09-01: `_anonlib_gp` (gaussian_process) joined as the THIRTEENTH,
+# the day the estimator left `_NOT_YET` (commit 22a5b550), added to BOTH
+# lists below the same day its binding was written.
+# 2026-09-02: `_anonlib_mamba` (FOURTEENTH) and `_anonlib_transformer`
+# (FIFTEENTH) added to BOTH lists. The mamba pair was FOUND MISSING while
+# the transformer binding was being written ([[fix-docs-on-discovery]]):
+# it had shipped a Python surface on 2026-09-01 with these two lists never
+# updated, which is exactly the ships-STALE failure the paragraph above
+# describes -- a release cut in between would have carried the mamba
+# classes and no binary, or a stale one. The transformer binding COMPILED
+# FOR THE FIRST TIME 2026-09-02, on the M4 and on APPLE ONLY -- no NVIDIA
+# or AMD box has built it -- and its Python surface gate
+# (python/anonlib/tests/test_transformer_surface.py) is green in all
+# three tiers on that one box (transformer/README.md's PyPI-surface
+# ledger). Listing it here means a release build ships it fresh or fails
+# loudly, never silently omits it.
+#
+# DELIBERATELY NOT MIRRORED IN tools/e1_bootstrap.sh, AND THAT ASYMMETRY IS
+# THE POINT. That script builds bindings on a RENTED GPU under a work bound.
+# Phase 8 drives every lane gate through `mojo run` on the lane's own driver,
+# not through a Python binding, so the five new extensions buy a leg nothing
+# and would roughly double its binding-build time. A leg that spends its
+# lease compiling and comes home with an empty lanes/ has bought nothing at
+# all. Add a binding there only when a phase actually imports it.
+BUILD_SCRIPTS="build_gbdt.sh build_rf.sh build_trees.sh"
+EXT_NAMES="_anonlib_gbdt _anonlib_rf _anonlib_trees"
+
+# ONE TIER RULE (DEVIATION 2490, 2026-09-10): the three TREE lanes above
+# build in every tier MODES names. EVERY OTHER BINDING is identical only and
+# lives in the two lists below, built and gated for the identical tier alone
+# the way the byte LM always was. Cross-vendor bitwise identity is the
+# product; a fast tier ships only where it has a measured win over the
+# opponent's own CPU, and outside trees it has none (the reasoning and the
+# M4 numbers are on `_TIERED` in python/anonlib/_backend.py). The
+# identical-only build scripts exit 2 on any other ANONLIB_NUMERIC_MODE.
+# Before this the split was neural-only (three lanes, 2026-09-10 morning);
+# the reason for THOSE was different (their fused kernels were gated on the
+# identical contract, so the lower tiers were slower) and no longer matters.
+# CLASSICAL ML (2026-09-25): fast and identical. They
+# build in the identical tier and, when MODES names it, the fast tier.
+FAST_CLASSICAL_SCRIPTS="build.sh build_estimators.sh build_svm.sh build_solver.sh build_metrics.sh build_preprocessing.sh build_tsa.sh build_linalg.sh build_arima.sh build_gp.sh build_kernel_methods.sh build_mixture.sh build_hdbscan.sh build_resample.sh build_ivf.sh build_training.sh build_mamba.sh build_transformer.sh build_embedding.sh"
+FAST_CLASSICAL_NAMES="_anonlib _anonlib_estimators _anonlib_svm _anonlib_solver _anonlib_metrics _anonlib_preprocessing _anonlib_tsa _anonlib_linalg _anonlib_arima _anonlib_gp _anonlib_kernel_methods _anonlib_mixture _anonlib_hdbscan _anonlib_resample _anonlib_ivf _anonlib_training _anonlib_mamba _anonlib_transformer _anonlib_embedding"
+# THE NEURAL BLOCKS (training, mamba, transformer, embedding) moved to the
+# FAST_CLASSICAL lists above on 2026-09-27 (lane neural): fast and identical.
+# The two lists below are empty until an expansion lane
+# declares an identical-only binding.
+IDENTICAL_ONLY_SCRIPTS=""
+IDENTICAL_ONLY_NAMES=""
+# THE EXPANSION LANES' GPU BINDINGS (lane/algos-prep, 2026-09-27), read from
+# the per-lane fragments python/anonlib/host_surface.py merges; empty until
+# a lane declares one, and then appended to the four lists above. Never spell
+# an expansion binding in them: packaging/check_ext_lists.py holds this file
+# to the manifest by the token below.
+_xs=$(python3 python/anonlib/host_surface.py --expansion-gpu-scripts classical) || exit 2
+_xn=$(python3 python/anonlib/host_surface.py --expansion-gpu-bindings classical) || exit 2
+FAST_CLASSICAL_SCRIPTS="$FAST_CLASSICAL_SCRIPTS${_xs:+ $_xs}"
+FAST_CLASSICAL_NAMES="$FAST_CLASSICAL_NAMES${_xn:+ $_xn}"
+_xs=$(python3 python/anonlib/host_surface.py --expansion-gpu-scripts identical-only) || exit 2
+_xn=$(python3 python/anonlib/host_surface.py --expansion-gpu-bindings identical-only) || exit 2
+IDENTICAL_ONLY_SCRIPTS="$IDENTICAL_ONLY_SCRIPTS${_xs:+ $_xs}"
+IDENTICAL_ONLY_NAMES="$IDENTICAL_ONLY_NAMES${_xn:+ $_xn}"
+# THE RELEASE PROFILE IS THE DEFAULT (2026-09-22). Until 0.8.14 this read
+# ${ANONLIB_PACKAGE_BYTE_LM:-0}: only release-provenance.yml set it to 1, so
+# the checklist's local command built a wheel with ZERO host bindings and the
+# smoke failed on `host/_anonlib_neural_host.so is not built`. A published
+# wheel always carries the byte LM and every host binding, so 1 is the
+# default; ANONLIB_PACKAGE_BYTE_LM=0 remains an explicit opt-out for a
+# legacy or bisect build. It is exported so verify_wheel.sh (run at the end)
+# checks the same profile this script built.
+PACKAGE_BYTE_LM=${ANONLIB_PACKAGE_BYTE_LM:-1}
+case "$PACKAGE_BYTE_LM" in 0|1) ;; *) echo 'ANONLIB_PACKAGE_BYTE_LM must be 0 or 1' >&2; exit 2 ;; esac
+export ANONLIB_PACKAGE_BYTE_LM="$PACKAGE_BYTE_LM"
+echo "== byte LM and host bindings: ANONLIB_PACKAGE_BYTE_LM=$PACKAGE_BYTE_LM"
+unset ANONLIB_BYTE_LM_OUTDIR
+# THE HOST (CPU) BINDINGS, one per family, under python/anonlib/host/.
+# Since 0.8.6 (the packaging lane, 2026-09-14) every host family the manifest
+# declares ships in the wheel, and WHICH families is READ from
+# python/anonlib/host_surface.py rather than written here;
+# packaging/check_ext_lists.py fails this file if it ever carries a host list
+# of its own. Until 0.8.5 the byte LM's was the only one, named by hand in
+# four places. They build with the release profile (PACKAGE_BYTE_LM=1), in
+# the identical tier alone, with no accelerator target, pinned to the CPU
+# column, and each is read back below.
+HOST_FAMILIES=$(python3 python/anonlib/host_surface.py --wheel-families) || exit 2
+HOST_NAMES=$(python3 python/anonlib/host_surface.py --wheel-bindings) || exit 2
+[ -n "$HOST_FAMILIES" ] && [ -n "$HOST_NAMES" ] || { echo 'the manifest names no wheel host family' >&2; exit 2; }
+if [ "$PACKAGE_BYTE_LM" = 1 ]; then
+    # bindings/build_host_family.sh refuses an existing output rather than
+    # overwriting it, so a host .so left by an earlier local build fails the
+    # build instead of being reused; remove them first, as build_sets.sh does.
+    for n in $HOST_NAMES; do rm -f "$PKG/host/$n.so"; done
+    # bindings/build_byte_lm.sh refuses the same way ("byte LM: output already
+    # exists"), and on 2026-09-21 a byte LM left by an earlier local build
+    # failed the 0.8.12 wheel build 13 minutes in. It is rebuilt below like
+    # every other extension, so the stale copy goes first; the refusal inside
+    # build_byte_lm.sh stays, for anyone running it by hand. A CI checkout
+    # never has the file.
+    rm -f "$PKG/_anonlib_byte_lm.so" "$PKG/identical/_anonlib_byte_lm.so"
+fi
+
+# THE PER-SCRIPT GATES ARE OFF HERE, AND THE REASON IS A CLEAN CHECKOUT.
+# Each bindings/build_*.sh ends by copying python/anonlib/ aside and
+# importing the package to fit on the binary it just built. The package
+# __init__ imports EVERY binding, so that gate needs all five extensions to
+# exist already; in the shared working tree they always did, and in a clean
+# checkout of a tag (the only honest place to build a release from) the
+# first gate fails on the fourth missing .so before anything runs. Found
+# 2026-08-23 on the first clean-tree build. So this script builds all
+# fifteen binaries gate-off (it said "eleven" until 2026-09-01 and
+# "thirteen" until 2026-09-02, in each case some bindings after that count
+# was true) and then runs THE release gate,
+# verify_wheel.sh, which
+# installs the finished wheel into a clean venv under every claimed
+# interpreter and fits every estimator family in EVERY SHIPPED numeric mode
+# (three since 2026-08-29; this line said BOTH when there were two). That
+# is strictly more than the per-script gates check, and it runs on the
+# artifact that ships rather than on a copy of the tree.
+#
+# THE TWO LISTS ABOVE ARE NOT THE SAME LIST AND BOTH MUST NAME EVERY
+# EXTENSION. BUILD_SCRIPTS is what runs; EXT_NAMES is what is then CHECKED
+# for existence and for being newer than this script's start. An extension
+# built but not named in EXT_NAMES ships STALE rather than absent, silently,
+# which is how `_anonlib.so` once shipped predating eval_x/eval_y.
+# THE TIERS THIS WHEEL CARRIES. `fast` lives at python/anonlib/*.so and
+# every other tier one directory down under its own name, which is the layout
+# python/anonlib/_backend.py loads from.
+#
+# To cut a one-tier wheel (a hotfix, a bisect), name the tier:
+#     ANONLIB_RELEASE_MODES="identical" ./packaging/macos/build_release_wheel.sh
+# and keep verify_wheel.sh's copy of the variable set the same for one release
+# or the verifier fails the wheel for lacking a tier it was never asked to
+# build. pyproject.toml's package-data glob carries both directories.
+MODES="${ANONLIB_RELEASE_MODES:-fast identical}"
+echo "== numeric tiers in this wheel: $MODES"
+if [ "$PACKAGE_BYTE_LM" = 1 ]; then
+    case " $MODES " in *' identical '*) ;; *) echo 'Byte LM requires the identical tier' >&2; exit 2 ;; esac
+fi
+if [ "$PACKAGE_BYTE_LM" = 0 ]; then
+    for byte_path in "$PKG/_anonlib_byte_lm.so" "$PKG/identical/_anonlib_byte_lm.so"; do
+        [ ! -e "$byte_path" ] && [ ! -L "$byte_path" ] || {
+            echo 'Legacy build refuses an unrequested byte LM binary' >&2; exit 2;
+        }
+    done
+fi
+
+# DEVIATION 2501: the builds run ANONLIB_BUILD_JOBS at a time through
+# xargs -P; each (mode, script) pair writes its own log, printed in full when
+# it finishes so the transcript reads as before. Every pair has its own output
+# directory and mktemp scratch, so the pairs are independent. The identical
+# tier is listed first because it holds the most scripts, and the pairs are
+# then queued heaviest first (ordered_pairs below). Any failure fails the
+# build after the running pairs finish (xargs exits 123).
+#
+# THE DEFAULT IS FOUR BUILDS OF ONE COMPILER WORKER (2026-09-21, measured).
+# The 0.8.13 macOS build with an empty compile cache ran 2666 s. It compiled
+# one extension at a time with one worker: it ran under `tools/mac_slot.py
+# run`, which pins ANONLIB_BUILD_JOBS=1 and ANONLIB_COMPILE_JOBS=1 and
+# overrides whatever this script defaults to (the log's third line says
+# "1 at a time"). The 61 per-extension compile times (build_seconds in the
+# local cache's manifests) sum to 2371 s, the longest is the identical mamba
+# binding at 322.5 s, and the remaining 295 s are staging, packing, the audit
+# and the five interpreter runs. The 0.8.12 build (908 s,
+# ~/anonlib-evidence/releases/0.8.12/mac-build-r5.log) was ALSO one at a
+# time with one worker, so its 16 minutes were not a parallel default: its
+# compiles were faster on that run, not more of them at once.
+#
+# Scheduling those 61 measured times on P single-worker builds, heaviest
+# first (the order below), gives a compile wall of 1186 s at P=2, 792 s at
+# 3, 595 s at 4 and 476 s at 5; with the 295 s around it, P=4 is about 890 s
+# (15 minutes) cold, where the 2 x 2 default of 63089d263 would have been
+# about 25 minutes even at full speed. Four workers stay inside the Apple
+# release budget of five cores (2026-09-21; the M4 has 4P + 6E cores
+# and 16 GB), and at about 1.2 GB peak per mojo compile they need about
+# 5 GB. One worker each, not two: the measurements are all at one worker, and
+# 4 x 2 would be eight compiler threads on a five core budget.
+#
+# UNDER mac_slot, pass --slots 4: it then holds four of the five Mac slots
+# and hands the build ANONLIB_BUILD_JOBS=4 (compiler workers stay 1):
+#
+#     python3 tools/mac_slot.py --slots 4 run -- ./packaging/macos/build_release_wheel.sh
+#
+# Without --slots, mac_slot still pins one build at a time.
+#
+# THE LOCAL COMPILE CACHE. With ANONLIB_BINCACHE_DIR set every pair runs
+# through `tools/bincache.py build`, keyed on the binding's import closure,
+# every build script, pixi.lock, the Mojo and Xcode toolchains, the mode, the
+# environment and the checkout path, with the one .so it writes DECLARED
+# (the pairs share a tree, so outputs are never inferred). An unchanged
+# binding is placed from the cache, verified byte for byte against the
+# archive's manifest, and every gate below runs on it exactly as on a fresh
+# build. Unset, nothing changes. The header of tools/bincache.py has the key.
+BUILD_JOBS="${ANONLIB_BUILD_JOBS:-4}"
+# One compiler worker per build unless the caller says otherwise (the
+# bindings/build_*.sh default is 2); see the measurement above.
+export ANONLIB_COMPILE_JOBS="${ANONLIB_COMPILE_JOBS:-1}"
+# REUSED BINDINGS (2026-09-23, tools/release_reuse.py). With
+# ANONLIB_REUSE_PLAN set to a macos-plan.json and ANONLIB_REUSE_DIR to the
+# directory it was extracted into, a pair whose output the plan names is not
+# compiled: the published wheel's bytes for it (already staged and signed by
+# the release that shipped them, extracted and verified against that wheel's
+# RECORD by tools/release.py) are copied into the package tree, verified
+# again against the plan's sha256, and stamped like a fresh build. The
+# stager then leaves those files untouched (ANONLIB_STAGE_SKIP), and the
+# gate after staging requires each one to still carry the plan's sha256, so a
+# reused binding is the published one or the build fails. Every other gate
+# (readbacks, floor, ISA, GPU code, verify_wheel.sh) runs on them unchanged.
+REUSE_PLAN="${ANONLIB_REUSE_PLAN:-}"
+REUSE_DIR="${ANONLIB_REUSE_DIR:-}"
+if [ -n "$REUSE_PLAN" ]; then
+    [ -f "$REUSE_PLAN" ] && [ -d "$REUSE_DIR" ] || { echo "ANONLIB_REUSE_PLAN=$REUSE_PLAN needs the file and ANONLIB_REUSE_DIR=$REUSE_DIR the directory" >&2; exit 2; }
+    echo "== reused bindings: $(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(len(d["files"]), "from", d["from_release"]["version"], d["from_release"]["wheel"])' "$REUSE_PLAN")"
+fi
+export ANONLIB_REUSE_PLAN="$REUSE_PLAN" ANONLIB_REUSE_DIR="$REUSE_DIR"
+# The plan's sha256 for one output path, empty when the plan does not reuse it.
+reused_sha() {
+    [ -n "$REUSE_PLAN" ] || return 0
+    python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["files"].get(sys.argv[2], {}).get("sha256", ""))' "$REUSE_PLAN" "$1"
+}
+case "$BUILD_JOBS" in ''|*[!0-9]*|0) echo 'ANONLIB_BUILD_JOBS must be 1..16' >&2; exit 2;; esac
+[ "$BUILD_JOBS" -le 16 ] || { echo 'ANONLIB_BUILD_JOBS must be 1..16' >&2; exit 2; }
+BUILD_LOGS=$(mktemp -d "${TMPDIR:-/tmp}/anonlib-release-builds.XXXXXX")
+build_pairs() {
+    for mode in $MODES; do
+        [ "$mode" = identical ] || continue
+        for script in $BUILD_SCRIPTS; do printf '%s %s\n' "$mode" "$script"; done
+        for script in $IDENTICAL_ONLY_SCRIPTS; do printf '%s %s\n' "$mode" "$script"; done
+        for script in $FAST_CLASSICAL_SCRIPTS; do printf '%s %s\n' "$mode" "$script"; done
+        if [ "$PACKAGE_BYTE_LM" = 1 ]; then printf '%s %s\n' "$mode" build_byte_lm.sh; fi
+        # The host bindings. Identical only, and built with no accelerator
+        # target, which is why they are named here rather than added to a
+        # tier list: none is a tier member or a vendor member.
+        if [ "$PACKAGE_BYTE_LM" = 1 ]; then
+            for f in $HOST_FAMILIES; do printf '%s %s\n' "$mode" "build_${f}_host.sh"; done
+        fi
+    done
+    for mode in $MODES; do
+        [ "$mode" = identical ] && continue
+        for script in $BUILD_SCRIPTS; do printf '%s %s\n' "$mode" "$script"; done
+        if [ "$mode" = fast ]; then
+            for script in $FAST_CLASSICAL_SCRIPTS; do printf '%s %s\n' "$mode" "$script"; done
+            if [ "$PACKAGE_BYTE_LM" = 1 ]; then printf '%s %s\n' "$mode" build_byte_lm.sh; fi
+        fi
+    done
+}
+# HEAVIEST FIRST. The seconds are the 0.8.13 cold compile times (one worker,
+# build_seconds in the cache manifests); every pair not named weighs 0 and
+# keeps its place (a stable sort). A stale entry only moves wall time: the
+# pairs are independent. Measured order-versus-heaviest-first at four builds:
+# 664 s against 595 s of compile.
+pair_weight() {
+    case "$1 $2" in
+        "identical build_mamba.sh") echo 323 ;;
+        "identical build_byte_lm.sh") echo 182 ;;
+        "identical build_hdbscan.sh") echo 182 ;;
+        "fast build_gbdt.sh") echo 157 ;;
+        "identical build_transformer.sh") echo 136 ;;
+        "identical build_kernel_methods.sh") echo 111 ;;
+        "identical build_ivf.sh") echo 110 ;;
+        "identical build_gbdt.sh") echo 87 ;;
+        "identical build_mixture.sh") echo 71 ;;
+        "identical build_resample.sh") echo 58 ;;
+        "identical build_gbdt_host.sh") echo 52 ;;
+        *) echo 0 ;;
+    esac
+}
+ordered_pairs() {
+    build_pairs | while read -r mode script; do
+        printf '%s %s %s\n' "$(pair_weight "$mode" "$script")" "$mode" "$script"
+    done | sort -s -k1,1nr | cut -d' ' -f2-
+}
+[ "$(ordered_pairs | sort)" = "$(build_pairs | sort)" ] || { echo 'build order lost or added a pair' >&2; exit 2; }
+echo "== building $(build_pairs | wc -l | tr -d ' ') extensions, $BUILD_JOBS at a time, $ANONLIB_COMPILE_JOBS compiler worker(s) each (logs in $BUILD_LOGS)"
+ordered_pairs | xargs -P "$BUILD_JOBS" -n 2 sh -c '
+    logs=$1; mode=$2; script=$3; log="$logs/${mode}_${script%.sh}.log"
+    # The byte LM build keeps its own gate on, as it always did here.
+    skip=1; [ "$script" = build_byte_lm.sh ] && skip=
+    # THE ONE FILE THIS PAIR WRITES, declared for the compile cache. Named
+    # the way the gates below name it: build.sh is _anonlib, build_X.sh is
+    # _anonlib_X, a host shim is host/_anonlib_X_host, the byte LM lives
+    # in its selected tier, and the fast tier is the package directory itself.
+    case "$script" in
+        build_*_host.sh) f="${script#build_}"; output="python/anonlib/host/_anonlib_${f%_host.sh}_host.so" ;;
+        build_byte_lm.sh) ext=_anonlib_byte_lm ;;
+        build.sh) ext=_anonlib ;;
+        *) e="${script#build_}"; ext="_anonlib_${e%.sh}" ;;
+    esac
+    case "$script" in build_*_host.sh) ;; *)
+        if [ "$mode" = fast ]; then output="python/anonlib/$ext.so"; else output="python/anonlib/$mode/$ext.so"; fi ;;
+    esac
+    # A REUSED BINDING IS PLACED, NOT BUILT (the header above BUILD_JOBS).
+    if [ -n "${ANONLIB_REUSE_PLAN:-}" ]; then
+        want=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))[\"files\"].get(sys.argv[2], {}).get(\"sha256\", \"\"))" "$ANONLIB_REUSE_PLAN" "$output")
+        if [ -n "$want" ]; then
+            src="$ANONLIB_REUSE_DIR/$output"
+            [ -f "$src" ] || { echo "== $script ($mode) REUSE FAILED: $src is absent"; exit 1; }
+            got=$(shasum -a 256 "$src" | cut -d" " -f1)
+            [ "$got" = "$want" ] || { echo "== $script ($mode) REUSE FAILED: $src sha256 $got, the plan says $want"; exit 1; }
+            mkdir -p "$(dirname "$output")"
+            rm -f "$output"
+            cp "$src" "$output"
+            chmod 755 "$output"
+            touch "$output"
+            python3 tools/binding_stamps.py write "$script" "$output" > "$log" 2>&1 || { echo "== $script ($mode) STAMP FAILED"; cat "$log"; exit 1; }
+            echo "== $script ($mode) REUSED from the published wheel, sha256 $got"
+            exit 0
+        fi
+    fi
+    runner=bash
+    if [ -n "${ANONLIB_BINCACHE_DIR:-}" ]; then
+        runner="python3 tools/bincache.py build"
+        export ANONLIB_BINCACHE_OUTPUTS="$output" ANONLIB_BINCACHE_SHELL=bash
+        # The cache never replaces an existing file, so a .so left by an
+        # earlier local build would force a compile. Every build script
+        # replaces its output anyway, and the staleness gate below requires a
+        # file newer than this run, so removing it first loses nothing.
+        rm -f "$output"
+    fi
+    # A host build must never see an accelerator target: it has no device
+    # code, and ANONLIB_GPU_ARCHS reaching it is the one way it can be
+    # silently wrong. Both output directory variables (the per-family one and
+    # the shared ANONLIB_HOST_OUTDIR) are unset for the same reason the byte
+    # LM build unsets its own (NO APOSTROPHE IN THIS BLOCK: it is one
+    # single-quoted sh -c string), so it lands in the package tree. It compiles the CPU
+    # column only and refuses any other ANONLIB_TARGET_COLUMN by name, so
+    # the column is pinned to cpu here (packaging/linux/build_sets.sh does the
+    # same; the Linux legs export the GPU column to every build).
+    case "$script" in build_*_host.sh)
+        fam="${script#build_}"; fam="${fam%_host.sh}"
+        FAM=$(printf "%s" "$fam" | tr "a-z" "A-Z")
+        if ANONLIB_NUMERIC_MODE=$mode ANONLIB_SKIP_BUILD_GATE=$skip ANONLIB_TARGET_COLUMN=cpu \
+             env -u ANONLIB_GPU_ARCHS -u ANONLIB_HOST_OUTDIR -u "ANONLIB_${FAM}_HOST_OUTDIR" \
+             $runner "./bindings/$script" > "$log" 2>&1; then
+            python3 tools/binding_stamps.py write "$script" "$output" >> "$log" 2>&1 || { echo "== $script ($mode) STAMP FAILED"; cat "$log"; exit 1; }
+            { echo "== $script ($mode) OK"; cat "$log"; }
+        else
+            { echo "== $script ($mode) FAILED"; cat "$log"; }
+            exit 1
+        fi
+        exit 0 ;;
+    esac
+    if ANONLIB_NUMERIC_MODE=$mode ANONLIB_SKIP_BUILD_GATE=$skip $runner "./bindings/$script" > "$log" 2>&1; then
+        # The sources this binding was built from, for the release passes
+        # (tools/binding_stamps.py check refuses a binding whose sources moved).
+        python3 tools/binding_stamps.py write "$script" "$output" >> "$log" 2>&1 || { echo "== $script ($mode) STAMP FAILED"; cat "$log"; exit 1; }
+        { echo "== $script ($mode) OK"; cat "$log"; }
+    else
+        { echo "== $script ($mode) FAILED"; cat "$log"; }
+        exit 1
+    fi' build_one_pair "$BUILD_LOGS" 2>&1 || { echo "== at least one extension failed to build (logs in $BUILD_LOGS)" >&2; exit 1; }
+
+# THE FILES THE REST OF THIS SCRIPT GATES: EXT_NAMES x MODES (three tree
+# bindings x two tiers = six) plus IDENTICAL_ONLY_NAMES in identical/
+# alone (thirteen), twenty-two on the default build as of DEVIATION 2490. Built above or absent, never
+# stale: every one is checked for existence and for being newer than this
+# script's start, so a build script that silently left the old file in place
+# fails here instead of shipping.
+# One entry per extension per tier. `fast` is the package directory itself and
+# every other tier is a subdirectory of the same name, so this loop does not
+# need to know which tiers exist, only what MODES says.
+ALL_SOS=""
+for n in $EXT_NAMES; do
+    for mode in $MODES; do
+        if [ "$mode" = "fast" ]; then
+            ALL_SOS="$ALL_SOS $PKG/$n.so"
+        else
+            ALL_SOS="$ALL_SOS $PKG/$mode/$n.so"
+        fi
+    done
+done
+# The identical-only lanes are gated in ONE tier, whatever MODES says.
+case " $MODES " in *" identical "*)
+    for n in $IDENTICAL_ONLY_NAMES $FAST_CLASSICAL_NAMES; do ALL_SOS="$ALL_SOS $PKG/identical/$n.so"; done ;;
+esac
+# Classical ML also ships the fast tier (the package directory itself).
+case " $MODES " in *" fast "*)
+    for n in $FAST_CLASSICAL_NAMES; do ALL_SOS="$ALL_SOS $PKG/$n.so"; done ;;
+esac
+if [ "$PACKAGE_BYTE_LM" = 1 ]; then
+    # Every host binding is gated for existence and staleness like every
+    # other extension, but each is asked a different question: it must report
+    # 'cpu' as its vendor AND as its kernel-matrix column, because a GPU
+    # vendor here would mean the CPU-only build saw an accelerator target, and
+    # a GPU column would mean the build box's GPU name was folded into a
+    # vendor-neutral binary (the 0.8.5 freeze caught exactly that: the NVIDIA
+    # and AMD legs' copies differed by 43 bytes and the packer refused the
+    # wheel). They live beside the tiers, in host/, which is where the
+    # runtime looks rather than through _backend.binding().
+    for n in $HOST_NAMES; do
+        ALL_SOS="$ALL_SOS $PKG/host/$n.so"
+        pixi run -e pkg python - "$PKG/host/$n.so" "$n" <<'PYHOST'
+import importlib.util, json, sys
+path, name = sys.argv[1], sys.argv[2]
+prefix = name[len('_anonlib_'):]
+spec = importlib.util.spec_from_file_location(name, path)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+assert getattr(module, prefix + '_numeric_mode')() == 1, name + ' must be IDENTICAL'
+assert getattr(module, prefix + '_vendor')() == 'cpu', name + ' must report cpu'
+assert str(getattr(module, prefix + '_column')()) == 'cpu', name + ' must compile as the CPU column'
+assert not bool(getattr(module, prefix + '_sabotage')()), name + ' is a sabotage build'
+print(json.dumps(dict(extension=name, native_vendor='cpu', column='cpu',
+    numeric_mode=1, supported_modes=['identical'],
+    unsupported_modes=['fast'])))
+PYHOST
+    done
+    for byte_mode in $MODES; do
+        case "$byte_mode" in fast) byte_path="$PKG/_anonlib_byte_lm.so" ;;
+            identical) byte_path="$PKG/identical/_anonlib_byte_lm.so" ;;
+            *) continue ;;
+        esac
+        ALL_SOS="$ALL_SOS $byte_path"
+        pixi run -e pkg python - "$byte_path" "$byte_mode" <<'PYBYTE'
+import importlib.util, json, sys
+spec = importlib.util.spec_from_file_location('_anonlib_byte_lm', sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+assert module.byte_lm_numeric_mode() == {"fast": 0, "identical": 1}[sys.argv[2]]
+assert module.byte_lm_vendor() == 'metal'
+assert module.byte_lm_profile() == 'anonlib.byte-lm.b2-l32-d32-h4-kv2-ff64-v256-blocks2.fp32.v1'
+print(json.dumps(dict(extension='_anonlib_byte_lm', native_vendor='metal', numeric_mode=module.byte_lm_numeric_mode(),
+    profile=module.byte_lm_profile(), supported_modes=['fast', 'identical'], unsupported_modes=[])))
+PYBYTE
+    done
+fi
+# macOS /bin/sh's -nt compares whole seconds. A reused binding can be
+# placed after STAMP within that same second; preserve the strict freshness
+# check using the filesystem's nanosecond timestamps instead.
+# shellcheck disable=SC2086
+python3 - "$STAMP" $ALL_SOS <<'PYFRESH'
+import pathlib, sys
+started = pathlib.Path(sys.argv[1]).stat().st_mtime_ns
+for name in sys.argv[2:]:
+    path = pathlib.Path(name)
+    if not path.is_file():
+        raise SystemExit(f"ERROR: {path} was not produced")
+    if path.stat().st_mtime_ns <= started:
+        raise SystemExit(f"ERROR: {path} predates this build (stale)")
+PYFRESH
+
+# AND NOTHING ELSE. The loop above walks ALL_SOS, so it can only ever check a
+# file it already expects; a .so that is on NO list is neither required nor
+# refused. pyproject.toml's package-data globs `*.so` and
+# `identical/*.so` unconditionally, so such a file is not absent from the wheel,
+# it SHIPS -- built by a different commit, for a different layout, with nothing
+# anywhere naming it.
+#
+# This is not hypothetical. On 2026-09-12 this tree held eighteen extensions
+# dated to the 0.6.0 build, nine in `fast` and nine in `deterministic`, from
+# before DEVIATION 2490 narrowed the lower tiers to the three tree lanes. Every
+# gate in this script passed over them in silence. PyPI was spared only because
+# the published wheel is built by release-provenance.yml on a FRESH CHECKOUT,
+# where .gitignore means they do not exist -- luck of the build environment, not
+# a check. A local build had no such luck, and this is the check.
+EXPECTED_SOS=$(mktemp "${TMPDIR:-/tmp}/anonlib-expected-sos.XXXXXX")
+for so in $ALL_SOS; do printf '%s\n' "${so#"$PKG/"}"; done | sort -u > "$EXPECTED_SOS"
+UNEXPECTED_SOS=$( (cd "$PKG" && find . -name '*.so') | sed 's|^\./||' | sort -u \
+    | grep -Fxv -f "$EXPECTED_SOS" || true )
+rm -f "$EXPECTED_SOS"
+if [ -n "$UNEXPECTED_SOS" ]; then
+    echo "ERROR: $PKG holds extensions this build does not expect." >&2
+    echo "       They are not absent from the wheel; package-data globs *.so," >&2
+    echo "       so they SHIP STALE. Remove them and build again:" >&2
+    printf '%s\n' "$UNEXPECTED_SOS" | sed 's|^|           '"$PKG"'/|' >&2
+    exit 1
+fi
+echo "package tree: exactly the $(printf '%s\n' $ALL_SOS | sort -u | wc -l | tr -d ' ') expected extensions, no strays"
+
+# The FULL transitive closure, walked rather than sampled. See
+# packaging/macos/stage_dylibs.py: reading only the extension's direct
+# dependencies staged 2 dylibs when the real closure is 4, and shipped a wheel
+# that failed on install with "Library not loaded:
+# @rpath/libMSupportGlobals.dylib, referenced from .dylibs/libAsyncRT...".
+# It also verifies statically that nothing is left unresolved, which is the
+# only form of this check that means anything on the build machine.
+# EVERY EXTENSION OF EVERY TIER IN ONE CALL, because there is one `.dylibs`
+# and the
+# script wipes it before staging. Separate calls would leave earlier closures
+# deleted -- invisibly, because on THIS machine the original rpath still
+# resolves into the pixi environment. The identical/ set sits one directory
+# down and gets @loader_path/../.dylibs; the stager computes that per file.
+# A REUSED EXTENSION IS ALREADY STAGED AND SIGNED (its load commands point at
+# @loader_path/.dylibs and the release that shipped it signed it), so the
+# stager must not rewrite or re-sign it: the bytes are the published ones or
+# they are nothing. It still counts toward the closure and is still verified
+# closed against the fresh .dylibs.
+STAGE_SKIP=""
+for so in $ALL_SOS; do
+    want=$(reused_sha "${so#"$here/"}")
+    [ -n "$want" ] && STAGE_SKIP="$STAGE_SKIP $so"
+done
+# shellcheck disable=SC2086
+ANONLIB_STAGE_SKIP="$STAGE_SKIP" pixi run -e pkg python "$here/packaging/macos/stage_dylibs.py" \
+    $ALL_SOS "$ENV_LIB"
+pixi run -e pkg python "$here/packaging/portable_math/stage.py" "$PKG/.dylibs" \
+    --receipt "$here/portable-math-build.json"
+# THE GATE ON REUSE: every reused binding still carries the plan's sha256
+# after staging. A byte moved is a build that must not ship.
+for so in $ALL_SOS; do
+    want=$(reused_sha "${so#"$here/"}")
+    [ -n "$want" ] || continue
+    got=$(shasum -a 256 "$so" | cut -d' ' -f1)
+    [ "$got" = "$want" ] || { echo "ERROR: reused ${so#$PKG/} changed after placement: $got, the plan says $want" >&2; exit 1; }
+    echo "reused: ${so#$PKG/} sha256 $got (the published bytes)"
+done
+
+
+
+# THE TAG AND THE BINARY MUST AGREE, and nothing else checks this.
+# The wheel filename is what pip compares before it tries to load anything, so
+# a tag above the binary's floor turns installable Macs away and a tag below it
+# installs onto Macs where the extension cannot load. Both are silent on the
+# machine that built the wheel.
+# CHECKED FOR EVERY EXTENSION, not just the first: one wheel carries one tag,
+# and the tag is only honest if it is the floor of EVERYTHING inside.
+TAG_MINOS=$(grep -E '^DEFAULT_MACOS_TARGET' "$here/python/setup.py" | sed 's/[^0-9.]//g')
+for so in $ALL_SOS; do
+    BIN_MINOS=$(otool -l "$so" | awk '/LC_BUILD_VERSION/{f=1} f&&/minos/{print $2; exit}')
+    if [ "$BIN_MINOS" != "$TAG_MINOS" ]; then
+        echo "ERROR: $(basename "$so") minos $BIN_MINOS but setup.py tags $TAG_MINOS" >&2
+        echo "       MACOS_FLOOR in bindings/build.sh and bindings/build_gbdt.sh" >&2
+        echo "       and DEFAULT_MACOS_TARGET in python/setup.py must all match" >&2
+        exit 1
+    fi
+    echo "macOS floor: ${so#$PKG/} minos $BIN_MINOS == wheel tag $TAG_MINOS"
+done
+
+# THE ISA BASELINE, WHICH NO HEADER CAN SEE. arm64 Mach-O cpusubtype stays
+# ARM64_ALL whatever --target-cpu was, so this has to disassemble. Gates the
+# wheel: a binary carrying bf16, i8mm or SME instructions SIGILLs on the Macs
+# the macosx_11_0 tag invites in.
+# shellcheck disable=SC2086
+pixi run -e pkg python "$here/packaging/isa_baseline.py" $ALL_SOS
+
+# NO GPU KERNELS, NO WHEEL. A build on a machine without a usable Apple GPU
+# emits the host half and silently no Metal shader code, exits 0, and produces
+# a wheel that imports and then dies on the first fit. That shipped once, as
+# TestPyPI 0.1.0a2. See packaging/macos/check_gpu_embedded.py.
+#
+# EVERY EXTENSION EXCEPT THE HOST BINDINGS (DEVIATION 2680). Those are built
+# with `env -u ANONLIB_GPU_ARCHS`, contain no device code by design and read
+# back vendor 'cpu', so they have ZERO AIR markers and this gate refuses them
+# correctly. The exclusion is HERE, at the call site, and NOT inside
+# check_gpu_embedded.py: that script exists because 0.1.0a2 shipped a host-only
+# build that passed every other gate, so teaching it to skip a file whose name
+# looks host-like would reopen the hole it was written to close. The exclusion
+# is by the exact names the manifest lists, never by a host-like pattern.
+# Every other consumer of ALL_SOS still sees the host bindings, and must:
+# stage_dylibs.py wipes and rebuilds the one .dylibs directory, the minos loop
+# keeps the wheel tag honest as the floor of everything inside, and
+# isa_baseline.py is a HOST-code check, which is precisely what they are.
+GPU_SOS=""
+for so in $ALL_SOS; do
+    is_host=0
+    for n in $HOST_NAMES; do
+        [ "$so" = "$PKG/host/$n.so" ] && is_host=1
+    done
+    [ "$is_host" = 1 ] || GPU_SOS="$GPU_SOS $so"
+done
+# shellcheck disable=SC2086
+pixi run -e pkg python "$here/packaging/macos/check_gpu_embedded.py" $GPU_SOS
+
+# THE IDENTITY PAYLOAD (the packaging lane, 2026-09-14; docs/VERIFY.md).
+# `python -m anonlib verify` needs the one card comparator and
+# anonlib/reference_cards/; `python -m anonlib identity` needs
+# tools/identity_break.py, the three training GPU columns the manifest
+# names, and a commit witness (an installed wheel has no git, and
+# identity_break refuses to write a column with an empty commit). All are
+# COPIES made here of files that live once in git, so the wheel has no
+# second implementation of anything; python/.gitignore keeps the copies out
+# of the checkout. The Linux packer (packaging/linux/pack_wheel.py) reads
+# the same sources straight into the archive.
+rm -f "$PKG/_identity_trace_diff.py" "$PKG/_identity_break.py"
+rm -rf "$PKG/identity_columns"
+cp "$here/tools/identity_trace_diff.py" "$PKG/_identity_trace_diff.py"
+cp "$here/tools/identity_break.py" "$PKG/_identity_break.py"
+# The expansion lanes' identity lanes (lane/algos-prep, 2026-09-27): the
+# harness copy loads `_identity_lane_<lane>.py` beside itself.
+rm -f "$PKG"/_identity_lane_*.py
+for f in "$here"/tools/identity_lanes/*.py; do
+    cp "$f" "$PKG/_identity_lane_$(basename "$f")"
+done
+python3 "$here/tools/verification_ctr_payload.py" --output "$PKG/verify_reference/ctr_models" || exit 1
+RECORD=$(python3 python/anonlib/host_surface.py --training-gpu-column-record) || exit 1
+mkdir -p "$PKG/identity_columns/$RECORD"
+for col in $(python3 python/anonlib/host_surface.py --training-gpu-columns); do
+    [ -f "$here/$col" ] || { echo "ERROR: the manifest names $col, which is not in this checkout" >&2; exit 1; }
+    cp "$here/$col" "$PKG/identity_columns/$RECORD/$(basename "$col")"
+done
+COMMIT=$(git -C "$here" rev-parse HEAD) || { echo "ERROR: no commit witness; the wheel's identity columns need one" >&2; exit 1; }
+printf '%s\n' "$COMMIT" > "$PKG/identity_columns/COMMIT"
+echo "identity payload: $(ls "$PKG/identity_columns/$RECORD" | wc -l | tr -d ' ') columns from $RECORD, commit $COMMIT"
+
+cd "$here/python"
+rm -rf dist build ./*.egg-info
+pixi run -e pkg python -m build --wheel --no-isolation
+# PyPI refuses a file over 100 MiB: strip local symbols, re-sign, deflate 9, and fail here if still over.
+python3 "$here/packaging/macos/shrink_wheel.py" "$here/python/dist/"*.whl || exit 1
+python3 "$here/tools/wheel_api_audit.py" --require-complete \
+    --output "$here/python/dist/API-macos.json" "$here/python/dist/"*.whl
+
+echo "wheel:"
+ls -la "$here/python/dist"/*.whl
+
+# Run the installed wheel gate by default. Explicit --build-only is for a
+# release reusing completed merged-lane checks; it records that no fresh
+# runtime verification was performed and cannot be used as a smoke receipt.
+cd "$here"
+if [ "$BUILD_ONLY" = 1 ]; then
+    echo 'BUILD ONLY: wheel packed; runtime verification intentionally not rerun (reuse completed lane checks).'
+else
+    ./packaging/macos/verify_wheel.sh
+fi

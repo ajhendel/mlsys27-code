@@ -1,0 +1,163 @@
+# Solved environment. `pixi.lock` IS committed so a runner reproduces the
+# exact solve; the materialised environment is not.
+.pixi/
+
+# `mojo precompile` output for the `build-pkg` task. The task does `mkdir -p`
+# because precompile will not create its own output directory and fails with
+# "cannot open output file" on a clean clone otherwise.
+build/
+
+# Optional local native Mojo package prefix (packaging/native/README.md).
+/native-install/
+
+# Python bytecode from the bench harness. `bench/` and `tools/` hold scripts
+# that the pixi bench and skgpu environments import, so running them leaves
+# these behind.
+__pycache__/
+*.pyc
+
+# `mojo build` output written next to the source rather than into build/.
+# These are native binaries for whichever chip built them; committing one
+# would ship a Mac-only artifact into a repository that claims portability.
+/kmeans_main
+/knn_main
+/probe_main
+/oracle_main
+/matrix_main
+/vendor_main
+
+# The tokenizer's Unicode class table, generated at build time from Python's
+# unicodedata by tokenizer/tools/gen_unicode_table.sh (2026-09-15). No data
+# file is tracked; the pin is in tokenizer/impl/unicode_class.mojo.
+tokenizer/impl/unicode_table_generated.mojo
+
+# Agent worktrees: transient, and each is its own git repo
+.claude/worktrees/
+
+# the upper tiers' binary sets (ANONLIB_NUMERIC_MODE=<tier> bash bindings/build_*.sh);
+# built per machine, never committed.
+python/anonlib/identical/
+
+# E1/E2/E3 leg artifacts: the saved models are reproducible from the cells (tools/e1_traced_fit.py, e2_matrix_fit.py) and are not committed
+bench/results/e1/*/*.model.npz
+bench/results/e1/*/control/
+bench/results/e1/.leg-*.state
+
+# CatBoost writes this training-log directory beside whatever invoked it.
+# Regenerated on every run, never an input to anything here.
+catboost_info/
+
+# NOTE: -dirty ladder runs are DELIBERATELY TRACKED records (see gemm/ DEVIATION 533).
+# They are not junk and must not be ignored or removed.
+# Dry-run leg output is not a record.
+bench/results/e1g/*-dryrun/
+
+# the Linux wheel legs' fetched binary sets (packaging/linux/leg.sh). The
+# manifests, sizes, gate JSON and logs beside them ARE committed; the
+# binaries and the packed wheels are build outputs of a rented box.
+bench/results/wheels/*/wheels/sets/*/
+bench/results/wheels/*/wheels/sets/*.tar.gz
+bench/results/wheels/*/wheels/tools-venv/
+# The SAME files under their raw fetch path. `leg.sh` copies `diag/` out of
+# bench/results/e1/<stamp>-<vendor>/ into bench/results/wheels/<stamp>-<vendor>/,
+# so everything here is a second copy, and the rules above matched only the
+# copy. A 15.8 MB `cuda.tar.gz` was staged for commit on 2026-08-30 through
+# this gap.
+bench/results/e1/*/diag/wheels/sets/*/
+bench/results/e1/*/diag/wheels/sets/*.tar.gz
+bench/results/e1/*/diag/wheels/tools-venv/
+
+# macOS Finder metadata. Never content.
+.DS_Store
+
+# BUILD ARTIFACTS AND RAW DUMPS UNDER bench/, UNTRACKED 2026-08-31.
+#
+# They were 235 files and 333 MB against an EVIDENCE BASE OF 5.5 MB. The
+# cards, the verdict markdown, the hashes and the maps are what back a claim;
+# a compiled .so, a fetched binary set and a raw tensor dump back nothing and
+# can be regenerated. They are still written and still read locally; they are
+# simply not carried in the repository, where they made the tree 18,346 files
+# and every AMD leg lose eleven minutes of a sixty-minute lease to scp.
+bench/**/*.bin
+bench/**/*.so
+bench/**/*.tar.gz
+# bootstrap.log IS NOT IGNORED, and the attempt to ignore it is why this
+# comment exists. It looked like 59 MB of compiler warnings. E1U_RESULTS.md:72
+# cites a COUNT out of it, and E1_RESULTS.md:71 and E2_RESULTS.md:126 list it
+# by name as part of the evidence bundle. Six documents reference it. An
+# artifact a result cites is evidence, whatever its signal-to-noise ratio.
+
+# 2026-09-08: bytes that are never evidence and once blocked every push for a
+# day (a 119 MB artifacts.tar over GitHub's 100 MiB limit). Wheels live on
+# PyPI, tarballs are packed copies of files beside them, fixture dumps are
+# regenerable from the Mojo driver. tools/hooks/pre-commit refuses them too.
+bench/results/**/*.whl
+bench/results/**/*.tar
+bench/results/**/*.tar.gz
+bench/results/**/*.tgz
+bench/results/**/*.fixture
+bench/results/**/remote/dump/
+
+# A release leg fetches the pod's patchelf venv beside its evidence; a
+# venv is a tool, not evidence (2026-09-10, five legs x 800 files).
+bench/results/e1g/*/remote/tools-venv/
+
+# Compiled historical benchmark executables (cleanup 2026-09-17).
+/bench/results/e1/2026-09-03_090654-anonlib-e2-amd/fast_replication_ab/bin/base
+/bench/results/e1/2026-09-03_090654-anonlib-e2-amd/fast_replication_ab/bin/pin
+/bench/results/e1/2026-09-03_101937-anonlib-e2-amd/fast_replication_ab/ANONLIB_2041_FAST_CHUNKS_PIN/bin/base
+/bench/results/e1/2026-09-03_101937-anonlib-e2-amd/fast_replication_ab/ANONLIB_2041_FAST_CHUNKS_PIN/bin/pin
+/bench/results/e1/2026-09-03_101937-anonlib-e2-amd/fast_replication_ab/ANONLIB_2042_FAST_NO_LOOKBACK/bin/base
+/bench/results/e1/2026-09-03_101937-anonlib-e2-amd/fast_replication_ab/ANONLIB_2042_FAST_NO_LOOKBACK/bin/pin
+/bench/results/e1/2026-09-03_104638-anonlib-e2-nv/fast_replication_ab/ANONLIB_2042_FAST_NO_LOOKBACK/bin/base
+/bench/results/e1/2026-09-03_104638-anonlib-e2-nv/fast_replication_ab/ANONLIB_2042_FAST_NO_LOOKBACK/bin/pin
+/bench/results/e1/2026-09-03_112707-anonlib-e2-nv/fast_replication_ab/ANONLIB_2043_FAST_FUSED_ONE_BYTE/bin/base
+/bench/results/e1/2026-09-03_112707-anonlib-e2-nv/fast_replication_ab/ANONLIB_2043_FAST_FUSED_ONE_BYTE/bin/pin
+/bench/results/e1/2026-09-03_210405-anonlib-e2-nv/fast_replication_ab/ANONLIB_2044_FAST_NO_RIDX_ONLY/bin/base
+/bench/results/e1/2026-09-03_210405-anonlib-e2-nv/fast_replication_ab/ANONLIB_2044_FAST_NO_RIDX_ONLY/bin/pin
+/bench/results/e1/2026-09-03_210405-anonlib-e2-nv/fast_replication_ab/ANONLIB_2045_FAST_NO_QUANT_HIST/bin/base
+/bench/results/e1/2026-09-03_210405-anonlib-e2-nv/fast_replication_ab/ANONLIB_2045_FAST_NO_QUANT_HIST/bin/pin
+/bench/results/e1g/2026-08-25_155542-nvidia-speed-gemmseq/remote/bin_gemmspeed
+/bench/results/e1g/2026-08-25_155542-nvidia-speed-gemmseq/remote/bin_seqspeed
+/bench/results/e1g/2026-08-25_160520-nvidia-speed-gemmseq/remote/bin_gemmspeed
+/bench/results/e1g/2026-08-25_160520-nvidia-speed-gemmseq/remote/bin_seqspeed
+/bench/results/e1g/2026-08-25_235543-nvidia-speed-classical/remote/bin_classicalspeed
+/bench/results/e1g/2026-08-26_040054-nvidia-speed-gemmseq/remote/bin_gemmspeed
+/bench/results/e1g/2026-08-26_040054-nvidia-speed-gemmseq/remote/bin_seqspeed
+/bench/results/e1g/2026-08-26_040100-nvidia-speed-classical/remote/bin_classicalspeed
+/bench/results/e1g/2026-08-28_040316-nvidia-speed-gemmseq/remote/bin_gemmspeed
+/bench/results/e1g/2026-08-28_040316-nvidia-speed-gemmseq/remote/bin_seqspeed
+/bench/results/e1g/2026-08-28_040832-nvidia-speed-classical/remote/bin_classicalspeed
+/bench/results/e1g/2026-09-13_161417-nvidia-h100-seam-probe/remote/seam-probe/seam_probe
+/bench/results/e1g/2026-09-13_161422-amd-mi300x-hotaisle-seam-probe/remote/seam-probe/seam_probe
+/bench/results/fast_speed/mac-2026-08-28_122551-classical/bin_classicalspeed
+/bench/results/fast_speed/mac-2026-08-28_122711-gemmseq/bin_gemmspeed
+/bench/results/fast_speed/mac-2026-08-28_122711-gemmseq/bin_seqspeed
+/bench/results/fast_speed/mac-2026-08-28_131915-gemmseq/bin_gemmspeed
+/bench/results/fast_speed/mac-2026-08-28_131915-gemmseq/bin_seqspeed
+/bench/results/gemm_resources_2026-09-10/cuda126/kernel.cubin
+/bench/results/gemm_resources_2026-09-10/scalar-cuda126/kernel.cubin
+/bench/results/resume/2026-09-06-root-training-nvidia/run2/remote/training-validation/train-gradient-capture
+/bench/results/resume/2026-09-06-root-training-nvidia/run3/remote/training-validation/train-gradient-capture
+/bench/results/resume/2026-09-06-root-training-nvidia/run4/remote/training-validation/train-gradient-capture
+/bench/results/resume/2026-09-07-root-mlp-amd/run1/remote/training-validation/train-gradient-capture
+
+# Which sources each built binding came from (tools/binding_stamps.py)
+python/.binding-stamps/
+
+# Working notes stay local: lane progress, handoffs, takeovers, plans and
+# session diaries are never part of the public repository.
+docs/lanes/
+docs/HANDOFF*
+docs/TAKEOVER*
+docs/*_TAKEOVER*
+HANDOFF*.md
+EXPERIMENTS.md
+**/RESUME.md
+**/NOTES.md
+
+# the committed Apple FAST experiments record (CLAUDE.md Experiments rule)
+!docs/apple-fast/EXPERIMENTS.md
+
+# Canonical planning matrix is tracked as lossless deterministic gzip.
+/experiments/six_lane_integration/matrix.json

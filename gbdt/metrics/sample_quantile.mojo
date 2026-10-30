@@ -1,0 +1,370 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 the authors. Part of anonlib, DOI-WITHHELD
+"""The weighted sample quantile behind `boost_from_average` on the MAE,
+Quantile and MAPE losses (lane/catboost-parity, 2026-09-19).
+
+Reference: `catboost/libs/helpers/quantile.cpp` (`CalcSampleQuantile`, both
+branches) and `libs/metrics/optimal_const_for_loss.h:69-116`
+(`CalculateWeightedTargetQuantile` with its delta adjust,
+`CalculateOptimalConstApproxForMAPE`), CatBoost `54a8143a`. The CPU
+column's code (the host oracles and the gbdt host binding); a GPU fit runs
+`gbdt/metrics/optimal_const_device.mojo`, the same statements in the same
+fold order on the device, so the bias is the same bits on both.
+
+TWO DEVIATIONS, stated. (1) The Quantile level reaches this module as the
+loss descriptor's float `alpha` widened to double; theirs is the double the
+params map parsed. They agree for levels a float holds exactly (0.5, 0.25,
+...); for others (0.3) `total * alpha` can differ in its last bits and so
+move a quantile that sits exactly on the boundary. (2) Their weight sums are
+serial chains in a `std::partition` order the library leaves unspecified;
+here every weight sum is `bfa_tree_sum`'s fixed blocked tree over the rows
+in index order (cpu-gpu-cleanup t-gbdt, 2026-10-02, so the device folds
+it in parallel). The order only reaches the answer through the double sums
+of non-integer weights, by an ulp at most; the unweighted fit sums integers
+and is exact either way.
+"""
+
+from std.math import fma
+from std.memory import bitcast
+from std.sys.compile import is_defined
+
+comptime SAMPLE_QUANTILE_SABOTAGE = is_defined[
+    "ANONLIB_SAMPLE_QUANTILE_SABOTAGE"
+]()
+"""THE NEGATIVE CONTROL of the quantile constant: `-D
+ANONLIB_SAMPLE_QUANTILE_SABOTAGE=1` skips their delta adjust, so the
+MAE / Quantile / MAPE starting point is the raw sample quantile. It moves
+the bias of every `boost_from_average` fit of those losses (the
+gbdt-bfa-quantile lane) and nothing else: RMSE, Logloss and CrossEntropy do
+not reach this module."""
+
+#: `DBL_EPSILON`
+comptime SQ_DBL_EPSILON = 2.220446049250313e-16
+#: `BINARY_SEARCH_ITERATIONS` (`quantile.cpp:22`)
+comptime SQ_BINARY_SEARCH_ITERATIONS = 100
+#: below this many elements the linear search runs (`quantile.cpp:110`)
+comptime SQ_LINEAR_SEARCH_MAX = 100
+#: one chunk of a `bfa_tree_sum` level: the block width of the device folds
+comptime BFA_FOLD_TPB = 256
+
+
+def _stable_sort_by_value(mut v: List[Float32], mut w: List[Float32]):
+    """`StableSort(elements, value <)`: insertion into runs by a merge sort,
+    ties keep their input order."""
+    var n = len(v)
+    var idx = List[Int](capacity=n)
+    for i in range(n):
+        idx.append(i)
+    var tmp = List[Int](length=n, fill=0)
+    var width = 1
+    while width < n:
+        var lo = 0
+        while lo < n:
+            var mid = min(lo + width, n)
+            var hi = min(lo + 2 * width, n)
+            var a = lo
+            var b = mid
+            var k = lo
+            while a < mid and b < hi:
+                # stable: take the LEFT run on a tie
+                if v[idx[b]] < v[idx[a]]:
+                    tmp[k] = idx[b]
+                    b += 1
+                else:
+                    tmp[k] = idx[a]
+                    a += 1
+                k += 1
+            while a < mid:
+                tmp[k] = idx[a]
+                a += 1
+                k += 1
+            while b < hi:
+                tmp[k] = idx[b]
+                b += 1
+                k += 1
+            lo = hi
+        for i in range(n):
+            idx[i] = tmp[i]
+        width *= 2
+    var sv = List[Float32](capacity=n)
+    var sw = List[Float32](capacity=n)
+    for i in range(n):
+        sv.append(v[idx[i]])
+        sw.append(w[idx[i]])
+    v = sv^
+    w = sw^
+
+
+def _stable_sort_values(mut v: List[Float32]):
+    """Stable value-only twin for the unweighted quantile path."""
+    var n = len(v)
+    var idx = List[Int](capacity=n)
+    for i in range(n):
+        idx.append(i)
+    var tmp = List[Int](length=n, fill=0)
+    var width = 1
+    while width < n:
+        var lo = 0
+        while lo < n:
+            var mid = min(lo + width, n)
+            var hi = min(lo + 2 * width, n)
+            var a = lo
+            var b = mid
+            var k = lo
+            while a < mid and b < hi:
+                if v[idx[b]] < v[idx[a]]:
+                    tmp[k] = idx[b]
+                    b += 1
+                else:
+                    tmp[k] = idx[a]
+                    a += 1
+                k += 1
+            while a < mid:
+                tmp[k] = idx[a]
+                a += 1
+                k += 1
+            while b < hi:
+                tmp[k] = idx[b]
+                b += 1
+                k += 1
+            lo = hi
+        for i in range(n):
+            idx[i] = tmp[i]
+        width *= 2
+    var sv = List[Float32](capacity=n)
+    for i in range(n):
+        sv.append(v[idx[i]])
+    v = sv^
+
+
+def bfa_tree_sum(vals: List[Float64]) -> Float64:
+    """THE FOLD ORDER of every `boost_from_average` sum (cpu-gpu-cleanup
+    t-gbdt, 2026-10-02; was a serial row-order chain): level 0 cuts `vals`
+    into consecutive chunks of `BFA_FOLD_TPB` cells, pads each chunk with
+    +0.0 and folds it by a halving tree (`s[t] = s[t] + s[t + step]`, step
+    `BFA_FOLD_TPB / 2` .. 1); the chunk sums are the next level's input and
+    the levels repeat until one value remains. The order is a function of
+    `len(vals)` alone: the device folds of `optimal_const_device.mojo` add the
+    same pairs in the same order through `checks/soft_f64.mojo` (IEEE binary64,
+    round to nearest even), so the host column and every vendor agree."""
+    if len(vals) == 0:
+        return Float64(0.0)
+    var cur = vals.copy()
+    var s = List[Float64](length=BFA_FOLD_TPB, fill=Float64(0.0))
+    while True:
+        var m = len(cur)
+        var nb = (m + BFA_FOLD_TPB - 1) // BFA_FOLD_TPB
+        var nxt = List[Float64](capacity=nb)
+        for b in range(nb):
+            for t in range(BFA_FOLD_TPB):
+                var i = b * BFA_FOLD_TPB + t
+                s[t] = cur[i] if i < m else Float64(0.0)
+            var step = BFA_FOLD_TPB // 2
+            while step > 0:
+                for t in range(step):
+                    s[t] = s[t] + s[t + step]
+                step //= 2
+            nxt.append(s[0])
+        cur = nxt^
+        if len(cur) == 1:
+            return cur[0]
+
+
+def bfa_f32_before(a: Float32, b: Float32) -> Bool:
+    """The min/max order of the quantile's range: `<`, with -0.0 before
+    +0.0 (a total order on non-NaN values, so the device tree's winner is
+    the host scan's whatever the fold order)."""
+    if a < b:
+        return True
+    if b < a:
+        return False
+    return bitcast[DType.uint32](a) >> 31 == 1 and bitcast[DType.uint32](b) >> 31 == 0
+
+
+def _bfa_weight_sum(weights: List[Float32], n: Int, has_weights: Bool) -> Float64:
+    """The total weight: the exact row count unweighted, else `bfa_tree_sum`."""
+    if not has_weights:
+        return Float64(n)
+    var vals = List[Float64](capacity=n)
+    for i in range(n):
+        vals.append(Float64(weights[i]))
+    return bfa_tree_sum(vals)
+
+
+def calc_sample_quantile(
+    sample: List[Float32],
+    weights: List[Float32],
+    alpha: Float64,
+    has_weights: Bool = True,
+) -> Float64:
+    """`CalcSampleQuantile` (`quantile.cpp:102-121`): 0 for an empty sample,
+    the minimum at `alpha <= 0`, the linear search below 100 elements and
+    the 100-step binary search otherwise. `weights` has one entry per
+    sample (the caller passes ones for an unweighted pool).
+
+    THE HOST TWIN of `optimal_const_device.mojo` (cpu-gpu-cleanup t-gbdt,
+    2026-10-02). Weight totals are `bfa_tree_sum`s; the binary search keeps
+    its range by VALUE (`(has_lower and v <= l_q)` is out, `v > r_q` is out)
+    rather than by a stable partition of indices -- the same set, so each
+    step's left weight is the tree sum over the rows in index order with
+    +0.0 for the rows outside it; min and max are `bfa_f32_before`'s."""
+    var n = len(sample)
+    if n == 0:
+        return 0.0
+    if alpha <= 0:
+        var mn = sample[0]
+        for i in range(1, n):
+            if bfa_f32_before(sample[i], mn):
+                mn = sample[i]
+        return Float64(mn)
+    var total = _bfa_weight_sum(weights, n, has_weights)
+    # `total * alpha - eps` in ONE rounding: the default (contract=fast)
+    # build fused the product into the subtraction (lane/explicit-fma-contract-proof)
+    var need_floor = fma(total, alpha, -SQ_DBL_EPSILON)
+    if n < SQ_LINEAR_SEARCH_MAX:
+        # `CalcSampleQuantileLinearSearch` (`:79-100`)
+        var v = sample.copy()
+        var w = List[Float32]()
+        if has_weights:
+            w = weights.copy()
+            _stable_sort_by_value(v, w)
+        else:
+            _stable_sort_values(v)
+        var acc = Float64(0.0)
+        for i in range(n):
+            acc += Float64(w[i]) if has_weights else 1.0
+            if acc >= need_floor:
+                return Float64(v[i])
+        return Float64(v[n - 1])
+    # `CalcSampleQuantileBinarySearch` (`:18-77`)
+    var mn = sample[0]
+    var mx = sample[0]
+    for i in range(1, n):
+        if bfa_f32_before(sample[i], mn):
+            mn = sample[i]
+        if bfa_f32_before(mx, sample[i]):
+            mx = sample[i]
+    var l_q = Float64(mn) - SQ_DBL_EPSILON
+    var r_q = Float64(mx)
+    var has_lower = False
+    var collected = Float64(0.0)
+    var left = List[Float64](length=n, fill=Float64(0.0))
+    for _ in range(SQ_BINARY_SEARCH_ITERATIONS):
+        var q = (l_q + r_q) / 2
+        for i in range(n):
+            var x = Float64(sample[i])
+            var inside = (not has_lower or x > l_q) and not (x > r_q)
+            left[i] = Float64(0.0)
+            if inside and not (x > q):
+                left[i] = Float64(weights[i]) if has_weights else 1.0
+        var left_weight = bfa_tree_sum(left)
+        if collected + left_weight < need_floor:
+            l_q = q
+            has_lower = True
+            collected += left_weight
+        else:
+            r_q = q
+    return r_q
+
+
+def calculate_weighted_target_quantile(
+    target: List[Float32],
+    weights: List[Float32],
+    has_weights: Bool,
+    alpha: Float64,
+    delta: Float64,
+) -> Float32:
+    """`CalculateWeightedTargetQuantile` (`optimal_const_for_loss.h:69-103`):
+    the sample quantile, then the delta adjust away from the tie, returned
+    through `inline float`."""
+    var n = len(target)
+    if n == 0:
+        return Float32(0.0)
+    var w = weights.copy() if has_weights else List[Float32]()
+    var q = calc_sample_quantile(target, w, alpha, has_weights)
+    comptime if SAMPLE_QUANTILE_SABOTAGE:
+        return Float32(q)
+    if delta > 0:
+        var total = _bfa_weight_sum(weights, n, has_weights)
+        var lv = List[Float64](length=n, fill=Float64(0.0))
+        var ev = List[Float64](length=n, fill=Float64(0.0))
+        for i in range(n):
+            var wi = Float64(weights[i]) if has_weights else 1.0
+            if Float64(target[i]) < q:
+                lv[i] = wi
+            elif Float64(target[i]) == q:
+                ev[i] = wi
+        var less = bfa_tree_sum(lv)
+        var equal = bfa_tree_sum(ev)
+        # both sides in ONE rounding, as the default build fused them (lane/explicit-fma-contract-proof)
+        if fma(equal, alpha, less) >= fma(total, alpha, -SQ_DBL_EPSILON):
+            q -= delta
+        else:
+            q += delta
+    return Float32(q)
+
+
+def calculate_optimal_const_approx_for_mape(
+    target: List[Float32], weights: List[Float32], has_weights: Bool
+) -> Float32:
+    """`CalculateOptimalConstApproxForMAPE` (`optimal_const_for_loss.h:
+    105-116`): the weighted median with each weight divided by
+    `max(1, |target|)` in float."""
+    var n = len(target)
+    var w = List[Float32](capacity=n)
+    for i in range(n):
+        var wi = weights[i] if has_weights else Float32(1.0)
+        w.append(wi / max(Float32(1.0), abs(target[i])))
+    comptime if SAMPLE_QUANTILE_SABOTAGE:
+        return Float32(calc_sample_quantile(target, w, 0.75))
+    return Float32(calc_sample_quantile(target, w, 0.5))
+
+
+# Moved from optimal_const_for_loss.mojo (lane rehearsal-suite-green,
+# 2026-10-08) so the CPU oracles take it without importing the pointwise
+# target kernels; optimal_const_for_loss.mojo imports it back.
+def calculate_weighted_target_average(
+    target: List[Float32],
+    weights: List[Float32],
+    has_weights: Bool,
+) raises -> Float32:
+    """`NCB::CalculateWeightedTargetAverage`, including the float return.
+
+    Their `weights.empty()` is `has_weights == False` here: the fit carries
+    a ones buffer for the unweighted case, and their empty-weights branch
+    is the same arithmetic with weight 1 -- but the BRANCH is kept, because
+    `summaryWeight` is `target.size()` (an exact integer sum) on their
+    empty branch and an accumulated float sum on the other, and those can
+    differ in the last bit at scale.
+
+    THE SUMS ARE `bfa_tree_sum`'s fixed blocked tree (cpu-gpu-cleanup
+    t-gbdt, 2026-10-02; their serial chain before), the order
+    `optimal_const_device.mojo` folds on the device; the weighted target
+    terms are exact products, so the fused `fma` chain they replace has
+    no counterpart left to contract.
+    """
+    var n = len(target)
+    if n == 0:
+        raise Error("optimal const approx: empty target")
+    var summary_weight: Float64
+    var vals = List[Float64](capacity=n)
+    if not has_weights:
+        summary_weight = Float64(n)
+        for i in range(n):
+            vals.append(Float64(target[i]))
+    else:
+        if len(weights) != n:
+            raise Error(
+                "optimal const approx: " + String(len(weights))
+                + " weights for " + String(n) + " targets"
+            )
+        for i in range(n):
+            vals.append(Float64(weights[i]))
+        summary_weight = bfa_tree_sum(vals)
+        for i in range(n):
+            # a float32 times a float32 is exact in double: no rounding
+            # here, whatever the build contracts
+            vals[i] = Float64(target[i]) * Float64(weights[i])
+    var target_sum = bfa_tree_sum(vals)
+    # their `return targetSum / summaryWeight;` through `inline float`
+    return Float32(target_sum / summary_weight)

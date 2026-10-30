@@ -1,0 +1,182 @@
+# SPDX-License-Identifier: Apache-2.0
+"""The Mamba-3 zero-state prefill VJP's result types and the scratch helpers
+its launches allocate with. The device VJP is assembled on the tape
+(autograd/rules_mamba3.mojo::mamba3_tape_backward_on); the CPU column's hand
+walk is mamba/host/mamba3_prefill_chain.mojo.
+"""
+from std.time import perf_counter_ns
+
+from max.gpu.host import DeviceBuffer, DeviceContext
+
+from checks.numerics import GLOBAL_NUMERIC_MODE, NUMERIC_IDENTICAL
+from mamba.impl.modeling.modeling_mamba import mamba_zeros
+
+# lane afn-samba (2026-10-03), Apple FAST only:
+#   ANONLIB_AFN_MAMBA3_BWD_ARENA: the VJP's ~70 scratch buffers are views
+#     of one device arena chunk (core/device_arena.mojo) opened at the
+#     pass's start and released after its wait, instead of ~70 fresh Metal
+#     buffers per backward (each live buffer taxes every launch).
+#   ANONLIB_AFN_MAMBA3_BWD_CHUNK: the angle stage's chunked chains
+#     (mamba3_backward.mojo) with their chunk-sum scratch.
+# `_m3_scratch`'s other arm is exactly the `mamba_zeros[False]` call it
+# replaces; the ten gradient outputs stay real buffers.
+from std.sys.compile import is_defined
+from std.sys.info import has_apple_gpu_accelerator
+from checks.numerics import NUMERIC_FAST
+from core.device_arena import arena_active, arena_begin, arena_end, arena_release, arena_take
+
+#: lane nr-mamba (2026-10-04) IDN_M3_BWD_SKIP_DEAD (IDENTICAL, default ON;
+#: `-D ANONLIB_IDN_M3_BWD_SKIP_DEAD_OFF` or `-D ANONLIB_IDN_ALL_OFF`
+#: restores main): the Mamba-3 prefill backward ran its angle stage twice,
+#: once on the pre-join d_theta whose results (and those of the join
+#: current, dt partial, dt_bias reduce and adt product around it) no
+#: returned gradient reads. Every column skips them; no bit moves.
+comptime IDN_M3_BWD_SKIP_DEAD = (
+    GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL
+    and not is_defined["ANONLIB_IDN_M3_BWD_SKIP_DEAD_OFF"]()
+    and not is_defined["ANONLIB_IDN_ALL_OFF"]()
+)
+comptime AFN_M3_BWD_ARENA = (
+    GLOBAL_NUMERIC_MODE == NUMERIC_FAST and has_apple_gpu_accelerator() and not is_defined["ANONLIB_COLUMN_CPU"]()
+) and (
+    is_defined["ANONLIB_AFN_MAMBA3_BWD_ARENA"]()
+    or is_defined["ANONLIB_AFN_SAMBA_ALL"]()
+)
+
+
+struct _AfnM3Arena(Movable):
+    """The pass's own arena under ANONLIB_AFN_MAMBA3_BWD_ARENA: opened
+    only when no arena is open, ended and released by `close` after the
+    pass's wait, or by the destructor when the pass raises. A plain -1
+    and nothing else in every other build."""
+
+    var id: Int
+    #: scratch the AFN arms enqueue work on, kept alive past the pass's wait
+    var keep: List[DeviceBuffer[DType.float32]]
+
+    def __init__(out self) raises:
+        self.id = -1
+        self.keep = List[DeviceBuffer[DType.float32]]()
+        comptime if AFN_M3_BWD_ARENA:
+            if not arena_active():
+                self.id = arena_begin()
+
+    def own(self) -> Bool:
+        return self.id >= 0
+
+    def close(mut self) raises:
+        comptime if AFN_M3_BWD_ARENA:
+            if self.id >= 0:
+                arena_end(self.id)
+                arena_release(self.id)
+                self.id = -1
+
+    def __deinit__(deinit self):
+        comptime if AFN_M3_BWD_ARENA:
+            if self.id >= 0:
+                try:
+                    arena_end(self.id)
+                    arena_release(self.id)
+                except:
+                    pass
+
+
+@always_inline
+def _m3_scratch(
+    own: Bool, ctx: DeviceContext, n: Int
+) raises -> DeviceBuffer[DType.float32]:
+    """A zero-filled scratch of `n` floats: a view of this pass's own arena
+    under ANONLIB_AFN_MAMBA3_BWD_ARENA (`own`: the pass opened it), else
+    `mamba_zeros[False]`. `own` is False whenever the pass found another
+    arena already open, so a session's arena never receives these views."""
+    comptime if AFN_M3_BWD_ARENA:
+        if own and arena_active():
+            var want = n
+            if want < 1:
+                want = 1
+            var view = arena_take(ctx, want)
+            view.enqueue_fill(Float32(0.0))
+            return view^
+    return mamba_zeros[False](ctx, n)
+
+
+struct Mamba3PrefillGradients(Movable):
+    var x: List[Float32]
+    var block_norm_weight: List[Float32]
+    var in_proj_weight: List[Float32]
+    var dt_bias: List[Float32]
+    var B_norm_weight: List[Float32]
+    var C_norm_weight: List[Float32]
+    var B_bias: List[Float32]
+    var C_bias: List[Float32]
+    var D: List[Float32]
+    var out_proj_weight: List[Float32]
+
+    def __init__(out self):
+        self.x = List[Float32]()
+        self.block_norm_weight = List[Float32]()
+        self.in_proj_weight = List[Float32]()
+        self.dt_bias = List[Float32]()
+        self.B_norm_weight = List[Float32]()
+        self.C_norm_weight = List[Float32]()
+        self.B_bias = List[Float32]()
+        self.C_bias = List[Float32]()
+        self.D = List[Float32]()
+        self.out_proj_weight = List[Float32]()
+
+
+def _mtick(ctx: DeviceContext, on: Bool, mut t: Int, name: String) raises:
+    """ANONLIB_MAMBA_TIMING (lane/neural-apple2): synchronize, print
+    `timing m3bwd.<name> <ms> ms`, advance `t`. A no-op when off."""
+    if not on:
+        return
+    ctx.synchronize()
+    var now = Int(perf_counter_ns())
+    print("timing m3bwd." + name + " " + String(Float64(now - t) / 1000000.0) + " ms")
+    t = now
+
+
+struct Mamba3DeviceGradients(Movable):
+    """The ten gradients of one zero-state prefill VJP, on the device, in
+    the public order (x, then the nine weights in forward order). The
+    session binding downloads them straight to the caller's arrays;
+    `mamba3_tape_backward` downloads them into lists."""
+    var x: DeviceBuffer[DType.float32]
+    var block_norm_weight: DeviceBuffer[DType.float32]
+    var in_proj_weight: DeviceBuffer[DType.float32]
+    var dt_bias: DeviceBuffer[DType.float32]
+    var B_norm_weight: DeviceBuffer[DType.float32]
+    var C_norm_weight: DeviceBuffer[DType.float32]
+    var B_bias: DeviceBuffer[DType.float32]
+    var C_bias: DeviceBuffer[DType.float32]
+    var D: DeviceBuffer[DType.float32]
+    var out_proj_weight: DeviceBuffer[DType.float32]
+
+    def __init__(
+        out self,
+        var x: DeviceBuffer[DType.float32],
+        var block_norm_weight: DeviceBuffer[DType.float32],
+        var in_proj_weight: DeviceBuffer[DType.float32],
+        var dt_bias: DeviceBuffer[DType.float32],
+        var B_norm_weight: DeviceBuffer[DType.float32],
+        var C_norm_weight: DeviceBuffer[DType.float32],
+        var B_bias: DeviceBuffer[DType.float32],
+        var C_bias: DeviceBuffer[DType.float32],
+        var D: DeviceBuffer[DType.float32],
+        var out_proj_weight: DeviceBuffer[DType.float32],
+    ):
+        self.x = x^
+        self.block_norm_weight = block_norm_weight^
+        self.in_proj_weight = in_proj_weight^
+        self.dt_bias = dt_bias^
+        self.B_norm_weight = B_norm_weight^
+        self.C_norm_weight = C_norm_weight^
+        self.B_bias = B_bias^
+        self.C_bias = C_bias^
+        self.D = D^
+        self.out_proj_weight = out_proj_weight^
+
+
+# TOMBSTONE: ANONLIB_AUTOGRAD_MAMBA3_OFF (the hand Mamba-3 prefill backward glue, mamba3_prefill_backward and mamba3_prefill_backward_on; superseded by the tape) deleted 2026-10-19 by bc0a9a24e; code recoverable at ba37327dc^.
+# Restore: git apply experiments/removed/ANONLIB_AUTOGRAD_MAMBA3_OFF.patch
+# (the CPU column keeps the same walk as generator input: mamba/host/mamba3_prefill_chain.mojo)

@@ -1,0 +1,438 @@
+"""Untimed benchmark receipts for scored outputs and public model exports.
+
+This is evidence glue, never part of the library runtime or measured operation.
+Output identity is deliberately separate from model identity. A missing public
+export remains explicit and must not be treated as a verified model match.
+"""
+import hashlib
+import json
+import os
+from pathlib import Path
+import tempfile
+from contextlib import contextmanager
+
+
+@contextmanager
+def _export_directory(retain_directory, prefix):
+    """Keep requested evidence; temporary exports remain explicitly hash-only."""
+    if retain_directory is None:
+        with tempfile.TemporaryDirectory(prefix=prefix) as directory:
+            yield Path(directory)
+    else:
+        directory = Path(retain_directory)
+        directory.mkdir(parents=True, exist_ok=False)
+        yield directory
+
+
+def _retained_export(path):
+    digest = hashlib.sha256()
+    with path.open('rb') as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b''):
+            digest.update(block)
+    return dict(path=str(path), bytes=path.stat().st_size,
+                sha256=digest.hexdigest(), encoding='original public save file bytes')
+
+
+# Reviewed against the public save/load and fit methods at numerical freeze
+# 4fc63c9d5486261f27fdd55eb31d1900e2cc0e8f. These are fitted-state contracts,
+# not a declaration that arbitrary public save() exports are complete models.
+PUBLIC_FITTED_STATE_CONTRACTS = {
+    'PCA': {
+        'id': 'anonlib.public-fitted-state/pca-1',
+        'format': 'anonlib-pca-1',
+        'fields': ('components', 'estimator', 'explained_variance', 'explained_variance_ratio',
+                   'format', 'mean', 'meta', 'noise_variance', 'numeric_mode', 'singular_values', 'svd_solver'),
+        'source': 'python/anonlib/decomposition.py:PCA.fit/_fit_randomized/save/load',
+        'excluded': {'input_copied_': 'input-copy diagnostic, not fitted numerical state',
+                     'constructor_settings': 'separately pinned estimator settings; save is not a refit checkpoint'},
+    },
+    'KMeans': {
+        'id': 'anonlib.public-fitted-state/kmeans-1',
+        'format': 'anonlib-kmeans-1',
+        'fields': ('centers', 'estimator', 'format', 'init', 'labels', 'meta', 'metric', 'numeric_mode', 'reals'),
+        'source': 'python/anonlib/cluster.py:KMeans.fit/save/load',
+        'excluded': {'init_centroids': 'original refit input, not learned centers; pinned by workload/settings',
+                     'input_copied_': 'input-copy diagnostic, not fitted numerical state'},
+    },
+}
+_PUBLIC_FITTED_TYPES = {
+    ('anonlib.decomposition', 'PCA'): 'PCA',
+    ('anonlib.cluster', 'KMeans'): 'KMeans',
+    ('anonlib._classical_host', 'HostPCA'): 'PCA',
+    ('anonlib._classical_host', 'HostKMeans'): 'KMeans',
+}
+
+
+# These exact classes expose their entire supported fitted state as public
+# attributes. Reviewed at cf442daed63f8d2c9d99947c3a7a4e50fb442319; see the
+# retained source audit. This is evidence glue after clocks stop, never a new
+# estimator save/load API, runtime route, or training-resumption checkpoint.
+PUBLIC_ATTRIBUTE_FITTED_STATE_CONTRACTS = {
+    'SGDRegressor': {
+        'id': 'anonlib.public-fitted-attributes/sgd-regressor-1',
+        'attributes': ('coef_', 'intercept_', 'n_features_in_', 'n_iter_', 't_'),
+        'source': 'python/anonlib/_expansion_linear.py:SGDRegressor.fit/_sgd_fit/_LinearRegressorMixin.predict',
+        'excluded': {'constructor_settings': 'separately pinned recipe; warm_start, average and early_stopping are refused',
+                     'optimizer_workspace': 'temporary native fit workspace, not retained; no supported partial_fit or resume API'},
+    },
+    'PassiveAggressiveRegressor': {
+        'id': 'anonlib.public-fitted-attributes/passive-aggressive-regressor-1',
+        'attributes': ('coef_', 'intercept_', 'n_features_in_', 'n_iter_', 't_'),
+        'source': 'python/anonlib/_expansion_linear.py:PassiveAggressiveRegressor.fit/_sgd_fit/_LinearRegressorMixin.predict',
+        'excluded': {'constructor_settings': 'separately pinned recipe; warm_start, average and early_stopping are refused',
+                     'optimizer_workspace': 'temporary native fit workspace, not retained; no supported partial_fit or resume API'},
+    },
+    'BayesianRidge': {
+        'id': 'anonlib.public-fitted-attributes/bayesian-ridge-1',
+        'attributes': ('coef_', 'intercept_', 'n_features_in_', 'n_iter_', 'alpha_', 'lambda_'),
+        'source': 'python/anonlib/_expansion_linear.py:BayesianRidge.fit/predict/_bayes_refuse; x_linear/bayes.mojo:bayes_finish',
+        'excluded': {'constructor_settings': 'separately pinned recipe; compute_score and return_std are refused',
+                     'posterior_covariance_and_training_statistics': 'temporary native workspace, not retained or exposed by any supported fitted operation'},
+    },
+}
+_PUBLIC_ATTRIBUTE_SOURCE = {
+    'module': 'anonlib._expansion_linear',
+    'path': 'python/anonlib/_expansion_linear.py',
+    'sha256': '06d0f8d75d727afcaa3fa7d820741c9c23ab6fd3a2ccc59290303d5f14f30957',
+    'audit': 'experiments/six_lane_integration/public_linear_fitted_state_audit.json',
+}
+
+
+def _public_attribute_fitted_state(model, estimator):
+    """Copy only allowlisted public attributes via the public Array protocol.
+
+    The loaded API source must match the reviewed implementation. New source,
+    subclasses, missing fields and schema changes remain explicitly unavailable.
+    No private attributes, device handles, predictions, or fitting are read/run.
+    """
+    import sys
+    import numpy as np
+    contract = PUBLIC_ATTRIBUTE_FITTED_STATE_CONTRACTS[estimator]
+    metadata = dict(contract=contract['id'], contract_source=contract['source'],
+                    contract_paths=public_fitted_state_paths(estimator),
+                    capture_source='reviewed public fitted attributes',
+                    model_class=type(model).__module__ + '.' + type(model).__name__,
+                    reviewed_api_source=dict(_PUBLIC_ATTRIBUTE_SOURCE),
+                    excluded_non_fitted_state=dict(contract['excluded']))
+    try:
+        module = sys.modules.get(_PUBLIC_ATTRIBUTE_SOURCE['module'])
+        source = getattr(module, '__file__', None)
+        if not source or hashlib.sha256(Path(source).read_bytes()).hexdigest() != _PUBLIC_ATTRIBUTE_SOURCE['sha256']:
+            raise ValueError('Loaded estimator API differs from the reviewed public-attribute source')
+        state = {name: getattr(model, name) for name in contract['attributes']}
+        for name in ('n_features_in_', 'n_iter_'):
+            if type(state[name]) is not int:
+                raise ValueError(name + ': expected public Python int')
+        nf = state['n_features_in_']
+        if nf < 1 or state['n_iter_'] < 0:
+            raise ValueError('Invalid fitted feature/iteration count')
+        coef = np.asarray(state['coef_'])
+        if coef.dtype.str != '<f4' or coef.shape != (nf,):
+            raise ValueError('coef_: expected exact float32 public coefficient vector')
+        state['coef_'] = coef.copy(order='C')
+        if estimator == 'BayesianRidge':
+            for name in ('intercept_', 'alpha_', 'lambda_'):
+                if type(state[name]) is not float:
+                    raise ValueError(name + ': expected public Python float')
+        else:
+            intercept = np.asarray(state['intercept_'])
+            if intercept.dtype.str != '<f4' or intercept.shape != (1,):
+                raise ValueError('intercept_: expected exact one-element float32 public array')
+            state['intercept_'] = intercept.copy(order='C')
+            if type(state['t_']) is not float:
+                raise ValueError('t_: expected public Python float')
+        state.update(estimator=estimator, format=contract['id'], prediction_link='identity')
+        return state, metadata
+    except Exception as exc:
+        return None, dict(metadata, status='UNAVAILABLE', missing_state=['validated complete public fitted attributes'],
+                          reason=type(exc).__name__ + ': ' + str(exc))
+
+
+def public_fitted_state_paths(estimator):
+    """The reviewed complete path set for a future frozen worker recipe."""
+    if estimator in PUBLIC_ATTRIBUTE_FITTED_STATE_CONTRACTS:
+        fields = (*PUBLIC_ATTRIBUTE_FITTED_STATE_CONTRACTS[estimator]['attributes'], 'estimator', 'format', 'prediction_link')
+    else:
+        fields = PUBLIC_FITTED_STATE_CONTRACTS[estimator]['fields']
+    return ['$.%s' % name for name in fields]
+
+
+def _saved_text(arrays, name):
+    value = arrays[name]
+    if value.dtype.kind != 'U' or value.shape != (1,):
+        raise ValueError(name + ': expected one Unicode export value')
+    return str(value[0])
+
+
+def normalize_public_fitted_state(arrays, estimator, saved_estimator):
+    """Validate a known saved schema, without loading or running a model.
+
+    Preserve numerical bytes and dtypes. Only the export's Python class name is
+    normalized: the explicit public host subclasses inherit these save formats.
+    The original full export hash remains in the capture's provenance.
+    """
+    import numpy as np
+    contract = PUBLIC_FITTED_STATE_CONTRACTS[estimator]
+    if set(arrays) != set(contract['fields']):
+        missing = sorted(set(contract['fields']) - set(arrays))
+        extra = sorted(set(arrays) - set(contract['fields']))
+        raise ValueError('export field set changed; missing=%r unexpected=%r' % (missing, extra))
+    if any(not isinstance(v, np.ndarray) or v.dtype.hasobject for v in arrays.values()):
+        raise ValueError('export requires typed non-object arrays')
+    if _saved_text(arrays, 'format') != contract['format']:
+        raise ValueError('unreviewed saved format version')
+    if saved_estimator not in (estimator, 'Host' + estimator) or _saved_text(arrays, 'estimator') != saved_estimator:
+        raise ValueError('saved estimator class differs from reviewed owner')
+    if _saved_text(arrays, 'numeric_mode') not in ('fast', 'identical'):
+        raise ValueError('invalid saved numeric mode')
+
+    def exact(name, dtype, shape):
+        value = arrays[name]
+        if value.dtype.str != dtype or value.shape != shape:
+            raise ValueError('%s: expected dtype=%s shape=%r, observed dtype=%s shape=%r' %
+                             (name, dtype, shape, value.dtype.str, value.shape))
+
+    if estimator == 'PCA':
+        exact('meta', '<i8', (4,))
+        nc, nf, ns, whiten = map(int, arrays['meta'])
+        if nc < 1 or nf < 1 or ns < 2 or whiten not in (0, 1):
+            raise ValueError('invalid PCA fitted counts/whitening metadata')
+        exact('components', '<f4', (nc, nf))
+        exact('mean', '<f4', (nf,))
+        for name in ('singular_values', 'explained_variance', 'explained_variance_ratio'):
+            exact(name, '<f4', (nc,))
+        exact('noise_variance', '<f8', (1,))
+        if not _saved_text(arrays, 'svd_solver'):
+            raise ValueError('missing PCA solver')
+    elif estimator == 'KMeans':
+        exact('meta', '<i8', (9,))
+        exact('reals', '<f8', (5,))
+        k, d, nfit, niter, metric, init, _, _, _ = map(int, arrays['meta'])
+        if k < 1 or d < 1 or nfit < 1 or niter < 0:
+            raise ValueError('invalid KMeans fitted counts')
+        exact('centers', '<f4', (k, d))
+        exact('labels', '<i4', (nfit,))
+        metrics = {'euclidean': 0, 'l2_expanded': 0, 'l2_sqrt_expanded': 1}
+        inits = {'k-means++': 0, 'random': 1, 'array': 2}
+        if metrics.get(_saved_text(arrays, 'metric')) != metric or inits.get(_saved_text(arrays, 'init')) != init:
+            raise ValueError('KMeans saved names and codes differ')
+    state = dict(arrays)
+    state['estimator'] = estimator
+    return state
+
+
+def public_fitted_state(model, *, retain_directory=None):
+    """Read a reviewed public export/attributes after clocks stop; never inspect handles.
+
+    Returns (typed state, provenance), or (None, explicit unavailable evidence).
+    No existing receipt is upgraded, and incomplete exports remain partial.
+    """
+    key = (type(model).__module__, type(model).__name__)
+    if key[0] == _PUBLIC_ATTRIBUTE_SOURCE['module'] and key[1] in PUBLIC_ATTRIBUTE_FITTED_STATE_CONTRACTS:
+        return _public_attribute_fitted_state(model, key[1])
+    estimator = _PUBLIC_FITTED_TYPES.get(key)
+    if estimator is None:
+        missing = ['reviewed complete typed fitted-state export']
+        if key in (('anonlib.linear_model', 'LinearRegression'),
+                   ('anonlib._classical_host', 'HostLinearRegression')):
+            missing = ['retained training mean _x_mean', 'retained training mean _y_mean']
+        return None, dict(status='UNAVAILABLE', missing_state=missing,
+                          reason='Public export is not a reviewed complete fitted-state contract',
+                          partial_export=model_receipt(model, retain_directory=retain_directory))
+    contract = PUBLIC_FITTED_STATE_CONTRACTS[estimator]
+    metadata = dict(contract=contract['id'], contract_source=contract['source'],
+                    contract_paths=public_fitted_state_paths(estimator),
+                    capture_source='public save npz', model_class='.'.join(key),
+                    excluded_non_fitted_state=dict(contract['excluded']),
+                    normalized_metadata={'estimator': dict(saved=key[1], logical=estimator,
+                        reason='public host route subclass uses the same versioned fitted-state format')})
+    try:
+        import numpy as np
+        with _export_directory(retain_directory, 'anonlib-typed-fitted-state-') as directory:
+            path = Path(directory) / 'model.npz'
+            model.save(path)
+            with np.load(path, allow_pickle=False) as saved:
+                arrays = {name: saved[name] for name in saved.files}
+            if retain_directory is not None:
+                metadata['retained_export'] = _retained_export(path)
+        metadata['complete_export_sha256'] = canonical_hash(arrays)
+        state = normalize_public_fitted_state(arrays, estimator, key[1])
+        return state, metadata
+    except Exception as exc:
+        return None, dict(metadata, status='UNAVAILABLE', missing_state=['validated complete fitted-state export'],
+                          reason=type(exc).__name__ + ': ' + str(exc))
+
+
+def canonical_hash(value):
+    """SHA256 of typed, framed nested state (including array shape and dtype)."""
+    import numpy as np
+    h = hashlib.sha256(b"anonlib-benchmark-state-v1\0")
+
+    def frame(kind, raw):
+        h.update(kind.encode() + b":" + str(len(raw)).encode() + b":" + raw)
+
+    def visit(obj):
+        if isinstance(obj, dict):
+            frame("dict", str(len(obj)).encode())
+            for key in sorted(obj):
+                frame("key", str(key).encode())
+                visit(obj[key])
+        elif isinstance(obj, (list, tuple)):
+            frame("sequence", str(len(obj)).encode())
+            for item in obj:
+                visit(item)
+        elif isinstance(obj, np.ndarray):
+            if obj.dtype.hasobject:
+                raise TypeError("object arrays cannot establish state identity")
+            arr = np.ascontiguousarray(obj)
+            frame("array", json.dumps([arr.dtype.str, list(arr.shape)], separators=(",", ":")).encode())
+            frame("bytes", arr.tobytes())
+        elif isinstance(obj, np.generic):
+            visit(np.asarray(obj))
+        elif obj is None or isinstance(obj, (str, bool, int, float)):
+            frame(type(obj).__name__, json.dumps(obj, allow_nan=False).encode())
+        else:
+            raise TypeError("unsupported exported state type: " + type(obj).__name__)
+    visit(value)
+    return h.hexdigest()
+
+
+def save_typed_state(path, value):
+    """Retain a public state_dict without pickle or loss of array/scalar types."""
+    import numpy as np
+    arrays = {}
+
+    def pack(obj):
+        if isinstance(obj, np.generic):
+            obj = np.asarray(obj)
+        if isinstance(obj, np.ndarray):
+            if obj.dtype.hasobject:
+                raise TypeError("object arrays cannot establish state identity")
+            key = "array_%d" % len(arrays)
+            arrays[key] = np.ascontiguousarray(obj) if obj.ndim else obj.copy()
+            return ["array", key]
+        if isinstance(obj, dict):
+            return ["dict", [[key, pack(obj[key])] for key in sorted(obj)]]
+        if isinstance(obj, (list, tuple)):
+            return ["sequence", [pack(item) for item in obj]]
+        if obj is None or isinstance(obj, (str, bool, int, float)):
+            return ["scalar", obj]
+        raise TypeError("unsupported exported state type: " + type(obj).__name__)
+
+    tree = json.dumps(pack(value), allow_nan=False, separators=(",", ":")).encode()
+    np.savez(path, structure=np.frombuffer(tree, dtype=np.uint8), **arrays)
+
+
+def load_typed_state(path):
+    """Read the non-executable container produced by save_typed_state."""
+    import numpy as np
+    with np.load(path, allow_pickle=False) as saved:
+        def unpack(node):
+            kind, value = node
+            if kind == "array":
+                return saved[value].copy()
+            if kind == "dict":
+                return {key: unpack(item) for key, item in value}
+            if kind == "sequence":
+                return [unpack(item) for item in value]
+            if kind == "scalar":
+                return value
+            raise ValueError("unknown state node: " + str(kind))
+        return unpack(json.loads(saved["structure"].tobytes()))
+
+
+def _model_receipt(model, *, retain_directory=None):
+    """Hash a public snapshot; never fit, predict, or inspect opaque handles."""
+    if model is None:
+        return {"status": "unavailable", "reason": "runner does not retain an exportable model"}
+    info = {"class": type(model).__name__, "schema": "anonlib-benchmark-state-v1"}
+    if not type(model).__module__.startswith("anonlib"):
+        return dict(info, status="unavailable", reason="opponent model export is not normalized")
+    if callable(getattr(model, "state_dict", None)):
+        state = model.state_dict()
+        result = dict(info, status="ok", source="public state_dict", sha256=canonical_hash(state))
+        if retain_directory is not None:
+            with _export_directory(retain_directory, "anonlib-scored-state-") as directory:
+                path = directory / "model.npz"
+                save_typed_state(path, state)
+                result['retained_export'] = dict(_retained_export(path), encoding='typed canonical state npz')
+        return result
+    if callable(getattr(model, "save", None)):
+        import numpy as np
+        with _export_directory(retain_directory, "anonlib-scored-state-") as directory:
+            path = Path(directory) / "model.npz"
+            model.save(path)
+            with np.load(path, allow_pickle=False) as saved:
+                # Device routing metadata is not numerical state. Preserve
+                # the complete export hash too so this exclusion is auditable.
+                state = {key: saved[key] for key in saved.files}
+                full = canonical_hash(state)
+                omitted = [key for key in ("device",) if key in state]
+                for key in omitted:
+                    del state[key]
+                result = dict(info, status="ok", source="public save npz", sha256=canonical_hash(state),
+                              complete_export_sha256=full, excluded_metadata=omitted)
+                if retain_directory is not None:
+                    result['retained_export'] = _retained_export(path)
+                return result
+    return dict(info, status="unavailable", reason="no public state_dict or save export")
+
+
+def model_receipt(model, *, retain_directory=None):
+    try:
+        return _model_receipt(model, retain_directory=retain_directory)
+    except Exception as exc:
+        # Keep the scored measurement and its original diagnostic. Failed
+        # exports are never an identity claim and can be repaired separately.
+        return {"status": "error", "class": type(model).__name__,
+                "error": type(exc).__name__ + ": " + str(exc),
+                "retention_error": retain_directory is not None and isinstance(exc, OSError)}
+
+
+def runner_model(runner):
+    callback = getattr(runner, "model_for_hash", None)
+    if callback is not None:
+        return callback()
+    for name in ("est", "nn", "kd", "trainer", "model"):
+        model = getattr(runner, name, None)
+        if model is not None:
+            return model
+    return None
+
+
+def scored_receipt(outputs, runner=None, model=None):
+    """Capture already-scored values after the clock, with bytes in board runs.
+
+    No fit/predict is performed here. Public model exports remain snapshots,
+    not a claim that every estimator exposes its complete fitted state.
+    """
+    present = outputs is not None and bool(outputs) and all(value is not None for value in outputs.values())
+    receipt = {"schema": "anonlib-scored-receipt/1", "output_status": "ok" if present else "unavailable",
+               "output_sha256": canonical_hash(outputs) if present else None}
+    directory = None
+    receipts = os.environ.get("ANONLIB_MEASUREMENT_RECEIPTS")
+    if receipts:
+        # FAIRNESS FIX (2026-10-13 audit): tree/model receipts used to hash
+        # temporary exports and discard the actual bytes. Capture each scored
+        # call centrally, before a later round can replace its output/state.
+        try:
+            import numpy as np
+            root = Path(receipts).parent / "scored"
+            root.mkdir(parents=True, exist_ok=True)
+            directory = Path(tempfile.mkdtemp(prefix=str(os.getpid()) + "-", dir=root))
+            if present:
+                path = directory / "outputs.npz"
+                if all(isinstance(value, np.ndarray) for value in outputs.values()):
+                    np.savez(path, **outputs)
+                    encoding = 'numpy output arrays'
+                else:
+                    save_typed_state(path, outputs)
+                    encoding = 'typed canonical state npz'
+                receipt['retained_output'] = dict(_retained_export(path), encoding=encoding)
+        except Exception as exc:
+            # Preserve the completed clock and its hash. Seal records the
+            # retention failure and blocks the next race, never reruns this one.
+            receipt['retention_error'] = type(exc).__name__ + ': ' + str(exc)
+    receipt['model'] = model_receipt(model if model is not None else runner_model(runner),
+                                    retain_directory=directory / 'model' if directory is not None else None)
+    return receipt

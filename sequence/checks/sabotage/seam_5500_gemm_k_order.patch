@@ -1,0 +1,52 @@
+diff --git a/sequence/exec_device.mojo b/sequence/exec_device.mojo
+--- a/sequence/exec_device.mojo
++++ b/sequence/exec_device.mojo
+@@ -63,7 +63,7 @@ comptime SEQ_COOP_NVAMD = (
+     GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL
+     and not (is_defined["ANONLIB_IDN_SEQ_COOP_NVAMD_OFF"]() or is_defined["ANONLIB_IDN_ALL_OFF"]())
+ )
+-comptime SEQ_COOP = has_apple_gpu_accelerator() or SEQ_COOP_NVAMD
++comptime SEQ_COOP = False
+ #: nr-small D10: LayerNorm forward / backward-x rows on a simdgroup (the
+ #: same chains over broadcast words, coalesced loads; sequence/coop.mojo),
+ #: IDENTICAL on every GPU. -D ANONLIB_IDN_SEQ_LN_COOP_OFF (or
+diff --git a/sequence/gemm_tiled.mojo b/sequence/gemm_tiled.mojo
+--- a/sequence/gemm_tiled.mojo
++++ b/sequence/gemm_tiled.mojo
+@@ -42,7 +42,7 @@ comptime GT_PAGE_BYTES = (GT_M + GT_N) * GT_K * 4
+ #: not keyed to any data shape)
+ comptime GT_MIN_EDGE = 8
+ 
+-comptime SEQ_GEMM_TILED = (
++comptime SEQ_GEMM_TILED = False and (
+     GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL
+     and not has_apple_gpu_accelerator()
+     and not (is_defined["ANONLIB_IDN_SEQ_GEMM_TILED_OFF"]() or is_defined["ANONLIB_IDN_ALL_OFF"]())
+diff --git a/sequence/ops.mojo b/sequence/ops.mojo
+--- a/sequence/ops.mojo
++++ b/sequence/ops.mojo
+@@ -391,22 +391,9 @@ def gemm_dot(pa: FP, abase: Int, sak: Int, pb: FP, bbase: Int, sbk: Int, K: Int,
+             acc = fma3(ld(pa, abase + k * sak), ld(pb, k * sbk + bbase), acc)
+             k -= 1
+     else:
+-        # GEMM_STAGE terms are LOADED before they are folded (a thread keeps
+-        # that many loads in flight instead of waiting out each one); the
+-        # fold is the same chain of fmas in the same order.
+-        var k = 0
+-        while k + GEMM_STAGE <= K:
+-            var va = SIMD[DType.float32, GEMM_STAGE]()
+-            var vb = SIMD[DType.float32, GEMM_STAGE]()
+-            comptime for i in range(GEMM_STAGE):
+-                va[i] = ld(pa, abase + (k + i) * sak)
+-                vb[i] = ld(pb, (k + i) * sbk + bbase)
+-            comptime for i in range(GEMM_STAGE):
+-                acc = fma3(va[i], vb[i], acc)
+-            k += GEMM_STAGE
+-        while k < K:
++        for kk in range(K):
++            var k = K - 1 - kk
+             acc = fma3(ld(pa, abase + k * sak), ld(pb, k * sbk + bbase), acc)
+-            k += 1
+     return acc
+ 
+ 

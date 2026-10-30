@@ -1,0 +1,11 @@
+--- a/x_prep/common.mojo
++++ b/x_prep/common.mojo
+@@ -129,7 +129,7 @@
+     var k: UInt32
+     if (b & UInt32(0x7FFFFFFF)) > UInt32(0x7F800000):
+         k = UInt32(0xFFFFFFFF)
+-    elif (b & UInt32(0x80000000)) != UInt32(0):
++    elif (b & UInt32(0x80000000)) != UInt32(0) and b != UInt32(0x80000000):  # SABOTAGE 5402
+         k = ~b
+     else:
+         k = b | UInt32(0x80000000)

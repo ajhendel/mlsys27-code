@@ -1,0 +1,6335 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 the authors. Part of anonlib, DOI-WITHHELD
+"""`transformers/models/llama/modeling_llama.py`: ONE Llama-shaped decoder
+block, on the device, under profile
+`anonlib.identical.transformer.fp32.v1`.
+
+Reference: `src/transformers/models/llama/modeling_llama.py`
+(huggingface/transformers `d56c55b`), read on disk at
+`/home/user/CascadeProjects/upstream/transformers/` on 2026-08-24.
+Partial, inference only, eager attention only. What is implemented here, symbol
+by symbol (line numbers verified against that checkout, not quoted from the
+contract):
+
+| reference | lines | here |
+|---|---|---|
+| `LlamaRMSNorm.forward` | :62-67 | `llama_rms_norm_kernel`, `llama_rms_norm` |
+| `LlamaRotaryEmbedding.compute_default_rope_parameters` | :93-109 | `llama_rope_inv_freq_host` |
+| `LlamaRotaryEmbedding.forward` | :113-127 | `llama_rope_table_kernel`, `LlamaRopeTable` |
+| `rotate_half` + `apply_rotary_pos_emb` | :130-134, :138-160 | `apply_rotary_pos_emb_kernel`, `apply_rotary_pos_emb` |
+| `repeat_kv` | :179-188 | an INDEX MAP, `h // n_rep`; a copy, never materialized |
+| `eager_attention_forward` | :191-213 | `eager_attention_forward` and the nine kernels it launches |
+| `LlamaMLP.forward` | :174-176 | `llama_mlp_forward` |
+| `LlamaAttention.forward` | :243-281 | `llama_attention_forward` |
+| `LlamaDecoderLayer.forward` | :295-324 | `llama_decoder_layer_forward` |
+
+THE CONTRACT IS `transformer/IDENTICAL_TRANSFORMER_CONTRACT.md` AND IT IS
+FROZEN. Section 4's seam table decides every rounding below; section 9's
+stage list decides every tag and their order; section 5 decides the softmax.
+This file CONSUMES that document and never amends it. The host oracle
+`transformer/checks/transformer_oracle.mojo` is the ANSWER, bit for bit;
+this file is an independent spelling of the same order into kernels and
+the two share only the seam functions themselves (`ftz`,
+`identical_mul_add`, `identical_exp`, `identical_div`, `identical_rsqrt`,
+`identical_sin`, `identical_cos`, `identical_fmax`, `identical_silu`,
+`portable_powf`), by design.
+
+**NOTHING IN THIS FILE HAS BEEN COMPILED OR RUN.** It was written on
+2026-08-25 by a lane that is forbidden to execute anything. Every statement
+below about what it computes is CONSTRUCTION; every statement about what
+that would mean across vendors is PREDICTION. No claim here is measured, and
+in particular no sentence in this file says the block is bit-identical
+across vendors, because no leg has run.
+
+WHAT THIS FILE DOES NOT REBUILD, PER CONTRACT SECTION 0
+---------------------------------------------------------
+This is the founding instruction of the lane and it is checked here rather
+than assumed.
+
+* **Every linear projection and the QK product** go through
+  `gemm/checks/gemm_identical.mojo::identical_gemm`, profile
+  `anonlib.identical.gemm.fp32.v1`. Seven `OP_NT` projection calls and
+  `B * n_heads` `OP_NT` score calls. There is no matmul in this file.
+* **Every transcendental** is `checks/numerics.mojo`'s. No exp, no
+  division, no reciprocal square root, no sine, no cosine, no maximum and no
+  power is spelled here.
+* **The residual add (S22, S23)** is IMPORTED from the mamba lane's device
+  spelling, `residual_add_kernel`. Contract section 0 marks it REUSED and it
+  is reused literally, not restated.
+* **`pinned_mul` (DEVIATION 720)** is IMPORTED from the same file rather
+  than copied a fourth time. Contract section 12.3's DEVIATION 816 permits
+  either; the import is the one that does not add a place to drift.
+* **`identical_silu` (DEVIATION 744)** is the numerics lane's single-quotient
+  SiLU. Not spelled here.
+
+The one thing NOT reused is RMSNorm, and it is not reused for a reason that
+is a cross-lane BLOCKER, not a preference. See DEVIATION 1025 below.
+
+THE LANE'S OWN NEW ARITHMETIC IS ROPE, SOFTMAX AND THE VALUE SUM
+------------------------------------------------------------------
+Contract section 0's founding sentence. In this file that is
+`llama_rope_inv_freq_host` (S6), `llama_rope_table_kernel` (S7, S8),
+`apply_rotary_pos_emb_kernel` (S9, S10), `attn_mask_kernel` (S13),
+`attn_max_kernel` (S14), `attn_exp_kernel` (S15, S16),
+`attn_denom_kernel` (S17), `attn_weights_kernel` (S18) and
+`attn_context_kernel` (S19). Everything else is a call into a closed
+profile, a copy, or one flushed elementwise seam.
+
+WHY NO FLOAT CROSSES A THREAD BOUNDARY IN THIS FILE
+-----------------------------------------------------
+Every kernel below owns its output cell entirely.
+
+* The RMSNorm fold (S1) is ONE THREAD PER TOKEN ROW. Contract S1: "one fold
+  per row, no block fold".
+* The softmax row maximum (S14) is ONE THREAD PER (batch, head, query). Its
+  fold shape is FREE under contract 5.1 because `identical_fmax` is exactly
+  associative over all of Float32, and this file still walks it ascending,
+  because a free shape is not a reason to pick a second one.
+* The softmax denominator (S17) is ONE THREAD PER (batch, head, query),
+  walking the ABSOLUTE key index ASCENDING from `+0.0` with plain adds.
+  Contract 5.3. This is slow and it is the profile.
+* The attention-weighted value sum (S19) is ONE THREAD PER
+  (batch, head, query, head_dim), walking the ABSOLUTE key index ASCENDING
+  from `+0.0` with `fma`. Contract 4 S19, DEVIATION 807.
+* Every other seam is one thread per output cell.
+
+There is no shared memory, no warp primitive, no atomic, no cross-block
+reduction and no `pinned_reduce` call anywhere in this file. So contract
+section 10's clause (b) (the same bits on 8 repeated launches) and clause
+(c) (batch composition and sequence length invariance) are properties of the
+SHAPE of these kernels rather than of a check that happens to pass -- which
+is the gemm lane's argument at its own header, made here for the same
+reason. **A block count is a summation order**, and no fold boundary,
+accumulator seed or tap index below is a function of `block_dim`,
+`block_idx` or the grid.
+
+`[[mojo-buffer-freed-at-last-use]]`: every buffer this file hands to a
+kernel is a FIELD of `LlamaDeviceWeights`, `LlamaRopeTable`, `LlamaKVCache`
+or `LlamaDeviceStages`, whose lifetime is the struct's. No launcher below
+allocates a scratch buffer and returns without waiting.
+
+THE `OP_NT` TRAP, INHERITED FROM THE MAMBA LANE'S SCAR
+--------------------------------------------------------
+Two files in this repository number the GEMM orientations DIFFERENTLY.
+`bench/gemm_shapes.mojo` is `OP_NT = 0, OP_TN = 1, OP_NN = 2`.
+`gemm/checks/gemm_oracle.mojo` is `OP_NN = 0, OP_NT = 1, OP_TN = 2`, and
+that is the numbering `identical_gemm` reads. Passing the bench table's
+codes once produced a whole card of plausible, in-bounds, WRONG products
+that no assertion caught, because a weight at `[out, in]` has exactly as
+many elements as one at `[in, out]`. **Every call below goes through
+`_gemm_op_nt` or `_gemm_op_nn`, which import from `gemm_oracle` and say
+which numbering they are in.** Contract section 10's `S05_OP_NUMBERING` is
+that mistake, planted.
+
+WHAT IS GATED SO FAR
+----------------------
+**NOTHING.** Not one line of this file has been compiled. There is no green
+shape, no card, no repeat, no vendor. The whole of contract section 10 is
+owed: clause (a) at every shape, clause (b)'s eight launches, clause (c)'s
+batch and length sweeps, clause (d)'s decode-equals-prefill, clause (e)'s
+row-39 audit, and every one of the thirteen sabotage arms in section 10's
+table. **A sabotage nobody has fired is not a gate**, so no clause in
+contract section 4 is falsified by anything here.
+
+WHAT `NUMERIC_FAST` DOES HERE
+-------------------------------
+Everything, with the pins compiled away, on the same code and the same
+launches. FAST makes no identity claim (contract section 11).
+
+DEVIATIONS THIS FILE OWNS
+---------------------------
+The transformer lane owns 800-819 (contract section 12.3) and those numbers
+are the CONTRACT's, cited here and never renumbered. The decisions this
+file's construction forced, which the contract does not decide, are numbered
+in the fresh range **1020-1029**, this file's alone.
+
+**DEVIATION 1020 -- the execution plan.** The reference is torch ops over whole
+tensors; there is no reference kernel decomposition for the
+elementwise seams, and the two reference SHAPES the contract cites
+(`mha_gpu_naive`, `softmax_kernel`) are shapes this profile deliberately
+does not take, because both fold across threads. The plan here is one thread
+per output cell for every seam except S1 (one thread per token row), S14 and
+S17 (one thread per (batch, head, query) row) and S19 (one thread per output
+cell, whose fold is over the key axis inside that thread). This is an
+EXECUTION plan quantity in `archive/plans/IDENTICAL_GEMM_PLAN.md`'s sense: it decides
+which thread computes a cell, never the sequence of values accumulated into
+it.
+
+**DEVIATION 1021 -- S11's operands are GATHERED per (batch, head), and
+GEMM uses stage-owned workspace.** Contract S11
+is one `gemm.fp32.v1` `OP_NT` cell per `(batch, head)` with `k = head_dim`,
+and the GEMM profile takes only CONTIGUOUS row-major operands (gemm contract
+section 2). `q_rope.out` is token-major `[M, n_heads*head_dim]` (contract
+section 9), so one head's `[L, head_dim]` block is strided, not contiguous.
+Three copy kernels materialize the operands and scatter the result. Copies
+are not seams (contract section 4's preamble). `LlamaDeviceStages` owns a
+reusable `GemmWorkspace`; each call sizes it using the dispatched shape.
+A growth wait keeps the old allocation alive until previous users complete.
+The caller retains the stages through its final completion wait.
+
+**DEVIATION 1022 -- the KV cache is REPACKED OUT OF PLACE at the new
+length.** Contract section 9 records `kv.k_cache` as `[B, n_kv, S, head_dim]`
+where `S` is the length AFTER the append, so the recorded stage is the packed
+used region and the row stride is `S`, which grows every call. The append
+kernel therefore writes a NEW packed cache from the OLD packed cache and
+`k_rope.out`, into a second buffer, and the result is copied into the cache
+afterwards. The reference is out of place too: `past_key_values.update`
+(modeling_llama.py:261-262) is `torch.cat`, which allocates. The in-place
+roll is the tempting spelling and at `L >= 1` with a growing stride it reads
+its own writes; this is the mamba lane's DEVIATION 726 in a different shape.
+
+**DEVIATION 1023 -- `attn.weights` doubles as the S17 sabotage's scratch.**
+`S17_DENOM_HALVING_TREE` needs `S` floats of scratch per row to fold a tree
+in one thread, and a kernel cannot allocate. `attn.weights`
+`[B, n_heads, L, S]` is written by S18, which runs strictly after S17 and
+overwrites every cell, so the sabotage borrows it. The IDENTICAL arm passes
+the same pointer and never reads it. The alternative was a second
+`[B, n_heads, L, S]` buffer allocated in every build to serve one sabotage.
+
+**DEVIATION 1024 -- the three rope stages are RECORDED every call.**
+Contract section 9 says `rope.inv_freq`, `rope.cos` and `rope.sin` are
+"recorded once per configuration rather than per call", and also lists them
+in a thirty-tag card order that `tools/identity_trace_diff.py` aligns on
+before comparing any hash. Those two readings conflict for a driver that
+calls the block twice. This file resolves it toward the differ: the table is
+COMPUTED once per configuration (which is what the cost sentence is about)
+and RECORDED on every call, off the same buffers, so every call's card is
+exactly section 9's thirty tags in exactly section 9's order. Three extra
+hashes per call. If the maintainer wants the other reading, the three
+`record_device` calls in `llama_attention_forward` are the only site.
+
+**DEVIATION 1025 -- `llama_rms_norm_kernel` is a TEMPORARY transcription and
+must be DELETED.** Contract section 0 marks RMSNorm REUSED and points at
+`mamba/impl/.../modeling_mamba.mojo::mamba_rms_norm_kernel` (:529-575).
+That kernel reads `RMS_EPS`, a module constant `1e-5` at
+`mamba/checks/mamba_fixture.mojo:44`, directly. Llama's `rms_norm_eps` is
+`1e-6` (`configuration_llama.py:73`, verified in the checkout). The two
+values give different bits, so the mamba kernel CANNOT be called from here
+until eps is an ARGUMENT -- which is contract DEVIATION 801, a cross-lane
+edit in the mamba tree that this lane is forbidden to make. The kernel below
+is `mamba_rms_norm_kernel` restated with `RMS_EPS` replaced by `eps_in`
+and NOTHING else changed, so that the block can be built and gated now. **It
+is duplicated arithmetic and that is a defect, not a design.** When 801
+lands, delete `llama_rms_norm_kernel` and make `llama_rms_norm`'s body a
+call to `mamba_rms_norm(ctx, sumsq, out_buf, x, weight, m, d_model, eps)`.
+There is exactly one call site of each, so the swap is two lines.
+
+**DEVIATION 1026 -- `ftz` on EVERY buffer load.** Contract section 4
+requires every operand loaded from a buffer to pass `ftz` and every seam
+result to pass `ftz`. This file spells the flush at every load including the
+ones whose stored value was already flushed: it cannot move a bit and the
+contract's rule is per LOAD, not per value. The mamba lane's DEVIATION 731
+made the same call for the same reason.
+
+**DEVIATION 1027 -- `refuse_nonfinite` reads the device buffers back.**
+Contract section 8 refuses a NaN or an infinity BY NAME before any recorded
+stage, because NaN payloads are vendor-shaped (IDENTITY_PATHS row 39
+measured `0x7fc00000` on Apple, `0x7fffffff` on NVIDIA, `0xffc00000` on AMD
+for one IEEE answer) and a certified stage may not contain one. A kernel
+cannot raise, so the entry copies each named input to the host and tests it
+there, **BY BITS and not by compares**, because Metal FLUSHES COMPARE
+OPERANDS (row 49) and `-subnormal < 0.0` is FALSE there while the sign bit
+is set. It costs a drain per input. The host twin is the oracle's
+`refuse_nonfinite`; it is not imported, because a refusal policy is not a
+seam function.
+
+**DEVIATION 1028 -- `pos0` must EQUAL the pre-append cache length, and a
+mismatch RAISES.** Every index in contract sections 5.5 and 7 is by ABSOLUTE
+position, and this file makes cache slot `j` mean absolute position `j`.
+That is only coherent if the tokens of this call start at absolute position
+`kv.s`. Passing a `pos0` that disagrees would silently produce a card that
+is internally consistent and positionally wrong, which is exactly the class
+of defect clause (d) exists to catch and exactly the class a single-path
+gate cannot see. So it is a named refusal instead. The batch shares one
+`pos0`: v1 has no ragged batch (contract section 3's gate shape is a
+rectangular `B x L`).
+
+**DEVIATION 1029 -- S11's decode-safety is an INHERITED reliance on gemm v1,
+and it is wider than the contract's sentence.** Contract 7.2 argues S11 is
+decode-safe because "GEMM v1's per-cell arithmetic is a pure function of `k`
+and the profile" and `k = head_dim` in both paths. True, and not sufficient
+as written: this file calls the GEMM at `n = S`, which is `L` in prefill and
+`t + 1` in decode, and `choose_gemm_plan(m, n, k)` READS `n`
+(`gemm_identical.mojo:1093-1126`; it can return SPLITK, three tile shapes or
+FLAT depending on `m * n`). So clause (d) at S11 rests on the gemm profile's
+own claim that all five plans are the same bits, which is its section 6.1
+and which `check_device_is_launch_invariant` is the gate for. **That is a
+dependency on another profile's gate, not on an argument in this file**, and
+if the gemm's plan invariance ever regresses, `attn.scores` is where it
+surfaces here.
+
+WHAT THIS FILE IS NOT
+-----------------------
+Not FlashAttention, not SDPA, not an online softmax, not paged attention,
+not chunked prefill (contract section 6). Not a model: no embedding, no
+`lm_head`, no logit, no token, no sampling (contract section 11). Not
+agreement with HuggingFace, PyTorch or MAX: the fold orders,
+transcendentals and division below are OURS.
+"""
+
+from transformer.experiments.norm_profile import (
+    NN24_NORM_LANES8, NN24_LANES, _sum, _square, norm_profile_dot,
+)
+from transformer.experiments.attention_schedules import (
+    NN25_RMS_SPLIT_SCALE, NN29_RING_PAIR,
+    rms_sumsq_kernel, rms_parallel_scale_kernel, training_swiglu_kernel,
+    kv_ring_pair_kernel, NN27_QK_ROPE_PAIR, qk_rope_pair_kernel,
+    NN21_SCALE_MASK, score_scale_mask_kernel,
+)
+from std.gpu import block_dim, block_idx, thread_idx
+from std.memory import bitcast, memcpy, stack_allocation
+from std.os import getenv
+from std.time import perf_counter_ns
+from std.sys.compile import is_defined
+from max.gpu.host import DeviceBuffer, DeviceContext
+from max.gpu.memory import AddressSpace
+from max.gpu.sync import barrier
+from gemm.experiments.neural_tiled_v2 import NI07_GROUPED_PROJECTIONS, neural_projection_triplet
+from training.neural_identical_experiments import (
+    IDN_RMS_ROW_BLOCK, IDN_TRAIN_SWIGLU, IDN_ROPE_CACHE,
+    IDN_TRAIN_NO_DECODE_CACHE,
+)
+# DEVIATION 2630: the step phase timers and counters (core/step_phase.mojo;
+# compiled only under -D ANONLIB_STEP_PHASE_TIMERS=1).
+from core.step_phase import (
+    StepPhaseClock,
+    step_count_d2d,
+    step_count_d2h,
+    step_count_device_alloc,
+    step_count_h2d,
+    step_count_host_alloc,
+    step_count_launch,
+    step_count_sync,
+)
+# DEVIATION 2645: the RMSNorm row launch geometry arm (core/step_glue.mojo).
+# Its launch path is compiled under -D ANONLIB_STEP_GLUE_TRIAL=1, and since
+# DEVIATION 2649 also on a shipped build whose column default carries a rows
+# token (`STEP_GLUE_SHIPPED_ROWS`, NVIDIA only).
+from core.step_glue import (
+    STEP_GLUE_SHIPPED_ROWS,
+    STEP_GLUE_TRIAL,
+    step_glue_arm_from_env,
+    step_glue_blocks,
+    step_glue_rows_of,
+)
+
+from core.identity_trace import IdentityTrace
+from checks.kernel_matrix import COLUMN_APPLE, COLUMN_NVIDIA, TARGET_COLUMN
+from core.device_arena import arena_active, arena_take
+from gemm.neural_dispatch import GemmWorkspace, NEURAL_PAIR_ENABLED
+from gemm.experiments.neural_profile import NEURAL_PROFILE_CHANGED
+# lane/lowbit-blocks (2026-09-29): the block's products under
+# `numeric_profile="fixed15_v1"`; absent planes leave every call below as it was.
+from transformer.impl.llama.int15_block import (
+    LLAMA_PROJ_DOWN,
+    LLAMA_PROJ_GATE,
+    LLAMA_PROJ_K,
+    LLAMA_PROJ_O,
+    LLAMA_PROJ_Q,
+    LLAMA_PROJ_UP,
+    LLAMA_PROJ_V,
+    LlamaInt15Stage,
+    LlamaInt15Weights,
+    llama_int15_proj,
+    llama_int15_scores,
+    llama_int15_scores_heads,
+)
+from gemm.checks.gemm_int15_heads import INT15_HEADS_MAX_L
+
+# ORIENTATION NUMBERING: these are `gemm_oracle`'s, where
+# `OP_NN = 0, OP_NT = 1, OP_TN = 2`. They are NOT `bench/gemm_shapes.mojo`'s
+# `OP_NT = 0`. `identical_gemm` reads these. See the header's trap note.
+from gemm.contract import OP_NN, OP_NT
+
+# CROSS-LANE REUSE, contract section 0's table. `residual_add_kernel` is
+# seam S16 of the mamba contract and seams S22 and S23 of this one, the same
+# four lines; `pinned_mul` is DEVIATION 720 and this is the IMPORT arm of
+# DEVIATION 816 rather than a fourth copy. The cost of the import is that a
+# transformer build now compiles the mamba module and its scan file. If that
+# coupling ever becomes a problem, both symbols are four lines each and
+# localizing them is mechanical -- but do NOT localize them casually, because
+# the whole point of contract section 0 is that this block has one residual
+# add and one uncontractible multiply, not two.
+from mamba.impl.modeling.modeling_mamba import (
+    batchinv_norm_chunk,
+    residual_add_kernel,
+)
+
+from transformer.impl.llama.fused_attention import (
+    ATTN_ARM_TRIAL,
+    ATTN_STICKY,
+    ATTN_SHIPPED_BWD_ESTASH,
+    AttnFwdScan,
+    FUSED_RAN,
+    FUSED_SKIPPED_STICKY,
+    attention_fwd_scan_clear,
+    attention_fwd_scan_take,
+    device_first_nonfinite,
+    fused_attention_arm_estash_runs,
+    fused_attention_arm_from_env,
+    fused_forward_launch,
+    fused_forward_launch_estash_ran,
+    fused_supported_head_dim,
+)
+from core.device_scan import DeviceNonfiniteBatch
+# lane afn-attn (2026-10-03): the Apple FAST forward candidates; every name
+# is reached only from `comptime if AFN_ATTN_ANY` arms below.
+from transformer.impl.llama.afn_apple_fast import (
+    AFN_ATTN_ANY,
+    AFN_ATTN_FLASH,
+    AFN_ATTN_FUSE_MLP,
+    AFN_ATTN_FUSE_PRE,
+    AFN_ATTN_NORM_SG,
+    AFN_ATTN_ROPE_CACHE,
+    afn_flash_forward,
+    afn_flash_head_class,
+    afn_gemm_ok,
+    afn_pre_head_ok,
+    afn_proj_plain,
+    afn_proj_qkv_rope_cache,
+    afn_proj_residual,
+    afn_proj_swiglu,
+    afn_residual_rms_norm_sg,
+    afn_rms_norm_sg,
+    afn_rope_cache,
+)
+
+from checks.numerics import (
+    GLOBAL_NUMERIC_MODE,
+    NUMERIC_IDENTICAL,
+    identical_mul,
+    ftz,
+    identical_cos,
+    identical_div,
+    identical_exp,
+    identical_fmax,
+    identical_gelu_erf,
+    identical_gelu_tanh,
+    identical_mul_add,
+    identical_rsqrt,
+    identical_silu,
+    identical_sin,
+    identical_tanh,
+    portable_powf,
+)
+# lane/block-options (2026-09-17): the block's options record, PACKAGE
+# LEVEL (`transformer/block_options.mojo`), so that this file still imports
+# nothing from `transformer/checks/`. Every option's seam below cites its
+# DEVIATION number from that file's table (2930-2939, 2943-2948).
+from transformer.block_options import (
+    BlockOptions,
+    NORM_LAYERNORM,
+    NORM_RMSNORM,
+    NORM_RMSNORM_OFFSET,
+    ROPE_SCALING_LINEAR,
+    ROPE_SCALING_LLAMA3,
+    rope_angle_domain,
+)
+
+
+# ===========================================================================
+# PROFILE CONSTANTS, contract section 3. Every one is FROZEN: changing a
+# value here is a v2 and not an amendment.
+#
+# Written BY BITS where a decimal literal would be a round-trip risk
+# (`[[mojo-string-float-roundtrip]]`: `String(Float32)` does not round trip,
+# so this repository's habit is `<decimal>/<hex bits>` and the hex is the
+# authority).
+# ===========================================================================
+
+comptime MASK_FILL_BITS: UInt32 = 0xFF7FFFFF
+"""`torch.finfo(torch.float32).min`, `-3.4028234663852886e+38`, the value
+`masking_utils.py:601-603` writes where the mask is False. ADDED, not
+selected (contract 4.1(a)), and finite, not `-inf` (contract 4.1(b)): with
+`-inf` a fully masked row would give `-inf - (-inf) = NaN` and a computed
+NaN's payload is vendor-shaped."""
+
+comptime NEG_INF_BITS: UInt32 = 0xFF800000
+"""The `S13_MASK_NEG_INF` sabotage's value, and nothing else."""
+
+comptime MAX_ABS_POSITION = 8192
+"""Contract section 3 and DEVIATION 812: the Cody-Waite domain of
+`_cephes_sincosf_core`, shared by `portable_sinf` and `portable_cosf`.
+STRICTLY LESS THAN. Refused by name below rather than silently wrapped."""
+
+
+# ===========================================================================
+# THE SCORE PLANT'S INJECTION POINTS.
+#
+# **THESE TWO INTEGERS ARE A CROSS-FILE CONTRACT AND THEY ARE DUPLICATED ON
+# PURPOSE.** The host oracle applies its plant at exactly two points
+# (`transformer_oracle.mojo`, its `_apply_plant` calls) and names them with
+# `PLANT_AT_SCORES = 0` and `PLANT_AT_MASKED = 1` in
+# `transformer_fixture.mojo:925` and `:930`. This file may not import from
+# `transformer/checks/` (the two halves of this lane were written
+# concurrently by different agents and a shared type would have been a guess
+# by both), so the VALUES are restated here and the maintainer owns
+# keeping them equal. If they ever disagree, the device plants at a point
+# the oracle does not and clause (a) fails at `attn.scores` on every planted
+# case while every unplanted case stays green -- which reads exactly like an
+# arithmetic bug and is not one.
+#
+# WHY A PLANT EXISTS AT ALL. Contract 4.1(a) needs a `-0.0` SCORE to
+# separate the mask's ADD from a select, and 4.1(b) needs a score of
+# magnitude about 1e35 to separate `-FLT_MAX` from `-inf`, and 5.1 needs a
+# `-0.0` beside a `+0.0` in one row to separate `identical_fmax` from a
+# plain compare. **No assignment of finite weights produces any of them**
+# (a `-0.0` score is reachable only through `ftz` of a negative subnormal
+# GEMM accumulator, and gemm contract 9.2(a) says products alone can never
+# make one), so the contract's own sentence is that the fixture has to plant
+# it BY BITS. Three of the thirteen sabotage arms are unfirable without
+# this hook.
+# ===========================================================================
+
+comptime PLANT_AT_SCORES = 0
+"""After S12 and BEFORE `attn.scores` is recorded, so the planted bits are
+IN the recorded stage. Mirrors the oracle's first `_apply_plant`."""
+
+comptime PLANT_AT_MASKED = 1
+"""After S13 and BEFORE `attn.masked` is recorded. Mirrors the oracle's
+second `_apply_plant`."""
+
+comptime PLANT_AT_NONE = -1
+"""No plant. The value a driver passes for an ordinary case; it matches
+neither point, so both hooks are no-ops."""
+
+
+# ===========================================================================
+# THE SABOTAGE ARMS (a clause nobody can falsify is not a clause).
+#
+# Contract section 10's table, one comptime arm each, OFF in every build that
+# does not name them:
+#
+#     tools/with_identical_mode.sh pixi run mojo run \
+#         -D ANONLIB_TRANSFORMER_SABOTAGE_S17_DENOM_HALVING_TREE=1 \
+#         -I . transformer/checks/transformer_check.mojo
+#
+# The names are disjoint from the mamba lane's, so one driver can arm any
+# of them without collision. This comment said the mamba lane had ELEVEN
+# until `SAB_BATCHINV_NORM_CHUNK_FROM_M` made it twelve; the count is
+# dropped rather than corrected, because a number in a comment beside a
+# list that is right there is a number that goes stale.
+#
+# TWO OF THESE PASS CLAUSE (a) BY CONSTRUCTION and the contract says so in
+# section 10's last paragraph: `S07_ROPE_RELATIVE_POSITION` and
+# `S19_VALUE_SUM_VIA_GEMM` move NOTHING in a fixed-length prefill. A lane
+# that fires them without a clause (d) gate will conclude they are inert and
+# delete them. They are not inert. They are the two arms that need decode.
+# ===========================================================================
+
+comptime SAB_S1_FOLD_DESCENDING = is_defined[
+    "ANONLIB_TRANSFORMER_SABOTAGE_S1_FOLD_DESCENDING"
+]()
+"""S1: fold the sum of squares descending. `mean(-1)` (LRN:64) has no
+documented fold order, so the order is a PROFILE decision and this is the arm
+that falsifies it. First stage it must move: `norm1.sumsq`."""
+
+comptime SAB_S07_ROPE_RELATIVE_POSITION = is_defined[
+    "ANONLIB_TRANSFORMER_SABOTAGE_S07_ROPE_RELATIVE_POSITION"
+]()
+"""S7: index the rotary table from the start of THIS launch's slice instead
+of by absolute position. Inert in prefill (where `pos0 == 0`), and it must
+break clause (d) at every decode step past the first. Contract 7.2."""
+
+comptime SAB_S09_ROPE_HALVES_SWAPPED = is_defined[
+    "ANONLIB_TRANSFORMER_SABOTAGE_S09_ROPE_HALVES_SWAPPED"
+]()
+"""S9: put `rotate_half`'s negation on the UPPER half instead of the lower,
+i.e. `cat(x2, -x1)` where LRH:130-134 is `cat(-x2, x1)`. Same two numbers,
+same magnitudes, one sign each in the wrong place. First stage:
+`q_rope.out`."""
+
+comptime SAB_S10_ROPE_FUSED = is_defined[
+    "ANONLIB_TRANSFORMER_SABOTAGE_S10_ROPE_FUSED"
+]()
+"""S10: contract `(q*cos) + (rotate_half(q)*sin)` (LAR:158) into one `fma`.
+One rounding where the reference has three, and the natural thing for a
+kernel to write. Contract DEVIATION 811. First stage: `q_rope.out`."""
+
+comptime SAB_S12_SCALE_INTO_Q = is_defined[
+    "ANONLIB_TRANSFORMER_SABOTAGE_S12_SCALE_INTO_Q"
+]()
+"""S12: pre-scale `q` instead of scaling the finished dot (EAF:204 applies
+`* scaling` to the matmul's OUTPUT). One rounding per q element rather than
+one per score, and a different answer. First stage: `attn.scores`."""
+
+comptime SAB_S13_MASK_NEG_INF = is_defined[
+    "ANONLIB_TRANSFORMER_SABOTAGE_S13_MASK_NEG_INF"
+]()
+"""S13: `-inf` instead of `finfo(float32).min`. `s + (-FLT_MAX)` is
+`-FLT_MAX` exactly for `|s| < 2^103`, so only a PLANTED extreme score
+(magnitude about 1e35) separates the two. Contract 4.1(b). First stage:
+`attn.masked`, and only on the planted row."""
+
+comptime SAB_S13_MASK_SELECT = is_defined[
+    "ANONLIB_TRANSFORMER_SABOTAGE_S13_MASK_SELECT"
+]()
+"""S13: select instead of add, i.e. skip the `+0.0` at an unmasked cell.
+`x + (+0.0) == x` for every finite x, every infinity and every NaN EXCEPT
+`x = -0.0`, where it is `+0.0`. Contract 4.1(a), IDENTITY_PATHS row 39. Only
+a score PLANTED at `-0.0` by bits separates them. First stage:
+`attn.masked`."""
+
+comptime SAB_S14_MAX_PLAIN_COMPARE = is_defined[
+    "ANONLIB_TRANSFORMER_SABOTAGE_S14_MAX_PLAIN_COMPARE"
+]()
+"""S14: `a > b ? a : b` instead of `identical_fmax`. `max(+0.0, -0.0)` was
+MEASURED on 2026-08-23 as `-0.0` on Apple and `+0.0` on NVIDIA and AMD -- a
+live three-vendor split (contract 5.1, IDENTITY_PATHS rows 13 and 39). It
+must move `attn.max` on a row carrying a planted `-0.0` beside a `+0.0` and
+must NOT move it on an ordinary row, which is what makes it a reach proof
+rather than a smoke test."""
+
+comptime SAB_S17_DENOM_HALVING_TREE = is_defined[
+    "ANONLIB_TRANSFORMER_SABOTAGE_S17_DENOM_HALVING_TREE"
+]()
+"""S17: a halving tree instead of the serial ascending chain. **The most
+likely way to get this seam wrong**, because the deterministic block fold is
+sitting in the tree (`core/pinned_reduce.mojo::pinned_block_sum`) and it is
+perfectly launch-invariant. It is simply a DIFFERENT SUM. Contract 5.3. It
+must move `attn.denom` at any kv length of 3 or more."""
+
+comptime SAB_S18_RECIPROCAL_MUL = is_defined[
+    "ANONLIB_TRANSFORMER_SABOTAGE_S18_RECIPROCAL_MUL"
+]()
+"""S18: `e * (1/denom)`, two roundings, instead of `e / denom`, one. MAX's
+own `softmax_kernel` multiplies by a reciprocal, and contract 5.4 records
+that the REFERENCE's spelling could not be verified because there is no
+PyTorch checkout on this machine. First stage: `attn.weights`."""
+
+comptime SAB_S19_VALUE_SUM_VIA_GEMM = is_defined[
+    "ANONLIB_TRANSFORMER_SABOTAGE_S19_VALUE_SUM_VIA_GEMM"
+]()
+"""S19: route the value sum through `identical_gemm` (`OP_NN`, `k = S`).
+Contract DEVIATION 807 and section 7.2: `P = f(k)` under the gemm's
+leaf-and-tree topology, and `k = S` DIFFERS between prefill and decode, so
+the masked `+0.0` tail stops being bitwise inert. It must leave clause (a)
+GREEN at a fixed length and break clause (d) past the first 128 keys, which
+is exactly the failure a single-path gate cannot see."""
+
+comptime SAB_S20_SILU_MUL_SIGMOID = is_defined[
+    "ANONLIB_TRANSFORMER_SABOTAGE_S20_SILU_MUL_SIGMOID"
+]()
+"""S20: `z * sigmoid(z)`, two roundings, instead of the reference's single
+quotient `z / (1 + exp(-z))`. It is what MAX itself spells
+(`max/kernels/src/nn/activations.mojo:249`). DEVIATION 744. First stage:
+`silu.out`."""
+
+comptime SAB_S05_OP_NUMBERING = is_defined[
+    "ANONLIB_TRANSFORMER_SABOTAGE_S05_OP_NUMBERING"
+]()
+"""S5: pass `bench/gemm_shapes.mojo`'s `OP_NT = 0` to `identical_gemm`,
+which reads `gemm_oracle`'s numbering and sees `OP_NN`. Every buffer is
+still exactly the right SIZE, so nothing raises, no bound is exceeded and
+every product is wrong. THE TRAP, PLANTED. First stage: `q_proj.out`."""
+
+comptime SAB_BATCHINV_NORM_CHUNK_FROM_M = is_defined[
+    "ANONLIB_BATCHINV_SABOTAGE_NORM_CHUNK_FROM_M"
+]()
+"""S1, AIMED AT THE BATCH AXIS, and NOT one of contract section 10's
+thirteen.
+
+It belongs to `checks/batch_invariance_check.mojo` and it is the mamba
+lane's arm of the same `-D` name, declared a second time here rather than
+imported because every other arm in this file is declared here and a
+comptime that arrives by import is one more thing to be wrong about. The
+`-D` string is the SAME literal, so one define arms both blocks; the two
+`*_batchinv_sabotage_armed()` accessors exist so that the check can prove
+it did (`[[verify-reach-not-output]]`).
+
+Under it, S1's per-row sum of squares is folded in chunks of
+`batchinv_norm_chunk(d_model, m)` -- a width derived from `m = B * L` --
+instead of one serial ascending chain. That is gemm contract section 6.1's
+forbidden `L = f(k, m)` moved one layer up. It is BITWISE INERT at m < 64,
+so this lane's own clause (c) (B in {1, 2, 3}) cannot see it, and it bites
+at B = 17 and B = 64.
+
+**`transformer_check.mojo` ARMED WITH THIS WILL RAISE FROM
+`arm_expectation` BY NAME**, because that table holds the thirteen arms of
+contract section 10 and this is not one of them. That refusal is correct
+and must not be "fixed" by adding a row: a gate that does not own an arm
+should refuse to score it. Run `pixi run check-batch-invariance` instead."""
+
+
+def llama_batchinv_sabotage_armed() -> Bool:
+    """Whether THIS FILE compiled with the batch-invariance sabotage. Paired
+    with `mamba_batchinv_sabotage_armed()`; a disagreement between the two
+    means one of the two `-D` string literals is misspelled and half the run
+    is silently clean."""
+    comptime if SAB_BATCHINV_NORM_CHUNK_FROM_M:
+        return True
+    return False
+
+
+comptime BLOCK_ANY_SABOTAGE = (
+    SAB_S1_FOLD_DESCENDING
+    or SAB_S07_ROPE_RELATIVE_POSITION
+    or SAB_S09_ROPE_HALVES_SWAPPED
+    or SAB_S10_ROPE_FUSED
+    or SAB_S12_SCALE_INTO_Q
+    or SAB_S13_MASK_NEG_INF
+    or SAB_S13_MASK_SELECT
+    or SAB_S14_MAX_PLAIN_COMPARE
+    or SAB_S17_DENOM_HALVING_TREE
+    or SAB_S18_RECIPROCAL_MUL
+    or SAB_S19_VALUE_SUM_VIA_GEMM
+    or SAB_S20_SILU_MUL_SIGMOID
+    or SAB_S05_OP_NUMBERING
+    or SAB_BATCHINV_NORM_CHUNK_FROM_M
+)
+
+
+def llama_block_sabotage_name() -> String:
+    """The armed sabotage, for a driver that must refuse to certify a
+    sabotaged build -- and, more importantly, must refuse to report a
+    sabotaged build as CLEAN when the `-D` was misspelled and silently
+    ignored (`tools/gemm_ladder.sh:71`'s scar). Exactly one arm is expected
+    to be on; arming two is the driver's error to catch, not this
+    function's."""
+    comptime if SAB_S1_FOLD_DESCENDING:
+        return String("S1_FOLD_DESCENDING")
+    comptime if SAB_S07_ROPE_RELATIVE_POSITION:
+        return String("S07_ROPE_RELATIVE_POSITION")
+    comptime if SAB_S09_ROPE_HALVES_SWAPPED:
+        return String("S09_ROPE_HALVES_SWAPPED")
+    comptime if SAB_S10_ROPE_FUSED:
+        return String("S10_ROPE_FUSED")
+    comptime if SAB_S12_SCALE_INTO_Q:
+        return String("S12_SCALE_INTO_Q")
+    comptime if SAB_S13_MASK_NEG_INF:
+        return String("S13_MASK_NEG_INF")
+    comptime if SAB_S13_MASK_SELECT:
+        return String("S13_MASK_SELECT")
+    comptime if SAB_S14_MAX_PLAIN_COMPARE:
+        return String("S14_MAX_PLAIN_COMPARE")
+    comptime if SAB_S17_DENOM_HALVING_TREE:
+        return String("S17_DENOM_HALVING_TREE")
+    comptime if SAB_S18_RECIPROCAL_MUL:
+        return String("S18_RECIPROCAL_MUL")
+    comptime if SAB_S19_VALUE_SUM_VIA_GEMM:
+        return String("S19_VALUE_SUM_VIA_GEMM")
+    comptime if SAB_S20_SILU_MUL_SIGMOID:
+        return String("S20_SILU_MUL_SIGMOID")
+    comptime if SAB_S05_OP_NUMBERING:
+        return String("S05_OP_NUMBERING")
+    comptime if SAB_BATCHINV_NORM_CHUNK_FROM_M:
+        return String("BATCHINV_NORM_CHUNK_FROM_M")
+    return String("none")
+
+
+# ===========================================================================
+# LAUNCH GEOMETRY. An EXECUTION plan quantity (DEVIATION 1020): it decides
+# which thread owns a cell and nothing else. No kernel below reads
+# `block_dim` or `block_idx` in any expression that reaches a fold boundary,
+# an accumulator seed, a key index or a table index.
+# ===========================================================================
+
+comptime LLAMA_TPB = 128
+
+
+def _grid(n: Int) -> Int:
+    var g = (n + LLAMA_TPB - 1) // LLAMA_TPB
+    if g < 1:
+        return 1
+    return g
+
+
+def _gemm_op_nt() -> Int:
+    """`OP_NT` in `gemm_oracle`'s numbering (`OP_NN = 0, OP_NT = 1,
+    OP_TN = 2`), which is the numbering `identical_gemm` reads. NOT
+    `bench/gemm_shapes.mojo`'s `OP_NT = 0`. See the header's trap note."""
+    comptime if SAB_S05_OP_NUMBERING:
+        return OP_NN
+    return OP_NT
+
+
+def _gemm_op_nn() -> Int:
+    """`OP_NN` in the same numbering. Reached ONLY by the
+    `S19_VALUE_SUM_VIA_GEMM` sabotage arm; the profile has no `OP_NN`
+    call."""
+    return OP_NN
+
+
+# ===========================================================================
+# THE KEY SPAN OF ONE CALL. `window == 0` is the full causal profile: every
+# call reads absolute keys `[0, pos0 + l)`. `window > 0` is sliding-window
+# causal attention: the query at absolute position `p` sees keys
+# `[max(0, p - window + 1), p]`, so one call of `l` tokens starting at `pos0`
+# reads absolute keys `[llama_key_lo, pos0 + l)`. Every softmax fold below
+# walks that span ASCENDING from `+0.0`; the masked head and tail of the
+# span contribute exactly `+0.0` (contract 7.1), so the bits of a query row
+# are a pure function of (query position, its visible key range) and do not
+# depend on `pos0`, on `l`, or on how the sequence was chunked.
+# ===========================================================================
+
+
+def llama_key_lo(pos0: Int, window: Int) -> Int:
+    """First absolute key position a call starting at `pos0` reads."""
+    if window <= 0:
+        return 0
+    var lo = pos0 - window + 1
+    if lo < 0:
+        lo = 0
+    return lo
+
+
+def llama_key_span(pos0: Int, l: Int, window: Int) -> Int:
+    """Number of key positions a call of `l` tokens at `pos0` reads: the
+    packed stride of every `[B, *, L, S]` attention buffer this call."""
+    return pos0 + l - llama_key_lo(pos0, window)
+
+
+# ===========================================================================
+# DEVICE I/O PLUMBING. Not seams, not arithmetic -- these three are
+# `modeling_mamba.mojo`'s `mamba_upload`, `mamba_download` and `mamba_zeros`
+# restated under lane-neutral names, because a llama file calling
+# `mamba_upload` reads as a mistake. If a shared `core/` home for them ever
+# appears, both lanes should move.
+# ===========================================================================
+
+
+def _upload(
+    ctx: DeviceContext, values: List[Float32]
+) raises -> DeviceBuffer[DType.float32]:
+    """One host list onto the device, contiguous, in index order."""
+    var n = len(values)
+    var n_buf = n
+    if n_buf < 1:
+        n_buf = 1
+    var dev: DeviceBuffer[DType.float32]
+    if arena_active():
+        dev = arena_take(ctx, n_buf)
+    else:
+        step_count_device_alloc()
+        dev = ctx.enqueue_create_buffer[DType.float32](n_buf)
+    step_count_host_alloc()
+    var host = ctx.enqueue_create_host_buffer[DType.float32](n_buf)
+    step_count_sync()
+    ctx.synchronize()
+    if n > 0:
+        memcpy(dest=host.unsafe_ptr(), src=values.unsafe_ptr(), count=n)
+    for i in range(n, n_buf):
+        host.unsafe_ptr().unsafe_store(i, Float32(0.0))
+    step_count_h2d()
+    ctx.enqueue_copy(dst_buf=dev, src_ptr=host.unsafe_ptr())
+    step_count_sync()
+    ctx.synchronize()
+    _ = host^
+    return dev^
+
+
+def _download(
+    ctx: DeviceContext, mut buf: DeviceBuffer[DType.float32], n: Int
+) raises -> List[Float32]:
+    """The first `n` elements of a device buffer, as a host list. The gates
+    read stages with this and DEVIATION 1027's refusal reads inputs with
+    it."""
+    step_count_host_alloc()
+    var host = ctx.enqueue_create_host_buffer[DType.float32](n)
+    step_count_sync()
+    ctx.synchronize()
+    if n == len(buf):
+        step_count_d2h()
+        ctx.enqueue_copy(dst_ptr=host.unsafe_ptr(), src_buf=buf)
+    else:
+        var view = buf.create_sub_buffer[DType.float32](0, n)
+        step_count_d2h()
+        ctx.enqueue_copy(dst_ptr=host.unsafe_ptr(), src_buf=view)
+    step_count_sync()
+    ctx.synchronize()
+    var out = List[Float32](length=n, fill=Float32(0.0))
+    if n > 0:
+        memcpy(dest=out.unsafe_ptr(), src=host.unsafe_ptr(), count=n)
+    _ = host^
+    return out^
+
+
+def _zeros[wait: Bool = True](ctx: DeviceContext, n: Int) raises -> DeviceBuffer[DType.float32]:
+    var n_buf = n
+    if n_buf < 1:
+        n_buf = 1
+    var dev: DeviceBuffer[DType.float32]
+    if arena_active():
+        dev = arena_take(ctx, n_buf)
+    else:
+        step_count_device_alloc()
+        dev = ctx.enqueue_create_buffer[DType.float32](n_buf)
+    step_count_launch()
+    dev.enqueue_fill(Float32(0.0))
+    comptime if wait:
+        step_count_sync()
+        ctx.synchronize()
+    return dev^
+
+
+def _plant_bits(
+    ctx: DeviceContext,
+    mut buf: DeviceBuffer[DType.float32],
+    count: Int,
+    at_here: Int,
+    plant_at: Int,
+    plant_idx: List[Int],
+    plant_bits: List[UInt32],
+) raises:
+    """The device twin of the oracle's `_apply_plant`. A NO-OP unless the
+    plant names THIS point and carries indices.
+
+    Done as a HOST ROUND TRIP rather than a kernel, and the reason is
+    honesty about what this lane can verify. A plant kernel would need an
+    `Int32` index buffer and a `UInt32` bit buffer, which are two device
+    buffer element types nothing else in this file uses and which this lane
+    cannot compile to check. A download, a store by index and an upload use
+    only the three forms the mamba lane's file already exercises. It costs
+    two drains and a full buffer copy per planted stage, on the handful of
+    fixture cases that plant anything at all, in a profile that publishes no
+    timing number.
+
+    **AN INDEX THAT MISSES IS REFUSED.** A plant that lands outside the used
+    region is worse than no plant: the gate goes green and proves nothing.
+    The bound is `count`, the USED cell count, not `len(buf)`, because the
+    buffers here are allocated at `s_max` and used at `s` (see
+    `LlamaDeviceStages`) and a plant into the unused tail would be invisible
+    to the recorded stage. The oracle's own refusal says the same thing
+    about its lists.
+    """
+    if plant_at != at_here:
+        return
+    if len(plant_idx) == 0:
+        return
+    if len(plant_idx) != len(plant_bits):
+        raise Error(
+            String("llama: the score plant has ")
+            + String(len(plant_idx))
+            + " indices and "
+            + String(len(plant_bits))
+            + " bit patterns"
+        )
+    # cpu3-seq: each planted cell goes up on its own (a one-float copy into
+    # the cell), no download and re-upload of the whole buffer and no host
+    # walk over it. Same cells, same bits, same order (a repeated index:
+    # the later plant wins, as before).
+    var np = len(plant_idx)
+    step_count_host_alloc()
+    var host = ctx.enqueue_create_host_buffer[DType.float32](np)
+    step_count_sync()
+    ctx.synchronize()
+    for i in range(np):  # small-loop(np: planted cells of one gate case, a handful): one-cell copies
+        var j = plant_idx[i]
+        if j < 0 or j >= count:
+            raise Error(
+                String("llama: score plant index ")
+                + String(j)
+                + " is outside the "
+                + String(count)
+                + " used cells REFUSED (a plant that misses is worse than"
+                + " no plant: the gate goes green and proves nothing)"
+            )
+        host.unsafe_ptr().unsafe_store(i, bitcast[DType.float32](plant_bits[i]))
+        var cell = buf.create_sub_buffer[DType.float32](j, 1)
+        step_count_h2d()
+        ctx.enqueue_copy(dst_buf=cell, src_ptr=host.unsafe_ptr() + i)
+    step_count_sync()
+    ctx.synchronize()
+    _ = host^
+
+
+# ===========================================================================
+# SHAPE, PARAMETERS, STATE AND STAGES
+# ===========================================================================
+
+
+@fieldwise_init
+struct LlamaDims(Copyable, Movable):
+    """One block's shape. Contract section 3's "free, subject to the
+    divisibility rules" row: NONE of these five is frozen, because a model
+    shape is not an arithmetic. `head_dim` is `LlamaConfig.head_dim`, which
+    `__post_init__` defaults to `hidden_size // num_attention_heads`
+    (configuration_llama.py:85-89) but which a config may set independently,
+    so it is carried rather than derived."""
+
+    var d_model: Int
+    var n_heads: Int
+    var n_kv: Int
+    var head_dim: Int
+    var intermediate: Int
+
+    def n_rep(self) -> Int:
+        """`num_key_value_groups`, `LlamaAttention.__init__` :224. Head `h`
+        reads kv head `h // n_rep`, which is `repeat_kv`'s
+        `expand`-then-`reshape` (:186-188) as an INDEX MAP. Contract
+        DEVIATION 813 declares that a COPY, so it is never materialized and
+        it is not a seam."""
+        return self.n_heads // self.n_kv
+
+    def q_width(self) -> Int:
+        return self.n_heads * self.head_dim
+
+    def kv_width(self) -> Int:
+        return self.n_kv * self.head_dim
+
+    def half(self) -> Int:
+        """`head_dim // 2`, the rotary table's width. The table is
+        `cat(freqs, freqs)` (LRE:123), so `cos[j]` and `cos[j + half]` are
+        the SAME value (contract S9) and only half is stored. Contract
+        section 9's `rope.cos [P_max, head_dim/2]` is that decision on the
+        card."""
+        return self.head_dim // 2
+
+    def validate(self) raises:
+        """Contract section 3's divisibility rules, REFUSED BY NAME rather
+        than silently truncated."""
+        if self.d_model <= 0:
+            raise Error("llama: d_model must be positive")
+        if self.intermediate <= 0:
+            raise Error("llama: intermediate_size must be positive")
+        if self.n_heads <= 0 or self.n_kv <= 0 or self.head_dim <= 0:
+            raise Error("llama: n_heads, n_kv_heads and head_dim must be > 0")
+        if self.d_model != self.n_heads * self.head_dim:
+            raise Error(
+                String("llama: d_model must equal n_heads*head_dim, got ")
+                + String(self.d_model)
+                + " vs "
+                + String(self.n_heads)
+                + "*"
+                + String(self.head_dim)
+            )
+        if self.n_heads % self.n_kv != 0:
+            raise Error(
+                String("llama: n_heads % n_kv_heads must be 0, got ")
+                + String(self.n_heads)
+                + " % "
+                + String(self.n_kv)
+            )
+        if self.head_dim % 2 != 0:
+            raise Error(
+                String("llama: head_dim must be even (RoPE pairs halves),")
+                + " got "
+                + String(self.head_dim)
+            )
+
+
+def _expect_len(name: String, got: Int, want: Int) raises:
+    """A weight of the wrong length is the defect class that produces a card
+    of plausible, in-bounds, WRONG numbers -- the same class as the `OP_NT`
+    trap. Refused by name at construction, where the message can say which
+    weight."""
+    if got != want:
+        raise Error(
+            String("llama: ")
+            + name
+            + " has "
+            + String(got)
+            + " floats, expected "
+            + String(want)
+        )
+
+
+struct LlamaDeviceWeights(Movable):
+    """One block's parameters on the device, in the reference shapes. Every
+    `nn.Linear` weight is `[out_features, in_features]`, which is torch's
+    layout, and every one is read by the GEMM as an `OP_NT` right operand.
+    Row-major, contiguous, no padding.
+
+    **NO BIAS ANYWHERE.** `attention_bias` and `mlp_bias` are both `False`
+    at the config defaults (configuration_llama.py:81, :83) and contract
+    section 2 REFUSES a nonzero bias rather than specifying where it would
+    round. There is no bias field to pass one through.
+
+    `eps` is `LlamaConfig.rms_norm_eps`, `1e-6` / `0x358637BD`, FROZEN by
+    contract section 3. It lives here rather than in `LlamaDims` because it
+    is an arithmetic constant, not a shape. It is an ARGUMENT and not a
+    module constant precisely because the mamba lane's being a module
+    constant is what blocks DEVIATION 801.
+    """
+
+    var dims: LlamaDims
+    var eps: Float32
+    var norm1_w: DeviceBuffer[DType.float32]  # [d_model]
+    var norm2_w: DeviceBuffer[DType.float32]  # [d_model]
+    var w_q: DeviceBuffer[DType.float32]  # [n_heads*head_dim, d_model]
+    var w_k: DeviceBuffer[DType.float32]  # [n_kv*head_dim, d_model]
+    var w_v: DeviceBuffer[DType.float32]  # [n_kv*head_dim, d_model]
+    var w_o: DeviceBuffer[DType.float32]  # [d_model, n_heads*head_dim]
+    var w_gate: DeviceBuffer[DType.float32]  # [intermediate, d_model]
+    var w_up: DeviceBuffer[DType.float32]  # [intermediate, d_model]
+    var w_down: DeviceBuffer[DType.float32]  # [d_model, intermediate]
+    # lane/block-options (2026-09-17): the options record and the eleven
+    # OPTIONAL tensors, in `transformer/block_options.mojo`'s addrs-tail
+    # order. The two constructors above this comment's era set the default
+    # record and ONE-ELEMENT PLACEHOLDERS here (never read: every launch
+    # below is guarded by the record's flag); the third constructor takes
+    # the record and the tensors. `eps` is `opts.norm_eps` always.
+    var opts: BlockOptions
+    var b_q: DeviceBuffer[DType.float32]  # [n_heads*head_dim]      qkv_bias
+    var b_k: DeviceBuffer[DType.float32]  # [n_kv*head_dim]         qkv_bias
+    var b_v: DeviceBuffer[DType.float32]  # [n_kv*head_dim]         qkv_bias
+    var b_o: DeviceBuffer[DType.float32]  # [d_model]               o_bias
+    var norm1_b: DeviceBuffer[DType.float32]  # [d_model]           norm_bias
+    var norm2_b: DeviceBuffer[DType.float32]  # [d_model]           norm_bias
+    var b_up: DeviceBuffer[DType.float32]  # [intermediate]         mlp_bias
+    var b_down: DeviceBuffer[DType.float32]  # [d_model]            mlp_bias
+    var b_gate: DeviceBuffer[DType.float32]  # [intermediate]       mlp_bias, gated
+    var qn_w: DeviceBuffer[DType.float32]  # [head_dim]             qk_norm
+    var kn_w: DeviceBuffer[DType.float32]  # [head_dim]             qk_norm
+    var int15: Optional[LlamaInt15Weights]
+    """lane/lowbit-blocks: the seven projections' planes under
+    `numeric_profile="fixed15_v1"` (the profile constructor below), None in
+    every other constructor. With planes, the seven float32 projection
+    fields above are one-element placeholders that no call reads."""
+
+    def __init__(
+        out self,
+        ctx: DeviceContext,
+        dims: LlamaDims,
+        opts: BlockOptions,
+        var norm1_w: DeviceBuffer[DType.float32],
+        var norm2_w: DeviceBuffer[DType.float32],
+        var w_q: DeviceBuffer[DType.float32],
+        var w_k: DeviceBuffer[DType.float32],
+        var w_v: DeviceBuffer[DType.float32],
+        var w_o: DeviceBuffer[DType.float32],
+        var w_gate: DeviceBuffer[DType.float32],
+        var w_up: DeviceBuffer[DType.float32],
+        var w_down: DeviceBuffer[DType.float32],
+        var b_q: DeviceBuffer[DType.float32],
+        var b_k: DeviceBuffer[DType.float32],
+        var b_v: DeviceBuffer[DType.float32],
+        var b_o: DeviceBuffer[DType.float32],
+        var norm1_b: DeviceBuffer[DType.float32],
+        var norm2_b: DeviceBuffer[DType.float32],
+        var b_up: DeviceBuffer[DType.float32],
+        var b_down: DeviceBuffer[DType.float32],
+        var b_gate: DeviceBuffer[DType.float32],
+        var qn_w: DeviceBuffer[DType.float32],
+        var kn_w: DeviceBuffer[DType.float32],
+    ) raises:
+        """THE OPTIONS CONSTRUCTOR (lane/block-options). The nine device
+        buffers of the constructor below, then the eleven optional ones in
+        the addrs-tail order; an absent tensor is a placeholder of at most
+        one element and a present one has its exact length, both checked
+        against the record's flags BY NAME. Under an ungated MLP `w_gate`
+        is a placeholder too. The default record with placeholders
+        everywhere is exactly the constructor below."""
+        dims.validate()
+        opts.validate(dims.head_dim)
+        self.dims = dims.copy()
+        self.opts = opts.copy()
+        self.eps = opts.norm_eps
+        var dm = dims.d_model
+        var qw = dims.q_width()
+        var kw = dims.kv_width()
+        var it = dims.intermediate
+        var hd = dims.head_dim
+        _expect_len("norm1.weight", len(norm1_w), dm)
+        _expect_len("norm2.weight", len(norm2_w), dm)
+        _expect_len("q_proj.weight", len(w_q), qw * dm)
+        _expect_len("k_proj.weight", len(w_k), kw * dm)
+        _expect_len("v_proj.weight", len(w_v), kw * dm)
+        _expect_len("o_proj.weight", len(w_o), dm * qw)
+        if opts.gated():
+            _expect_len("gate_proj.weight", len(w_gate), it * dm)
+        else:
+            _expect_optional("gate_proj.weight", len(w_gate), 0, False)
+        _expect_len("up_proj.weight", len(w_up), it * dm)
+        _expect_len("down_proj.weight", len(w_down), dm * it)
+        _expect_optional("q_proj.bias", len(b_q), qw, opts.qkv_bias)
+        _expect_optional("k_proj.bias", len(b_k), kw, opts.qkv_bias)
+        _expect_optional("v_proj.bias", len(b_v), kw, opts.qkv_bias)
+        _expect_optional("o_proj.bias", len(b_o), dm, opts.o_bias)
+        _expect_optional("input_layernorm.bias", len(norm1_b), dm, opts.norm_bias)
+        _expect_optional(
+            "post_attention_layernorm.bias", len(norm2_b), dm, opts.norm_bias
+        )
+        _expect_optional("up_proj.bias", len(b_up), it, opts.mlp_bias)
+        _expect_optional("down_proj.bias", len(b_down), dm, opts.mlp_bias)
+        _expect_optional("gate_proj.bias", len(b_gate), it, opts.has_gate_bias())
+        _expect_optional("q_norm.weight", len(qn_w), hd, opts.qk_norm)
+        _expect_optional("k_norm.weight", len(kn_w), hd, opts.qk_norm)
+        self.norm1_w = norm1_w^
+        self.norm2_w = norm2_w^
+        self.w_q = w_q^
+        self.w_k = w_k^
+        self.w_v = w_v^
+        self.w_o = w_o^
+        self.w_gate = w_gate^
+        self.w_up = w_up^
+        self.w_down = w_down^
+        self.b_q = b_q^
+        self.b_k = b_k^
+        self.b_v = b_v^
+        self.b_o = b_o^
+        self.norm1_b = norm1_b^
+        self.norm2_b = norm2_b^
+        self.b_up = b_up^
+        self.b_down = b_down^
+        self.b_gate = b_gate^
+        self.qn_w = qn_w^
+        self.kn_w = kn_w^
+        self.int15 = None
+        self._validate_finite(ctx)
+
+    def __init__(
+        out self,
+        ctx: DeviceContext,
+        dims: LlamaDims,
+        opts: BlockOptions,
+        var norm1_w: DeviceBuffer[DType.float32],
+        var norm2_w: DeviceBuffer[DType.float32],
+        var int15: LlamaInt15Weights,
+        var b_q: DeviceBuffer[DType.float32],
+        var b_k: DeviceBuffer[DType.float32],
+        var b_v: DeviceBuffer[DType.float32],
+        var b_o: DeviceBuffer[DType.float32],
+        var norm1_b: DeviceBuffer[DType.float32],
+        var norm2_b: DeviceBuffer[DType.float32],
+        var b_up: DeviceBuffer[DType.float32],
+        var b_down: DeviceBuffer[DType.float32],
+        var b_gate: DeviceBuffer[DType.float32],
+        var qn_w: DeviceBuffer[DType.float32],
+        var kn_w: DeviceBuffer[DType.float32],
+    ) raises:
+        """THE PROFILE CONSTRUCTOR (lane/lowbit-blocks,
+        `numeric_profile="fixed15_v1"`, inference only): the options
+        constructor with the seven float32 projection weights replaced by
+        their planes. The planes are checked against the block's shapes BY
+        NAME; the float32 projection fields are one-element placeholders,
+        never read (every projection goes through `llama_proj`, which takes
+        the planes when they are present)."""
+        dims.validate()
+        opts.validate(dims.head_dim)
+        self.dims = dims.copy()
+        self.opts = opts.copy()
+        self.eps = opts.norm_eps
+        var dm = dims.d_model
+        var qw = dims.q_width()
+        var kw = dims.kv_width()
+        var it = dims.intermediate
+        var hd = dims.head_dim
+        _expect_len("norm1.weight", len(norm1_w), dm)
+        _expect_len("norm2.weight", len(norm2_w), dm)
+        if int15.gated != opts.gated():
+            raise Error(
+                "llama int15: the planes say gated=" + String(int15.gated)
+                + " and the options record says gated=" + String(opts.gated())
+            )
+        int15.check_shapes(dm, qw, kw, it)
+        _expect_optional("q_proj.bias", len(b_q), qw, opts.qkv_bias)
+        _expect_optional("k_proj.bias", len(b_k), kw, opts.qkv_bias)
+        _expect_optional("v_proj.bias", len(b_v), kw, opts.qkv_bias)
+        _expect_optional("o_proj.bias", len(b_o), dm, opts.o_bias)
+        _expect_optional("input_layernorm.bias", len(norm1_b), dm, opts.norm_bias)
+        _expect_optional(
+            "post_attention_layernorm.bias", len(norm2_b), dm, opts.norm_bias
+        )
+        _expect_optional("up_proj.bias", len(b_up), it, opts.mlp_bias)
+        _expect_optional("down_proj.bias", len(b_down), dm, opts.mlp_bias)
+        _expect_optional("gate_proj.bias", len(b_gate), it, opts.has_gate_bias())
+        _expect_optional("q_norm.weight", len(qn_w), hd, opts.qk_norm)
+        _expect_optional("k_norm.weight", len(kn_w), hd, opts.qk_norm)
+        var ph = _zeros(ctx, 1)
+        self.norm1_w = norm1_w^
+        self.norm2_w = norm2_w^
+        self.w_q = ph.copy()
+        self.w_k = ph.copy()
+        self.w_v = ph.copy()
+        self.w_o = ph.copy()
+        self.w_gate = ph.copy()
+        self.w_up = ph.copy()
+        self.w_down = ph^
+        self.b_q = b_q^
+        self.b_k = b_k^
+        self.b_v = b_v^
+        self.b_o = b_o^
+        self.norm1_b = norm1_b^
+        self.norm2_b = norm2_b^
+        self.b_up = b_up^
+        self.b_down = b_down^
+        self.b_gate = b_gate^
+        self.qn_w = qn_w^
+        self.kn_w = kn_w^
+        self.int15 = int15^
+        self._validate_finite(ctx)
+
+    def __init__(
+        out self,
+        ctx: DeviceContext,
+        dims: LlamaDims,
+        eps: Float32,
+        norm1_w: List[Float32],
+        norm2_w: List[Float32],
+        w_q: List[Float32],
+        w_k: List[Float32],
+        w_v: List[Float32],
+        w_o: List[Float32],
+        w_gate: List[Float32],
+        w_up: List[Float32],
+        w_down: List[Float32],
+    ) raises:
+        """Nine host lists and two scalars. **No fixture type crosses this
+        boundary on purpose**: the oracle half of this lane is being written
+        concurrently and by a different agent, so nothing in
+        `transformer/checks/` is imported anywhere in this file."""
+        dims.validate()
+        self.dims = dims.copy()
+        self.eps = eps
+        var dm = dims.d_model
+        var qw = dims.q_width()
+        var kw = dims.kv_width()
+        var it = dims.intermediate
+        _expect_len("norm1.weight", len(norm1_w), dm)
+        _expect_len("norm2.weight", len(norm2_w), dm)
+        _expect_len("q_proj.weight", len(w_q), qw * dm)
+        _expect_len("k_proj.weight", len(w_k), kw * dm)
+        _expect_len("v_proj.weight", len(w_v), kw * dm)
+        _expect_len("o_proj.weight", len(w_o), dm * qw)
+        _expect_len("gate_proj.weight", len(w_gate), it * dm)
+        _expect_len("up_proj.weight", len(w_up), it * dm)
+        _expect_len("down_proj.weight", len(w_down), dm * it)
+        # DEVIATION 1875 -- THE WEIGHTS ARE REFUSED HERE, ON THE HOST, ONCE.
+        #
+        # `llama_refuse_bad_inputs` walks all thirteen named inputs and it
+        # DOWNLOADS every weight tensor to do it. That is correct and it was
+        # being paid on EVERY forward call. Measured on an H100 2026-08-25 at
+        # the Llama-3-8B shapes: 218 million floats, about 872 MB per call,
+        # 825 to 967 ms -- and the whole block measured 936 to 1010 ms, flat
+        # in token count from t1 to t512. A forward pass whose cost does not
+        # move with its input is not computing the input.
+        #
+        # THE WEIGHTS DO NOT CHANGE BETWEEN CALLS, and here they are still on
+        # the HOST, so this check costs no device traffic at all. It also
+        # fires EARLIER than the old one and under the SAME reference names,
+        # which is what the oracle comparison needs.
+        #
+        # WHAT THIS DOES NOT COVER, said plainly: a caller that writes into a
+        # weight BUFFER after construction. `llama_refuse_bad_inputs` is
+        # unchanged and still walks all thirteen names in its original order
+        # for anyone who needs that, and it is what
+        # `transformer_check.mojo`'s refusal audit calls directly, so the
+        # audit's coverage of every name is untouched.
+        # Uploaded first, refused on the device (2026-09-09: the host walk
+        # of 17 M weights was 38 ms per call at the Samba shape). Same
+        # names, same order, same message at the same flat index.
+        self.norm1_w = _upload(ctx, norm1_w)
+        self.norm2_w = _upload(ctx, norm2_w)
+        self.w_q = _upload(ctx, w_q)
+        self.w_k = _upload(ctx, w_k)
+        self.w_v = _upload(ctx, w_v)
+        self.w_o = _upload(ctx, w_o)
+        self.w_gate = _upload(ctx, w_gate)
+        self.w_up = _upload(ctx, w_up)
+        self.w_down = _upload(ctx, w_down)
+        # lane/block-options: the default record and placeholders. The
+        # frozen `eps` argument is kept for this constructor's callers and
+        # copied INTO the record so that `self.eps == self.opts.norm_eps`
+        # holds on every path (the gates pass RMS_EPS; one bench passes
+        # another value on purpose and gets it).
+        var dflt = BlockOptions()
+        dflt.norm_eps = eps
+        self.opts = dflt^
+        var ph = _zeros[False](ctx, 1)
+        self.b_q = ph.copy()
+        self.b_k = ph.copy()
+        self.b_v = ph.copy()
+        self.b_o = ph.copy()
+        self.norm1_b = ph.copy()
+        self.norm2_b = ph.copy()
+        self.b_up = ph.copy()
+        self.b_down = ph.copy()
+        self.b_gate = ph.copy()
+        self.qn_w = ph.copy()
+        self.kn_w = ph^
+        self.int15 = None
+        self._validate_finite(ctx)
+
+
+    def __init__(
+        out self, ctx: DeviceContext, dims: LlamaDims, eps: Float32,
+        var norm1_w: DeviceBuffer[DType.float32],
+        var norm2_w: DeviceBuffer[DType.float32],
+        var w_q: DeviceBuffer[DType.float32],
+        var w_k: DeviceBuffer[DType.float32],
+        var w_v: DeviceBuffer[DType.float32],
+        var w_o: DeviceBuffer[DType.float32],
+        var w_gate: DeviceBuffer[DType.float32],
+        var w_up: DeviceBuffer[DType.float32],
+        var w_down: DeviceBuffer[DType.float32],
+    ) raises:
+        """Own uploaded buffers directly, with the host constructor's
+        identical length checks and ordered device refusals. The binding
+        uses this to avoid zero-filled host Lists and a redundant copy of
+        every weight on each call; no pointer or weight cache survives it.
+        """
+        dims.validate()
+        self.dims = dims.copy()
+        self.eps = eps
+        var dm = dims.d_model
+        var qw = dims.q_width()
+        var kw = dims.kv_width()
+        var it = dims.intermediate
+        _expect_len("norm1.weight", len(norm1_w), dm)
+        _expect_len("norm2.weight", len(norm2_w), dm)
+        _expect_len("q_proj.weight", len(w_q), qw * dm)
+        _expect_len("k_proj.weight", len(w_k), kw * dm)
+        _expect_len("v_proj.weight", len(w_v), kw * dm)
+        _expect_len("o_proj.weight", len(w_o), dm * qw)
+        _expect_len("gate_proj.weight", len(w_gate), it * dm)
+        _expect_len("up_proj.weight", len(w_up), it * dm)
+        _expect_len("down_proj.weight", len(w_down), dm * it)
+        self.norm1_w = norm1_w^
+        self.norm2_w = norm2_w^
+        self.w_q = w_q^
+        self.w_k = w_k^
+        self.w_v = w_v^
+        self.w_o = w_o^
+        self.w_gate = w_gate^
+        self.w_up = w_up^
+        self.w_down = w_down^
+        # lane/block-options: the default record and placeholders (see the
+        # host-list constructor above).
+        var dflt = BlockOptions()
+        dflt.norm_eps = eps
+        self.opts = dflt^
+        var ph = _zeros[False](ctx, 1)
+        self.b_q = ph.copy()
+        self.b_k = ph.copy()
+        self.b_v = ph.copy()
+        self.b_o = ph.copy()
+        self.norm1_b = ph.copy()
+        self.norm2_b = ph.copy()
+        self.b_up = ph.copy()
+        self.b_down = ph.copy()
+        self.b_gate = ph.copy()
+        self.qn_w = ph.copy()
+        self.kn_w = ph^
+        self.int15 = None
+        self._validate_finite(ctx)
+
+
+    def _validate_finite(mut self, ctx: DeviceContext) raises:
+        """Validate all weights before use, preserving named refusal order.
+
+        Sources are owned by self throughout the batch. No value or validation
+        result survives construction, so mutable Python weights are reread.
+
+        lane/block-options: the optional tensors that the record switches
+        on join the batch AFTER the nine, in the addrs-tail order, under
+        their reference names; a placeholder is never scanned.
+        """
+        var lens = List[Int]()
+        lens.append(len(self.norm1_w))
+        lens.append(len(self.norm2_w))
+        lens.append(len(self.w_q))
+        lens.append(len(self.w_k))
+        lens.append(len(self.w_v))
+        lens.append(len(self.w_o))
+        lens.append(len(self.w_gate))
+        lens.append(len(self.w_up))
+        lens.append(len(self.w_down))
+        var o = self.opts.copy()
+        var flags = List[Bool]()
+        flags.append(o.qkv_bias)
+        flags.append(o.qkv_bias)
+        flags.append(o.qkv_bias)
+        flags.append(o.o_bias)
+        flags.append(o.norm_bias)
+        flags.append(o.norm_bias)
+        flags.append(o.mlp_bias)
+        flags.append(o.mlp_bias)
+        flags.append(o.has_gate_bias())
+        flags.append(o.qk_norm)
+        flags.append(o.qk_norm)
+        var opt_lens = List[Int]()
+        opt_lens.append(len(self.b_q))
+        opt_lens.append(len(self.b_k))
+        opt_lens.append(len(self.b_v))
+        opt_lens.append(len(self.b_o))
+        opt_lens.append(len(self.norm1_b))
+        opt_lens.append(len(self.norm2_b))
+        opt_lens.append(len(self.b_up))
+        opt_lens.append(len(self.b_down))
+        opt_lens.append(len(self.b_gate))
+        opt_lens.append(len(self.qn_w))
+        opt_lens.append(len(self.kn_w))
+        for i in range(len(flags)):  # small-loop(flags: the 11 optional block tensors): scan lengths of the present ones
+            if flags[i]:
+                lens.append(opt_lens[i])
+        var batch = DeviceNonfiniteBatch(ctx, lens)
+        batch.enqueue(ctx, 0, self.norm1_w)
+        batch.enqueue(ctx, 1, self.norm2_w)
+        batch.enqueue(ctx, 2, self.w_q)
+        batch.enqueue(ctx, 3, self.w_k)
+        batch.enqueue(ctx, 4, self.w_v)
+        batch.enqueue(ctx, 5, self.w_o)
+        batch.enqueue(ctx, 6, self.w_gate)
+        batch.enqueue(ctx, 7, self.w_up)
+        batch.enqueue(ctx, 8, self.w_down)
+        var slot = 9
+        var slots = List[Int](length=11, fill=-1)
+        for i in range(len(flags)):
+            if flags[i]:
+                slots[i] = slot
+                if i == 0:
+                    batch.enqueue(ctx, slot, self.b_q)
+                elif i == 1:
+                    batch.enqueue(ctx, slot, self.b_k)
+                elif i == 2:
+                    batch.enqueue(ctx, slot, self.b_v)
+                elif i == 3:
+                    batch.enqueue(ctx, slot, self.b_o)
+                elif i == 4:
+                    batch.enqueue(ctx, slot, self.norm1_b)
+                elif i == 5:
+                    batch.enqueue(ctx, slot, self.norm2_b)
+                elif i == 6:
+                    batch.enqueue(ctx, slot, self.b_up)
+                elif i == 7:
+                    batch.enqueue(ctx, slot, self.b_down)
+                elif i == 8:
+                    batch.enqueue(ctx, slot, self.b_gate)
+                elif i == 9:
+                    batch.enqueue(ctx, slot, self.qn_w)
+                else:
+                    batch.enqueue(ctx, slot, self.kn_w)
+                slot += 1
+        var indices = batch.finish(ctx)
+        _refuse_nonfinite_at(ctx, "input_layernorm.weight", self.norm1_w, indices[0])
+        _refuse_nonfinite_at(ctx, "post_attention_layernorm.weight", self.norm2_w, indices[1])
+        _refuse_nonfinite_at(ctx, "q_proj.weight", self.w_q, indices[2])
+        _refuse_nonfinite_at(ctx, "k_proj.weight", self.w_k, indices[3])
+        _refuse_nonfinite_at(ctx, "v_proj.weight", self.w_v, indices[4])
+        _refuse_nonfinite_at(ctx, "o_proj.weight", self.w_o, indices[5])
+        _refuse_nonfinite_at(ctx, "gate_proj.weight", self.w_gate, indices[6])
+        _refuse_nonfinite_at(ctx, "up_proj.weight", self.w_up, indices[7])
+        _refuse_nonfinite_at(ctx, "down_proj.weight", self.w_down, indices[8])
+        if slots[0] >= 0:
+            _refuse_nonfinite_at(ctx, "q_proj.bias", self.b_q, indices[slots[0]])
+        if slots[1] >= 0:
+            _refuse_nonfinite_at(ctx, "k_proj.bias", self.b_k, indices[slots[1]])
+        if slots[2] >= 0:
+            _refuse_nonfinite_at(ctx, "v_proj.bias", self.b_v, indices[slots[2]])
+        if slots[3] >= 0:
+            _refuse_nonfinite_at(ctx, "o_proj.bias", self.b_o, indices[slots[3]])
+        if slots[4] >= 0:
+            _refuse_nonfinite_at(ctx, "input_layernorm.bias", self.norm1_b, indices[slots[4]])
+        if slots[5] >= 0:
+            _refuse_nonfinite_at(ctx, "post_attention_layernorm.bias", self.norm2_b, indices[slots[5]])
+        if slots[6] >= 0:
+            _refuse_nonfinite_at(ctx, "up_proj.bias", self.b_up, indices[slots[6]])
+        if slots[7] >= 0:
+            _refuse_nonfinite_at(ctx, "down_proj.bias", self.b_down, indices[slots[7]])
+        if slots[8] >= 0:
+            _refuse_nonfinite_at(ctx, "gate_proj.bias", self.b_gate, indices[slots[8]])
+        if slots[9] >= 0:
+            _refuse_nonfinite_at(ctx, "q_norm.weight", self.qn_w, indices[slots[9]])
+        if slots[10] >= 0:
+            _refuse_nonfinite_at(ctx, "k_norm.weight", self.kn_w, indices[slots[10]])
+
+
+def _expect_optional(name: String, got: Int, want: Int, on: Bool) raises:
+    """lane/block-options: an optional device tensor is PRESENT at its exact
+    length iff its option is on, and a PLACEHOLDER (at most one element)
+    otherwise. Both mismatches are refused by the tensor's name."""
+    if on:
+        if got != want:
+            raise Error(
+                String("llama: ")
+                + name
+                + " is required by its option and has "
+                + String(got)
+                + " floats, expected "
+                + String(want)
+            )
+    elif got > 1:
+        raise Error(
+            String("llama: ")
+            + name
+            + " is present ("
+            + String(got)
+            + " floats) but its option is off; pass the option or drop the"
+            + " tensor"
+        )
+
+
+struct LlamaKVCache(Movable):
+    """The recurrent state between calls (contract section 7.2):
+    `k_cache` and `v_cache`, each `[B, n_kv, S, head_dim]`, appended to at
+    modeling_llama.py:261-262.
+
+    **CACHE SLOT `j` MEANS ABSOLUTE POSITION `j`.** That identification is
+    what makes contract section 5.5 ("every one of S11 through S19 indexes
+    the key axis BY ABSOLUTE POSITION, not by an offset into whatever slice
+    this launch happens to hold") mechanical here rather than a discipline.
+    DEVIATION 1028 refuses a `pos0` that would break it.
+
+    `s` is the USED length and it grows by `L` per call; `s_max` is the
+    allocation. The buffers are PACKED at stride `s`, not at stride `s_max`,
+    because contract section 9 records the stage as `[B, n_kv, S, head_dim]`
+    and a hash of the first `B*n_kv*S*head_dim` elements has to BE that
+    array. DEVIATION 1022 is why the repack is out of place.
+
+    Prefill is a fresh `LlamaKVCache` with `s == 0`; the decode step is the
+    same block function at `l == 1` carrying this. ONE spelling for both.
+    """
+
+    var b: Int
+    var n_kv: Int
+    var head_dim: Int
+    var s_max: Int
+    var s: Int
+    var window: Int
+    var cap: Int
+    var k: DeviceBuffer[DType.float32]
+    var v: DeviceBuffer[DType.float32]
+
+    def __init__(
+        out self,
+        ctx: DeviceContext,
+        b: Int,
+        dims: LlamaDims,
+        s_max: Int,
+        window: Int = 0,
+        max_positions: Int = MAX_ABS_POSITION,
+    ) raises:
+        """`window == 0`: the linear cache above, packed at stride `s`.
+        `window > 0`: a RING of `window` slots per (batch, kv head), slot
+        `= position % window`, always at stride `window`; `s` still counts
+        absolute positions and `s_max` still bounds them (the rotary table
+        and DEVIATION 812's ceiling are per position, not per slot). A
+        call gathers the keys it reads out of the ring into the packed
+        work span (`kv_window_gather_kernel`) before writing its own
+        tokens back (`kv_ring_write_kernel`).
+
+        `max_positions` (DEVIATION 2933, lane/block-options): the model's
+        declared absolute-position ceiling, `BlockOptions.max_positions`;
+        the default is DEVIATION 812's 8192, so every pre-existing caller
+        keeps its refusal word for word. The ANGLE domain of the rotary
+        reduction is enforced where the table is built (`LlamaRopeTable`),
+        which is where it can be, since it depends on the inverse
+        frequencies and not on the position alone."""
+        if b <= 0:
+            raise Error("llama: KV cache needs B > 0")
+        if s_max <= 0:
+            raise Error("llama: KV cache needs s_max > 0")
+        if window < 0:
+            raise Error("llama: KV cache window must be >= 0 (0 = full causal)")
+        if s_max > max_positions:
+            raise Error(
+                String("llama: s_max ")
+                + String(s_max)
+                + " exceeds the absolute-position ceiling "
+                + String(max_positions)
+                + " (the model's max_positions, DEVIATION 2933; at the"
+                + " default it is DEVIATION 812's 8192, the Cody-Waite"
+                + " domain of _cephes_sincosf_core, shared by portable_sinf"
+                + " and portable_cosf)"
+            )
+        self.b = b
+        self.n_kv = dims.n_kv
+        self.head_dim = dims.head_dim
+        self.s_max = s_max
+        self.s = 0
+        self.window = window
+        self.cap = s_max
+        if window > 0:
+            self.cap = window
+        self.k = _zeros(ctx, b * dims.n_kv * self.cap * dims.head_dim)
+        self.v = _zeros(ctx, b * dims.n_kv * self.cap * dims.head_dim)
+
+
+# TOMBSTONE: ANONLIB_IDN_ATTN_SOFTMAX=2 (slower) deleted 2026-10-10 by c1bf9d832; code recoverable at ca25d9321.
+# Restore: git apply experiments/removed/ANONLIB_IDN_ATTN_SOFTMAX-arm2.patch
+
+
+struct LlamaDeviceStages(Movable):
+    """Every recorded stage of one block call, contract section 9, in card
+    order, in the layouts that section names. `M = B * L` token-major rows.
+
+    The attention buffers are allocated at `s_max` and USED PACKED at the
+    call's `s`, so `record_device(..., count = b*n_heads*l*s)` hashes
+    exactly the `[B, n_heads, L, S]` array the card lists and never folds
+    uninitialized tail memory into a stage. `core/identity_trace.mojo`'s own
+    docstring is emphatic about this: "when a buffer is used short, PASS THE
+    LENGTH".
+
+    Four fields carry NO TAG. `qbh`, `kbh` and `sbh` are DEVIATION 1021's
+    per-(batch, head) gather scratch for the GEMM; they hold copies and no
+    seam ever writes them. `k_cache`/`v_cache` here are DEVIATION 1022's
+    out-of-place repack targets and they DO carry the `kv.k_cache` and
+    `kv.v_cache` tags -- the stage is the cache as COMPUTED, recorded before
+    it is copied into `LlamaKVCache`.
+    """
+
+    var b: Int
+    var l: Int
+    var s_max: Int
+    var window: Int
+    var s_cap: Int
+    var dims: LlamaDims
+    var norm1_sumsq: DeviceBuffer[DType.float32]  # [M]
+    var norm1_out: DeviceBuffer[DType.float32]  # [M, d_model]
+    var q_proj: DeviceBuffer[DType.float32]  # [M, n_heads*head_dim]
+    var k_proj: DeviceBuffer[DType.float32]  # [M, n_kv*head_dim]
+    var v_proj: DeviceBuffer[DType.float32]  # [M, n_kv*head_dim]
+    var q_rope: DeviceBuffer[DType.float32]  # [M, n_heads*head_dim]
+    var k_rope: DeviceBuffer[DType.float32]  # [M, n_kv*head_dim]
+    var k_cache: DeviceBuffer[DType.float32]  # [B, n_kv, S, head_dim]
+    var v_cache: DeviceBuffer[DType.float32]  # [B, n_kv, S, head_dim]
+    var scores: DeviceBuffer[DType.float32]  # [B, n_heads, L, S]
+    var masked: DeviceBuffer[DType.float32]  # [B, n_heads, L, S]
+    var amax: DeviceBuffer[DType.float32]  # [B, n_heads, L]
+    var aexp: DeviceBuffer[DType.float32]  # [B, n_heads, L, S]
+    var denom: DeviceBuffer[DType.float32]  # [B, n_heads, L]
+    var weights: DeviceBuffer[DType.float32]  # [B, n_heads, L, S]
+    var ctxv: DeviceBuffer[DType.float32]  # [M, n_heads*head_dim]
+    var o_proj: DeviceBuffer[DType.float32]  # [M, d_model]
+    var residual1: DeviceBuffer[DType.float32]  # [M, d_model]
+    var norm2_sumsq: DeviceBuffer[DType.float32]  # [M]
+    var norm2_out: DeviceBuffer[DType.float32]  # [M, d_model]
+    var gate_proj: DeviceBuffer[DType.float32]  # [M, intermediate]
+    var up_proj: DeviceBuffer[DType.float32]  # [M, intermediate]
+    var silu_out: DeviceBuffer[DType.float32]  # [M, intermediate]
+    var gated: DeviceBuffer[DType.float32]  # [M, intermediate]
+    var down_proj: DeviceBuffer[DType.float32]  # [M, d_model]
+    var residual2: DeviceBuffer[DType.float32]  # [M, d_model]
+    var qbh: DeviceBuffer[DType.float32]  # [L, head_dim]     (no tag)
+    var kbh: DeviceBuffer[DType.float32]  # [s_max, head_dim] (no tag)
+    var sbh: DeviceBuffer[DType.float32]  # [L, s_max]        (no tag)
+    var qk_sumsq: DeviceBuffer[DType.float32]  # [M * n_heads]  (no tag)
+    """DEVIATION 2946 (lane/block-options): the per-head sum of squares
+    scratch of the q/k RMSNorm under `qk_norm`; an internal, never
+    recorded, sized for q (`n_heads >= n_kv`). Allocated always because it
+    is `M * n_heads` floats and a conditional field is a second struct
+    shape to get wrong."""
+    var gemm_workspace: GemmWorkspace
+    var int15: Optional[LlamaInt15Stage]
+    """lane/lowbit-blocks: the profile's per-call scratch, created by the
+    first call whose weights carry planes; None on the default path, which
+    therefore allocates nothing new."""
+    var int15_on: Bool
+    """lane/lowbit-blocks: THIS call runs under `fixed15_v1` (its weights
+    carry planes). Set by `llama_decoder_layer_forward_planted` on every
+    call; read by S11 and by the attention path choice."""
+    var attn_prefer_eager: Bool  # byte-LM auto policy; explicit fused overrides
+    var attn_recompute_backward: Bool
+    """Model-kind attention stash policy (lane grid-act-4, 2026-10-08): the
+    caller's training step wants the backward to recompute the attention
+    exponents instead of keeping the fused forward's exp stash in `aexp`.
+    The fused forward then takes the plain launcher (nothing kept,
+    `attn_estash_cells` stays 0) and the backward takes the plain launcher,
+    exactly what `-D ANONLIB_IDN_ATTN_STASH=1` does for every caller. Set
+    only by the Samba resident train step (training/samba_resident.mojo,
+    IDN_SAMBA_ATTN_RECOMPUTE); every other caller (the LM / transformer
+    training steps) keeps the build's stash profile. False by default and
+    after `reset`."""
+    var attn_forward_status: Int  # -1 not attempted; otherwise FUSED_* for last forward
+    var attn_fused_off: Bool
+    """DEVIATION 3110: this layer's fused FORWARD refused once, so it is not
+    launched again for the life of this struct. Latched, never cleared by a
+    step; `reset` clears it because that is a fresh fixture."""
+    var attn_materialized: Bool
+    """Whether the LAST call's eager softmax weights are valid for backward.
+    The eager path sets it; fused clears it. The byte trainer may release
+    dead scores/masked/sbh after forward while retaining weights and aexp.
+    `ensure_attention_materialized` recomputes when weights are absent."""
+    var attn_estash_cells: Int
+    """DEVIATION 2652 (trial builds only): the `[B, n_heads, L, S]` cell count of the fused forward's exp stash KEPT in
+    `aexp` by the LAST call, 0 when nothing is kept. Set by
+    `eager_attention_forward` after a fused forward under an `_estash` arm
+    ran into `aexp` with no eager stages needed (`attn_materialized` stays
+    False: `aexp` does not hold the eager stage); cleared at the start of
+    every `eager_attention_forward` and by `attention_eager_core`, the only
+    other writer of `aexp`, on every build (a host integer nothing on a
+    shipped build reads). `llama_decoder_layer_backward_device` hands it
+    with `aexp` to `fused_backward_launch_estash_ran`, which runs the
+    DEVIATION 2650 backward only when it equals this call's cell count."""
+    var attn_fwd_scan: AttnFwdScan
+    """IDN_ATTN_BWD_SCAN_REUSE (lane/nr-attn): the LAST call's fused forward
+    regime-scan maxima of `q_rope`, `k_cache` and `v_cache`, keyed by their
+    addresses and lengths; empty when the last call ran no fused scan.
+    Cleared at the start of every `eager_attention_forward` (the attention
+    forward of every layer call, which follows the only writes of those
+    three buffers) and on the AFN flash path; set after a fused forward.
+    The fused backward takes the three maxima from it instead of scanning
+    the three buffers again."""
+
+    def __init__(
+        out self,
+        ctx: DeviceContext,
+        b: Int,
+        l: Int,
+        s_max: Int,
+        dims: LlamaDims,
+        window: Int = 0,
+        lean: Bool = False,
+    ) raises:
+        """`window` must equal the cache's. The attention buffers are
+        allocated at `s_cap`: `s_max` for full causal, and the widest key
+        span a windowed call of `l` tokens can read otherwise.
+
+        `lean`: the four `[B, n_heads, L, S]` attention stages and `sbh`
+        are allocated at ONE element, for a caller that runs the fused
+        attention path with the trace off. The eager path grows them on
+        demand (`ensure_attention_stage_capacity`), so a lean struct is
+        never wrong, only late."""
+        dims.validate()
+        if b <= 0 or l <= 0:
+            raise Error("llama: stages need B > 0 and L > 0")
+        if s_max < l:
+            raise Error(
+                String("llama: s_max ")
+                + String(s_max)
+                + " is smaller than L "
+                + String(l)
+                + "; the cache must hold at least one call's tokens"
+            )
+        if window < 0:
+            raise Error("llama: stages window must be >= 0 (0 = full causal)")
+        self.gemm_workspace = GemmWorkspace(ctx)
+        self.int15 = None
+        self.int15_on = False
+        self.b = b
+        self.l = l
+        self.s_max = s_max
+        self.window = window
+        self.s_cap = s_max
+        if window > 0 and window - 1 + l < s_max:
+            self.s_cap = window - 1 + l
+        self.dims = dims.copy()
+        var m = b * l
+        var dm = dims.d_model
+        var qw = dims.q_width()
+        var kw = dims.kv_width()
+        var hd = dims.head_dim
+        var it = dims.intermediate
+        var nh = dims.n_heads
+        var nkv = dims.n_kv
+        self.norm1_sumsq = _zeros[False](ctx, m)
+        self.norm1_out = _zeros[False](ctx, m * dm)
+        self.q_proj = _zeros[False](ctx, m * qw)
+        self.k_proj = _zeros[False](ctx, m * kw)
+        self.v_proj = _zeros[False](ctx, m * kw)
+        self.q_rope = _zeros[False](ctx, m * qw)
+        self.k_rope = _zeros[False](ctx, m * kw)
+        var sc = self.s_cap
+        var cells = b * nh * l * sc
+        var sbh_n = l * sc
+        if lean:
+            cells = 1
+            sbh_n = 1
+        self.k_cache = _zeros[False](ctx, b * nkv * sc * hd)
+        self.v_cache = _zeros[False](ctx, b * nkv * sc * hd)
+        self.scores = _zeros[False](ctx, cells)
+        self.masked = _zeros[False](ctx, cells)
+        self.amax = _zeros[False](ctx, b * nh * l)
+        self.aexp = _zeros[False](ctx, cells)
+        self.denom = _zeros[False](ctx, b * nh * l)
+        self.weights = _zeros[False](ctx, cells)
+        self.ctxv = _zeros[False](ctx, m * qw)
+        self.o_proj = _zeros[False](ctx, m * dm)
+        self.residual1 = _zeros[False](ctx, m * dm)
+        self.norm2_sumsq = _zeros[False](ctx, m)
+        self.norm2_out = _zeros[False](ctx, m * dm)
+        self.gate_proj = _zeros[False](ctx, m * it)
+        self.up_proj = _zeros[False](ctx, m * it)
+        self.silu_out = _zeros[False](ctx, m * it)
+        self.gated = _zeros[False](ctx, m * it)
+        self.down_proj = _zeros[False](ctx, m * dm)
+        self.residual2 = _zeros[False](ctx, m * dm)
+        self.qbh = _zeros[False](ctx, l * hd)
+        self.kbh = _zeros[False](ctx, sc * hd)
+        self.sbh = _zeros[False](ctx, sbh_n)
+        self.qk_sumsq = _zeros[False](ctx, m * nh)
+        self.attn_prefer_eager = False
+        self.attn_recompute_backward = False
+        self.attn_forward_status = -1
+        self.attn_fused_off = False
+        self.attn_materialized = False
+        self.attn_estash_cells = 0
+        self.attn_fwd_scan = AttnFwdScan()
+
+        # All 30 buffers are owned by self through this fence. Preserve every
+        # zero fill, but submit them together instead of waiting per buffer.
+        step_count_sync()
+        ctx.synchronize()
+
+
+    def reset(mut self, ctx: DeviceContext) raises:
+        """Restore constructor scratch bits before a retained binding call.
+
+        Keep all zero fills: partially written scratch must never carry NaNs
+        or stale values from a previous input. The owner retains every buffer
+        through this fence. GEMM workspace ownership is unchanged.
+        """
+        step_count_launch()
+        self.norm1_sumsq.enqueue_fill(Float32(0))
+        step_count_launch()
+        self.norm1_out.enqueue_fill(Float32(0))
+        step_count_launch()
+        self.q_proj.enqueue_fill(Float32(0))
+        step_count_launch()
+        self.k_proj.enqueue_fill(Float32(0))
+        step_count_launch()
+        self.v_proj.enqueue_fill(Float32(0))
+        step_count_launch()
+        self.q_rope.enqueue_fill(Float32(0))
+        step_count_launch()
+        self.k_rope.enqueue_fill(Float32(0))
+        step_count_launch()
+        self.k_cache.enqueue_fill(Float32(0))
+        step_count_launch()
+        self.v_cache.enqueue_fill(Float32(0))
+        step_count_launch()
+        self.scores.enqueue_fill(Float32(0))
+        step_count_launch()
+        self.masked.enqueue_fill(Float32(0))
+        step_count_launch()
+        self.amax.enqueue_fill(Float32(0))
+        step_count_launch()
+        self.aexp.enqueue_fill(Float32(0))
+        step_count_launch()
+        self.denom.enqueue_fill(Float32(0))
+        step_count_launch()
+        self.weights.enqueue_fill(Float32(0))
+        step_count_launch()
+        self.ctxv.enqueue_fill(Float32(0))
+        step_count_launch()
+        self.o_proj.enqueue_fill(Float32(0))
+        step_count_launch()
+        self.residual1.enqueue_fill(Float32(0))
+        step_count_launch()
+        self.norm2_sumsq.enqueue_fill(Float32(0))
+        step_count_launch()
+        self.norm2_out.enqueue_fill(Float32(0))
+        step_count_launch()
+        self.gate_proj.enqueue_fill(Float32(0))
+        step_count_launch()
+        self.up_proj.enqueue_fill(Float32(0))
+        step_count_launch()
+        self.silu_out.enqueue_fill(Float32(0))
+        step_count_launch()
+        self.gated.enqueue_fill(Float32(0))
+        step_count_launch()
+        self.down_proj.enqueue_fill(Float32(0))
+        step_count_launch()
+        self.residual2.enqueue_fill(Float32(0))
+        step_count_launch()
+        self.qbh.enqueue_fill(Float32(0))
+        step_count_launch()
+        self.kbh.enqueue_fill(Float32(0))
+        step_count_launch()
+        self.sbh.enqueue_fill(Float32(0))
+        step_count_launch()
+        self.qk_sumsq.enqueue_fill(Float32(0))
+        self.attn_prefer_eager = False
+        self.attn_recompute_backward = False
+        self.attn_forward_status = -1
+        self.attn_fused_off = False
+        self.attn_materialized = False
+        self.attn_estash_cells = 0
+        self.attn_fwd_scan = AttnFwdScan()
+        step_count_sync()
+        ctx.synchronize()
+
+
+def llama_proj(
+    ctx: DeviceContext,
+    mut gw: GemmWorkspace,
+    mut st15: Optional[LlamaInt15Stage],
+    w15: Optional[LlamaInt15Weights],
+    which: Int,
+    mut c: DeviceBuffer[DType.float32],
+    mut a: DeviceBuffer[DType.float32],
+    mut wf: DeviceBuffer[DType.float32],
+    m: Int,
+    n: Int,
+    k: Int,
+) raises:
+    """ONE projection, `C[m x n] = A[m x k] . W[n x k]^T` (OP_NT).
+
+    Weights WITHOUT planes (every block but the profile's): exactly the call
+    that stood at each site before lane/lowbit-blocks, `gw.run[False](ctx, c,
+    a, wf, m, n, k, OP_NT)`, gemm.fp32.v1. Weights WITH planes
+    (`numeric_profile="fixed15_v1"`): `A` quantized per token by the
+    parallel quantizer, the weight's kept planes, gemm.int15i64.v1
+    (`int15_block.mojo`); `wf` is then a placeholder and is not read."""
+    if w15:
+        if not st15:
+            st15 = Optional[LlamaInt15Stage](LlamaInt15Stage(ctx))
+        llama_int15_proj(ctx, st15.value(), c, a, w15.value().get(which), m, n, k)
+    else:
+        gw.run[False](ctx, c, a, wf, m, n, k, _gemm_op_nt())
+
+
+def ensure_attention_stage_capacity(
+    ctx: DeviceContext, mut stages: LlamaDeviceStages, l: Int, s: Int
+) raises:
+    """Grow a lean struct's attention stages to this call's `[B, n_heads,
+    L, S]` before the eager path writes them. A no-op on a full struct."""
+    var cells = stages.b * stages.dims.n_heads * l * s
+    if len(stages.scores) < cells:
+        stages.scores = _zeros(ctx, cells)
+        stages.masked = _zeros(ctx, cells)
+        stages.aexp = _zeros(ctx, cells)
+        stages.weights = _zeros(ctx, cells)
+    if len(stages.sbh) < l * s:
+        stages.sbh = _zeros(ctx, l * s)
+
+
+# ===========================================================================
+# `LlamaRMSNorm.forward` (:62-67). Seams S1-S4.
+#
+#     variance = hidden_states.pow(2).mean(-1, keepdim=True)          :64
+#     hidden_states = hidden_states * torch.rsqrt(variance + eps)     :65
+#     return self.weight * hidden_states.to(input_dtype)              :67
+#
+# eps is `config.rms_norm_eps`, 1e-6, bits 0x358637BD -- contract section 3.
+#
+# **DEVIATION 1025: THIS KERNEL IS A DUPLICATE AND MUST BE DELETED.** It is
+# `mamba/impl/modeling/modeling_mamba.mojo`'s
+# `mamba_rms_norm_kernel` (:529-575) with the module constant `RMS_EPS`
+# replaced by the argument `eps_in` and NOTHING else changed. The mamba
+# kernel is the REUSED form contract section 0 names; it cannot be called
+# from here while its epsilon is a `comptime` at
+# `mamba/checks/mamba_fixture.mojo:44` set to 1e-5. Lifting it is contract
+# DEVIATION 801, a cross-lane edit this lane is forbidden to make. The
+# CROSS-LANE REQUEST is in this lane's report, verbatim, both spellings.
+# ===========================================================================
+
+
+def llama_rms_norm_kernel(
+    sumsq: MutPointer[Float32, MutAnyOrigin],
+    out_buf: MutPointer[Float32, MutAnyOrigin],
+    x: MutPointer[Float32, MutAnyOrigin],
+    weight: MutPointer[Float32, MutAnyOrigin],
+    m_in: Int32,
+    dm_in: Int32,
+    eps_in: Float32,
+):
+    """One thread per TOKEN ROW. Contract S1: "serial ascending j from +0.0,
+    one fold per row, no block fold" -- so the row's fold never leaves this
+    thread's registers and no launch geometry can reorder it."""
+    var m = Int(m_in)
+    var dm = Int(dm_in)
+    var t = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if t >= m:
+        return
+
+    # S1, FUSED: `acc = ftz(fma(x_j, x_j, acc))`, ascending from +0.0. The
+    # +0.0 seed is contract section 8's clause -- an all-zero row sums to
+    # +0.0 on every vendor because IEEE says (+0) + (-0) = +0.
+    var acc = Float32(0.0)
+    comptime if SAB_S1_FOLD_DESCENDING:
+        for jj in range(dm):
+            var jd = dm - 1 - jj
+            var xd = ftz(x.unsafe_load(t * dm + jd))
+            acc = ftz(identical_mul_add(xd, xd, acc))
+    else:
+        for j in range(dm):
+            var xj = ftz(x.unsafe_load(t * dm + j))
+            acc = ftz(identical_mul_add(xj, xj, acc))
+
+    comptime if SAB_BATCHINV_NORM_CHUNK_FROM_M:
+        # SABOTAGE: a chunked fold whose CHUNK WIDTH is derived from
+        # `m = B * L`, so the row's summation order is a function of how
+        # many other tokens shared the launch. Additive rather than a third
+        # branch above, so S1's two profile spellings stay one if/else.
+        # `batchinv_norm_chunk` is the mamba module's, imported, so the two
+        # blocks cannot hold two opinions about the chunk width.
+        var chunk = batchinv_norm_chunk(dm, m)
+        var acc_b = Float32(0.0)
+        var j0 = 0
+        while j0 < dm:
+            var j1 = j0 + chunk
+            if j1 > dm:
+                j1 = dm
+            var part = Float32(0.0)
+            for j in range(j0, j1):
+                var xb = ftz(x.unsafe_load(t * dm + j))
+                part = ftz(identical_mul_add(xb, xb, part))
+            acc_b = ftz(acc_b + part)
+            j0 = j1
+        acc = acc_b
+
+    comptime if NN24_NORM_LANES8:
+        acc = norm_profile_dot[NN24_LANES](x, x, t * dm, t * dm, dm)
+    sumsq.unsafe_store(t, acc)
+
+    # S2: the mean through `identical_div` (row 49) and the reciprocal
+    # square root through `identical_rsqrt`, which is the reference's
+    # `1 / sqrt` (DEVIATION 741) and NEVER the hardware rsqrt intrinsic
+    # (DEVIATION 746 RECORDED Metal's intrinsic as correctly rounded where
+    # the reference's spelling is not -- being righter than the reference is
+    # not the goal).
+    var mean = ftz(identical_div(acc, Float32(dm)))
+    var rstd = ftz(identical_rsqrt(ftz(mean + eps_in)))
+
+    # S3 and S4, both PRODUCT: `hidden * rstd` then `weight * hidden`, each
+    # its own rounding, neither contractible into a neighboring add.
+    for j in range(dm):
+        var inner = ftz(identical_mul(ftz(x.unsafe_load(t * dm + j)), rstd))
+        out_buf.unsafe_store(
+            t * dm + j, ftz(identical_mul(ftz(weight.unsafe_load(j)), inner))
+        )
+
+
+def llama_rms_norm_row_block_kernel(
+    sumsq: MutPointer[Float32, MutAnyOrigin],
+    out_buf: MutPointer[Float32, MutAnyOrigin],
+    x: MutPointer[Float32, MutAnyOrigin],
+    weight: MutPointer[Float32, MutAnyOrigin],
+    dm_in: Int32,
+    eps_in: Float32,
+):
+    """NI25 S arm: one block per row; original serial S1, parallel S3/S4.
+
+    Lane zero alone owns the original ascending FMA chain. A shared scalar
+    broadcasts the same rounded rstd to all output lanes, so the physical
+    thread count is never a numerical reduction parameter. No shape cutoff.
+    """
+    var t = Int(block_idx.x)
+    var lane = Int(thread_idx.x)
+    var dm = Int(dm_in)
+    var shared = stack_allocation[1, Float32, address_space=AddressSpace.SHARED]()
+    if lane == 0:
+        var acc = Float32(0.0)
+        for j in range(dm):
+            var xj = ftz(x.unsafe_load(t * dm + j))
+            acc = ftz(identical_mul_add(xj, xj, acc))
+        sumsq.unsafe_store(t, acc)
+        var mean = ftz(identical_div(acc, Float32(dm)))
+        shared.unsafe_store(0, ftz(identical_rsqrt(ftz(mean + eps_in))))
+    barrier()
+    var rstd = shared.unsafe_load(0)
+    for j in range(lane, dm, Int(block_dim.x)):
+        var inner = ftz(identical_mul(ftz(x.unsafe_load(t * dm + j)), rstd))
+        out_buf.unsafe_store(t * dm + j, ftz(identical_mul(ftz(weight.unsafe_load(j)), inner)))
+
+
+def residual_rms_norm_kernel(
+    residual: MutPointer[Float32, MutAnyOrigin],
+    sumsq: MutPointer[Float32, MutAnyOrigin],
+    out_buf: MutPointer[Float32, MutAnyOrigin],
+    a: MutPointer[Float32, MutAnyOrigin],
+    b: MutPointer[Float32, MutAnyOrigin],
+    weight: MutPointer[Float32, MutAnyOrigin],
+    m_in: Int32,
+    dm_in: Int32,
+    eps_in: Float32,
+):
+    """Exact S22 residual add followed by S1--S4 RMSNorm.
+
+    One row owner preserves S1's serial ascending fold. The residual is still
+    materialized for tracing/backward, but its value feeds S1 directly rather
+    than being written by one launch and reread by the next.
+    """
+    var m = Int(m_in)
+    var dm = Int(dm_in)
+    var t = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if t >= m:
+        return
+    var acc = Float32(0.0)
+    for j in range(dm):
+        var i = t * dm + j
+        var r = ftz(ftz(a.unsafe_load(i)) + ftz(b.unsafe_load(i)))
+        residual.unsafe_store(i, r)
+        acc = ftz(identical_mul_add(r, r, acc))
+    comptime if NN24_NORM_LANES8:
+        acc = norm_profile_dot[NN24_LANES](residual, residual, t * dm, t * dm, dm)
+    sumsq.unsafe_store(t, acc)
+    var mean = ftz(identical_div(acc, Float32(dm)))
+    var rstd = ftz(identical_rsqrt(ftz(mean + eps_in)))
+    for j in range(dm):
+        var i = t * dm + j
+        var inner = ftz(identical_mul(ftz(residual.unsafe_load(i)), rstd))
+        out_buf.unsafe_store(
+            i, ftz(identical_mul(ftz(weight.unsafe_load(j)), inner))
+        )
+
+
+# The fused residual + RMSNorm kernel and the unfused pair compute the same
+# bits (one row owner, S1's serial ascending fold either way); this only picks
+# which launch plan runs. The fusion saves one launch and one reread of the
+# residual, which pays while the residual working set is small; as M * d_model
+# grows the extra serial pass per row thread costs more than the launch it
+# saves. Measured on Apple at d_model 768 (evidence
+# 2026-09-20_residual_rmsnorm_fusion.md): faster at 1.6 M f32 elements,
+# neutral at 3.1 M and 6.3 M, 10.7% slower at 25.2 M. The cut is a working-set
+# RANGE between the last neutral and the first slower point (2^23 elements,
+# 32 MiB f32), so it scales with d_model and is not tied to one row count.
+# Needs neighbor-shape validation (d_model 512 / 1024, M around the cut).
+comptime RESIDUAL_NORM_FUSE_MAX_ELEMS = 1 << 23
+
+
+def residual_norm_fusion_size_ok(m: Int, dm: Int) -> Bool:
+    """True while the [m, dm] residual is within the fusion's working set."""
+    return m * dm <= RESIDUAL_NORM_FUSE_MAX_ELEMS
+
+
+def residual_next_norm_fusion_enabled(
+    m: Int, dm: Int, norm_kind: Int, norm_bias: Bool
+) -> Bool:
+    """The measured cross-block residual2 -> norm1 route."""
+    return (
+        not is_defined["ANONLIB_DISABLE_RESIDUAL2_NEXT_NORM"]()
+        and TARGET_COLUMN == COLUMN_APPLE
+        and residual_norm_fusion_size_ok(m, dm)
+        and norm_kind == NORM_RMSNORM and not norm_bias
+    )
+
+
+def llama_rms_norm(
+    ctx: DeviceContext,
+    mut sumsq: DeviceBuffer[DType.float32],
+    mut out_buf: DeviceBuffer[DType.float32],
+    mut x: DeviceBuffer[DType.float32],
+    mut weight: DeviceBuffer[DType.float32],
+    m: Int,
+    d_model: Int,
+    eps: Float32,
+) raises:
+    """`LlamaRMSNorm.forward(hidden_states)` (:62-67) over `M = B * L` token
+    rows. ASYNCHRONOUS: the caller synchronizes.
+
+    **AFTER DEVIATION 801 LANDS THIS BODY BECOMES ONE CALL** to
+    `mamba_rms_norm(ctx, sumsq, out_buf, x, weight, m, d_model, eps)` and
+    `llama_rms_norm_kernel` is deleted. This launcher exists so that the
+    swap touches one function and no call site.
+    """
+    # NN25 keeps the exact S1 fold; cell work is a second flat launch.
+    # OFF by default. No width threshold: this arm measures the actual
+    # extra launch/repeated-rsqrt cost across neighboring model widths.
+    comptime if NN25_RMS_SPLIT_SCALE and not SAB_S1_FOLD_DESCENDING and not SAB_BATCHINV_NORM_CHUNK_FROM_M:
+        step_count_launch()
+        ctx.enqueue_function[rms_sumsq_kernel](
+            sumsq.unsafe_ptr(), x.unsafe_ptr(), Int32(m), Int32(d_model),
+            grid_dim=(_grid(m), 1, 1), block_dim=(LLAMA_TPB, 1, 1),
+        )
+        step_count_launch()
+        ctx.enqueue_function[rms_parallel_scale_kernel](
+            out_buf.unsafe_ptr(), sumsq.unsafe_ptr(), x.unsafe_ptr(),
+            weight.unsafe_ptr(), Int32(m), Int32(d_model), eps,
+            grid_dim=(_grid(m * d_model), 1, 1), block_dim=(LLAMA_TPB, 1, 1),
+        )
+        return
+    comptime if IDN_RMS_ROW_BLOCK and not BLOCK_ANY_SABOTAGE:
+        step_count_launch()
+        ctx.enqueue_function[llama_rms_norm_row_block_kernel](
+            sumsq.unsafe_ptr(), out_buf.unsafe_ptr(), x.unsafe_ptr(),
+            weight.unsafe_ptr(), Int32(d_model), eps,
+            grid_dim=(m, 1, 1), block_dim=(LLAMA_TPB, 1, 1),
+        )
+        return
+    # DEVIATION 2645:
+    # a trial build under an arm carrying `rows16`, `rows8` or `rows4` launches
+    # the same kernel at that many threads per block. The kernel owns one
+    # token row per thread and reads `block_dim` only to index its row, so
+    # every geometry covering [0, m) computes the same bits. On a build
+    # without the trial define and without a column default carrying a rows
+    # token (DEVIATION 2649) the two values below are the shipped `_grid(m)`
+    # and `LLAMA_TPB`.
+    var norm_blocks = _grid(m)
+    var norm_threads = LLAMA_TPB
+    comptime if STEP_GLUE_TRIAL or STEP_GLUE_SHIPPED_ROWS:
+        var glue_rows = step_glue_rows_of(step_glue_arm_from_env())
+        if glue_rows > 0:
+            norm_blocks = step_glue_blocks(m, glue_rows)
+            norm_threads = glue_rows
+    step_count_launch()
+    ctx.enqueue_function[llama_rms_norm_kernel](
+        sumsq.unsafe_ptr(),
+        out_buf.unsafe_ptr(),
+        x.unsafe_ptr(),
+        weight.unsafe_ptr(),
+        Int32(m),
+        Int32(d_model),
+        eps,
+        grid_dim=(norm_blocks, 1, 1),
+        block_dim=(norm_threads, 1, 1),
+    )
+
+
+def llama_norm_variant_kernel(
+    sumsq: MutPointer[Float32, MutAnyOrigin],
+    out_buf: MutPointer[Float32, MutAnyOrigin],
+    x: MutPointer[Float32, MutAnyOrigin],
+    weight: MutPointer[Float32, MutAnyOrigin],
+    bias: MutPointer[Float32, MutAnyOrigin],
+    m_in: Int32,
+    dm_in: Int32,
+    eps_in: Float32,
+    kind_in: Int32,
+    has_bias_in: Int32,
+):
+    """lane/block-options (2026-09-17): the norm VARIANTS, one thread per
+    row, the DEVICE spelling of `transformer_oracle.mojo::norm_into`'s
+    non-default arms. `llama_rms_norm_kernel` above is UNTOUCHED and is
+    what the default record launches, so no default bit moves.
+
+    DEVIATION 2936, `kind == NORM_LAYERNORM` (`nn.LayerNorm`): two SERIAL
+    ASCENDING folds per row, mean first (plain adds from +0.0) then the sum
+    of squared deviations (fma chain from +0.0), `rstd =
+    identical_rsqrt(var + eps)`, `y = identical_mul(w, identical_mul(dev, rstd))`
+    and, with `has_bias`, one plain add of the bias. The recorded
+    `norm*.sumsq` stage is the sum of squared DEVIATIONS.
+
+    DEVIATION 2938, `kind == NORM_RMSNORM_OFFSET` (Gemma's `(1 + w)`):
+    S1-S4 verbatim with S4's weight `ftz(1.0 + ftz(w_j))`.
+
+    `kind == NORM_RMSNORM` is spelled here too (S1-S4 with the eps
+    argument, DEVIATION 2937) so that the q/k norm (DEVIATION 2946) has one
+    launcher, but the block's own norms take `llama_rms_norm` for it.
+    """
+    var m = Int(m_in)
+    var dm = Int(dm_in)
+    var kind = Int(kind_in)
+    var has_bias = Int(has_bias_in) != 0
+    var t = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if t >= m:
+        return
+    if kind == NORM_LAYERNORM:
+        var acc = Float32(0.0)
+        for j in range(dm):
+            acc = ftz(ftz(acc) + ftz(x.unsafe_load(t * dm + j)))
+        comptime if NN24_NORM_LANES8:
+            acc = _sum[NN24_LANES](x, t * dm, dm)
+        var mean = ftz(identical_div(acc, Float32(dm)))
+        var acc2 = Float32(0.0)
+        for j in range(dm):
+            var dev = ftz(ftz(x.unsafe_load(t * dm + j)) - mean)
+            acc2 = ftz(identical_mul_add(dev, dev, acc2))
+        comptime if NN24_NORM_LANES8:
+            acc2 = _square[NN24_LANES](x, t * dm, dm, mean)
+        sumsq.unsafe_store(t, acc2)
+        var variance = ftz(identical_div(acc2, Float32(dm)))
+        var rstd = ftz(identical_rsqrt(ftz(variance + eps_in)))
+        for j in range(dm):
+            var dev = ftz(ftz(x.unsafe_load(t * dm + j)) - mean)
+            var inner = ftz(identical_mul(dev, rstd))
+            var y = ftz(identical_mul(ftz(weight.unsafe_load(j)), inner))
+            if has_bias:
+                y = ftz(ftz(y) + ftz(bias.unsafe_load(j)))
+            out_buf.unsafe_store(t * dm + j, y)
+        return
+    var acc = Float32(0.0)
+    for j in range(dm):
+        var xj = ftz(x.unsafe_load(t * dm + j))
+        acc = ftz(identical_mul_add(xj, xj, acc))
+    comptime if NN24_NORM_LANES8:
+        acc = norm_profile_dot[NN24_LANES](x, x, t * dm, t * dm, dm)
+    sumsq.unsafe_store(t, acc)
+    var mean = ftz(identical_div(acc, Float32(dm)))
+    var rstd = ftz(identical_rsqrt(ftz(mean + eps_in)))
+    for j in range(dm):
+        var inner = ftz(identical_mul(ftz(x.unsafe_load(t * dm + j)), rstd))
+        var wj = ftz(weight.unsafe_load(j))
+        if kind == NORM_RMSNORM_OFFSET:
+            wj = ftz(Float32(1.0) + wj)
+        out_buf.unsafe_store(t * dm + j, ftz(identical_mul(wj, inner)))
+
+
+def llama_norm(
+    ctx: DeviceContext,
+    mut sumsq: DeviceBuffer[DType.float32],
+    mut out_buf: DeviceBuffer[DType.float32],
+    mut x: DeviceBuffer[DType.float32],
+    mut weight: DeviceBuffer[DType.float32],
+    mut bias: DeviceBuffer[DType.float32],
+    m: Int,
+    d_model: Int,
+    eps: Float32,
+    kind: Int,
+    has_bias: Bool,
+) raises:
+    """The block's normalization under the record (lane/block-options):
+    the plain RMSNorm without a bias is `llama_rms_norm`, UNCHANGED, and
+    every other form is `llama_norm_variant_kernel`. ASYNCHRONOUS."""
+    if kind == NORM_RMSNORM and not has_bias:
+        llama_rms_norm(ctx, sumsq, out_buf, x, weight, m, d_model, eps)
+        return
+    if has_bias and kind != NORM_LAYERNORM:
+        raise Error("llama: an RMSNorm carries no bias (norm_bias needs layernorm)")
+    step_count_launch()
+    ctx.enqueue_function[llama_norm_variant_kernel](
+        sumsq.unsafe_ptr(),
+        out_buf.unsafe_ptr(),
+        x.unsafe_ptr(),
+        weight.unsafe_ptr(),
+        bias.unsafe_ptr(),
+        Int32(m),
+        Int32(d_model),
+        eps,
+        Int32(kind),
+        Int32(1 if has_bias else 0),
+        grid_dim=(_grid(m), 1, 1),
+        block_dim=(LLAMA_TPB, 1, 1),
+    )
+
+
+# ===========================================================================
+# `LlamaRotaryEmbedding` (:73-127). Seams S6, S7, S8.
+#
+#     inv_freq = 1.0 / (base ** (arange(0, dim, 2).float() / dim))    :108
+#     freqs = (inv_freq_expanded @ position_ids_expanded).transpose   :120
+#     emb = torch.cat((freqs, freqs), dim=-1)                         :123
+#     cos = emb.cos() * self.attention_scaling                        :124
+#     sin = emb.sin() * self.attention_scaling                        :125
+#
+# `attention_scaling` is EXACTLY 1.0 for `rope_type = "default"`
+# (`compute_default_rope_parameters` :105 `attention_factor = 1.0`), so the
+# multiply at :124-125 is bit-inert on every finite input and both zero signs
+# and IS NOT SPELLED. Contract section 3, DEVIATION 810.
+#
+# `cat(freqs, freqs)` is a COPY and is not materialized: only `[p_max, half]`
+# is stored and column `j` of a head reads table column `j % half`.
+# ===========================================================================
+
+
+def llama_rope_inv_freq_host(
+    theta: Float32, head_dim: Int
+) raises -> List[Float32]:
+    """S6, on the HOST, once per `(theta, head_dim)`. Contract section 4's
+    S6 row.
+
+        e   = ftz(identical_div(Float32(2*i), Float32(head_dim)))
+        inv = ftz(identical_div(1.0, portable_powf(theta, e)))
+
+    **`portable_powf` and NOT the host libm `pow`.** A constant computed by
+    the host's libm is IDENTITY_PATHS row 18 applied to a table: cross-vendor
+    is cross-HOST for a constant, and three build machines with three libms
+    would seed three different rotary tables that no device stage could
+    explain. Contract DEVIATION 809.
+
+    `portable_powf` is `portable_expf(p * portable_logf(x))`. The syntactic
+    `*` in it is the numerics lane's spelling, not this lane's; it feeds a
+    function ARGUMENT and has no neighboring add to be contracted into, so
+    it is not an FMA hazard here. That is an argument, not a measurement.
+
+    NOT FLUSHED-AND-DONE: the result list is uploaded verbatim and the
+    device flushes on load like every other operand (DEVIATION 1026).
+    """
+    if head_dim <= 0 or head_dim % 2 != 0:
+        raise Error("llama: rope needs an even positive head_dim")
+    var half = head_dim // 2
+    var out = List[Float32]()
+    for i in range(half):
+        var e = ftz(identical_div(Float32(2 * i), Float32(head_dim)))
+        var p = portable_powf(theta, e)
+        out.append(ftz(identical_div(Float32(1.0), p)))
+    return out^
+
+
+def llama_rope_inv_freq_scaled_host(
+    opts: BlockOptions, rope_dim: Int
+) raises -> List[Float32]:
+    """S6 under the record, the DEVICE FILE's transcription (the oracle's
+    is `transformer_oracle.mojo::rope_inv_freq_scaled`; the two share
+    only the seam functions). HOST, once per configuration, like S6 has
+    always been.
+
+    DEVIATION 2930: the base is `opts.rope_theta`, S6's arithmetic otherwise
+    (`e = 2i / rope_dim`, `inv = 1 / theta**e`, `identical_div` and
+    `portable_powf`; `_compute_default_rope_parameters`,
+    modeling_rope_utils.py:95-135).
+    DEVIATION 2931, linear: `inv = inv / factor`, one `identical_div`
+    (`_compute_linear_scaling_rope_parameters`, :138-176).
+    DEVIATION 2932, llama3 (`_compute_llama3_parameters`, :384-432), in the
+    reference's operation order, every intermediate Float32 and flushed:
+    the two wavelength thresholds `old / low` and `old / high`; the
+    column's wavelength `2*pi / inv` (2*pi = 0x40C90FDB); `inv / factor`
+    where the wavelength exceeds the low threshold; and on the medium band
+    (`not (wl < high_wl) and not (wl > low_wl)`) the smoothed value
+    `((1 - s) * inv_l) / factor + s * inv_l` with `s = (old / wl - low) /
+    (high - low)`, products through `pinned_mul`, the final add UNFUSED.
+    `attention_factor` is 1.0 for all three, so nothing scales cos or sin.
+    """
+    if rope_dim <= 0 or rope_dim % 2 != 0:
+        raise Error("llama: rope needs an even positive rope_dim")
+    var half = rope_dim // 2
+    var out = List[Float32]()
+    var theta = opts.rope_theta
+    for i in range(half):
+        var e = ftz(identical_div(Float32(2 * i), Float32(rope_dim)))
+        var p = portable_powf(theta, e)
+        var inv = ftz(identical_div(Float32(1.0), p))
+        if opts.rope_scaling == ROPE_SCALING_LINEAR:
+            inv = ftz(identical_div(inv, ftz(opts.rope_factor)))
+        elif opts.rope_scaling == ROPE_SCALING_LLAMA3:
+            var factor = ftz(opts.rope_factor)
+            var lo_f = ftz(opts.rope_low_freq_factor)
+            var hi_f = ftz(opts.rope_high_freq_factor)
+            var old = Float32(opts.rope_original_max_positions)
+            var low_wl = ftz(identical_div(old, lo_f))
+            var high_wl = ftz(identical_div(old, hi_f))
+            var two_pi = bitcast[DType.float32](UInt32(0x40C90FDB))
+            var wl = ftz(identical_div(two_pi, inv))
+            var inv_l = inv
+            if wl > low_wl:
+                inv_l = ftz(identical_div(inv, factor))
+            if (not (wl < high_wl)) and (not (wl > low_wl)):
+                var ratio = ftz(identical_div(old, wl))
+                var smooth = ftz(identical_div(ftz(ratio - lo_f), ftz(hi_f - lo_f)))
+                var t1 = ftz(identical_mul(ftz(Float32(1.0) - smooth), inv_l))
+                t1 = ftz(identical_div(t1, factor))
+                var t2 = ftz(identical_mul(smooth, inv_l))
+                inv_l = ftz(ftz(t1) + ftz(t2))
+            inv = inv_l
+        out.append(inv)
+    return out^
+
+
+def llama_refuse_rope_angle_domain(
+    inv_freq: List[Float32], positions: Int
+) raises:
+    """DEVIATION 2933: the rotary reduction's domain, on the ANGLE. The
+    largest angle the table will hold, `(positions - 1) * inv_freq[i]` at
+    the column with the largest inverse frequency, spelled as S7 spells it,
+    must be strictly below 8192.0 (`_cephes_sincosf_core`'s Cody-Waite
+    domain, DEVIATION 812). At the default record `inv_freq[0] == 1.0` and
+    this is `positions > 8192` exactly. REFUSED BY NAME; never clamped."""
+    var worst = Float32(0.0)
+    var worst_i = 0
+    for i in range(len(inv_freq)):  # small-loop(inv_freq: head_dim/2 rotary columns): angle-domain refusal of the table, once per table
+        var angle = ftz(identical_mul(Float32(positions - 1), ftz(inv_freq[i])))
+        if angle > worst:
+            worst = angle
+            worst_i = i
+    if worst >= rope_angle_domain():
+        raise Error(
+            String("llama: a rotary table of ")
+            + String(positions)
+            + " positions puts the RoPE angle at column "
+            + String(worst_i)
+            + " at "
+            + String(worst)
+            + ", at or beyond the Cody-Waite ceiling of"
+            + " _cephes_sincosf_core (8192.0; DEVIATION 812 restated as"
+            + " DEVIATION 2933). Fewer positions, a rope_scaling factor or"
+            + " a wider reduction in checks/numerics.mojo are the exits"
+        )
+
+
+def llama_rope_table_kernel(
+    cos_tab: MutPointer[Float32, MutAnyOrigin],
+    sin_tab: MutPointer[Float32, MutAnyOrigin],
+    inv_freq: MutPointer[Float32, MutAnyOrigin],
+    p_max_in: Int32,
+    half_in: Int32,
+):
+    """S7 and S8. One thread per `(position, frequency)` cell.
+
+    S7, PRODUCT: `identical_mul(Float32(abs_pos), inv_freq[i])`. In the reference this
+    is a `k = 1` matmul in FP32 with autocast explicitly disabled
+    (:118-122). At `k = 1` the gemm leaf is `ftz(fma(a, b, +0.0))`, which is
+    bit-equal to this product because both operands are NON-NEGATIVE (the
+    position is an absolute index and `inv_freq` is a reciprocal of a
+    positive power), so the two spellings coincide and contract S7 pins the
+    cheaper one.
+
+    S8: `identical_cos` (DEVIATION 258) and `identical_sin` (DEVIATION 820).
+    They share `_cephes_sincosf_core`, so BOTH HALVES OF ONE ROTATION COME
+    FROM ONE REDUCTION rather than from two functions wearing one name.
+
+    THE TRIG PAIR'S FLUSH ASYMMETRY IS NOT A BUG HERE. `portable_sinf`
+    flushes its input and `portable_cosf` does not (DEVIATION 820), because
+    near zero `sin` returns its argument and a subnormal survives to the
+    output while `cos` returns 1.0 for every subnormal on every column. The
+    angle is flushed once, before both calls, so the asymmetry cannot be
+    reached from this site at all.
+
+    `portable_sinf(-0.0)` is `-0.0`, a knowing departure from Cephes. It is
+    UNREACHABLE here: the angle is `position * inv_freq` with
+    `position >= 0` and `inv_freq > 0`. Contract section 8's last clause
+    exists so nobody plants a fixture expecting Cephes's answer.
+    """
+    var p_max = Int(p_max_in)
+    var half = Int(half_in)
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if i >= p_max * half:
+        return
+    var pos = i // half
+    var f = i - pos * half
+    var angle = ftz(
+        identical_mul(Float32(pos), ftz(inv_freq.unsafe_load(f)))
+    )
+    cos_tab.unsafe_store(i, ftz(identical_cos(angle)))
+    sin_tab.unsafe_store(i, ftz(identical_sin(angle)))
+
+
+struct LlamaRopeTable(Movable):
+    """`LlamaRotaryEmbedding` (:73-127), computed ONCE per
+    `(theta, head_dim, p_max)` and indexed by ABSOLUTE POSITION. Contract
+    DEVIATION 810, and MAX's own `rope.mojo` does the same thing (it takes
+    `freqs_cis` as a tensor and computes no angle in any kernel).
+
+    `inv_freq` `[half]` is S6 and it is computed on the HOST, once. `cos`
+    and `sin` are `[p_max, half]` and they are S7 and S8, computed on the
+    DEVICE, because the transcendentals are where the cross-vendor claim
+    lives and a host-computed table would move that claim onto the host's
+    libm -- which is IDENTITY_PATHS row 18's hazard applied to a constant.
+
+    S6 stays on the host anyway, and the asymmetry is deliberate: it is one
+    `portable_powf` per table column, its inputs are integers, and contract
+    section 4's S6 row says HOST in capitals.
+
+    DEFINED HERE, AFTER ITS TWO FUNCTIONS, ON PURPOSE. This file avoids
+    forward references at module scope throughout, because it was written
+    by a lane that cannot compile and a resolution order it guessed wrong
+    would be a whole build cycle spent on nothing.
+    """
+
+    var half: Int
+    var p_max: Int
+    var theta: Float32
+    var rope_dim: Int
+    """DEVIATION 2948 (lane/block-options): the rotated width; `half` is
+    `rope_dim // 2` and the table is `[p_max, half]`. `head_dim` for every
+    table built through the `theta` constructor."""
+    var inv_freq: DeviceBuffer[DType.float32]  # [half]
+    var cos: DeviceBuffer[DType.float32]  # [p_max, half]
+    var sin: DeviceBuffer[DType.float32]  # [p_max, half]
+
+    def __init__(
+        out self,
+        ctx: DeviceContext,
+        dims: LlamaDims,
+        theta: Float32,
+        p_max: Int,
+    ) raises:
+        """Today's table: the default record with `theta` in place of the
+        frozen base. Every pre-existing caller (the gates, the byte LM, the
+        benches) reaches this constructor and the bits it always produced;
+        `theta == 10000.0` is the default record exactly and any other
+        value is DEVIATION 2930 through the same spelling."""
+        var opts = BlockOptions()
+        opts.rope_theta = theta
+        self = Self(ctx, dims, opts, p_max)
+
+    def __init__(
+        out self,
+        ctx: DeviceContext,
+        dims: LlamaDims,
+        opts: BlockOptions,
+        p_max: Int,
+    ) raises:
+        """The table under the record (lane/block-options): DEVIATIONS
+        2930-2932 (S6 through `llama_rope_inv_freq_scaled_host`), 2933
+        (the ceiling: `p_max <= opts.max_positions` and the ANGLE domain)
+        and 2948 (`rope_dim` columns)."""
+        dims.validate()
+        opts.validate(dims.head_dim)
+        if p_max <= 0:
+            raise Error("llama: the rotary table needs p_max > 0")
+        if p_max > opts.max_positions:
+            raise Error(
+                String("llama: p_max ")
+                + String(p_max)
+                + " exceeds the absolute-position ceiling "
+                + String(opts.max_positions)
+                + " (the model's max_positions, DEVIATION 2933; contract"
+                + " section 3's DEVIATION 812 at the default)"
+            )
+        self.rope_dim = opts.rope_dim_of(dims.head_dim)
+        self.half = self.rope_dim // 2
+        self.p_max = p_max
+        self.theta = opts.rope_theta
+        var inv = llama_rope_inv_freq_scaled_host(opts, self.rope_dim)
+        llama_refuse_rope_angle_domain(inv, p_max)
+        self.inv_freq = _upload(ctx, inv)
+        self.cos = _zeros(ctx, p_max * self.half)
+        self.sin = _zeros(ctx, p_max * self.half)
+        step_count_launch()
+        ctx.enqueue_function[llama_rope_table_kernel](
+            self.cos.unsafe_ptr(),
+            self.sin.unsafe_ptr(),
+            self.inv_freq.unsafe_ptr(),
+            Int32(p_max),
+            Int32(self.half),
+            grid_dim=(_grid(p_max * self.half), 1, 1),
+            block_dim=(LLAMA_TPB, 1, 1),
+        )
+        step_count_sync()
+        ctx.synchronize()
+
+
+# ===========================================================================
+# `rotate_half` (:130-134) and `apply_rotary_pos_emb` (:138-160).
+# Seams S9 and S10.
+#
+#     x1 = x[..., : x.shape[-1] // 2]                                 :132
+#     x2 = x[..., x.shape[-1] // 2 :]                                 :133
+#     return torch.cat((-x2, x1), dim=-1)                             :134
+#     q_embed = (q * cos) + (rotate_half(q) * sin)                    :158
+#
+# ONE kernel serves q and k, because the reference applies the same function to
+# both (:158-159) and a second spelling would be a second place to drift.
+# ===========================================================================
+
+
+def apply_rotary_pos_emb_kernel(
+    out_buf: MutPointer[Float32, MutAnyOrigin],
+    x: MutPointer[Float32, MutAnyOrigin],
+    cos_tab: MutPointer[Float32, MutAnyOrigin],
+    sin_tab: MutPointer[Float32, MutAnyOrigin],
+    m_in: Int32,
+    l_in: Int32,
+    nh_in: Int32,
+    hd_in: Int32,
+    pos0_in: Int32,
+    rd_in: Int32,
+):
+    """One thread per output cell of `[M, n_h*head_dim]`, token-major.
+
+    DEVIATION 2948 (lane/block-options): `rd_in` is the ROTATED WIDTH.
+    Columns `d >= rd` pass through, flushed on load (a copy, not a seam;
+    DEVIATION 1026's per-load rule), and the table is `[p_max, rd/2]`. At
+    `rd == head_dim` (every call before this lane) the pass-through branch
+    is never taken and the arithmetic below is unchanged.
+
+    THE POSITION IS THE ABSOLUTE POSITION, ALWAYS (contract S7, 5.5, 7.2).
+    Token `t` of this launch is at absolute position `pos0 + t`, so a decode
+    step reads the SAME table rows the prefill read for that token. An
+    implementation that indexes from the start of the slice is the
+    `S07_ROPE_RELATIVE_POSITION` sabotage and it must break clause (d) and
+    nothing else.
+
+    S9, PRODUCT twice: `q * cos` and `rotate_half(q) * sin`, each its own
+    rounding (LAR:158 writes two separate products).
+
+    S10, UNFUSED ADD: `ftz(ftz(S9a) + ftz(S9b))`. **An fma here is one
+    rounding where the reference has three**, and it is the natural thing
+    for a kernel to write. Contract DEVIATION 811.
+
+    THE NEGATION IS EXACT. `-x` flips one bit and is not a seam, so it
+    carries no flush of its own (the mamba lane's S15 made the same call).
+    """
+    var m = Int(m_in)
+    var l = Int(l_in)
+    var nh = Int(nh_in)
+    var hd = Int(hd_in)
+    var pos0 = Int(pos0_in)
+    var rd = Int(rd_in)
+    var half = rd // 2
+    var width = nh * hd
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if i >= m * width:
+        return
+
+    var tok = i // width
+    var rem = i - tok * width
+    var h = rem // hd
+    var d = rem - h * hd
+    var t = tok - (tok // l) * l
+
+    if d >= rd:
+        # DEVIATION 2948: outside the rotated width, a flushed copy.
+        out_buf.unsafe_store(i, ftz(x.unsafe_load(i)))
+        return
+
+    var pos = pos0 + t
+    comptime if SAB_S07_ROPE_RELATIVE_POSITION:
+        pos = t
+
+    # `cat(freqs, freqs)` (:123): column `d` and column `d + half` read the
+    # SAME table entry. A COPY, never materialized.
+    var f = d
+    if f >= half:
+        f = f - half
+    var cos_v = ftz(cos_tab.unsafe_load(pos * half + f))
+    var sin_v = ftz(sin_tab.unsafe_load(pos * half + f))
+
+    var xj = ftz(x.unsafe_load(i))
+
+    # `rotate_half`: `cat(-x2, x1)`. The lower half takes MINUS the upper
+    # half's partner; the upper half takes the lower half's partner as is.
+    var rh: Float32
+    comptime if SAB_S09_ROPE_HALVES_SWAPPED:
+        if d < half:
+            rh = ftz(x.unsafe_load(i + half))
+        else:
+            rh = -ftz(x.unsafe_load(i - half))
+    else:
+        if d < half:
+            rh = -ftz(x.unsafe_load(i + half))
+        else:
+            rh = ftz(x.unsafe_load(i - half))
+
+    var a = ftz(identical_mul(xj, cos_v))
+    comptime if SAB_S10_ROPE_FUSED:
+        out_buf.unsafe_store(i, ftz(identical_mul_add(rh, sin_v, a)))
+    else:
+        var bterm = ftz(identical_mul(rh, sin_v))
+        out_buf.unsafe_store(i, ftz(ftz(a) + ftz(bterm)))
+
+
+def apply_rotary_pos_emb(
+    ctx: DeviceContext,
+    mut out_buf: DeviceBuffer[DType.float32],
+    mut x: DeviceBuffer[DType.float32],
+    mut cos_tab: DeviceBuffer[DType.float32],
+    mut sin_tab: DeviceBuffer[DType.float32],
+    m: Int,
+    l: Int,
+    n_h: Int,
+    head_dim: Int,
+    pos0: Int,
+    rope_dim: Int,
+) raises:
+    """`apply_rotary_pos_emb(q, k, cos, sin)` (:138-160), one tensor per
+    call. `n_h` is `n_heads` for q and `n_kv` for k. `rope_dim` is the
+    rotated width (`head_dim` for the full rotary; DEVIATION 2948).
+    ASYNCHRONOUS."""
+    if rope_dim <= 0 or rope_dim > head_dim or rope_dim % 2 != 0:
+        raise Error(
+            String("llama: rope_dim ")
+            + String(rope_dim)
+            + " must be even and in (0, head_dim="
+            + String(head_dim)
+            + "]"
+        )
+    step_count_launch()
+    ctx.enqueue_function[apply_rotary_pos_emb_kernel](
+        out_buf.unsafe_ptr(),
+        x.unsafe_ptr(),
+        cos_tab.unsafe_ptr(),
+        sin_tab.unsafe_ptr(),
+        Int32(m),
+        Int32(l),
+        Int32(n_h),
+        Int32(head_dim),
+        Int32(pos0),
+        Int32(rope_dim),
+        grid_dim=(_grid(m * n_h * head_dim), 1, 1),
+        block_dim=(LLAMA_TPB, 1, 1),
+    )
+
+
+# ===========================================================================
+# `past_key_values.update(key_states, value_states, self.layer_idx)`
+# (:261-262), which for the default `DynamicCache` is a `torch.cat` along
+# the sequence axis.
+#
+# COPIES, NOT A SEAM (contract section 4's preamble names the KV cache
+# append explicitly). DEVIATION 1022: out of place, at the NEW stride.
+# ===========================================================================
+
+
+def rotary_k_prefill_cache_kernel(
+    k_rope: MutPointer[Float32, MutAnyOrigin],
+    k_cache: MutPointer[Float32, MutAnyOrigin],
+    v_cache: MutPointer[Float32, MutAnyOrigin],
+    k_proj: MutPointer[Float32, MutAnyOrigin],
+    v_proj: MutPointer[Float32, MutAnyOrigin],
+    cos_tab: MutPointer[Float32, MutAnyOrigin],
+    sin_tab: MutPointer[Float32, MutAnyOrigin],
+    b_in: Int32, l_in: Int32, nkv_in: Int32, hd_in: Int32, rd_in: Int32,
+):
+    """NI23: full-prefill K RoPE plus the K/V attention-layout stores.
+
+    Only cache-empty, absolute-position-zero calls enter. One cell computes
+    apply_rotary_pos_emb_kernel's clean S9/S10 spelling, saves its original
+    token-major tape value, and writes the same value to the packed K layout.
+    V is a raw copy, matching kv_append2_kernel (no newly introduced FTZ).
+    """
+    var l = Int(l_in)
+    var nkv = Int(nkv_in)
+    var hd = Int(hd_in)
+    var rd = Int(rd_in)
+    var half = rd // 2
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if i >= Int(b_in) * l * nkv * hd:
+        return
+    var d = i % hd
+    var kvh = (i // hd) % nkv
+    var tok = i // (nkv * hd)
+    var t = tok % l
+    var bb = tok // l
+    var rotated = ftz(k_proj.unsafe_load(i))
+    if d < rd:
+        var f = d if d < half else d - half
+        var c = ftz(cos_tab.unsafe_load(t * half + f))
+        var s = ftz(sin_tab.unsafe_load(t * half + f))
+        var rh = -ftz(k_proj.unsafe_load(i + half)) if d < half else ftz(k_proj.unsafe_load(i - half))
+        var a = ftz(identical_mul(rotated, c))
+        var bterm = ftz(identical_mul(rh, s))
+        rotated = ftz(ftz(a) + ftz(bterm))
+    k_rope.unsafe_store(i, rotated)
+    var dst = ((bb * nkv + kvh) * l + t) * hd + d
+    k_cache.unsafe_store(dst, rotated)
+    v_cache.unsafe_store(dst, v_proj.unsafe_load(i))
+
+
+def kv_append_kernel(
+    new_cache: MutPointer[Float32, MutAnyOrigin],
+    old_cache: MutPointer[Float32, MutAnyOrigin],
+    fresh: MutPointer[Float32, MutAnyOrigin],
+    b_in: Int32,
+    l_in: Int32,
+    nkv_in: Int32,
+    hd_in: Int32,
+    s_old_in: Int32,
+):
+    """One thread per cell of the NEW `[B, n_kv, S_new, head_dim]` cache.
+
+    Slot `j < s_old` copies the old cache (which is packed at stride
+    `s_old`); slot `j >= s_old` copies `fresh`, which is token-major
+    `[M, n_kv*head_dim]`, at token `j - s_old`.
+
+    **CACHE SLOT `j` IS ABSOLUTE POSITION `j`**, which holds because
+    DEVIATION 1028 refuses a call whose `pos0` is not `s_old`.
+    """
+    var b = Int(b_in)
+    var l = Int(l_in)
+    var nkv = Int(nkv_in)
+    var hd = Int(hd_in)
+    var s_old = Int(s_old_in)
+    var s_new = s_old + l
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if i >= b * nkv * s_new * hd:
+        return
+    var d = i % hd
+    var rest = i // hd
+    var j = rest % s_new
+    var rest2 = rest // s_new
+    var kvh = rest2 % nkv
+    var bb = rest2 // nkv
+    var v: Float32
+    if j < s_old:
+        v = old_cache.unsafe_load(((bb * nkv + kvh) * s_old + j) * hd + d)
+    else:
+        var t = j - s_old
+        v = fresh.unsafe_load((bb * l + t) * nkv * hd + kvh * hd + d)
+    new_cache.unsafe_store(i, v)
+
+
+def kv_append2_kernel(
+    new_k: MutPointer[Float32, MutAnyOrigin],
+    new_v: MutPointer[Float32, MutAnyOrigin],
+    old_k: MutPointer[Float32, MutAnyOrigin],
+    old_v: MutPointer[Float32, MutAnyOrigin],
+    fresh_k: MutPointer[Float32, MutAnyOrigin],
+    fresh_v: MutPointer[Float32, MutAnyOrigin],
+    b_in: Int32,
+    l_in: Int32,
+    nkv_in: Int32,
+    hd_in: Int32,
+    s_old_in: Int32,
+):
+    """Append K and V with `kv_append_kernel`'s one shared index walk.
+
+    Each destination remains a plain bit copy from its original source.  K
+    and V are independent; only their integer address calculation and launch
+    are shared.
+    """
+    var b = Int(b_in)
+    var l = Int(l_in)
+    var nkv = Int(nkv_in)
+    var hd = Int(hd_in)
+    var s_old = Int(s_old_in)
+    var s_new = s_old + l
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if i >= b * nkv * s_new * hd:
+        return
+    var d = i % hd
+    var rest = i // hd
+    var j = rest % s_new
+    var rest2 = rest // s_new
+    var kvh = rest2 % nkv
+    var bb = rest2 // nkv
+    var src_i: Int
+    if j < s_old:
+        src_i = ((bb * nkv + kvh) * s_old + j) * hd + d
+        new_k.unsafe_store(i, old_k.unsafe_load(src_i))
+        new_v.unsafe_store(i, old_v.unsafe_load(src_i))
+    else:
+        var t = j - s_old
+        src_i = (bb * l + t) * nkv * hd + kvh * hd + d
+        new_k.unsafe_store(i, fresh_k.unsafe_load(src_i))
+        new_v.unsafe_store(i, fresh_v.unsafe_load(src_i))
+
+
+def kv_window_gather_kernel(
+    work: MutPointer[Float32, MutAnyOrigin],
+    ring: MutPointer[Float32, MutAnyOrigin],
+    fresh: MutPointer[Float32, MutAnyOrigin],
+    b_in: Int32,
+    l_in: Int32,
+    nkv_in: Int32,
+    hd_in: Int32,
+    cap_in: Int32,
+    key_lo_in: Int32,
+    pos0_in: Int32,
+    s_in: Int32,
+):
+    """The windowed twin of `kv_append_kernel`: one thread per cell of the
+    packed work span `[B, n_kv, S, head_dim]`, where work index `j` is
+    absolute position `key_lo + j`. Positions before `pos0` come out of
+    the ring at slot `position % cap`; positions from `pos0` on come out of
+    this call's token-major `fresh`. A COPY, not a seam. It runs BEFORE
+    `kv_ring_write_kernel`, because this call's tokens may evict positions
+    this call still attends to."""
+    var b = Int(b_in)
+    var l = Int(l_in)
+    var nkv = Int(nkv_in)
+    var hd = Int(hd_in)
+    var cap = Int(cap_in)
+    var key_lo = Int(key_lo_in)
+    var pos0 = Int(pos0_in)
+    var s = Int(s_in)
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if i >= b * nkv * s * hd:
+        return
+    var d = i % hd
+    var rest = i // hd
+    var j = rest % s
+    var rest2 = rest // s
+    var kvh = rest2 % nkv
+    var bb = rest2 // nkv
+    var pos = key_lo + j
+    var v: Float32
+    if pos < pos0:
+        v = ring.unsafe_load(((bb * nkv + kvh) * cap + pos % cap) * hd + d)
+    else:
+        var t = pos - pos0
+        v = fresh.unsafe_load((bb * l + t) * nkv * hd + kvh * hd + d)
+    work.unsafe_store(i, v)
+
+
+def kv_ring_write_kernel(
+    ring: MutPointer[Float32, MutAnyOrigin],
+    fresh: MutPointer[Float32, MutAnyOrigin],
+    b_in: Int32,
+    l_in: Int32,
+    nkv_in: Int32,
+    hd_in: Int32,
+    cap_in: Int32,
+    pos0_in: Int32,
+):
+    """Write this call's `l` tokens into the ring at slot `position % cap`.
+    One thread per RING cell: it finds the LAST of this call's positions
+    that maps to its slot (the highest position wins, as an in-order
+    append would) and copies that token, or leaves the slot alone when no
+    token of this call lands there. No thread reads a cell another thread
+    writes, so the result does not depend on the launch."""
+    var b = Int(b_in)
+    var l = Int(l_in)
+    var nkv = Int(nkv_in)
+    var hd = Int(hd_in)
+    var cap = Int(cap_in)
+    var pos0 = Int(pos0_in)
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if i >= b * nkv * cap * hd:
+        return
+    var d = i % hd
+    var rest = i // hd
+    var slot = rest % cap
+    var rest2 = rest // cap
+    var kvh = rest2 % nkv
+    var bb = rest2 // nkv
+    var p_last = pos0 + l - 1
+    var delta = (p_last % cap - slot + cap) % cap
+    var pos = p_last - delta
+    if pos < pos0:
+        return
+    var t = pos - pos0
+    ring.unsafe_store(
+        i, fresh.unsafe_load((bb * l + t) * nkv * hd + kvh * hd + d)
+    )
+
+
+# ===========================================================================
+# `eager_attention_forward` (:191-213), the pinned path. Contract section 6
+# excludes FlashAttention, SDPA, paged attention and chunked prefill, and
+# the reason is that an ONLINE softmax's rescale count is the KV TILE COUNT,
+# an execution-plan quantity, which is IDENTITY_PATHS rows 3 and 7 moved
+# inside the softmax where no contract can reach it by pinning a topology.
+#
+#     attn_weights = torch.matmul(q, k.transpose(2,3)) * scaling      :204
+#     attn_weights = attn_weights + attention_mask                    :206
+#     attn_weights = nn.functional.softmax(attn_weights, dim=-1)      :208
+#     attn_output  = torch.matmul(attn_weights, value_states)         :210
+#
+# Nine kernels and `B * n_heads` GEMM calls below, one recorded stage per
+# clause, because a lane whose whole instrument is the per-stage card should
+# not begin by fusing the stages away (contract section 6's last paragraph).
+# ===========================================================================
+
+
+def gather_q_head_kernel(
+    qbh: MutPointer[Float32, MutAnyOrigin],
+    q_rope: MutPointer[Float32, MutAnyOrigin],
+    l_in: Int32,
+    nh_in: Int32,
+    hd_in: Int32,
+    bb_in: Int32,
+    h_in: Int32,
+    scale_in: Float32,
+):
+    """DEVIATION 1021: one head's `[L, head_dim]` block, contiguous, for the
+    GEMM. A COPY.
+
+    `scale_in` is read ONLY by the `S12_SCALE_INTO_Q` sabotage arm. The
+    profile scales the FINISHED dot (S12), never `q`."""
+    var l = Int(l_in)
+    var nh = Int(nh_in)
+    var hd = Int(hd_in)
+    var bb = Int(bb_in)
+    var h = Int(h_in)
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if i >= l * hd:
+        return
+    var t = i // hd
+    var d = i - t * hd
+    var v = q_rope.unsafe_load((bb * l + t) * nh * hd + h * hd + d)
+    comptime if SAB_S12_SCALE_INTO_Q:
+        # SABOTAGE: one rounding per q element rather than one per score.
+        v = ftz(identical_mul(ftz(v), scale_in))
+    qbh.unsafe_store(i, v)
+
+
+def gather_kv_head_kernel(
+    dst: MutPointer[Float32, MutAnyOrigin],
+    cache: MutPointer[Float32, MutAnyOrigin],
+    s_in: Int32,
+    nkv_in: Int32,
+    hd_in: Int32,
+    bb_in: Int32,
+    kvh_in: Int32,
+):
+    """DEVIATION 1021: one kv head's `[S, head_dim]` block for the GEMM. A
+    COPY. `repeat_kv` (:179-188) is the `kvh = h // n_rep` the CALLER passes
+    -- an index map, never a materialized expansion (contract DEVIATION
+    813)."""
+    var s = Int(s_in)
+    var nkv = Int(nkv_in)
+    var hd = Int(hd_in)
+    var bb = Int(bb_in)
+    var kvh = Int(kvh_in)
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if i >= s * hd:
+        return
+    dst.unsafe_store(i, cache.unsafe_load((bb * nkv + kvh) * s * hd + i))
+
+
+def scatter_scores_kernel(
+    scores: MutPointer[Float32, MutAnyOrigin],
+    sbh: MutPointer[Float32, MutAnyOrigin],
+    l_in: Int32,
+    s_in: Int32,
+    nh_in: Int32,
+    bb_in: Int32,
+    h_in: Int32,
+):
+    """DEVIATION 1021: the GEMM's `[L, S]` result into
+    `[B, n_heads, L, S]`. A COPY, no arithmetic. The scale (S12) is a
+    SEPARATE kernel on purpose: a copy that also rounds is a copy nobody
+    reviews as a seam."""
+    var l = Int(l_in)
+    var s = Int(s_in)
+    var nh = Int(nh_in)
+    var bb = Int(bb_in)
+    var h = Int(h_in)
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if i >= l * s:
+        return
+    var t = i // s
+    var j = i - t * s
+    scores.unsafe_store(((bb * nh + h) * l + t) * s + j, sbh.unsafe_load(i))
+
+
+def gather_scores_head_kernel(
+    sbh: MutPointer[Float32, MutAnyOrigin],
+    src: MutPointer[Float32, MutAnyOrigin],
+    l_in: Int32,
+    s_in: Int32,
+    nh_in: Int32,
+    bb_in: Int32,
+    h_in: Int32,
+):
+    """`scatter_scores_kernel` in reverse. SABOTAGE-ONLY: it exists so
+    `S19_VALUE_SUM_VIA_GEMM` has a body. Nothing in the profile calls it."""
+    var l = Int(l_in)
+    var s = Int(s_in)
+    var nh = Int(nh_in)
+    var bb = Int(bb_in)
+    var h = Int(h_in)
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if i >= l * s:
+        return
+    var t = i // s
+    var j = i - t * s
+    sbh.unsafe_store(i, src.unsafe_load(((bb * nh + h) * l + t) * s + j))
+
+
+def scatter_ctx_head_kernel(
+    ctxv: MutPointer[Float32, MutAnyOrigin],
+    qbh: MutPointer[Float32, MutAnyOrigin],
+    l_in: Int32,
+    nh_in: Int32,
+    hd_in: Int32,
+    bb_in: Int32,
+    h_in: Int32,
+):
+    """One head's `[L, head_dim]` context into `[M, n_heads*head_dim]`.
+    SABOTAGE-ONLY, the other half of `S19_VALUE_SUM_VIA_GEMM`."""
+    var l = Int(l_in)
+    var nh = Int(nh_in)
+    var hd = Int(hd_in)
+    var bb = Int(bb_in)
+    var h = Int(h_in)
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if i >= l * hd:
+        return
+    var t = i // hd
+    var d = i - t * hd
+    ctxv.unsafe_store(
+        (bb * l + t) * nh * hd + h * hd + d, qbh.unsafe_load(i)
+    )
+
+
+def attn_scale_kernel(
+    scores: MutPointer[Float32, MutAnyOrigin],
+    n_in: Int32,
+    scale_in: Float32,
+):
+    """S12, PRODUCT: `* scaling` applied to the FINISHED dot (:204 scales
+    the matmul's output). `identical_mul(score, scale)`, one rounding per
+    score.
+
+    `scale` is `identical_rsqrt(Float32(head_dim))` computed ONCE on the
+    host (contract DEVIATION 802). **A wrong scale SPELLING is invisible at
+    a power-of-four head_dim**: at 16 the scale is 0.25 (0x3E800000) and at
+    64 it is 0.125 (0x3E000000), both exact, so contract section 3 requires
+    a second fixture at a non-power-of-four `head_dim` such as 24.
+
+    IN PLACE, and safe: one thread owns one cell and reads only that cell.
+    """
+    var n = Int(n_in)
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if i >= n:
+        return
+    comptime if SAB_S12_SCALE_INTO_Q:
+        # SABOTAGE: the scale already went into q, so this seam is skipped
+        # entirely and the GEMM's own output stands.
+        return
+    scores.unsafe_store(i, ftz(identical_mul(ftz(scores.unsafe_load(i)), scale_in)))
+
+
+def attn_mask_kernel(
+    masked: MutPointer[Float32, MutAnyOrigin],
+    scores: MutPointer[Float32, MutAnyOrigin],
+    b_in: Int32,
+    nh_in: Int32,
+    l_in: Int32,
+    s_in: Int32,
+    pos0_in: Int32,
+    key_lo_in: Int32,
+    window_in: Int32,
+):
+    """S13: `attn_weights + attention_mask` (:206), ONE ADD of
+    `finfo(float32).min` where masked and of `+0.0` where not
+    (masking_utils.py:601-603). One thread per cell.
+
+    **THE `+0.0` ADD AT AN UNMASKED CELL MAY NOT BE ELIDED** (contract
+    4.1(a)). `x + (+0.0) == x` for every finite x, every infinity and every
+    NaN EXCEPT `x = -0.0`, where it is `+0.0`. An implementation that skips
+    the add keeps a `-0.0` score that the reference LAUNDERS, and it passes
+    every fixture that does not PLANT a negative zero in a score by bits.
+    `S13_MASK_SELECT` is that mistake.
+
+    **`-FLT_MAX`, NOT `-inf`** (contract 4.1(b)). The causal mask never
+    produces a fully masked row, because position t always attends to
+    itself, so the two values differ only at a PLANTED extreme score:
+    `s + (-FLT_MAX)` is `-FLT_MAX` exactly for `|s| < 2^103` and overflows
+    to `-inf` below roughly `-1e31`. `S13_MASK_NEG_INF` is the other value.
+
+    THE MASK IS CAUSAL, OPTIONALLY SLIDING-WINDOW, AND NOTHING ELSE: key
+    at absolute position `p_k = key_lo + j` is visible to the query at
+    absolute position `p_q = pos0 + t` iff `p_k <= p_q` and, when
+    `window > 0`, `p_k > p_q - window`. `window == 0` with `key_lo == 0`
+    is the full causal mask of contract section 11 exactly. No prefix
+    mask, no attention sink.
+    """
+    var b = Int(b_in)
+    var nh = Int(nh_in)
+    var l = Int(l_in)
+    var s = Int(s_in)
+    var pos0 = Int(pos0_in)
+    var key_lo = Int(key_lo_in)
+    var window = Int(window_in)
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if i >= b * nh * l * s:
+        return
+    var j = i % s
+    var rest = i // s
+    var t = rest % l
+    var p_k = key_lo + j
+    var p_q = pos0 + t
+    var visible = p_k <= p_q
+    if window > 0 and p_k <= p_q - window:
+        visible = False
+
+    var fill: Float32
+    comptime if SAB_S13_MASK_NEG_INF:
+        fill = bitcast[DType.float32](UInt32(NEG_INF_BITS))
+    else:
+        fill = bitcast[DType.float32](UInt32(MASK_FILL_BITS))
+
+    var sv = ftz(scores.unsafe_load(i))
+    if visible:
+        comptime if SAB_S13_MASK_SELECT:
+            # SABOTAGE: the unmasked cell passes through unchanged, so a
+            # planted `-0.0` score survives instead of being laundered.
+            masked.unsafe_store(i, sv)
+        else:
+            masked.unsafe_store(i, ftz(sv + Float32(0.0)))
+    else:
+        comptime if SAB_S13_MASK_SELECT:
+            masked.unsafe_store(i, fill)
+        else:
+            masked.unsafe_store(i, ftz(sv + fill))
+
+
+def attn_max_kernel(
+    amax: MutPointer[Float32, MutAnyOrigin],
+    masked: MutPointer[Float32, MutAnyOrigin],
+    b_in: Int32,
+    nh_in: Int32,
+    l_in: Int32,
+    s_in: Int32,
+):
+    """S14: the softmax row maximum, `identical_fmax` (DEVIATION 825) folded
+    over EVERY element of the row, MASKED CELLS INCLUDED (contract 5.2),
+    with no seed. One thread per `(batch, head, query)` row.
+
+    **THE FOLD SHAPE IS FREE AND THIS IS THE ONLY SEAM IN THE PROFILE WHERE
+    IT IS** (contract 5.1). `identical_fmax` is exactly commutative and
+    associative over all of Float32 including both zeros and NaN, so an
+    execution plan may choose its own tree here -- because the operation is
+    exactly associative, not because the difference is thought to be small.
+    This kernel still walks ascending, because a free shape is not a reason
+    to introduce a second one.
+
+    **`pinned_block_max` MAY NOT BE USED** and this is the trap, because it
+    is the deterministic-looking helper already in the tree. Its fold is a
+    plain `other > red[tid]` compare (`core/pinned_reduce.mojo:159-190`),
+    which is precisely the spelling IDENTITY_PATHS row 13 closed everywhere
+    else, and its own block comment says a caller whose inputs can carry
+    `+-0.0` or NaN must say why before using it. **This caller cannot say
+    why.** `max(+0.0, -0.0)` was MEASURED on 2026-08-23 as `-0.0` on Apple
+    and `+0.0` on NVIDIA and AMD, and a row of attention scores reaches both
+    zero signs easily -- a masked lane one way, a flushed subnormal the
+    other.
+
+    WHAT THE CLAUSE COSTS AND WHY IT IS KEPT. Downstream it costs nothing:
+    the only consumer is S15, and `s - (+0.0)` and `s - (-0.0)` agree bit
+    for bit for every finite s except `s = -0.0`, and `exp` of either
+    difference is exactly 1.0. **On the card it costs the clause**, because
+    `attn.max` is a recorded stage and clause (a) requires every stage to
+    agree bitwise. A laundered divergence is still a divergence at the stage
+    that produced it, and the card is the ONLY instrument that can see this
+    clause at all.
+    """
+    var b = Int(b_in)
+    var nh = Int(nh_in)
+    var l = Int(l_in)
+    var s = Int(s_in)
+    var r = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if r >= b * nh * l:
+        return
+    var base = r * s
+    # No seed: the fold starts at element 0, which is always a real element
+    # because `s >= 1` and, being at absolute position 0, is always visible.
+    var m = ftz(masked.unsafe_load(base))
+    for j in range(1, s):
+        var v = ftz(masked.unsafe_load(base + j))
+        comptime if SAB_S14_MAX_PLAIN_COMPARE:
+            # SABOTAGE: the plain float compare. Identical on every ordinary
+            # row and vendor-shaped at +-0.0.
+            if v > m:
+                m = v
+        else:
+            m = identical_fmax(m, v)
+    amax.unsafe_store(r, m)
+
+
+def attn_exp_kernel(
+    aexp: MutPointer[Float32, MutAnyOrigin],
+    masked: MutPointer[Float32, MutAnyOrigin],
+    amax: MutPointer[Float32, MutAnyOrigin],
+    n_in: Int32,
+    s_in: Int32,
+):
+    """S15 and S16: `exp(s - m)`, one thread per cell.
+
+    S15 is a plain subtract, `ftz(ftz(s) - ftz(m))`. S16 is `identical_exp`,
+    IDENTITY_PATHS row 12's polynomial, NOT the hardware exp and NOT
+    `exp2` with the scale folded into it (which is what MAX's own
+    FlashAttention kernels do -- contract section 6's third consequence).
+
+    **THIS IS WHERE THE MASKED TAIL BECOMES EXACTLY `+0.0`** and everything
+    in contract section 7 rests on it. For a masked cell the difference is
+    about `-3.4e38`; `portable_expf` returns exactly `+0.0` below
+    `-87.33655`, and `+0.0` rather than `-0.0`. The denominator is then at
+    least `exp(0) = 1.0` (the maximal element contributes exactly 1.0), so
+    `identical_div(+0.0, denom)` is exactly `+0.0` too, and both the S17
+    chain and the S19 chain are bitwise inert on that tail. That is the
+    theorem decode-equals-prefill and length-invariance are built on.
+    """
+    var n = Int(n_in)
+    var s = Int(s_in)
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if i >= n:
+        return
+    var r = i // s
+    var d = ftz(ftz(masked.unsafe_load(i)) - ftz(amax.unsafe_load(r)))
+    aexp.unsafe_store(i, ftz(identical_exp(d)))
+
+
+def attn_denom_kernel(
+    denom: MutPointer[Float32, MutAnyOrigin],
+    aexp: MutPointer[Float32, MutAnyOrigin],
+    scratch: MutPointer[Float32, MutAnyOrigin],
+    b_in: Int32,
+    nh_in: Int32,
+    l_in: Int32,
+    s_in: Int32,
+):
+    """S17: the softmax denominator, a SERIAL ASCENDING CHAIN over the
+    ABSOLUTE key index from `+0.0`, plain adds. Contract 5.3. One thread per
+    `(batch, head, query)` row.
+
+        acc = +0.0
+        for j = 0 .. s-1:  acc = ftz(ftz(acc) + ftz(e[j]))
+
+    Nothing to fuse: `e[j]` is not a product.
+
+    **`core/pinned_reduce.mojo::pinned_block_sum` MAY NOT BE USED FOR THIS**,
+    and saying so is the point of the clause. It is a halving tree, its own
+    docstring says a halving tree and CUB's warp-then-block shape combine
+    different partials, and a halving tree is not a serial ascending chain
+    either. Reaching for the deterministic block fold BECAUSE it is the
+    deterministic block fold is the single most likely way to get this
+    wrong, and it would be wrong in a way that passes every
+    launch-invariance gate, because the tree is perfectly launch-invariant.
+    It is simply a different sum.
+
+    TWO REASONS FOR THE CHAIN, AND THE SECOND IS THE LOAD-BEARING ONE.
+    First, it is the same spelling as S1 and as the mamba contract's S10, so
+    the block has ONE fold shape rather than two. Second, **it is what makes
+    decode equal prefill and makes the answer independent of sequence
+    length**: under the GEMM's topology `P` is a pure function of the
+    contraction length, so a row folded over 257 keys and the same row
+    folded over 5 keys have different trees and different bits, while under
+    a serial ascending chain seeded `+0.0` a tail of exactly-`+0.0` terms is
+    bitwise inert.
+
+    THE PRICE, STATED RATHER THAN HIDDEN. A row's fold may not be split
+    across threads, so v1's kv length is bounded by what one thread will
+    walk, and this profile is reference quality and SLOW BY CONSTRUCTION. A
+    v2 that wants a tree must fix the fold LENGTH so prefill and decode fold
+    the same number of terms, which means folding over the ALLOCATED cache
+    length, which makes `P` a function of an allocation quantity and puts
+    batch invariance back at risk. That is a research question and contract
+    5.3 names it as one.
+
+    `scratch` is DEVIATION 1023: `attn.weights`, borrowed by the sabotage
+    arm and untouched by the profile.
+    """
+    var b = Int(b_in)
+    var nh = Int(nh_in)
+    var l = Int(l_in)
+    var s = Int(s_in)
+    var r = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if r >= b * nh * l:
+        return
+    var base = r * s
+
+    comptime if SAB_S17_DENOM_HALVING_TREE:
+        # SABOTAGE: a halving tree over the same terms. Perfectly
+        # deterministic, perfectly launch-invariant, and a DIFFERENT SUM.
+        # At s = 3 it folds (0+2) then (+1) where the chain folds
+        # ((0+1)+2).
+        for j in range(s):
+            scratch.unsafe_store(base + j, ftz(aexp.unsafe_load(base + j)))
+        var n = s
+        while n > 1:
+            var halfn = (n + 1) // 2
+            for j in range(n - halfn):
+                var a = ftz(scratch.unsafe_load(base + j))
+                var c = ftz(scratch.unsafe_load(base + halfn + j))
+                scratch.unsafe_store(base + j, ftz(a + c))
+            n = halfn
+        denom.unsafe_store(r, ftz(scratch.unsafe_load(base)))
+    else:
+        var acc = Float32(0.0)
+        for j in range(s):
+            acc = ftz(ftz(acc) + ftz(aexp.unsafe_load(base + j)))
+        denom.unsafe_store(r, ftz(acc))
+
+
+def attn_weights_kernel(
+    weights: MutPointer[Float32, MutAnyOrigin],
+    aexp: MutPointer[Float32, MutAnyOrigin],
+    denom: MutPointer[Float32, MutAnyOrigin],
+    n_in: Int32,
+    s_in: Int32,
+):
+    """S18: `e / denom`, ONE DIVISION per weight through `identical_div`
+    (IDENTITY_PATHS row 49's `portable_divf`), never a reciprocal
+    multiplied in. One thread per cell.
+
+    **A RECIPROCAL MULTIPLIED IN IS A DIFFERENT ANSWER.** `e * (1/denom)`
+    rounds twice where `e / denom` rounds once and they differ in the last
+    bit on ordinary inputs.
+
+    **THE REFERENCE'S OWN SPELLING COULD NOT BE VERIFIED.**
+    `nn.functional.softmax` dispatches into ATen and there is no PyTorch
+    checkout in `/home/user/CascadeProjects/upstream/`, so whether
+    ATen's CUDA softmax divides or multiplies by a reciprocal is NOT KNOWN
+    to this lane. MAX's `softmax_kernel` multiplies by a reciprocal, which
+    is evidence about MAX and not about the reference. The profile pins the
+    DIVISION because it is the spelling with one rounding and because
+    `identical_div` is already characterized per class on Apple. **This is a
+    stated gap, not a decision made on evidence** (contract 5.4), and it is
+    the first thing to check when a PyTorch checkout lands.
+    """
+    var n = Int(n_in)
+    var s = Int(s_in)
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if i >= n:
+        return
+    var r = i // s
+    var e = ftz(aexp.unsafe_load(i))
+    var dv = ftz(denom.unsafe_load(r))
+    comptime if SAB_S18_RECIPROCAL_MUL:
+        var recip = ftz(identical_div(Float32(1.0), dv))
+        weights.unsafe_store(i, ftz(identical_mul(e, recip)))
+    else:
+        weights.unsafe_store(i, ftz(identical_div(e, dv)))
+
+
+def attn_context_kernel(
+    ctxv: MutPointer[Float32, MutAnyOrigin],
+    weights: MutPointer[Float32, MutAnyOrigin],
+    v_cache: MutPointer[Float32, MutAnyOrigin],
+    b_in: Int32,
+    l_in: Int32,
+    nh_in: Int32,
+    nkv_in: Int32,
+    hd_in: Int32,
+    s_in: Int32,
+):
+    """S19: the attention-weighted value sum, SERIAL ASCENDING over the
+    ABSOLUTE key index from `+0.0`, `acc = ftz(fma(w[j], v[j][d], acc))`.
+    One thread per output cell of `[M, n_heads*head_dim]`.
+
+    **DELIBERATELY NOT A `gemm.fp32.v1` CALL** (contract DEVIATION 807), and
+    this is the least obvious decision in the document, so it is argued
+    here rather than cited.
+
+    S11, the QK product, CONTRACTS OVER `head_dim`, which is the same
+    integer in prefill and in decode. GEMM v1's per-cell arithmetic is a
+    pure function of the contraction length `k` and the profile, so a
+    contraction axis whose LENGTH is the same in both paths is safe to hand
+    to it. S19 contracts over the KEY AXIS, whose length is `t + 1` in
+    decode and `L` in prefill. Under the GEMM's leaf-and-tree topology
+    `P = f(k)`, so those are different trees over the same numbers and the
+    extra `L - t - 1` masked terms would NOT be bitwise inert. Under a
+    serial ascending chain seeded `+0.0` they ARE inert, because
+    `fma(+0.0, v, acc)` is `acc + (+-0.0)`, which is `acc` for every `acc`
+    except `acc = -0.0`, and the `+0.0` seed forbids that.
+
+    So the same asymmetry that makes S11 safe to reuse makes S19 unsafe to
+    reuse, and `S19_VALUE_SUM_VIA_GEMM` is the arm that proves it: it must
+    leave clause (a) GREEN at a fixed length and break clause (d) past the
+    first 128 keys, which is exactly the failure a single-path gate cannot
+    see.
+
+    `repeat_kv` is `kvh = h // n_rep` (contract DEVIATION 813). **At
+    `n_rep == 1` a broken head-to-kv-head map is INVISIBLE**, so the gates
+    must carry both `n_rep == 1` and `n_rep == 2`.
+    """
+    var b = Int(b_in)
+    var l = Int(l_in)
+    var nh = Int(nh_in)
+    var nkv = Int(nkv_in)
+    var hd = Int(hd_in)
+    var s = Int(s_in)
+    var n_rep = nh // nkv
+    var width = nh * hd
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if i >= b * l * width:
+        return
+    var tok = i // width
+    var rem = i - tok * width
+    var h = rem // hd
+    var d = rem - h * hd
+    var bb = tok // l
+    var t = tok - bb * l
+    var kvh = h // n_rep
+    var wbase = ((bb * nh + h) * l + t) * s
+    var vbase = (bb * nkv + kvh) * s * hd
+
+    var acc = Float32(0.0)
+    for j in range(s):
+        var w = ftz(weights.unsafe_load(wbase + j))
+        var v = ftz(v_cache.unsafe_load(vbase + j * hd + d))
+        acc = ftz(identical_mul_add(w, v, acc))
+    ctxv.unsafe_store(i, acc)
+
+
+# ===========================================================================
+# `LlamaMLP.forward` (:174-176). Seams S20 and S21.
+#
+#     down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))     :175
+# ===========================================================================
+
+
+def silu_kernel(
+    silu_out: MutPointer[Float32, MutAnyOrigin],
+    gate: MutPointer[Float32, MutAnyOrigin],
+    n_in: Int32,
+):
+    """S20: `ACT2FN["silu"]`, which is ATen's `F.silu`, the SINGLE QUOTIENT
+    `z / (1 + exp(-z))` -- ONE division and ONE rounding.
+
+    **NOT `z * sigmoid(z)`**, which is two roundings and which is what MAX
+    itself spells (`max/kernels/src/nn/activations.mojo:249`). DEVIATION 744,
+    IDENTITY_PATHS row 53. `S20_SILU_MUL_SIGMOID` is the other spelling."""
+    var n = Int(n_in)
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if i >= n:
+        return
+    var z = ftz(gate.unsafe_load(i))
+    comptime if SAB_S20_SILU_MUL_SIGMOID:
+        var sg = ftz(
+            identical_div(
+                Float32(1.0), ftz(Float32(1.0) + ftz(identical_exp(-z)))
+            )
+        )
+        silu_out.unsafe_store(i, ftz(identical_mul(z, sg)))
+    else:
+        silu_out.unsafe_store(i, ftz(identical_silu(z)))
+
+
+def swiglu_fused_kernel(
+    gated: MutPointer[Float32, MutAnyOrigin],
+    gate: MutPointer[Float32, MutAnyOrigin],
+    up: MutPointer[Float32, MutAnyOrigin],
+    n_in: Int32,
+):
+    """lane/neural-net-experiment (2026-09-30): S20 and S21 in one launch,
+    FORWARD-ONLY. Per element exactly `mlp_gated_kernel(silu_kernel(gate),
+    up)`: `z = ftz(gate)`, `sil = ftz(identical_silu(z))`, `gated =
+    ftz(identical_mul(ftz(sil), ftz(up)))`, the same operations in the same
+    order (and `ftz(ftz(v)) == ftz(v)`), so the same bits, one launch and
+    one `[M, intermediate]` write plus read fewer. `silu_out` is NOT
+    written: the backward reads it (`transformer_backward.mojo`, dup =
+    av * silu_out) and the trace records it, so the launcher takes this
+    kernel only when the caller says no backward follows and the trace is
+    off. Never under the S20 sabotage spelling."""
+    var n = Int(n_in)
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if i >= n:
+        return
+    var z = ftz(gate.unsafe_load(i))
+    var sil = ftz(identical_silu(z))
+    gated.unsafe_store(i, ftz(identical_mul(ftz(sil), ftz(up.unsafe_load(i)))))
+
+
+def swiglu_training_fused_kernel(
+    silu_out: MutPointer[Float32, MutAnyOrigin],
+    gated: MutPointer[Float32, MutAnyOrigin],
+    gate: MutPointer[Float32, MutAnyOrigin],
+    up: MutPointer[Float32, MutAnyOrigin],
+    n_in: Int32,
+):
+    """NI26: S20/S21 in one pass with BOTH original tape outputs saved.
+
+    This retains the quotient SiLU, every FTZ and the separately rounded
+    gate product. The backward and trace see the same saved stages.
+    """
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if i >= Int(n_in):
+        return
+    var sil = ftz(identical_silu(ftz(gate.unsafe_load(i))))
+    silu_out.unsafe_store(i, sil)
+    gated.unsafe_store(i, ftz(identical_mul(ftz(sil), ftz(up.unsafe_load(i)))))
+
+
+def swiglu_fused_enabled() -> Bool:
+    """`ANONLIB_SWIGLU_FUSED=1`; read per block call, default off."""
+    return String(getenv("ANONLIB_SWIGLU_FUSED")) == "1"
+
+
+def mlp_gated_kernel(
+    gated: MutPointer[Float32, MutAnyOrigin],
+    silu_out: MutPointer[Float32, MutAnyOrigin],
+    up: MutPointer[Float32, MutAnyOrigin],
+    n_in: Int32,
+):
+    """S21, PRODUCT: `silu(gate_proj(x)) * up_proj(x)` (:175), one
+    rounding, uncontractible into the `down_proj` GEMM that consumes it."""
+    var n = Int(n_in)
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if i >= n:
+        return
+    gated.unsafe_store(
+        i,
+        ftz(
+            identical_mul(ftz(silu_out.unsafe_load(i)), ftz(up.unsafe_load(i)))
+        ),
+    )
+
+
+# ===========================================================================
+# lane/block-options (2026-09-17): the three elementwise kernels the
+# options add. Each is one thread per cell, one seam, through
+# `checks/numerics.mojo`; the oracle spellings are `add_bias_into`, the
+# softcap lines in `transformer_block_oracle`'s score loop, and the S20
+# branch there.
+# ===========================================================================
+
+
+def add_bias_kernel(
+    y: MutPointer[Float32, MutAnyOrigin],
+    bias: MutPointer[Float32, MutAnyOrigin],
+    n_in: Int32,
+    width_in: Int32,
+):
+    """DEVIATIONS 2934, 2935, 2945: `nn.Linear`'s bias as ONE plain add per
+    cell AFTER the profile's GEMM, `ftz(ftz(y) + ftz(b[col]))`. IN PLACE,
+    one thread per cell. The reference's `addmm` may seed its accumulator
+    with the bias or add it in an epilogue, which is cuBLAS's choice and
+    not a pinnable spelling; the one-add-after form is OURS."""
+    var n = Int(n_in)
+    var width = Int(width_in)
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if i >= n:
+        return
+    var col = i - (i // width) * width
+    y.unsafe_store(i, ftz(ftz(y.unsafe_load(i)) + ftz(bias.unsafe_load(col))))
+
+
+def attn_softcap_kernel(
+    scores: MutPointer[Float32, MutAnyOrigin],
+    n_in: Int32,
+    cap_in: Float32,
+):
+    """DEVIATION 2947, `attn_softcap` (Gemma2's `attn_logit_softcapping`):
+    `s = cap * tanh(s / cap)`, applied to the SCALED score before the mask,
+    as `modeling_gemma2.py::eager_attention_forward` orders it. One
+    `identical_div`, one `identical_tanh` (DEVIATION 821), one `pinned_mul`,
+    each flushed. IN PLACE."""
+    var n = Int(n_in)
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if i >= n:
+        return
+    var cap = ftz(cap_in)
+    var s = ftz(scores.unsafe_load(i))
+    var th = ftz(identical_tanh(ftz(identical_div(s, cap))))
+    scores.unsafe_store(i, ftz(identical_mul(th, cap)))
+
+
+def gelu_kernel(
+    act_out: MutPointer[Float32, MutAnyOrigin],
+    src: MutPointer[Float32, MutAnyOrigin],
+    n_in: Int32,
+    tanh_form_in: Int32,
+):
+    """DEVIATIONS 2939, 2943, 2944: the GELU activations in S20's place.
+    `identical_gelu_erf` (DEVIATION 823, `GELUActivation` verbatim) or
+    `identical_gelu_tanh` (DEVIATION 824, `GELUTanh` verbatim); nothing is
+    spelled here. Reads the gate projection (gated forms) or the up
+    projection (ungated forms), which the launcher decides."""
+    var n = Int(n_in)
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if i >= n:
+        return
+    var z = ftz(src.unsafe_load(i))
+    if Int(tanh_form_in) != 0:
+        act_out.unsafe_store(i, ftz(identical_gelu_tanh(z)))
+    else:
+        act_out.unsafe_store(i, ftz(identical_gelu_erf(z)))
+
+
+def bias_gelu_kernel(
+    act_out: MutPointer[Float32, MutAnyOrigin],
+    src: MutPointer[Float32, MutAnyOrigin],
+    bias: MutPointer[Float32, MutAnyOrigin],
+    n_in: Int32,
+    width_in: Int32,
+    tanh_form_in: Int32,
+):
+    """Bias epilogue followed by GELU, preserving the materialized source."""
+    var n = Int(n_in)
+    var width = Int(width_in)
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if i >= n:
+        return
+    var col = i - (i // width) * width
+    var z = ftz(ftz(src.unsafe_load(i)) + ftz(bias.unsafe_load(col)))
+    src.unsafe_store(i, z)
+    if Int(tanh_form_in) != 0:
+        act_out.unsafe_store(i, ftz(identical_gelu_tanh(z)))
+    else:
+        act_out.unsafe_store(i, ftz(identical_gelu_erf(z)))
+
+
+def bias_silu_kernel(
+    act_out: MutPointer[Float32, MutAnyOrigin],
+    src: MutPointer[Float32, MutAnyOrigin],
+    bias: MutPointer[Float32, MutAnyOrigin],
+    n_in: Int32,
+    width_in: Int32,
+):
+    """Bias epilogue followed by SiLU, preserving the biased projection."""
+    var n = Int(n_in)
+    var width = Int(width_in)
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if i >= n:
+        return
+    var col = i - (i // width) * width
+    var z = ftz(ftz(src.unsafe_load(i)) + ftz(bias.unsafe_load(col)))
+    src.unsafe_store(i, z)
+    act_out.unsafe_store(i, ftz(identical_silu(z)))
+
+
+# ===========================================================================
+# THE REFUSAL, contract section 8. Before ANY recorded stage.
+# ===========================================================================
+
+
+def _refuse_nonfinite_named_host(name: String, values: List[Float32]) raises:
+    """Contract section 8 / IDENTITY_PATHS row 39, the device path's copy of
+    the oracle's `refuse_nonfinite`. Tested BY BITS, not by compares: **Metal
+    FLUSHES COMPARE OPERANDS** (row 49), so `-subnormal < 0.0` is FALSE
+    there while the sign bit is set, and a bit test is the only spelling
+    with one meaning on every column. DEVIATION 1027 explains why this is
+    not the oracle's function imported."""
+    for i in range(len(values)):
+        var au = bitcast[DType.uint32](values[i]) & UInt32(0x7FFFFFFF)
+        if au > UInt32(0x7F800000):
+            raise Error(
+                String("llama: NaN in ")
+                + name
+                + " at flat index "
+                + String(i)
+                + " REFUSED (row 39: NaN payloads are vendor-shaped;"
+                + " no stage may record one)"
+            )
+        if au == UInt32(0x7F800000):
+            raise Error(
+                String("llama: infinity in ")
+                + name
+                + " at flat index "
+                + String(i)
+                + " REFUSED (row 39)"
+            )
+
+
+def _refuse_nonfinite_device(
+    ctx: DeviceContext,
+    name: String,
+    mut buf: DeviceBuffer[DType.float32],
+    n: Int,
+) raises:
+    """`_refuse_nonfinite_named_host` over a DEVICE buffer: the scan runs on
+    the device (`device_first_nonfinite`) and only the offending element is
+    brought back to classify it, so the message is character for character
+    the host loop's message at the same flat index."""
+    var idx = device_first_nonfinite(ctx, buf, n)
+    _refuse_nonfinite_at(ctx, name, buf, idx)
+
+
+def _refuse_nonfinite_at(
+    ctx: DeviceContext, name: String,
+    mut buf: DeviceBuffer[DType.float32], idx: Int,
+) raises:
+    """Classify an already completed scan without changing refusal messages."""
+    if idx < 0:
+        return
+    var one = buf.create_sub_buffer[DType.float32](idx, 1)
+    step_count_host_alloc()
+    var host = ctx.enqueue_create_host_buffer[DType.float32](1)
+    step_count_sync()
+    ctx.synchronize()
+    step_count_d2h()
+    ctx.enqueue_copy(dst_ptr=host.unsafe_ptr(), src_buf=one)
+    step_count_sync()
+    ctx.synchronize()
+    var v = host.unsafe_ptr().unsafe_load(0)
+    _ = host^
+    var au = bitcast[DType.uint32](v) & UInt32(0x7FFFFFFF)
+    if au > UInt32(0x7F800000):
+        raise Error(
+            String("llama: NaN in ")
+            + name
+            + " at flat index "
+            + String(idx)
+            + " REFUSED (row 39: NaN payloads are vendor-shaped;"
+            + " no stage may record one)"
+        )
+    raise Error(
+        String("llama: infinity in ")
+        + name
+        + " at flat index "
+        + String(idx)
+        + " REFUSED (row 39: an infinity in an input is a computed"
+        + " NaN one seam later)"
+    )
+
+
+comptime IDN_LLAMA_REFUSE_BATCH = GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL and not (
+    is_defined["ANONLIB_IDN_LLAMA_REFUSE_BATCH_OFF"]() or is_defined["ANONLIB_IDN_ALL_OFF"]()
+)
+"""lane/fam-lm (2026-10-04), default ON under IDENTICAL: the per-call
+refusal scans of `llama_refuse_bad_call` (hidden states, rotary inv_freq
+and, on a decode step, the key and value caches) are enqueued together on
+one `DeviceNonfiniteBatch` and read with ONE wait and one pair of
+allocations, where each scan had its own partials buffer, pinned host
+buffer and wait (two per layer per forward, four on a decode step). Same
+kernel, same geometry, same integer first-index fold; the names are tested
+in the same order, so the refusal raised is the one the separate scans
+raised. No float is produced: no bit moves on any column.
+`-D ANONLIB_IDN_LLAMA_REFUSE_BATCH_OFF` restores the separate scans."""
+
+comptime IDN_ATTN_CACHE_NOWAIT = GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL and not (
+    is_defined["ANONLIB_IDN_ATTN_CACHE_NOWAIT_OFF"]()
+    or is_defined["ANONLIB_ATTN_CACHE_WAIT"]()
+    or is_defined["ANONLIB_IDN_ALL_OFF"]()
+)
+"""lane/nr-attn (2026-10-04), default ON under IDENTICAL; ported from
+lane/neural-pass67 087231ba3 (`ANONLIB_ATTN_CACHE_WAIT`). The per-layer
+hard wait after the KV cache update in `llama_attention_forward` is compiled
+out: every reader of the caches is a launch on the same in-order context,
+so the wait ordered nothing (one wait per layer per forward; 0.54 ms a
+layer on the M3, 0.05 ms on the MI325X when measured on 2026-10-01). No
+arithmetic moves: same bits on every column. `-D
+ANONLIB_IDN_ATTN_CACHE_NOWAIT_OFF` (or the old `-D
+ANONLIB_ATTN_CACHE_WAIT=1`) restores the wait."""
+
+
+def llama_refuse_bad_call(
+    ctx: DeviceContext,
+    mut w: LlamaDeviceWeights,
+    mut rope: LlamaRopeTable,
+    mut x: DeviceBuffer[DType.float32],
+    mut kv: LlamaKVCache,
+    b: Int,
+    l: Int,
+) raises:
+    """The inputs that ACTUALLY CHANGE from one block call to the next.
+
+    DEVIATION 1875. `llama_refuse_bad_inputs` walks thirteen names, ten of
+    which are weights that are identical on every call and are now refused
+    once, on the host, in `LlamaDeviceWeights.__init__`. What is left here is
+    what a second call can genuinely differ in: the hidden states, the rotary
+    table, and the carried key and value caches.
+
+    The names and their ORDER are the same as the corresponding entries in
+    `llama_refuse_bad_inputs`, because the point of using the reference names
+    at all is that this side and the oracle's side fail identically.
+
+    The KV entries are the reason this cannot be hoisted with the weights.
+    They are WRITTEN BY THE BLOCK, so a decode step's input is the previous
+    step's output, and two of the refusal audit's plants land there
+    specifically to exercise a refusal on a SECOND call.
+    """
+    var dims = w.dims.copy()
+    var dm = dims.d_model
+    var hd = dims.head_dim
+    comptime if IDN_LLAMA_REFUSE_BATCH:
+        var has_kv = kv.s > 0
+        var kv_used = kv.s
+        if kv.window > 0:
+            kv_used = kv.cap
+        var lens = List[Int]()
+        lens.append(b * l * dm)
+        lens.append(rope.half)
+        if has_kv:
+            lens.append(b * dims.n_kv * kv_used * hd)
+            lens.append(b * dims.n_kv * kv_used * hd)
+        var batch = DeviceNonfiniteBatch(ctx, lens)
+        batch.enqueue(ctx, 0, x)
+        batch.enqueue(ctx, 1, rope.inv_freq)
+        if has_kv:
+            batch.enqueue(ctx, 2, kv.k)
+            batch.enqueue(ctx, 3, kv.v)
+        var hits = batch.finish(ctx)
+        _refuse_nonfinite_at(ctx, "hidden_states", x, hits[0])
+        _refuse_nonfinite_at(ctx, "rotary_emb.inv_freq", rope.inv_freq, hits[1])
+        if has_kv:
+            _refuse_nonfinite_at(ctx, "past_key_values.key_cache", kv.k, hits[2])
+            _refuse_nonfinite_at(ctx, "past_key_values.value_cache", kv.v, hits[3])
+        return
+    # ON THE DEVICE (2026-09-09): the download-and-walk of the block input
+    # was 65 ms per call at the Samba shape, a fifth of the forward.
+    _refuse_nonfinite_device(ctx, "hidden_states", x, b * l * dm)
+    _refuse_nonfinite_device(ctx, "rotary_emb.inv_freq", rope.inv_freq, rope.half)
+    if kv.s > 0:
+        # The linear cache is packed at stride `s`; the ring is always at
+        # stride `cap`, so the whole ring is read (unused slots are zeros).
+        var used = kv.s
+        if kv.window > 0:
+            used = kv.cap
+        _refuse_nonfinite_device(
+            ctx, "past_key_values.key_cache", kv.k, b * dims.n_kv * used * hd
+        )
+        _refuse_nonfinite_device(
+            ctx, "past_key_values.value_cache", kv.v, b * dims.n_kv * used * hd
+        )
+
+
+def llama_refuse_bad_inputs(
+    ctx: DeviceContext,
+    mut w: LlamaDeviceWeights,
+    mut rope: LlamaRopeTable,
+    mut x: DeviceBuffer[DType.float32],
+    mut kv: LlamaKVCache,
+    b: Int,
+    l: Int,
+) raises:
+    """Every named input and parameter of one block call, refused if it
+    holds a NaN or an infinity. The names are the reference parameter names
+    so that this side and the oracle's side fail IDENTICALLY, which is the
+    only way the two refusals can be compared at all.
+
+    **THE REFUSAL COVERS INPUTS AND NOT INTERMEDIATES**, and that is a
+    STATED GAP, contract DEVIATION 815. A score can overflow to `-inf`
+    through S13 at a planted extreme, and at extreme weights `exp` can
+    saturate. Those are deterministic and the same on every vendor, so they
+    do not break identity; a COMPUTED NaN would, and this profile does not
+    check for one at every stage. What catches it is the card, since a stage
+    hash containing a vendor-shaped payload cannot match.
+    """
+    var dims = w.dims.copy()
+    var dm = dims.d_model
+    var qw = dims.q_width()
+    var kw = dims.kv_width()
+    var it = dims.intermediate
+    var hd = dims.head_dim
+    _refuse_nonfinite_named_host("hidden_states", _download(ctx, x, b * l * dm))
+    _refuse_nonfinite_named_host(
+        "input_layernorm.weight", _download(ctx, w.norm1_w, dm)
+    )
+    _refuse_nonfinite_named_host(
+        "post_attention_layernorm.weight", _download(ctx, w.norm2_w, dm)
+    )
+    _refuse_nonfinite_named_host("q_proj.weight", _download(ctx, w.w_q, qw * dm))
+    _refuse_nonfinite_named_host("k_proj.weight", _download(ctx, w.w_k, kw * dm))
+    _refuse_nonfinite_named_host("v_proj.weight", _download(ctx, w.w_v, kw * dm))
+    _refuse_nonfinite_named_host("o_proj.weight", _download(ctx, w.w_o, dm * qw))
+    _refuse_nonfinite_named_host(
+        "gate_proj.weight", _download(ctx, w.w_gate, it * dm)
+    )
+    _refuse_nonfinite_named_host("up_proj.weight", _download(ctx, w.w_up, it * dm))
+    _refuse_nonfinite_named_host(
+        "down_proj.weight", _download(ctx, w.w_down, dm * it)
+    )
+    _refuse_nonfinite_named_host(
+        "rotary_emb.inv_freq", _download(ctx, rope.inv_freq, dims.half())
+    )
+    if kv.s > 0:
+        _refuse_nonfinite_named_host(
+            "past_key_values.key_cache",
+            _download(ctx, kv.k, b * dims.n_kv * kv.s * hd),
+        )
+        _refuse_nonfinite_named_host(
+            "past_key_values.value_cache",
+            _download(ctx, kv.v, b * dims.n_kv * kv.s * hd),
+        )
+
+
+# ===========================================================================
+# THE ATTENTION SUBMODULE
+# ===========================================================================
+
+
+def llama_attention_scale(head_dim: Int) -> Float32:
+    """`self.scaling = self.head_dim ** -0.5` (`LlamaAttention.__init__`
+    :226), computed ONCE on the host and stored FP32. Contract DEVIATION
+    802.
+
+    The SPELLING is pinned (`identical_rsqrt`, DEVIATION 741) so that the
+    value does not depend on the host's libm, which is IDENTITY_PATHS row
+    18's hazard applied to a constant. Contract section 3 records that
+    `head_dim ** -0.5` in float64 rounded once to FP32 equals
+    `f32div(1, f32sqrt(head_dim))` at head_dim in
+    {8, 16, 32, 64, 80, 128, 256} -- measured on the HOST on 2026-08-24 and
+    NOT on a device, which is agreement at seven points and not a proof."""
+    return ftz(identical_rsqrt(Float32(head_dim)))
+
+
+def timing_on() -> Bool:
+    """`ANONLIB_TRANSFORMER_TIMING=1`: print a host-timed, synchronized
+    phase breakdown of every block call. A traced or timed run is not a
+    measurement of anything else; this exists to say where the time goes."""
+    return String(getenv("ANONLIB_TRANSFORMER_TIMING")) != ""
+
+
+def timing_tick(
+    ctx: DeviceContext, on: Bool, mut t: Int, name: String
+) raises:
+    """Synchronize, print the milliseconds since `t`, advance `t`."""
+    if not on:
+        return
+    ctx.synchronize()
+    var now = Int(perf_counter_ns())
+    print(
+        "timing " + name + " " + String(Float64(now - t) / 1000000.0) + " ms"
+    )
+    t = now
+
+
+comptime ATTN_PATH_AUTO = 0
+"""Fused when the build, the call and the data allow it; eager otherwise."""
+comptime ATTN_PATH_EAGER = 1
+"""The eager stage kernels, always."""
+comptime ATTN_PATH_FUSED = 2
+"""The fused kernels, with the eager fallback on a regime or corner refusal."""
+
+
+def attention_path_choice(plant_at: Int) -> Int:
+    """Which attention path THIS call takes, before the data is looked at.
+
+    `ANONLIB_TRANSFORMER_ATTN_PATH=eager` forces the eager kernels (the
+    A/B arm for timing; also what a sabotage build and a planted call get
+    unconditionally). `fused` asks for the fused kernels; the default is
+    `auto`, which is `fused`.
+
+    THIS FUNCTION USED TO RETURN EAGER FOR A FAST BUILD,
+    which is the whole case against that tier existing in this lane: the
+    fused kernels are gated on IDENTICAL, so the tier sold as "fast" got the
+    UNFUSED path and ran slower than the default while promising less. The
+    transformer lane is IDENTICAL-only as of 2026-09-10 and the branch is
+    gone."""
+    comptime if NEURAL_PROFILE_CHANGED:
+        # Incumbent fused QK embeds v1 GEMM; new profiles use shared dispatcher.
+        return ATTN_PATH_EAGER
+    comptime if BLOCK_ANY_SABOTAGE:
+        return ATTN_PATH_EAGER
+    if plant_at != PLANT_AT_NONE:
+        return ATTN_PATH_EAGER
+    var want = String(getenv("ANONLIB_TRANSFORMER_ATTN_PATH"))
+    if want == "eager":
+        return ATTN_PATH_EAGER
+    if want == "fused":
+        return ATTN_PATH_FUSED
+    return ATTN_PATH_AUTO
+
+
+# TOMBSTONE: ANONLIB_IDN_ATTN_SOFTMAX=2 (slower) deleted 2026-10-10 by c1bf9d832; code recoverable at ca25d9321.
+# (online_tile32 attention v2; bytes lm-train-step NV/AMD 1.43x/1.56x slower, lm-forward 0.98x/1.04x, mean_nll same; nv2 v1229/v1231/v1232, amd a1555/a1556/a1557): _model_attention_v2_forward.
+# Restore: git apply experiments/removed/ANONLIB_IDN_ATTN_SOFTMAX-arm2.patch
+
+
+def eager_attention_forward(
+    ctx: DeviceContext,
+    mut stages: LlamaDeviceStages,
+    b: Int,
+    l: Int,
+    s: Int,
+    pos0: Int,
+    key_lo: Int,
+    window: Int,
+    dims: LlamaDims,
+    plant_at: Int,
+    plant_idx: List[Int],
+    plant_bits: List[UInt32],
+    mut trace: IdentityTrace,
+    prefix: String,
+    materialize: Bool,
+    softcap: Float32 = Float32(0.0),
+) raises -> Int:
+    """The attention interface, eager or fused, ONE set of bits.
+
+    `softcap` (DEVIATION 2947, lane/block-options): a nonzero value FORCES
+    the eager kernels, because the fused path computes the scaled score
+    and its softmax in one pass and spells no softcap; the eager path
+    applies it between S12 and S13. Zero (the default record) changes
+    nothing here.
+
+    `materialize`: run the eager stage kernels even with the trace off, so
+    that `scores`, `masked`, `aexp` and `weights` hold this call's stages
+    for a caller that reads them back (the gates' device dumps). The
+    fused output is still what lands in `ctxv`.
+
+    With the trace ON the eager kernels run and record S11-S18 as they
+    always have; then, when the call is fused-eligible, the fused kernels
+    run too and `attn.ctx` is recorded FROM THE FUSED OUTPUT, so the card
+    gates the fused path at every fixture it is eligible for (and every
+    downstream stage with it). With the trace OFF only one path runs: the
+    fused kernels, or the eager ones when the choice, the regime or the
+    corner says so. Returns the fused status (`FUSED_RAN` when the fused
+    bits are the ones in `stages.ctxv`; -1 when the fused path was not
+    attempted)."""
+    # Tried 2026-10-08 (ANONLIB_IDN_ATTN_SOFTMAX=1, the NN20 summary_tree arm, run ge123e6f9): NV/AMD lm-forward
+    # 4.86x/16.79x, lm-train-step 42.89x/40.18x, samba-forward 1.79x/4.79x, samba-train-step 1.64x/1.81x, transformer-forward
+    # 5.48x/21.89x SLOWER (mean_nll not judged). Deleted (transformer/experiments/attention_summary_*.mojo,
+    # summary_model*.mojo, the NN20 split-KV) and =1 refused; recoverable at main bc10b8b56.
+    # TOMBSTONE: ANONLIB_IDN_ATTN_SOFTMAX=2 (slower) deleted 2026-10-10 by c1bf9d832; code recoverable at ca25d9321.
+    var choice = attention_path_choice(plant_at)
+    if choice == ATTN_PATH_AUTO and stages.attn_prefer_eager:
+        choice = ATTN_PATH_EAGER
+    if softcap != Float32(0.0):
+        choice = ATTN_PATH_EAGER
+    # lane/lowbit-blocks: under `fixed15_v1` the fused kernels would compute
+    # Q.K^T in fp32 inside themselves, so the profile FORCES the eager
+    # kernels, whose S11 is the profile's product and whose S19 (P.V) is
+    # the pinned fp32 chain the profile keeps.
+    if stages.int15_on:
+        choice = ATTN_PATH_EAGER
+    var need_eager = materialize or trace.enabled or choice == ATTN_PATH_EAGER
+    var status = -1
+    # DEVIATION 2652: nothing kept until this call keeps it.
+    stages.attn_estash_cells = 0
+    # IDN_ATTN_BWD_SCAN_REUSE: no forward scan recorded until this call's.
+    stages.attn_fwd_scan.clear()
+    if need_eager:
+        attention_eager_core(
+            ctx, stages, b, l, s, pos0, key_lo, window, dims, plant_at,
+            plant_idx, plant_bits, trace, prefix, softcap,
+        )
+    # DEVIATION 3110: a layer that refused once is not launched again. The
+    # eager path below is the one the refusal mandates; skipping the launch
+    # removes the discarded fused kernel and its synchronize, nothing else.
+    #
+    # `not need_eager` CONFINES THE LATCH TO THE TRACE-OFF TRAINER PATH. With
+    # the trace on, the eager kernels run and record S11-S18 and then the
+    # fused kernels rewrite `ctxv` so `attn.ctx` is recorded FROM THE FUSED
+    # OUTPUT, which is what gates the fused path at every fixture. Latching
+    # there would record `attn.ctx` from the eager output instead on the call
+    # after a refusal, which is a different card. Under `need_eager` this
+    # whole branch reduces to the code that was here before, so the identity
+    # card is untouched by this commit and the measured path is the one that
+    # was measured.
+    if (choice != ATTN_PATH_EAGER and stages.attn_fused_off
+            and ATTN_STICKY and not need_eager):
+        status = FUSED_SKIPPED_STICKY
+        if not need_eager:
+            attention_eager_core(
+                ctx, stages, b, l, s, pos0, key_lo, window, dims, plant_at,
+                plant_idx, plant_bits, trace, prefix, softcap,
+            )
+    elif choice != ATTN_PATH_EAGER:
+        attention_fwd_scan_clear()
+        var kept_estash = False
+        comptime if ATTN_ARM_TRIAL or ATTN_SHIPPED_BWD_ESTASH:
+            # DEVIATION 2652 (brief section 20.3): under an `_estash` arm,
+            # with no eager stages needed (so `aexp` holds no stage this
+            # call reads back), the fused forward writes its exp stash into
+            # `aexp` and keeps it for the backward. A trial build, or a
+            # shipped build whose column default carries the estash bits
+            # (DEVIATION 2657); every other build takes the branch below
+            # unchanged.
+            var arm = fused_attention_arm_from_env()
+            # A caller that asked for the recompute policy
+            # (`attn_recompute_backward`, the Samba train step) keeps no
+            # stash: the plain launcher below runs, as under ATTN_STASH=1.
+            # TOMBSTONE: ANONLIB_IDN_ATTN_DEFER_REGIME (loser: transformer-forward 1.376) deleted 2026-10-11 by 68d9654bb; code recoverable at 68d9654bb^.
+            # Restore: git apply experiments/removed/ANONLIB_IDN_ATTN_DEFER_REGIME.patch
+            if (not need_eager) and fused_attention_arm_estash_runs(arm) and not stages.attn_recompute_backward:
+                var ran = 0
+                status = fused_forward_launch_estash_ran(
+                    ctx, stages.ctxv, stages.amax, stages.denom, stages.q_rope,
+                    stages.k_cache, stages.v_cache, stages.aexp, b, l,
+                    dims.n_heads, dims.n_kv, dims.head_dim, s, pos0, key_lo,
+                    window, llama_attention_scale(dims.head_dim), arm, ran,
+                    stages.attn_estash_cells,
+                )
+                kept_estash = True
+        if not kept_estash:
+            status = fused_forward_launch(
+                ctx, stages.ctxv, stages.amax, stages.denom, stages.q_rope,
+                stages.k_cache, stages.v_cache, b, l, dims.n_heads, dims.n_kv,
+                dims.head_dim, s, pos0, key_lo, window,
+                llama_attention_scale(dims.head_dim),
+            )
+        # IDN_ATTN_BWD_SCAN_REUSE: keep this call's forward scan (empty
+        # unless it was taken over exactly these three buffers).
+        stages.attn_fwd_scan = attention_fwd_scan_take(
+            ctx, Int(stages.q_rope.unsafe_ptr()), b * l * dims.n_heads * dims.head_dim,
+            Int(stages.k_cache.unsafe_ptr()), Int(stages.v_cache.unsafe_ptr()),
+            b * dims.n_kv * s * dims.head_dim,
+        )
+        if status != FUSED_RAN and not need_eager:
+            stages.attn_fused_off = True
+        if status != FUSED_RAN and not need_eager:
+            attention_eager_core(
+                ctx, stages, b, l, s, pos0, key_lo, window, dims, plant_at,
+                plant_idx, plant_bits, trace, prefix, softcap,
+            )
+        elif status == FUSED_RAN and not need_eager:
+            stages.attn_materialized = False
+    trace.record_device[DType.float32](
+        ctx,
+        prefix + ".attn.ctx",
+        stages.ctxv,
+        b * l * dims.n_heads * dims.head_dim,
+    )
+    stages.attn_forward_status = status
+    return status
+
+
+def ensure_attention_materialized(
+    ctx: DeviceContext,
+    mut stages: LlamaDeviceStages,
+    b: Int,
+    l: Int,
+    s: Int,
+    pos0: Int,
+    key_lo: Int,
+    window: Int,
+) raises:
+    """Recompute the eager attention stages of the LAST forward call when
+    the fused path skipped them (a backward that takes the eager path
+    reads `weights`). The inputs (`q_rope`, the packed caches) are still
+    in `stages`; the output `ctxv` is rewritten with the same bits."""
+    if stages.attn_materialized:
+        return
+    # TOMBSTONE: ANONLIB_IDN_ATTN_SOFTMAX=2 (slower) deleted 2026-10-10 by c1bf9d832; code recoverable at ca25d9321.
+    var off = IdentityTrace.disabled()
+    var dims = stages.dims.copy()
+    attention_eager_core(
+        ctx, stages, b, l, s, pos0, key_lo, window, dims,
+        PLANT_AT_NONE, List[Int](), List[UInt32](), off, String(""),
+    )
+
+
+def attention_eager_core(
+    ctx: DeviceContext,
+    mut stages: LlamaDeviceStages,
+    b: Int,
+    l: Int,
+    s: Int,
+    pos0: Int,
+    key_lo: Int,
+    window: Int,
+    dims: LlamaDims,
+    plant_at: Int,
+    plant_idx: List[Int],
+    plant_bits: List[UInt32],
+    mut trace: IdentityTrace,
+    prefix: String,
+    softcap: Float32 = Float32(0.0),
+) raises:
+    """`eager_attention_forward(module, query, key, value, attention_mask,
+    scaling, dropout)` (:191-213), inference only, `dropout = 0.0` and
+    REFUSED as a config (contract section 2). THE EAGER STAGE KERNELS,
+    S11 through S19; records S11-S18 (`attn.ctx` is recorded by the
+    caller, after the path decision).
+
+    Their order, and this function's:
+
+        key_states   = repeat_kv(key, n_rep)                          :202
+        value_states = repeat_kv(value, n_rep)                        :203
+        attn_weights = matmul(query, key_states.transpose(2,3))*scale :204
+        attn_weights = attn_weights + attention_mask                  :206
+        attn_weights = softmax(attn_weights, dim=-1, float32)         :208
+        attn_output  = matmul(attn_weights, value_states)             :210
+
+    `repeat_kv` is not spelled: it is `h // n_rep` wherever a kv head is
+    indexed, which is contract DEVIATION 813's declared COPY.
+
+    Records `attn.scores`, `attn.masked`, `attn.max`, `attn.exp`,
+    `attn.denom`, `attn.weights` and `attn.ctx`, in contract section 9's
+    order. Every one of those is a separate materialized buffer, which the
+    eager path costs and which contract section 6 argues is the point: a
+    lane whose whole instrument is the per-stage card should not begin by
+    fusing the stages away.
+    """
+    var nh = dims.n_heads
+    var nkv = dims.n_kv
+    var hd = dims.head_dim
+    var n_rep = dims.n_rep()
+    var cells = b * nh * l * s
+    var scale = llama_attention_scale(hd)
+    ensure_attention_stage_capacity(ctx, stages, l, s)
+    stages.attn_materialized = True
+    # DEVIATION 2652: the eager stage overwrites `aexp`; nothing is kept.
+    stages.attn_estash_cells = 0
+
+    # ---- S11 (:204's matmul). `gemm.fp32.v1` OP_NT with `k = head_dim`,
+    #      ONE CALL PER (batch, head). Contract DEVIATION 808.
+    #      C[L, S] = q_head[L, hd] . k_head[S, hd]^T.
+    #      `k = head_dim` is the SAME integer in prefill and decode, which
+    #      is what makes this reuse decode-safe (contract 7.2). See
+    #      DEVIATION 1029 for the part of that argument the contract leaves
+    #      to the gemm profile's own plan-invariance gate.
+    # lane/lowbit-default: under `fixed15_v1` at the decode rows, every
+    # (batch, head) at once (`llama_int15_scores_heads`: one gather, one
+    # quantizer launch a side, one product launch), the same bits as the
+    # loop below, which every other case keeps. NVIDIA only until the heads
+    # gate has run on the other columns.
+    comptime heads_column = TARGET_COLUMN == COLUMN_NVIDIA
+    var heads_at_once = heads_column and stages.int15_on and l <= INT15_HEADS_MAX_L
+    # lane/lowbit-default, lever 3: under the profile the phase fences of
+    # this core are skipped. ONE in-order context runs every launch below in
+    # program order, and no fence here guards a host read: the only host
+    # reads in this core are `_plant_bits` and `trace.record_device`, and
+    # each drains the context itself before it reads. fp32_v1 keeps every
+    # fence, byte for byte the code that was here, and so do AMD and Apple
+    # under the profile until this has run there (NVIDIA only, as above).
+    var fence = not (heads_column and stages.int15_on)
+    if heads_at_once:
+        if not stages.int15:
+            stages.int15 = Optional[LlamaInt15Stage](LlamaInt15Stage(ctx))
+        llama_int15_scores_heads(
+            ctx, stages.int15.value(), stages.scores, stages.q_rope, stages.k_cache,
+            b, nh, nkv, l, s, hd,
+        )
+    for bb in range(b if not heads_at_once else 0):
+        for h in range(nh):
+            var kvh = h // n_rep
+            step_count_launch()
+            ctx.enqueue_function[gather_q_head_kernel](
+                stages.qbh.unsafe_ptr(),
+                stages.q_rope.unsafe_ptr(),
+                Int32(l),
+                Int32(nh),
+                Int32(hd),
+                Int32(bb),
+                Int32(h),
+                scale,
+                grid_dim=(_grid(l * hd), 1, 1),
+                block_dim=(LLAMA_TPB, 1, 1),
+            )
+            step_count_launch()
+            ctx.enqueue_function[gather_kv_head_kernel](
+                stages.kbh.unsafe_ptr(),
+                stages.k_cache.unsafe_ptr(),
+                Int32(s),
+                Int32(nkv),
+                Int32(hd),
+                Int32(bb),
+                Int32(kvh),
+                grid_dim=(_grid(s * hd), 1, 1),
+                block_dim=(LLAMA_TPB, 1, 1),
+            )
+            # lane/lowbit-blocks: under `fixed15_v1` the score product is
+            # gemm.int15i64.v1, one scale per query row and one per key row,
+            # each over head_dim (`int15_block.mojo`); otherwise the call
+            # that stood here.
+            if stages.int15_on:
+                if not stages.int15:
+                    stages.int15 = Optional[LlamaInt15Stage](LlamaInt15Stage(ctx))
+                llama_int15_scores(
+                    ctx, stages.int15.value(), stages.sbh, stages.qbh,
+                    stages.kbh, l, s, hd,
+                )
+            else:
+                stages.gemm_workspace.run[False](
+                    ctx,
+                    stages.sbh,
+                    stages.qbh,
+                    stages.kbh,
+                    l,
+                    s,
+                    hd,
+                    _gemm_op_nt(),
+                )
+            step_count_launch()
+            ctx.enqueue_function[scatter_scores_kernel](
+                stages.scores.unsafe_ptr(),
+                stages.sbh.unsafe_ptr(),
+                Int32(l),
+                Int32(s),
+                Int32(nh),
+                Int32(bb),
+                Int32(h),
+                grid_dim=(_grid(l * s), 1, 1),
+                block_dim=(LLAMA_TPB, 1, 1),
+            )
+
+    # Gather -> GEMM -> scatter -> next head uses one in-order context.
+    # Stage-owned scratch survives the entire loop, and each scatter finishes
+    # before the next head overwrites that scratch. Preserve one phase fence.
+    if fence:
+        step_count_sync()
+        ctx.synchronize()
+
+    # ---- S12 (:204's `* scaling`), applied to the FINISHED dot.
+    var scale_mask_fused = False
+    comptime if NN21_SCALE_MASK and not BLOCK_ANY_SABOTAGE:
+        scale_mask_fused = softcap == Float32(0.0) and plant_at == PLANT_AT_NONE
+    if scale_mask_fused:
+        step_count_launch()
+        ctx.enqueue_function[score_scale_mask_kernel](
+            stages.scores.unsafe_ptr(), stages.masked.unsafe_ptr(),
+            Int32(cells), Int32(l), Int32(s), Int32(pos0), Int32(key_lo),
+            Int32(window), scale, bitcast[DType.float32](UInt32(MASK_FILL_BITS)),
+            grid_dim=(_grid(cells), 1, 1), block_dim=(LLAMA_TPB, 1, 1),
+        )
+    else:
+        step_count_launch()
+        ctx.enqueue_function[attn_scale_kernel](
+            stages.scores.unsafe_ptr(),
+            Int32(cells),
+            scale,
+            grid_dim=(_grid(cells), 1, 1),
+            block_dim=(LLAMA_TPB, 1, 1),
+        )
+    if fence:
+        step_count_sync()
+        ctx.synchronize()
+    # DEVIATION 2947 (lane/block-options): the softcap, after the scale and
+    # before the mask and the plant, recorded INTO `attn.scores`. Skipped
+    # entirely at the default record (softcap 0.0).
+    if softcap != Float32(0.0):
+        step_count_launch()
+        ctx.enqueue_function[attn_softcap_kernel](
+            stages.scores.unsafe_ptr(),
+            Int32(cells),
+            softcap,
+            grid_dim=(_grid(cells), 1, 1),
+            block_dim=(LLAMA_TPB, 1, 1),
+        )
+        if fence:
+            step_count_sync()
+            ctx.synchronize()
+    # The score plant, injection point 1. Applied AFTER S12 and BEFORE the
+    # stage is recorded, so the planted bits are IN `attn.scores` -- which
+    # is the oracle's order and the only order under which clause (a) can
+    # compare a planted case at all.
+    _plant_bits(
+        ctx,
+        stages.scores,
+        cells,
+        PLANT_AT_SCORES,
+        plant_at,
+        plant_idx,
+        plant_bits,
+    )
+    trace.record_device[DType.float32](
+        ctx, prefix + ".attn.scores", stages.scores, cells
+    )
+
+    # ---- S13 (:206). An ADD, of -FLT_MAX or of +0.0. Not a select.
+    if not scale_mask_fused:
+        step_count_launch()
+        ctx.enqueue_function[attn_mask_kernel](
+            stages.masked.unsafe_ptr(),
+            stages.scores.unsafe_ptr(),
+            Int32(b),
+            Int32(nh),
+            Int32(l),
+            Int32(s),
+            Int32(pos0),
+            Int32(key_lo),
+            Int32(window),
+            grid_dim=(_grid(cells), 1, 1),
+            block_dim=(LLAMA_TPB, 1, 1),
+        )
+    if fence:
+        step_count_sync()
+        ctx.synchronize()
+    # The score plant, injection point 2. `PLANT_MASKED_ZERO_ROW` and any
+    # other case whose separating value has to survive the mask lands here.
+    _plant_bits(
+        ctx,
+        stages.masked,
+        cells,
+        PLANT_AT_MASKED,
+        plant_at,
+        plant_idx,
+        plant_bits,
+    )
+    trace.record_device[DType.float32](
+        ctx, prefix + ".attn.masked", stages.masked, cells
+    )
+
+    # ---- S14 (:208's row max). `identical_fmax`, fold shape free.
+    step_count_launch()
+    ctx.enqueue_function[attn_max_kernel](
+        stages.amax.unsafe_ptr(),
+        stages.masked.unsafe_ptr(),
+        Int32(b),
+        Int32(nh),
+        Int32(l),
+        Int32(s),
+        grid_dim=(_grid(b * nh * l), 1, 1),
+        block_dim=(LLAMA_TPB, 1, 1),
+    )
+    # DEVIATION 2721 (lane/wait-removal): WAIT REMOVED here. The next
+    # statement is a trace record. `IdentityTrace.record_device` returns
+    # at once when tracing is off; when it is on it enqueues its OWN copy
+    # behind this kernel on the same in-order context and drains AFTER
+    # it. This wait ordered nothing in either branch.
+    trace.record_device[DType.float32](
+        ctx, prefix + ".attn.max", stages.amax, b * nh * l
+    )
+
+    # ---- S15 and S16 (:208). `exp(s - m)`.
+    step_count_launch()
+    ctx.enqueue_function[attn_exp_kernel](
+        stages.aexp.unsafe_ptr(),
+        stages.masked.unsafe_ptr(),
+        stages.amax.unsafe_ptr(),
+        Int32(cells),
+        Int32(s),
+        grid_dim=(_grid(cells), 1, 1),
+        block_dim=(LLAMA_TPB, 1, 1),
+    )
+    # DEVIATION 2721 (lane/wait-removal): WAIT REMOVED here. The next
+    # statement is a trace record. `IdentityTrace.record_device` returns
+    # at once when tracing is off; when it is on it enqueues its OWN copy
+    # behind this kernel on the same in-order context and drains AFTER
+    # it. This wait ordered nothing in either branch.
+    trace.record_device[DType.float32](
+        ctx, prefix + ".attn.exp", stages.aexp, cells
+    )
+
+    # ---- S17 (:208's denominator). SERIAL ASCENDING, ABSOLUTE index.
+    step_count_launch()
+    ctx.enqueue_function[attn_denom_kernel](
+        stages.denom.unsafe_ptr(),
+        stages.aexp.unsafe_ptr(),
+        stages.weights.unsafe_ptr(),  # DEVIATION 1023, sabotage scratch
+        Int32(b),
+        Int32(nh),
+        Int32(l),
+        Int32(s),
+        grid_dim=(_grid(b * nh * l), 1, 1),
+        block_dim=(LLAMA_TPB, 1, 1),
+    )
+    # DEVIATION 2721 (lane/wait-removal): WAIT REMOVED here. The next
+    # statement is a trace record. `IdentityTrace.record_device` returns
+    # at once when tracing is off; when it is on it enqueues its OWN copy
+    # behind this kernel on the same in-order context and drains AFTER
+    # it. This wait ordered nothing in either branch.
+    trace.record_device[DType.float32](
+        ctx, prefix + ".attn.denom", stages.denom, b * nh * l
+    )
+
+    # ---- S18 (:208's normalize). ONE DIVISION per weight.
+    step_count_launch()
+    ctx.enqueue_function[attn_weights_kernel](
+        stages.weights.unsafe_ptr(),
+        stages.aexp.unsafe_ptr(),
+        stages.denom.unsafe_ptr(),
+        Int32(cells),
+        Int32(s),
+        grid_dim=(_grid(cells), 1, 1),
+        block_dim=(LLAMA_TPB, 1, 1),
+    )
+    # DEVIATION 2721 (lane/wait-removal): WAIT REMOVED here. The next
+    # statement is a trace record. `IdentityTrace.record_device` returns
+    # at once when tracing is off; when it is on it enqueues its OWN copy
+    # behind this kernel on the same in-order context and drains AFTER
+    # it. This wait ordered nothing in either branch.
+    trace.record_device[DType.float32](
+        ctx, prefix + ".attn.weights", stages.weights, cells
+    )
+
+    # ---- S19 (:210). SERIAL ASCENDING over the ABSOLUTE key index, fma.
+    #      NOT a gemm call. Contract DEVIATION 807 and section 7.2.
+    comptime if SAB_S19_VALUE_SUM_VIA_GEMM:
+        # SABOTAGE: `C[L, hd] = W[L, S] . V[S, hd]`, an OP_NN cell with
+        # `k = S`. `P = f(S)` and `S` differs between prefill and decode, so
+        # the masked `+0.0` tail stops being bitwise inert. Clause (a) stays
+        # GREEN at a fixed length; clause (d) is what falls over.
+        for bb2 in range(b):
+            for h2 in range(nh):
+                var kvh2 = h2 // n_rep
+                step_count_launch()
+                ctx.enqueue_function[gather_scores_head_kernel](
+                    stages.sbh.unsafe_ptr(),
+                    stages.weights.unsafe_ptr(),
+                    Int32(l),
+                    Int32(s),
+                    Int32(nh),
+                    Int32(bb2),
+                    Int32(h2),
+                    grid_dim=(_grid(l * s), 1, 1),
+                    block_dim=(LLAMA_TPB, 1, 1),
+                )
+                step_count_launch()
+                ctx.enqueue_function[gather_kv_head_kernel](
+                    stages.kbh.unsafe_ptr(),
+                    stages.v_cache.unsafe_ptr(),
+                    Int32(s),
+                    Int32(nkv),
+                    Int32(hd),
+                    Int32(bb2),
+                    Int32(kvh2),
+                    grid_dim=(_grid(s * hd), 1, 1),
+                    block_dim=(LLAMA_TPB, 1, 1),
+                )
+                step_count_sync()
+                ctx.synchronize()
+                stages.gemm_workspace.run[False](
+                    ctx,
+                    stages.qbh,
+                    stages.sbh,
+                    stages.kbh,
+                    l,
+                    hd,
+                    s,
+                    _gemm_op_nn(),
+                )
+                step_count_launch()
+                ctx.enqueue_function[scatter_ctx_head_kernel](
+                    stages.ctxv.unsafe_ptr(),
+                    stages.qbh.unsafe_ptr(),
+                    Int32(l),
+                    Int32(nh),
+                    Int32(hd),
+                    Int32(bb2),
+                    Int32(h2),
+                    grid_dim=(_grid(l * hd), 1, 1),
+                    block_dim=(LLAMA_TPB, 1, 1),
+                )
+                step_count_sync()
+                ctx.synchronize()
+    else:
+        step_count_launch()
+        ctx.enqueue_function[attn_context_kernel](
+            stages.ctxv.unsafe_ptr(),
+            stages.weights.unsafe_ptr(),
+            stages.v_cache.unsafe_ptr(),
+            Int32(b),
+            Int32(l),
+            Int32(nh),
+            Int32(nkv),
+            Int32(hd),
+            Int32(s),
+            grid_dim=(_grid(b * l * nh * hd), 1, 1),
+            block_dim=(LLAMA_TPB, 1, 1),
+        )
+        if fence:
+            step_count_sync()
+            ctx.synchronize()
+
+
+def llama_attention_forward(
+    ctx: DeviceContext,
+    mut stages: LlamaDeviceStages,
+    mut kv: LlamaKVCache,
+    mut rope: LlamaRopeTable,
+    mut w: LlamaDeviceWeights,
+    b: Int,
+    l: Int,
+    pos0: Int,
+    plant_at: Int,
+    plant_idx: List[Int],
+    plant_bits: List[UInt32],
+    mut trace: IdentityTrace,
+    prefix: String,
+    materialize: Bool,
+    retain_kv_cache: Bool = True,
+) raises:
+    """`LlamaAttention.forward(hidden_states, position_embeddings,
+    attention_mask, past_key_values)` (:243-281), eager path, inference
+    only.
+
+    Their order, and this function's:
+
+        query_states = q_proj(h).view(hidden_shape).transpose(1, 2)   :252
+        key_states   = k_proj(h).view(hidden_shape).transpose(1, 2)   :253
+        value_states = v_proj(h).view(hidden_shape).transpose(1, 2)   :254
+        q, k = apply_rotary_pos_emb(q, k, cos, sin)                   :257
+        k, v = past_key_values.update(k, v, self.layer_idx)           :261
+        attn_output, _ = attention_interface(...)                     :270
+        attn_output = attn_output.reshape(*input_shape, -1)           :279
+        attn_output = self.o_proj(attn_output)                        :280
+
+    `view` and `transpose` are COPIES that move no bits, and the head
+    structure lives in the INDEX ARITHMETIC of the kernels rather than in a
+    materialized transpose. So does the `reshape` at :279, which is why
+    `attn.ctx` is already `[M, n_heads*head_dim]` and feeds `o_proj`
+    directly.
+
+    `attention_interface` is `eager_attention_forward` and nothing else.
+    :264-266 lets `ALL_ATTENTION_FUNCTIONS` choose it at run time; **v1 pins
+    the eager path** (contract section 6) because SDPA's arithmetic is
+    chosen by whichever backend the runtime picks, which is the same class
+    of defect as a vendor BLAS dispatch.
+
+    `norm1.out` arrives as this function's input from `stages`: the decoder
+    layer normalizes first and this reads `stages.norm1_out`, rather than
+    taking a tensor argument.
+    """
+    var commit_cache = True
+    comptime if IDN_TRAIN_NO_DECODE_CACHE:
+        if not retain_kv_cache:
+            # Explicit training-only capability, never inferred from size.
+            # Stages retain the exact packed K/V consumed by backward.
+            if pos0 != 0 or kv.s != 0:
+                raise Error("no-decode-cache: training prefill requires an empty cache")
+            commit_cache = False
+    var dims = stages.dims.copy()
+    var dm = dims.d_model
+    var qw = dims.q_width()
+    var kw = dims.kv_width()
+    var nkv = dims.n_kv
+    var hd = dims.head_dim
+    var m = b * l
+    var s_old = kv.s
+    var window = kv.window
+    if not retain_kv_cache:
+        if not (IDN_TRAIN_NO_DECODE_CACHE) or s_old != 0 or pos0 != 0 or window != 0:
+            raise Error("llama: no-decode-cache requires the NI24 IDENTICAL arm and an empty full-prefill cache")
+    var key_lo = llama_key_lo(s_old, window)
+    var s = llama_key_span(s_old, l, window)
+    var ton = timing_on()
+    var tk = Int(perf_counter_ns())
+    # DEVIATION 2630 (core/step_phase.mojo): per-component ticks, compiled
+    # only under -D ANONLIB_STEP_PHASE_TIMERS=1; on any other build the
+    # clock stores three fields and every method returns at once.
+    var pc = StepPhaseClock(ctx)
+
+    # ---- q_proj, k_proj, v_proj (:252-254). `nn.Linear(d_model, *,
+    #      bias=attention_bias)` with `attention_bias` False, so weight
+    #      only. GEMM v1 OP_NT: C[M, out] = norm1_out[M, dm] . W[out, dm]^T.
+    # Retain FP32 operands in every tier. The vendor fast route can select
+    # TF32 projections, exceeding the block's unchanged accuracy contract.
+    # IDENTICAL already uses this plan; its arithmetic remains unchanged.
+    var opts = w.opts.copy()
+    var grouped_projections = False
+    comptime if NI07_GROUPED_PROJECTIONS and not BLOCK_ANY_SABOTAGE:
+        # Three independent OP_NT outputs share one input and a launch.
+        # Plain FP32 only: quantized projection planes keep their own route.
+        # Bias and q/k normalization remain AFTER these same rounded outputs.
+        grouped_projections = not Bool(w.int15)
+        if grouped_projections:
+            step_count_launch()
+            neural_projection_triplet(ctx, stages.q_proj, stages.k_proj,
+                stages.v_proj, stages.norm1_out, w.w_q, w.w_k, w.w_v,
+                m, qw, kw, dm)
+    if not grouped_projections:
+        llama_proj(
+            ctx, stages.gemm_workspace, stages.int15, w.int15, LLAMA_PROJ_Q,
+            stages.q_proj, stages.norm1_out, w.w_q, m, qw, dm,
+        )
+    # DEVIATION 2934 (lane/block-options), `qkv_bias`: one plain add per
+    # cell after the GEMM, in place, BEFORE the stage is recorded so the
+    # card's `q_proj.out` is the projection with its bias, as the oracle's.
+    if opts.qkv_bias:
+        step_count_launch()
+        ctx.enqueue_function[add_bias_kernel](
+            stages.q_proj.unsafe_ptr(),
+            w.b_q.unsafe_ptr(),
+            Int32(m * qw),
+            Int32(qw),
+            grid_dim=(_grid(m * qw), 1, 1),
+            block_dim=(LLAMA_TPB, 1, 1),
+        )
+    # DEVIATION 2946, `qk_norm`: an RMSNorm over each head's `head_dim`
+    # vector of q (and of k below), BEFORE RoPE, `M * n_heads` rows of
+    # width `head_dim` in the token-major layout, the shared `[head_dim]`
+    # weight, the block's eps, the block's RMSNorm form (plain or Gemma's
+    # offset), no bias. Written into `q_rope` as a TEMPORARY and copied
+    # back over `q_proj` (a device copy, not a seam; `q_rope` is
+    # overwritten by RoPE below and one buffer may not be both operands of
+    # one launcher under Mojo's exclusivity rule). The sum of squares goes
+    # to the untagged `qk_sumsq` scratch. Recorded INTO `q_proj.out`.
+    if opts.qk_norm:
+        # `w.norm1_b` fills the bias slot and is NEVER READ (has_bias is
+        # False); one buffer may not be two arguments of one call.
+        llama_norm(
+            ctx, stages.qk_sumsq, stages.q_rope, stages.q_proj, w.qn_w,
+            w.norm1_b, m * dims.n_heads, hd, opts.norm_eps, opts.qk_norm_kind(),
+            False,
+        )
+        step_count_d2d()
+        ctx.enqueue_copy(dst_buf=stages.q_proj, src_buf=stages.q_rope)
+    trace.record_device[DType.float32](
+        ctx, prefix + ".q_proj.out", stages.q_proj, m * qw
+    )
+    pc.tick(ctx, "fwd.q_proj", "proj_fwd")
+    if not grouped_projections:
+        llama_proj(
+            ctx, stages.gemm_workspace, stages.int15, w.int15, LLAMA_PROJ_K,
+            stages.k_proj, stages.norm1_out, w.w_k, m, kw, dm,
+        )
+    if opts.qkv_bias:
+        step_count_launch()
+        ctx.enqueue_function[add_bias_kernel](
+            stages.k_proj.unsafe_ptr(),
+            w.b_k.unsafe_ptr(),
+            Int32(m * kw),
+            Int32(kw),
+            grid_dim=(_grid(m * kw), 1, 1),
+            block_dim=(LLAMA_TPB, 1, 1),
+        )
+    if opts.qk_norm:
+        llama_norm(
+            ctx, stages.qk_sumsq, stages.k_rope, stages.k_proj, w.kn_w,
+            w.norm2_b, m * nkv, hd, opts.norm_eps, opts.qk_norm_kind(), False,
+        )
+        step_count_d2d()
+        ctx.enqueue_copy(dst_buf=stages.k_proj, src_buf=stages.k_rope)
+    trace.record_device[DType.float32](
+        ctx, prefix + ".k_proj.out", stages.k_proj, m * kw
+    )
+    pc.tick(ctx, "fwd.k_proj", "proj_fwd")
+    if not grouped_projections:
+        llama_proj(
+            ctx, stages.gemm_workspace, stages.int15, w.int15, LLAMA_PROJ_V,
+            stages.v_proj, stages.norm1_out, w.w_v, m, kw, dm,
+        )
+    if opts.qkv_bias:
+        step_count_launch()
+        ctx.enqueue_function[add_bias_kernel](
+            stages.v_proj.unsafe_ptr(),
+            w.b_v.unsafe_ptr(),
+            Int32(m * kw),
+            Int32(kw),
+            grid_dim=(_grid(m * kw), 1, 1),
+            block_dim=(LLAMA_TPB, 1, 1),
+        )
+    trace.record_device[DType.float32](
+        ctx, prefix + ".v_proj.out", stages.v_proj, m * kw
+    )
+    pc.tick(ctx, "fwd.v_proj", "proj_fwd")
+    timing_tick(ctx, ton, tk, "attn.qkv_proj")
+
+    # ---- the rotary table (:113-127). COMPUTED once per configuration,
+    #      RECORDED every call. DEVIATION 1024: contract section 9 says
+    #      "once" and also lists these three inside a thirty-tag card order
+    #      the differ aligns on; this file resolves toward the differ.
+    #      `rope.half` is `rope_dim / 2` (DEVIATION 2948), `head_dim / 2`
+    #      at the default.
+    trace.record_device[DType.float32](
+        ctx, prefix + ".rope.inv_freq", rope.inv_freq, rope.half
+    )
+    trace.record_device[DType.float32](
+        ctx, prefix + ".rope.cos", rope.cos, rope.p_max * rope.half
+    )
+    trace.record_device[DType.float32](
+        ctx, prefix + ".rope.sin", rope.sin, rope.p_max * rope.half
+    )
+
+    # ---- apply_rotary_pos_emb (:257). S9 and S10, q then k. V IS NOT
+    #      ROTATED (:257 takes q and k only).
+    var rope_cache_fused = False
+    comptime if NN27_QK_ROPE_PAIR and not SAB_S07_ROPE_RELATIVE_POSITION and not SAB_S09_ROPE_HALVES_SWAPPED and not SAB_S10_ROPE_FUSED:
+        step_count_launch()
+        ctx.enqueue_function[qk_rope_pair_kernel](
+            stages.q_rope.unsafe_ptr(), stages.k_rope.unsafe_ptr(),
+            stages.q_proj.unsafe_ptr(), stages.k_proj.unsafe_ptr(),
+            rope.cos.unsafe_ptr(), rope.sin.unsafe_ptr(),
+            Int32(m), Int32(l), Int32(dims.n_heads), Int32(nkv),
+            Int32(hd), Int32(pos0), Int32(rope.rope_dim),
+            grid_dim=(_grid(m * qw), 1, 1), block_dim=(LLAMA_TPB, 1, 1),
+        )
+
+    else:
+        apply_rotary_pos_emb(
+            ctx,
+            stages.q_rope,
+            stages.q_proj,
+            rope.cos,
+            rope.sin,
+            m,
+            l,
+            dims.n_heads,
+            hd,
+            pos0,
+            rope.rope_dim,
+        )
+        comptime if IDN_ROPE_CACHE and not BLOCK_ANY_SABOTAGE:
+            # Cache semantics, not a benchmark size: no previous keys and no ring.
+            rope_cache_fused = s_old == 0 and pos0 == 0 and window == 0
+        if rope_cache_fused:
+            step_count_launch()
+            ctx.enqueue_function[rotary_k_prefill_cache_kernel](
+                stages.k_rope.unsafe_ptr(), stages.k_cache.unsafe_ptr(),
+                stages.v_cache.unsafe_ptr(), stages.k_proj.unsafe_ptr(),
+                stages.v_proj.unsafe_ptr(), rope.cos.unsafe_ptr(), rope.sin.unsafe_ptr(),
+                Int32(b), Int32(l), Int32(nkv), Int32(hd), Int32(rope.rope_dim),
+                grid_dim=(_grid(m * kw), 1, 1), block_dim=(LLAMA_TPB, 1, 1),
+            )
+        else:
+            apply_rotary_pos_emb(
+                ctx, stages.k_rope, stages.k_proj, rope.cos, rope.sin,
+                m, l, nkv, hd, pos0, rope.rope_dim,
+            )
+    # DEVIATION 2721 (lane/wait-removal): WAIT REMOVED here. The next
+    # statement is a trace record. `IdentityTrace.record_device` returns
+    # at once when tracing is off; when it is on it enqueues its OWN copy
+    # behind this kernel on the same in-order context and drains AFTER
+    # it. This wait ordered nothing in either branch.
+    trace.record_device[DType.float32](
+        ctx, prefix + ".q_rope.out", stages.q_rope, m * qw
+    )
+    trace.record_device[DType.float32](
+        ctx, prefix + ".k_rope.out", stages.k_rope, m * kw
+    )
+
+    # ---- past_key_values.update (:261-262). Copies. DEVIATION 1022: the
+    #      repack is OUT OF PLACE, at the NEW stride S.
+    #
+    #      `window > 0`: `stages.k_cache`/`v_cache` hold the packed KEY
+    #      SPAN this call reads (absolute `[key_lo, pos0 + l)`), gathered
+    #      from the ring plus this call's tokens; the ring itself is then
+    #      updated in place. The recorded `kv.k_cache` stage is that span.
+    if rope_cache_fused:
+        pass  # NI23 wrote both packed attention stages with K RoPE above.
+    elif window == 0:
+        step_count_launch()
+        ctx.enqueue_function[kv_append2_kernel](
+            stages.k_cache.unsafe_ptr(),
+            stages.v_cache.unsafe_ptr(),
+            kv.k.unsafe_ptr(),
+            kv.v.unsafe_ptr(),
+            stages.k_rope.unsafe_ptr(),
+            stages.v_proj.unsafe_ptr(),
+            Int32(b),
+            Int32(l),
+            Int32(nkv),
+            Int32(hd),
+            Int32(s_old),
+            grid_dim=(_grid(b * nkv * s * hd), 1, 1),
+            block_dim=(LLAMA_TPB, 1, 1),
+        )
+    else:
+        step_count_launch()
+        ctx.enqueue_function[kv_window_gather_kernel](
+            stages.k_cache.unsafe_ptr(),
+            kv.k.unsafe_ptr(),
+            stages.k_rope.unsafe_ptr(),
+            Int32(b),
+            Int32(l),
+            Int32(nkv),
+            Int32(hd),
+            Int32(kv.cap),
+            Int32(key_lo),
+            Int32(s_old),
+            Int32(s),
+            grid_dim=(_grid(b * nkv * s * hd), 1, 1),
+            block_dim=(LLAMA_TPB, 1, 1),
+        )
+        step_count_launch()
+        ctx.enqueue_function[kv_window_gather_kernel](
+            stages.v_cache.unsafe_ptr(),
+            kv.v.unsafe_ptr(),
+            stages.v_proj.unsafe_ptr(),
+            Int32(b),
+            Int32(l),
+            Int32(nkv),
+            Int32(hd),
+            Int32(kv.cap),
+            Int32(key_lo),
+            Int32(s_old),
+            Int32(s),
+            grid_dim=(_grid(b * nkv * s * hd), 1, 1),
+            block_dim=(LLAMA_TPB, 1, 1),
+        )
+    # DEVIATION 2721 (lane/wait-removal): WAIT REMOVED here. The next
+    # statement is a trace record. `IdentityTrace.record_device` returns
+    # at once when tracing is off; when it is on it enqueues its OWN copy
+    # behind this kernel on the same in-order context and drains AFTER
+    # it. This wait ordered nothing in either branch.
+    trace.record_device[DType.float32](
+        ctx, prefix + ".kv.k_cache", stages.k_cache, b * nkv * s * hd
+    )
+    trace.record_device[DType.float32](
+        ctx, prefix + ".kv.v_cache", stages.v_cache, b * nkv * s * hd
+    )
+    # The cache carries the NEW packed contents into the next call. A copy,
+    # taken AFTER the stages are recorded so the stage is the cache as
+    # computed. DEVIATION 1022 is why the two buffers are distinct; the rest
+    # of THIS call reads `stages.k_cache` and `stages.v_cache`, which hold
+    # the same bits.
+    if commit_cache:
+        if window == 0:
+            step_count_d2d()
+            ctx.enqueue_copy(dst_buf=kv.k, src_buf=stages.k_cache)
+            step_count_d2d()
+            ctx.enqueue_copy(dst_buf=kv.v, src_buf=stages.v_cache)
+        else:
+            comptime if NN29_RING_PAIR:
+                step_count_launch()
+                ctx.enqueue_function[kv_ring_pair_kernel](
+                    kv.k.unsafe_ptr(), kv.v.unsafe_ptr(),
+                    stages.k_rope.unsafe_ptr(), stages.v_proj.unsafe_ptr(),
+                    Int32(b), Int32(l), Int32(nkv), Int32(hd),
+                    Int32(kv.cap), Int32(s_old),
+                    grid_dim=(_grid(b * nkv * kv.cap * hd), 1, 1),
+                    block_dim=(LLAMA_TPB, 1, 1),
+                )
+            else:
+                # The ring takes this call's tokens AFTER the gather above read it.
+                step_count_launch()
+                ctx.enqueue_function[kv_ring_write_kernel](
+                    kv.k.unsafe_ptr(),
+                    stages.k_rope.unsafe_ptr(),
+                    Int32(b),
+                    Int32(l),
+                    Int32(nkv),
+                    Int32(hd),
+                    Int32(kv.cap),
+                    Int32(s_old),
+                    grid_dim=(_grid(b * nkv * kv.cap * hd), 1, 1),
+                    block_dim=(LLAMA_TPB, 1, 1),
+                )
+                step_count_launch()
+                ctx.enqueue_function[kv_ring_write_kernel](
+                    kv.v.unsafe_ptr(),
+                    stages.v_proj.unsafe_ptr(),
+                    Int32(b),
+                    Int32(l),
+                    Int32(nkv),
+                    Int32(hd),
+                    Int32(kv.cap),
+                    Int32(s_old),
+                    grid_dim=(_grid(b * nkv * kv.cap * hd), 1, 1),
+                    block_dim=(LLAMA_TPB, 1, 1),
+                )
+        # IDN_ATTN_CACHE_NOWAIT (lane/nr-attn, from lane/neural-pass67
+        # 087231ba3): the hard wait after the cache update ordered nothing.
+        # Every consumer of the cache stages (and of `kv.k`/`kv.v`) is a launch
+        # or copy on the same in-order context, and the host reads none of them
+        # before its own later wait (the fused forward's regime scan or flag
+        # read, or the next call's). No buffer local to this call is freed here.
+        comptime if not IDN_ATTN_CACHE_NOWAIT:
+            step_count_sync()
+            ctx.synchronize()
+        kv.s = s_old + l
+    timing_tick(ctx, ton, tk, "attn.rope_and_cache")
+
+    # ---- the attention interface (:264-277). Eager or fused, ONE set of
+    #      bits (`eager_attention_forward`'s docstring).
+    _ = eager_attention_forward(
+        ctx,
+        stages,
+        b,
+        l,
+        s,
+        pos0,
+        key_lo,
+        window,
+        dims,
+        plant_at,
+        plant_idx,
+        plant_bits,
+        trace,
+        prefix,
+        materialize,
+        opts.attn_softcap,
+    )
+    timing_tick(ctx, ton, tk, "attn.core")
+    pc.mark(ctx)
+
+    # ---- o_proj (:280). `nn.Linear(n_heads*head_dim, d_model,
+    #      bias=attention_bias)`; the bias under `o_bias` (DEVIATION 2935).
+    #      C[M, dm] = ctx[M, qw] . w_o[dm, qw]^T, `k = n_heads*head_dim`.
+    llama_proj(
+        ctx, stages.gemm_workspace, stages.int15, w.int15, LLAMA_PROJ_O,
+        stages.o_proj, stages.ctxv, w.w_o, m, dm, qw,
+    )
+    if opts.o_bias:
+        step_count_launch()
+        ctx.enqueue_function[add_bias_kernel](
+            stages.o_proj.unsafe_ptr(),
+            w.b_o.unsafe_ptr(),
+            Int32(m * dm),
+            Int32(dm),
+            grid_dim=(_grid(m * dm), 1, 1),
+            block_dim=(LLAMA_TPB, 1, 1),
+        )
+    trace.record_device[DType.float32](
+        ctx, prefix + ".o_proj.out", stages.o_proj, m * dm
+    )
+    pc.tick(ctx, "fwd.o_proj", "proj_fwd")
+    timing_tick(ctx, ton, tk, "attn.o_proj")
+
+
+# ===========================================================================
+# THE MLP SUBMODULE
+# ===========================================================================
+
+
+def llama_mlp_forward(
+    ctx: DeviceContext,
+    mut stages: LlamaDeviceStages,
+    mut w: LlamaDeviceWeights,
+    m: Int,
+    mut trace: IdentityTrace,
+    prefix: String,
+    forward_only: Bool = False,
+) raises:
+    """`LlamaMLP.forward(x)` (:174-176).
+
+        down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))   :175
+
+    Three `OP_NT` GEMM cells and two elementwise seams. `mlp_bias` is False
+    (configuration_llama.py:83), so no projection carries a bias.
+
+    Reads `stages.norm2_out` and writes `stages.down_proj`.
+    """
+    var dims = stages.dims.copy()
+    var dm = dims.d_model
+    var it = dims.intermediate
+    # DEVIATION 2630 (core/step_phase.mojo): per-component ticks, compiled
+    # only under -D ANONLIB_STEP_PHASE_TIMERS=1; on any other build the
+    # clock stores three fields and every method returns at once.
+    var pc = StepPhaseClock(ctx)
+    # lane/block-options, the MLP axis (the oracle's S20 section has the
+    # same table): DEVIATION 2939 gelu, 2943 gelu_tanh (ungated,
+    # `down(act(up(x)))`, no gate GEMM, `gate_proj.out` and `mlp.gated`
+    # recorded EMPTY so the card keeps its thirty tags), 2944 geglu and
+    # geglu_tanh (gated, GELU in S20's place), 2945 mlp_bias (one plain add
+    # after gate, up and down). The default record is the code that was
+    # here before, launch for launch.
+    var opts = w.opts.copy()
+    var gated = opts.gated()
+    var bias_gelu_fused = opts.mlp_bias and not opts.act_is_silu()
+    var bias_silu_fused = opts.mlp_bias and opts.act_is_silu()
+
+    # ---- gate_proj and up_proj. C[M, it] = norm2_out[M, dm] . W[it, dm]^T.
+    var projections_paired = False
+    comptime if NEURAL_PAIR_ENABLED:
+        if gated and not w.int15:
+            stages.gemm_workspace.run_pair(ctx, stages.gate_proj, stages.up_proj,
+                stages.norm2_out, w.w_gate, w.w_up, m, it, dm, _gemm_op_nt())
+            projections_paired = True
+    if gated:
+        if not projections_paired:
+            llama_proj(
+                ctx, stages.gemm_workspace, stages.int15, w.int15, LLAMA_PROJ_GATE,
+                stages.gate_proj, stages.norm2_out, w.w_gate, m, it, dm,
+            )
+        if bias_silu_fused:
+            step_count_launch()
+            ctx.enqueue_function[bias_silu_kernel](
+                stages.silu_out.unsafe_ptr(), stages.gate_proj.unsafe_ptr(),
+                w.b_gate.unsafe_ptr(), Int32(m * it), Int32(it),
+                grid_dim=(_grid(m * it), 1, 1), block_dim=(LLAMA_TPB, 1, 1),
+            )
+        elif bias_gelu_fused:
+            step_count_launch()
+            ctx.enqueue_function[bias_gelu_kernel](
+                stages.silu_out.unsafe_ptr(), stages.gate_proj.unsafe_ptr(),
+                w.b_gate.unsafe_ptr(), Int32(m * it), Int32(it),
+                Int32(1 if opts.act_is_gelu_tanh() else 0),
+                grid_dim=(_grid(m * it), 1, 1), block_dim=(LLAMA_TPB, 1, 1),
+            )
+        elif opts.mlp_bias:
+            step_count_launch()
+            ctx.enqueue_function[add_bias_kernel](
+                stages.gate_proj.unsafe_ptr(),
+                w.b_gate.unsafe_ptr(),
+                Int32(m * it),
+                Int32(it),
+                grid_dim=(_grid(m * it), 1, 1),
+                block_dim=(LLAMA_TPB, 1, 1),
+            )
+        trace.record_device[DType.float32](
+            ctx, prefix + ".gate_proj.out", stages.gate_proj, m * it
+        )
+    else:
+        # EMPTY stage, recorded as the oracle records it (a zero-count
+        # host record; a zero-length device sub-buffer is not a thing to
+        # ask a backend for).
+        var no_gate = List[Float32]()
+        trace.record_list_f32(prefix + ".gate_proj.out", no_gate)
+    pc.tick(ctx, "fwd.gate_proj", "gateup_fwd")
+    if not projections_paired:
+        llama_proj(
+            ctx, stages.gemm_workspace, stages.int15, w.int15, LLAMA_PROJ_UP,
+            stages.up_proj, stages.norm2_out, w.w_up, m, it, dm,
+        )
+    if bias_gelu_fused and not gated:
+        step_count_launch()
+        ctx.enqueue_function[bias_gelu_kernel](
+            stages.silu_out.unsafe_ptr(), stages.up_proj.unsafe_ptr(),
+            w.b_up.unsafe_ptr(), Int32(m * it), Int32(it),
+            Int32(1 if opts.act_is_gelu_tanh() else 0),
+            grid_dim=(_grid(m * it), 1, 1), block_dim=(LLAMA_TPB, 1, 1),
+        )
+    elif opts.mlp_bias:
+        step_count_launch()
+        ctx.enqueue_function[add_bias_kernel](
+            stages.up_proj.unsafe_ptr(),
+            w.b_up.unsafe_ptr(),
+            Int32(m * it),
+            Int32(it),
+            grid_dim=(_grid(m * it), 1, 1),
+            block_dim=(LLAMA_TPB, 1, 1),
+        )
+    trace.record_device[DType.float32](
+        ctx, prefix + ".up_proj.out", stages.up_proj, m * it
+    )
+    pc.tick(ctx, "fwd.up_proj", "gateup_fwd")
+
+    # ---- act_fn (:175). S20: SiLU at the default record, a GELU form
+    #      otherwise, over the gate projection (gated) or the up
+    #      projection (ungated).
+    # lane/neural-net-experiment: S20 + S21 in one launch when no backward
+    # follows, the trace is off, the record is the default SiLU gated MLP
+    # and the build is not the S20 sabotage spelling (`swiglu_fused_kernel`).
+    var swiglu_fused = False
+    comptime if not SAB_S20_SILU_MUL_SIGMOID:
+        swiglu_fused = (forward_only and gated and opts.act_is_silu()
+                        and not bias_silu_fused and not bias_gelu_fused
+                        and not trace.enabled and swiglu_fused_enabled())
+    var training_swiglu = False
+    comptime if IDN_TRAIN_SWIGLU and not BLOCK_ANY_SABOTAGE:
+        training_swiglu = (not forward_only and gated and opts.act_is_silu()
+                           and not bias_silu_fused and not bias_gelu_fused)
+    if training_swiglu:
+        step_count_launch()
+        ctx.enqueue_function[training_swiglu_kernel](
+            stages.silu_out.unsafe_ptr(), stages.gated.unsafe_ptr(),
+            stages.gate_proj.unsafe_ptr(), stages.up_proj.unsafe_ptr(),
+            Int32(m * it), grid_dim=(_grid(m * it), 1, 1),
+            block_dim=(LLAMA_TPB, 1, 1),
+        )
+    elif swiglu_fused:
+        step_count_launch()
+        ctx.enqueue_function[swiglu_fused_kernel](
+            stages.gated.unsafe_ptr(),
+            stages.gate_proj.unsafe_ptr(),
+            stages.up_proj.unsafe_ptr(),
+            Int32(m * it),
+            grid_dim=(_grid(m * it), 1, 1),
+            block_dim=(LLAMA_TPB, 1, 1),
+        )
+    elif bias_gelu_fused or bias_silu_fused:
+        pass
+    elif opts.act_is_silu():
+        step_count_launch()
+        ctx.enqueue_function[silu_kernel](
+            stages.silu_out.unsafe_ptr(),
+            stages.gate_proj.unsafe_ptr(),
+            Int32(m * it),
+            grid_dim=(_grid(m * it), 1, 1),
+            block_dim=(LLAMA_TPB, 1, 1),
+        )
+    elif gated:
+        step_count_launch()
+        ctx.enqueue_function[gelu_kernel](
+            stages.silu_out.unsafe_ptr(),
+            stages.gate_proj.unsafe_ptr(),
+            Int32(m * it),
+            Int32(1 if opts.act_is_gelu_tanh() else 0),
+            grid_dim=(_grid(m * it), 1, 1),
+            block_dim=(LLAMA_TPB, 1, 1),
+        )
+    else:
+        step_count_launch()
+        ctx.enqueue_function[gelu_kernel](
+            stages.silu_out.unsafe_ptr(),
+            stages.up_proj.unsafe_ptr(),
+            Int32(m * it),
+            Int32(1 if opts.act_is_gelu_tanh() else 0),
+            grid_dim=(_grid(m * it), 1, 1),
+            block_dim=(LLAMA_TPB, 1, 1),
+        )
+    # DEVIATION 2721 (lane/wait-removal): WAIT REMOVED here. The next
+    # statement is a trace record. `IdentityTrace.record_device` returns
+    # at once when tracing is off; when it is on it enqueues its OWN copy
+    # behind this kernel on the same in-order context and drains AFTER
+    # it. This wait ordered nothing in either branch.
+    trace.record_device[DType.float32](
+        ctx, prefix + ".silu.out", stages.silu_out, m * it
+    )
+    pc.tick(ctx, "fwd.silu")
+
+    # ---- the gate product (:175). S21. Absent under an ungated MLP.
+    if training_swiglu:
+        trace.record_device[DType.float32](
+            ctx, prefix + ".mlp.gated", stages.gated, m * it
+        )
+    if swiglu_fused or training_swiglu:
+        pass  # the selected fused kernel already wrote S21
+    elif gated:
+        step_count_launch()
+        ctx.enqueue_function[mlp_gated_kernel](
+            stages.gated.unsafe_ptr(),
+            stages.silu_out.unsafe_ptr(),
+            stages.up_proj.unsafe_ptr(),
+            Int32(m * it),
+            grid_dim=(_grid(m * it), 1, 1),
+            block_dim=(LLAMA_TPB, 1, 1),
+        )
+        # DEVIATION 2721 (lane/wait-removal): WAIT REMOVED here. The next
+        # statement is a trace record. `IdentityTrace.record_device` returns
+        # at once when tracing is off; when it is on it enqueues its OWN copy
+        # behind this kernel on the same in-order context and drains AFTER
+        # it. This wait ordered nothing in either branch.
+        trace.record_device[DType.float32](
+            ctx, prefix + ".mlp.gated", stages.gated, m * it
+        )
+    else:
+        var no_gated = List[Float32]()
+        trace.record_list_f32(prefix + ".mlp.gated", no_gated)
+    pc.tick(ctx, "fwd.gate_mul")
+
+    # ---- down_proj (:175). C[M, dm] = gated[M, it] . w_down[dm, it]^T,
+    #      `k = intermediate_size`. **THIS IS THE ONE CELL IN A SMALL
+    #      CONFIG WHERE THE GEMM'S BALANCED FOLD TREE RUNS AT ALL.** Every
+    #      other projection has `k <= 128`, which is `P == 1` under the gemm
+    #      profile; at `intermediate_size = 300` this one has `P = 3` with a
+    #      ragged 44-element last leaf and one carry (contract section 3).
+    #      Without that fixture the tree sits unexercised inside the block.
+    #      An ungated MLP feeds the activation itself.
+    if gated:
+        llama_proj(
+            ctx, stages.gemm_workspace, stages.int15, w.int15, LLAMA_PROJ_DOWN,
+            stages.down_proj, stages.gated, w.w_down, m, dm, it,
+        )
+    else:
+        llama_proj(
+            ctx, stages.gemm_workspace, stages.int15, w.int15, LLAMA_PROJ_DOWN,
+            stages.down_proj, stages.silu_out, w.w_down, m, dm, it,
+        )
+    if opts.mlp_bias:
+        step_count_launch()
+        ctx.enqueue_function[add_bias_kernel](
+            stages.down_proj.unsafe_ptr(),
+            w.b_down.unsafe_ptr(),
+            Int32(m * dm),
+            Int32(dm),
+            grid_dim=(_grid(m * dm), 1, 1),
+            block_dim=(LLAMA_TPB, 1, 1),
+        )
+    trace.record_device[DType.float32](
+        ctx, prefix + ".down_proj.out", stages.down_proj, m * dm
+    )
+    pc.tick(ctx, "fwd.down_proj", "down_fwd")
+
+
+# ===========================================================================
+# lane afn-attn (2026-10-03): the Apple FAST forward candidates. Every
+# function below is called ONLY from a `comptime if AFN_ATTN_ANY` arm of
+# `llama_decoder_layer_forward_planted`; the kernels and launchers live in
+# transformer/impl/llama/afn_apple_fast.mojo (its defines are FAST + Apple +
+# `-D ANONLIB_AFN_ATTN_<NAME>`). Every decision is a pure function of the
+# shape, the options record and the defines, so the helpers recompute them
+# rather than carrying state across the sections.
+# ===========================================================================
+
+
+def _afn_p(mut buf: DeviceBuffer[DType.float32]) -> MutPointer[Float32, MutAnyOrigin]:
+    return buf.unsafe_ptr().unsafe_origin_cast[MutAnyOrigin]()
+
+
+def _afn_block_ok(
+    stages: LlamaDeviceStages,
+    w: LlamaDeviceWeights,
+    trace: IdentityTrace,
+    plant_at: Int,
+    materialize: Bool,
+    forward_only: Bool,
+) -> Bool:
+    """Whether this call may take the afn candidates: the default record,
+    no planes, no plant, no trace, no eager stages wanted, forward only,
+    `d_model % 4 == 0` (the vector-4 row loads)."""
+    comptime if BLOCK_ANY_SABOTAGE:
+        return False
+    if plant_at != PLANT_AT_NONE or materialize or trace.enabled or not forward_only:
+        return False
+    if stages.int15_on or Bool(w.int15):
+        return False
+    if not w.opts.is_default():
+        return False
+    return stages.dims.d_model % 4 == 0
+
+
+def _afn_pre_ok(stages: LlamaDeviceStages, kv: LlamaKVCache, rope: LlamaRopeTable) -> Bool:
+    """The fused QKV launch (FUSE_PRE): a fresh full-causal prefill with
+    the head rotated fully (`rope_dim == head_dim`) and whole GEMM K windows.
+    lane/no-bench-tuning-2: every head size that fits one GEMM column tile
+    (`afn_pre_head_ok`), not head_dim 64 only."""
+    return (
+        kv.window == 0 and kv.s == 0 and afn_pre_head_ok(stages.dims.head_dim)
+        and rope.rope_dim == stages.dims.head_dim
+        and afn_gemm_ok(stages.b * stages.l, stages.dims.q_width(), stages.dims.d_model)
+    )
+
+
+def _afn_fold2(stages: LlamaDeviceStages) -> Bool:
+    """Whether norm2 is folded into the gate/up projections (FUSE_PRE), so
+    `norm2_out` is never written and the MLP reads `residual1` + `norm2_sumsq`."""
+    comptime if AFN_ATTN_FUSE_PRE:
+        return afn_gemm_ok(stages.b * stages.l, stages.dims.intermediate, stages.dims.d_model)
+    return False
+
+
+def _afn_res1_done(stages: LlamaDeviceStages) -> Bool:
+    """Whether `residual1` comes from the o_proj epilogue (FUSE_MLP)."""
+    comptime if AFN_ATTN_FUSE_MLP:
+        return afn_gemm_ok(stages.b * stages.l, stages.dims.d_model, stages.dims.q_width())
+    return False
+
+
+def _afn_norm1(
+    ctx: DeviceContext,
+    mut stages: LlamaDeviceStages,
+    kv: LlamaKVCache,
+    rope: LlamaRopeTable,
+    mut w: LlamaDeviceWeights,
+    mut x: DeviceBuffer[DType.float32],
+    m: Int,
+    dm: Int,
+    mut trace: IdentityTrace,
+    plant_at: Int,
+    materialize: Bool,
+    forward_only: Bool,
+) raises -> Bool:
+    """norm1 by the simdgroup kernel; under FUSE_PRE at a fused-QKV shape
+    only its sum of squares (the QKV launch applies the normalization while
+    staging). False: the caller runs main's launch."""
+    if not _afn_block_ok(stages, w, trace, plant_at, materialize, forward_only):
+        return False
+    comptime if AFN_ATTN_FUSE_PRE:
+        if _afn_pre_ok(stages, kv, rope):
+            afn_rms_norm_sg(
+                ctx, _afn_p(stages.norm1_sumsq), _afn_p(stages.norm1_out), _afn_p(x),
+                _afn_p(w.norm1_w), m, dm, w.eps, False,
+            )
+            return True
+    comptime if AFN_ATTN_NORM_SG:
+        afn_rms_norm_sg(
+            ctx, _afn_p(stages.norm1_sumsq), _afn_p(stages.norm1_out), _afn_p(x),
+            _afn_p(w.norm1_w), m, dm, w.eps, True,
+        )
+        return True
+    return False
+
+
+def _afn_attention_forward(
+    ctx: DeviceContext,
+    mut stages: LlamaDeviceStages,
+    mut kv: LlamaKVCache,
+    mut rope: LlamaRopeTable,
+    mut w: LlamaDeviceWeights,
+    mut x: DeviceBuffer[DType.float32],
+    b: Int,
+    l: Int,
+    pos0: Int,
+    plant_at: Int,
+    materialize: Bool,
+    mut trace: IdentityTrace,
+    prefix: String,
+    norm1_ready: Bool,
+    forward_only: Bool,
+) raises -> Bool:
+    """`llama_attention_forward` with the candidates: FUSE_PRE (one QKV
+    launch with norm1 folded, RoPE and the cache append in its epilogue),
+    ROPE_CACHE (one launch for both RoPEs and the append, no wait), FLASH
+    (one online-softmax launch, no stash, no scan, no flag read), FUSE_MLP
+    (`residual1 = x + ctx . Wo^T` in the o_proj epilogue). Each falls back
+    to main's launches where its shape condition fails. False when the
+    call may not take any candidate (then the caller runs main's)."""
+    if not _afn_block_ok(stages, w, trace, plant_at, materialize, forward_only):
+        return False
+    var dims = stages.dims.copy()
+    var dm = dims.d_model
+    var qw = dims.q_width()
+    var kw = dims.kv_width()
+    var nh = dims.n_heads
+    var nkv = dims.n_kv
+    var hd = dims.head_dim
+    var m = b * l
+    var s_old = kv.s
+    var window = kv.window
+    var key_lo = llama_key_lo(s_old, window)
+    var s = llama_key_span(s_old, l, window)
+    var opts = w.opts.copy()
+
+    # ---- q_proj, k_proj, v_proj, RoPE, the cache append.
+    var pre_done = False
+    comptime if AFN_ATTN_FUSE_PRE:
+        if _afn_pre_ok(stages, kv, rope):
+            if norm1_ready:
+                afn_proj_qkv_rope_cache(
+                    ctx, _afn_p(stages.q_rope), _afn_p(stages.k_rope),
+                    _afn_p(stages.k_cache), _afn_p(kv.k), _afn_p(stages.v_cache),
+                    _afn_p(kv.v), _afn_p(stages.norm1_out), _afn_p(w.w_q), _afn_p(w.w_k),
+                    _afn_p(w.w_v), _afn_p(stages.norm1_sumsq), _afn_p(w.norm1_w),
+                    _afn_p(rope.cos), _afn_p(rope.sin), m, dm, w.eps, l, nh, nkv, pos0,
+                    False, hd,
+                )
+            else:
+                afn_proj_qkv_rope_cache(
+                    ctx, _afn_p(stages.q_rope), _afn_p(stages.k_rope),
+                    _afn_p(stages.k_cache), _afn_p(kv.k), _afn_p(stages.v_cache),
+                    _afn_p(kv.v), _afn_p(x), _afn_p(w.w_q), _afn_p(w.w_k),
+                    _afn_p(w.w_v), _afn_p(stages.norm1_sumsq), _afn_p(w.norm1_w),
+                    _afn_p(rope.cos), _afn_p(rope.sin), m, dm, w.eps, l, nh, nkv, pos0,
+                    True, hd,
+                )
+            pre_done = True
+    if not pre_done:
+        llama_proj(
+            ctx, stages.gemm_workspace, stages.int15, w.int15, LLAMA_PROJ_Q,
+            stages.q_proj, stages.norm1_out, w.w_q, m, qw, dm,
+        )
+        llama_proj(
+            ctx, stages.gemm_workspace, stages.int15, w.int15, LLAMA_PROJ_K,
+            stages.k_proj, stages.norm1_out, w.w_k, m, kw, dm,
+        )
+        llama_proj(
+            ctx, stages.gemm_workspace, stages.int15, w.int15, LLAMA_PROJ_V,
+            stages.v_proj, stages.norm1_out, w.w_v, m, kw, dm,
+        )
+        var rc_done = False
+        comptime if AFN_ATTN_ROPE_CACHE:
+            if window == 0 and s_old == 0:
+                afn_rope_cache(
+                    ctx, _afn_p(stages.q_rope), _afn_p(stages.k_rope),
+                    _afn_p(stages.k_cache), _afn_p(stages.v_cache), _afn_p(kv.k),
+                    _afn_p(kv.v), _afn_p(stages.q_proj), _afn_p(stages.k_proj),
+                    _afn_p(stages.v_proj), _afn_p(rope.cos), _afn_p(rope.sin), b, l,
+                    nh, nkv, hd, pos0, rope.rope_dim,
+                )
+                rc_done = True
+        if not rc_done:
+            # main's launches, the default record (no bias, no qk_norm).
+            apply_rotary_pos_emb(
+                ctx, stages.q_rope, stages.q_proj, rope.cos, rope.sin, m, l, nh, hd,
+                pos0, rope.rope_dim,
+            )
+            apply_rotary_pos_emb(
+                ctx, stages.k_rope, stages.k_proj, rope.cos, rope.sin, m, l, nkv, hd,
+                pos0, rope.rope_dim,
+            )
+            if window == 0:
+                step_count_launch()
+                ctx.enqueue_function[kv_append2_kernel](
+                    stages.k_cache.unsafe_ptr(), stages.v_cache.unsafe_ptr(),
+                    kv.k.unsafe_ptr(), kv.v.unsafe_ptr(), stages.k_rope.unsafe_ptr(),
+                    stages.v_proj.unsafe_ptr(), Int32(b), Int32(l), Int32(nkv),
+                    Int32(hd), Int32(s_old),
+                    grid_dim=(_grid(b * nkv * s * hd), 1, 1),
+                    block_dim=(LLAMA_TPB, 1, 1),
+                )
+                step_count_d2d()
+                ctx.enqueue_copy(dst_buf=kv.k, src_buf=stages.k_cache)
+                step_count_d2d()
+                ctx.enqueue_copy(dst_buf=kv.v, src_buf=stages.v_cache)
+            else:
+                step_count_launch()
+                ctx.enqueue_function[kv_window_gather_kernel](
+                    stages.k_cache.unsafe_ptr(), kv.k.unsafe_ptr(),
+                    stages.k_rope.unsafe_ptr(), Int32(b), Int32(l), Int32(nkv),
+                    Int32(hd), Int32(kv.cap), Int32(key_lo), Int32(s_old), Int32(s),
+                    grid_dim=(_grid(b * nkv * s * hd), 1, 1),
+                    block_dim=(LLAMA_TPB, 1, 1),
+                )
+                step_count_launch()
+                ctx.enqueue_function[kv_window_gather_kernel](
+                    stages.v_cache.unsafe_ptr(), kv.v.unsafe_ptr(),
+                    stages.v_proj.unsafe_ptr(), Int32(b), Int32(l), Int32(nkv),
+                    Int32(hd), Int32(kv.cap), Int32(key_lo), Int32(s_old), Int32(s),
+                    grid_dim=(_grid(b * nkv * s * hd), 1, 1),
+                    block_dim=(LLAMA_TPB, 1, 1),
+                )
+                step_count_launch()
+                ctx.enqueue_function[kv_ring_write_kernel](
+                    kv.k.unsafe_ptr(), stages.k_rope.unsafe_ptr(), Int32(b), Int32(l),
+                    Int32(nkv), Int32(hd), Int32(kv.cap), Int32(s_old),
+                    grid_dim=(_grid(b * nkv * kv.cap * hd), 1, 1),
+                    block_dim=(LLAMA_TPB, 1, 1),
+                )
+                step_count_launch()
+                ctx.enqueue_function[kv_ring_write_kernel](
+                    kv.v.unsafe_ptr(), stages.v_proj.unsafe_ptr(), Int32(b), Int32(l),
+                    Int32(nkv), Int32(hd), Int32(kv.cap), Int32(s_old),
+                    grid_dim=(_grid(b * nkv * kv.cap * hd), 1, 1),
+                    block_dim=(LLAMA_TPB, 1, 1),
+                )
+            step_count_sync()
+            ctx.synchronize()
+    kv.s = s_old + l
+
+    # ---- the attention core.
+    var core_done = False
+    comptime if AFN_ATTN_FLASH:
+        # lane/no-bench-tuning-2: every head size with a padded head class
+        # (hd <= 80, hd % 4 == 0; `afn_flash_head_class`), not hd == 64 only.
+        if afn_flash_head_class(hd) != 0:
+            stages.attn_estash_cells = 0
+            stages.attn_fwd_scan.clear()
+            afn_flash_forward(
+                ctx, _afn_p(stages.ctxv), _afn_p(stages.amax), _afn_p(stages.denom),
+                _afn_p(stages.q_rope), _afn_p(stages.k_cache), _afn_p(stages.v_cache),
+                b, l, nh, nkv, s, pos0, key_lo, window, llama_attention_scale(hd), hd,
+            )
+            stages.attn_materialized = False
+            stages.attn_forward_status = FUSED_RAN
+            core_done = True
+    if not core_done:
+        _ = eager_attention_forward(
+            ctx, stages, b, l, s, pos0, key_lo, window, dims, PLANT_AT_NONE,
+            List[Int](), List[UInt32](), trace, prefix, False, opts.attn_softcap,
+        )
+
+    # ---- o_proj, with the residual add in its epilogue under FUSE_MLP.
+    var o_done = False
+    comptime if AFN_ATTN_FUSE_MLP:
+        if _afn_res1_done(stages):
+            afn_proj_residual(
+                ctx, _afn_p(stages.residual1), _afn_p(x), _afn_p(stages.ctxv),
+                _afn_p(w.w_o), m, dm, qw,
+            )
+            o_done = True
+    if not o_done:
+        llama_proj(
+            ctx, stages.gemm_workspace, stages.int15, w.int15, LLAMA_PROJ_O,
+            stages.o_proj, stages.ctxv, w.w_o, m, dm, qw,
+        )
+    return True
+
+
+def _afn_residual1_norm2(
+    ctx: DeviceContext,
+    mut stages: LlamaDeviceStages,
+    mut w: LlamaDeviceWeights,
+    mut x: DeviceBuffer[DType.float32],
+    m: Int,
+    dm: Int,
+    mut trace: IdentityTrace,
+    plant_at: Int,
+    materialize: Bool,
+    forward_only: Bool,
+) raises -> Bool:
+    """`residual1 = x + o_proj` and norm2. With FUSE_MLP residual1 is the
+    o_proj epilogue's, so only the norm runs (the simdgroup kernel under
+    NORM_SG or FUSE_PRE, main's row kernel otherwise); with FUSE_PRE at a
+    foldable shape only norm2's sum of squares is written. False: the
+    caller runs main's launches."""
+    if not _afn_block_ok(stages, w, trace, plant_at, materialize, forward_only):
+        return False
+    var write_out = not _afn_fold2(stages)
+    if _afn_res1_done(stages):
+        comptime if AFN_ATTN_NORM_SG or AFN_ATTN_FUSE_PRE:
+            afn_rms_norm_sg(
+                ctx, _afn_p(stages.norm2_sumsq), _afn_p(stages.norm2_out),
+                _afn_p(stages.residual1), _afn_p(w.norm2_w), m, dm, w.eps, write_out,
+            )
+        else:
+            llama_norm(
+                ctx, stages.norm2_sumsq, stages.norm2_out, stages.residual1, w.norm2_w,
+                w.norm2_b, m, dm, w.eps, w.opts.norm_kind, w.opts.norm_bias,
+            )
+        return True
+    comptime if AFN_ATTN_NORM_SG or AFN_ATTN_FUSE_PRE:
+        afn_residual_rms_norm_sg(
+            ctx, _afn_p(stages.residual1), _afn_p(stages.norm2_sumsq),
+            _afn_p(stages.norm2_out), _afn_p(x), _afn_p(stages.o_proj), _afn_p(w.norm2_w),
+            m, dm, w.eps, write_out,
+        )
+        return True
+    return False
+
+
+def _afn_mlp_and_residual2(
+    ctx: DeviceContext,
+    mut stages: LlamaDeviceStages,
+    mut w: LlamaDeviceWeights,
+    m: Int,
+    mut trace: IdentityTrace,
+    prefix: String,
+    plant_at: Int,
+    materialize: Bool,
+    forward_only: Bool,
+    next_norm_sumsq: Optional[MutPointer[Float32, MutAnyOrigin]],
+    next_norm_out: Optional[MutPointer[Float32, MutAnyOrigin]],
+    next_norm_weight: Optional[MutPointer[Float32, MutAnyOrigin]],
+    next_norm_eps: Optional[Float32],
+) raises -> Bool:
+    """The MLP and `residual2 = residual1 + down_proj` (and the next
+    layer's norm1 when asked). FUSE_MLP: one gate+up launch with the
+    SwiGLU epilogue, one down launch with the residual epilogue. FUSE_PRE
+    alone: gate and up with norm2 folded into their staging, then main's
+    SwiGLU launch and down projection. Otherwise main's MLP. The residual
+    add (+ next norm) is the simdgroup kernel under NORM_SG, main's
+    launches otherwise. False: the caller runs main's."""
+    if not _afn_block_ok(stages, w, trace, plant_at, materialize, forward_only):
+        return False
+    var dims = stages.dims.copy()
+    var dm = dims.d_model
+    var it = dims.intermediate
+    var fold2 = _afn_fold2(stages)
+    var res2_done = False
+    var mlp_done = False
+    comptime if AFN_ATTN_FUSE_MLP:
+        if afn_gemm_ok(m, it, dm) and afn_gemm_ok(m, dm, it):
+            if fold2:
+                afn_proj_swiglu(
+                    ctx, _afn_p(stages.gated), _afn_p(stages.residual1), _afn_p(w.w_gate),
+                    _afn_p(w.w_up), _afn_p(stages.norm2_sumsq), _afn_p(w.norm2_w), m, it,
+                    dm, w.eps, True,
+                )
+            else:
+                afn_proj_swiglu(
+                    ctx, _afn_p(stages.gated), _afn_p(stages.norm2_out), _afn_p(w.w_gate),
+                    _afn_p(w.w_up), _afn_p(stages.norm2_sumsq), _afn_p(w.norm2_w), m, it,
+                    dm, w.eps, False,
+                )
+            afn_proj_residual(
+                ctx, _afn_p(stages.residual2), _afn_p(stages.residual1), _afn_p(stages.gated),
+                _afn_p(w.w_down), m, dm, it,
+            )
+            mlp_done = True
+            res2_done = True
+    comptime if AFN_ATTN_FUSE_PRE:
+        if not mlp_done and fold2:
+            afn_proj_plain(
+                ctx, _afn_p(stages.gate_proj), _afn_p(stages.residual1), _afn_p(w.w_gate),
+                _afn_p(stages.norm2_sumsq), _afn_p(w.norm2_w), m, it, dm, w.eps, True,
+            )
+            afn_proj_plain(
+                ctx, _afn_p(stages.up_proj), _afn_p(stages.residual1), _afn_p(w.w_up),
+                _afn_p(stages.norm2_sumsq), _afn_p(w.norm2_w), m, it, dm, w.eps, True,
+            )
+            step_count_launch()
+            ctx.enqueue_function[swiglu_fused_kernel](
+                stages.gated.unsafe_ptr(), stages.gate_proj.unsafe_ptr(),
+                stages.up_proj.unsafe_ptr(), Int32(m * it),
+                grid_dim=(_grid(m * it), 1, 1), block_dim=(LLAMA_TPB, 1, 1),
+            )
+            llama_proj(
+                ctx, stages.gemm_workspace, stages.int15, w.int15, LLAMA_PROJ_DOWN,
+                stages.down_proj, stages.gated, w.w_down, m, dm, it,
+            )
+            mlp_done = True
+    if not mlp_done:
+        llama_mlp_forward(ctx, stages, w, m, trace, prefix, forward_only=True)
+
+    # ---- residual2, and the next layer's norm1 when asked.
+    var want_next = (
+        next_norm_sumsq and next_norm_out and next_norm_weight and next_norm_eps
+    )
+    if res2_done:
+        if want_next:
+            comptime if AFN_ATTN_NORM_SG or AFN_ATTN_FUSE_PRE:
+                afn_rms_norm_sg(
+                    ctx, next_norm_sumsq.value(), next_norm_out.value(),
+                    _afn_p(stages.residual2), next_norm_weight.value(), m, dm,
+                    next_norm_eps.value(), True,
+                )
+            else:
+                step_count_launch()
+                ctx.enqueue_function[llama_rms_norm_kernel](
+                    next_norm_sumsq.value(), next_norm_out.value(),
+                    stages.residual2.unsafe_ptr(), next_norm_weight.value(), Int32(m),
+                    Int32(dm), next_norm_eps.value(),
+                    grid_dim=(_grid(m), 1, 1), block_dim=(LLAMA_TPB, 1, 1),
+                )
+        return True
+    comptime if AFN_ATTN_NORM_SG:
+        if want_next:
+            afn_residual_rms_norm_sg(
+                ctx, _afn_p(stages.residual2), next_norm_sumsq.value(),
+                next_norm_out.value(), _afn_p(stages.residual1), _afn_p(stages.down_proj),
+                next_norm_weight.value(), m, dm, next_norm_eps.value(), True,
+            )
+        else:
+            step_count_launch()
+            ctx.enqueue_function[residual_add_kernel](
+                stages.residual2.unsafe_ptr(), stages.residual1.unsafe_ptr(),
+                stages.down_proj.unsafe_ptr(), Int32(m * dm),
+                grid_dim=(_grid(m * dm), 1, 1), block_dim=(LLAMA_TPB, 1, 1),
+            )
+        return True
+    # main's residual2 launches.
+    var fuse_next_norm = (
+        want_next and residual_next_norm_fusion_enabled(m, dm, NORM_RMSNORM, False)
+    )
+    step_count_launch()
+    if fuse_next_norm:
+        ctx.enqueue_function[residual_rms_norm_kernel](
+            stages.residual2.unsafe_ptr(), next_norm_sumsq.value(),
+            next_norm_out.value(), stages.residual1.unsafe_ptr(),
+            stages.down_proj.unsafe_ptr(), next_norm_weight.value(), Int32(m),
+            Int32(dm), next_norm_eps.value(), grid_dim=(_grid(m), 1, 1),
+            block_dim=(LLAMA_TPB, 1, 1),
+        )
+    else:
+        ctx.enqueue_function[residual_add_kernel](
+            stages.residual2.unsafe_ptr(), stages.residual1.unsafe_ptr(),
+            stages.down_proj.unsafe_ptr(), Int32(m * dm),
+            grid_dim=(_grid(m * dm), 1, 1), block_dim=(LLAMA_TPB, 1, 1),
+        )
+    return True
+
+
+# ===========================================================================
+# `LlamaDecoderLayer.forward` (:295-324). THE ENTRY POINT.
+# ===========================================================================
+
+
+def llama_decoder_layer_forward_planted(
+    ctx: DeviceContext,
+    mut stages: LlamaDeviceStages,
+    mut kv: LlamaKVCache,
+    mut rope: LlamaRopeTable,
+    mut w: LlamaDeviceWeights,
+    mut x: DeviceBuffer[DType.float32],
+    b: Int,
+    l: Int,
+    pos0: Int,
+    plant_at: Int,
+    plant_idx: List[Int],
+    plant_bits: List[UInt32],
+    mut trace: IdentityTrace,
+    prefix: String,
+    materialize: Bool = True,
+    norm1_ready: Bool = False,
+    next_norm_sumsq: Optional[MutPointer[Float32, MutAnyOrigin]] = None,
+    next_norm_out: Optional[MutPointer[Float32, MutAnyOrigin]] = None,
+    next_norm_weight: Optional[MutPointer[Float32, MutAnyOrigin]] = None,
+    next_norm_eps: Optional[Float32] = None,
+    forward_only: Bool = False,
+    retain_kv_cache: Bool = True,
+) raises:
+    """`LlamaDecoderLayer.forward(hidden_states, ...)` (:295-324).
+
+    `materialize` (default True): keep the eager attention stages
+    materialized whatever path computes `attn.ctx`, because every caller
+    of THIS entry point is a gate that reads them back. The plain entry
+    point below passes False and lets the fused path skip them.
+
+        residual = hidden_states                                      :305
+        hidden_states = self.input_layernorm(hidden_states)           :306
+        hidden_states, _ = self.self_attn(...)                        :308
+        hidden_states = residual + hidden_states                      :317
+        residual = hidden_states                                      :320
+        hidden_states = self.post_attention_layernorm(hidden_states)  :321
+        hidden_states = self.mlp(hidden_states)                       :322
+        hidden_states = residual + hidden_states                      :323
+
+    **THE ENTRY POINT of profile
+    `anonlib.identical.transformer.fp32.v1`.**
+
+    Prefill is a fresh zero `LlamaKVCache` at `pos0 = 0`; the decode step is
+    this same function at `l == 1` and `pos0 = kv.s`, carrying the cache.
+    ONE SPELLING FOR BOTH PATHS -- which is what makes contract section 10's
+    clause (d) (decode == prefill, bitwise, at every position) a theorem the
+    gate then verifies, rather than a coincidence the gate hopes for. The
+    theorem's two halves are in `attn_denom_kernel` and
+    `attn_context_kernel`, and the fact underneath both is in
+    `attn_exp_kernel`.
+
+    Emits exactly the thirty stages of contract section 9, in section 9's
+    order, under `prefix`. Tags must be UNIQUE within a trace
+    (`core/identity_trace.mojo`'s tag invariant), so the DRIVER supplies the
+    prefix -- one per block call -- and it carries no machine property.
+
+    **NOTHING BELOW HAS BEEN COMPILED OR RUN.** Read the header.
+    """
+    var dims = stages.dims.copy()
+    dims.validate()
+    var dm = dims.d_model
+    var m = b * l
+    var ton = timing_on()
+    var tk = Int(perf_counter_ns())
+    # DEVIATION 2630 (core/step_phase.mojo): per-component ticks, compiled
+    # only under -D ANONLIB_STEP_PHASE_TIMERS=1; on any other build the
+    # clock stores three fields and every method returns at once.
+    var pc = StepPhaseClock(ctx)
+
+    if b <= 0 or l <= 0:
+        raise Error(
+            String("llama_decoder_layer_forward: B and L must be positive,")
+            + " got B="
+            + String(b)
+            + " L="
+            + String(l)
+        )
+    if stages.b != b or stages.l != l:
+        raise Error(
+            String("llama_decoder_layer_forward: stages were built for B=")
+            + String(stages.b)
+            + " L="
+            + String(stages.l)
+            + " but the call is B="
+            + String(b)
+            + " L="
+            + String(l)
+        )
+    if kv.b != b or kv.n_kv != dims.n_kv or kv.head_dim != dims.head_dim:
+        raise Error(
+            "llama_decoder_layer_forward: the KV cache's shape is not the"
+            " call's"
+        )
+    if kv.s_max != stages.s_max:
+        raise Error(
+            String("llama_decoder_layer_forward: the cache holds s_max=")
+            + String(kv.s_max)
+            + " but the stages were sized for s_max="
+            + String(stages.s_max)
+            + "; a stage recorded past the cache is uninitialized memory"
+        )
+    if w.dims.d_model != dims.d_model:
+        raise Error(
+            "llama_decoder_layer_forward: the weights' d_model is not the"
+            " stages'"
+        )
+    # DEVIATION 1028. Cache slot j IS absolute position j, so this call's
+    # tokens must start exactly where the cache ends.
+    if pos0 != kv.s:
+        raise Error(
+            String("llama_decoder_layer_forward: pos0=")
+            + String(pos0)
+            + " but the cache already holds "
+            + String(kv.s)
+            + " positions. Cache slot j IS absolute position j (DEVIATION"
+            + " 1028); a mismatch gives a card that is internally"
+            + " consistent and positionally wrong"
+        )
+    if kv.s + l > kv.s_max:
+        raise Error(
+            String("llama_decoder_layer_forward: the cache would grow to ")
+            + String(kv.s + l)
+            + " past its capacity "
+            + String(kv.s_max)
+        )
+    if kv.window != stages.window:
+        raise Error(
+            String("llama_decoder_layer_forward: the cache has window=")
+            + String(kv.window)
+            + " but the stages were sized for window="
+            + String(stages.window)
+        )
+    if llama_key_span(kv.s, l, kv.window) > stages.s_cap:
+        raise Error(
+            "llama_decoder_layer_forward: this call's key span exceeds the"
+            " stages' attention buffers"
+        )
+    if pos0 + l > rope.p_max:
+        raise Error(
+            String("llama_decoder_layer_forward: absolute position ")
+            + String(pos0 + l - 1)
+            + " is past the rotary table's p_max "
+            + String(rope.p_max)
+        )
+    # DEVIATION 2933 (lane/block-options): the model's declared ceiling;
+    # the rotary reduction's ANGLE domain was enforced when the table was
+    # built, which is the only place it can be.
+    if pos0 + l > w.opts.max_positions:
+        raise Error(
+            String("llama_decoder_layer_forward: absolute position ")
+            + String(pos0 + l - 1)
+            + " reaches the model's max_positions ceiling "
+            + String(w.opts.max_positions)
+            + " (DEVIATION 2933; contract section 3's DEVIATION 812 at the"
+            + " default)"
+        )
+    if rope.rope_dim != w.opts.rope_dim_of(dims.head_dim) or rope.half != rope.rope_dim // 2:
+        raise Error(
+            "llama_decoder_layer_forward: the rotary table was built for a"
+            " different head_dim or rope_dim"
+        )
+
+    # Contract section 8, before ANY recorded stage.
+    # DEVIATION 1875: the WEIGHT half of this refusal moved to
+    # `LlamaDeviceWeights.__init__`, where the tensors are still on the host
+    # and cost nothing to scan. What is left is what a call can actually
+    # differ in. `llama_refuse_bad_inputs` is unchanged and still walks all
+    # thirteen names for anyone who wants them in one call.
+    llama_refuse_bad_call(ctx, w, rope, x, kv, b, l)
+    pc.tick(ctx, "fwd.refuse_call")
+    # lane/lowbit-blocks: this call runs under `fixed15_v1` exactly when its
+    # weights carry planes.
+    stages.int15_on = Bool(w.int15)
+
+    trace.record_device[DType.float32](ctx, prefix + ".input.x", x, m * dm)
+
+    # ---- residual = hidden_states (:305): a NAME, not a copy. `x` is read
+    #      again at S22 and nothing writes it.
+    # ---- self.input_layernorm(...) (:306) == LlamaRMSNorm.forward
+    #      (:62-67). S1-S4.
+    # lane/block-options: `llama_norm` is `llama_rms_norm` (this launch,
+    # unchanged) at the default record and the variant kernel otherwise
+    # (DEVIATIONS 2936-2938).
+    if not norm1_ready:
+        comptime if AFN_ATTN_ANY:
+            if not _afn_norm1(
+                ctx, stages, kv, rope, w, x, m, dm, trace, plant_at, materialize,
+                forward_only,
+            ):
+                llama_norm(
+                    ctx, stages.norm1_sumsq, stages.norm1_out, x, w.norm1_w, w.norm1_b,
+                    m, dm, w.eps, w.opts.norm_kind, w.opts.norm_bias,
+                )
+        else:
+            llama_norm(
+                ctx,
+                stages.norm1_sumsq,
+                stages.norm1_out,
+                x,
+                w.norm1_w,
+                w.norm1_b,
+                m,
+                dm,
+                w.eps,
+                w.opts.norm_kind,
+                w.opts.norm_bias,
+            )
+    # DEVIATION 2721 (lane/wait-removal): WAIT REMOVED here. The next
+    # statement is a trace record. `IdentityTrace.record_device` returns
+    # at once when tracing is off; when it is on it enqueues its OWN copy
+    # behind this kernel on the same in-order context and drains AFTER
+    # it. This wait ordered nothing in either branch.
+    trace.record_device[DType.float32](
+        ctx, prefix + ".norm1.sumsq", stages.norm1_sumsq, m
+    )
+    trace.record_device[DType.float32](
+        ctx, prefix + ".norm1.out", stages.norm1_out, m * dm
+    )
+
+    # ---- self.self_attn(...) (:308-316).
+    pc.tick(ctx, "fwd.norm1")
+    timing_tick(ctx, ton, tk, "block.norm1")
+    comptime if AFN_ATTN_ANY:
+        if not _afn_attention_forward(
+            ctx, stages, kv, rope, w, x, b, l, pos0, plant_at, materialize, trace,
+            prefix, norm1_ready, forward_only,
+        ):
+            llama_attention_forward(
+                ctx, stages, kv, rope, w, b, l, pos0, plant_at, plant_idx, plant_bits,
+                trace, prefix, materialize, retain_kv_cache=retain_kv_cache,
+            )
+    else:
+        llama_attention_forward(
+            ctx,
+            stages,
+            kv,
+            rope,
+            w,
+            b,
+            l,
+            pos0,
+            plant_at,
+            plant_idx,
+            plant_bits,
+            trace,
+            prefix,
+            materialize,
+            retain_kv_cache=retain_kv_cache,
+        )
+    timing_tick(ctx, ton, tk, "block.attention_total")
+    pc.mark(ctx)
+
+    # ---- residual + hidden_states (:317). S22. The mamba lane's S16
+    #      kernel, IMPORTED (contract section 0).
+    comptime fuse_residual_norm = (
+        is_defined["ANONLIB_FUSE_RESIDUAL1_NORM2"]()
+        or TARGET_COLUMN == COLUMN_APPLE
+    )
+    var fused_residual_norm = (
+        fuse_residual_norm and w.opts.norm_kind == NORM_RMSNORM
+        and not w.opts.norm_bias and (
+            is_defined["ANONLIB_FUSE_RESIDUAL1_NORM2"]()
+            or residual_norm_fusion_size_ok(m, dm)
+        )
+    )
+    comptime if AFN_ATTN_ANY:
+        if _afn_residual1_norm2(
+            ctx, stages, w, x, m, dm, trace, plant_at, materialize, forward_only,
+        ):
+            fused_residual_norm = True  # norm2 done above; main's second launch is skipped
+        else:
+            step_count_launch()
+            if fused_residual_norm:
+                ctx.enqueue_function[residual_rms_norm_kernel](
+                    stages.residual1.unsafe_ptr(), stages.norm2_sumsq.unsafe_ptr(),
+                    stages.norm2_out.unsafe_ptr(), x.unsafe_ptr(),
+                    stages.o_proj.unsafe_ptr(), w.norm2_w.unsafe_ptr(), Int32(m),
+                    Int32(dm), w.eps, grid_dim=(_grid(m), 1, 1),
+                    block_dim=(LLAMA_TPB, 1, 1),
+                )
+            else:
+                ctx.enqueue_function[residual_add_kernel](
+                    stages.residual1.unsafe_ptr(), x.unsafe_ptr(),
+                    stages.o_proj.unsafe_ptr(), Int32(m * dm),
+                    grid_dim=(_grid(m * dm), 1, 1), block_dim=(LLAMA_TPB, 1, 1),
+                )
+    else:
+        step_count_launch()
+        if fused_residual_norm:
+            ctx.enqueue_function[residual_rms_norm_kernel](
+                stages.residual1.unsafe_ptr(), stages.norm2_sumsq.unsafe_ptr(),
+                stages.norm2_out.unsafe_ptr(), x.unsafe_ptr(),
+                stages.o_proj.unsafe_ptr(), w.norm2_w.unsafe_ptr(), Int32(m),
+                Int32(dm), w.eps, grid_dim=(_grid(m), 1, 1),
+                block_dim=(LLAMA_TPB, 1, 1),
+            )
+        else:
+            ctx.enqueue_function[residual_add_kernel](
+                stages.residual1.unsafe_ptr(),
+                x.unsafe_ptr(),
+                stages.o_proj.unsafe_ptr(),
+                Int32(m * dm),
+                grid_dim=(_grid(m * dm), 1, 1),
+                block_dim=(LLAMA_TPB, 1, 1),
+            )
+    # DEVIATION 2721 (lane/wait-removal): WAIT REMOVED here. The next
+    # statement is a trace record. `IdentityTrace.record_device` returns
+    # at once when tracing is off; when it is on it enqueues its OWN copy
+    # behind this kernel on the same in-order context and drains AFTER
+    # it. This wait ordered nothing in either branch.
+    trace.record_device[DType.float32](
+        ctx, prefix + ".residual1.out", stages.residual1, m * dm
+    )
+    pc.tick(ctx, "fwd.residual1_add")
+
+    # ---- residual = hidden_states (:320), then
+    #      self.post_attention_layernorm(...) (:321). S1-S4 again, the SAME
+    #      kernel with the SAME eps and a different weight.
+    if not fused_residual_norm:
+        llama_norm(
+            ctx,
+            stages.norm2_sumsq,
+            stages.norm2_out,
+            stages.residual1,
+            w.norm2_w,
+            w.norm2_b,
+            m,
+            dm,
+            w.eps,
+            w.opts.norm_kind,
+            w.opts.norm_bias,
+        )
+    # DEVIATION 2721 (lane/wait-removal): WAIT REMOVED here. The next
+    # statement is a trace record. `IdentityTrace.record_device` returns
+    # at once when tracing is off; when it is on it enqueues its OWN copy
+    # behind this kernel on the same in-order context and drains AFTER
+    # it. This wait ordered nothing in either branch.
+    trace.record_device[DType.float32](
+        ctx, prefix + ".norm2.sumsq", stages.norm2_sumsq, m
+    )
+    trace.record_device[DType.float32](
+        ctx, prefix + ".norm2.out", stages.norm2_out, m * dm
+    )
+    pc.tick(ctx, "fwd.norm2")
+
+    # ---- self.mlp(...) (:322). S5, S20, S21.
+    comptime if AFN_ATTN_ANY:
+        if not _afn_mlp_and_residual2(
+            ctx, stages, w, m, trace, prefix, plant_at, materialize, forward_only,
+            next_norm_sumsq, next_norm_out, next_norm_weight, next_norm_eps,
+        ):
+            llama_mlp_forward(ctx, stages, w, m, trace, prefix, forward_only=forward_only)
+            pc.mark(ctx)
+            var fuse_next_norm = (
+                next_norm_sumsq and next_norm_out and next_norm_weight
+                and next_norm_eps
+                and residual_next_norm_fusion_enabled(m, dm, NORM_RMSNORM, False)
+            )
+            step_count_launch()
+            if fuse_next_norm:
+                ctx.enqueue_function[residual_rms_norm_kernel](
+                    stages.residual2.unsafe_ptr(), next_norm_sumsq.value(),
+                    next_norm_out.value(), stages.residual1.unsafe_ptr(),
+                    stages.down_proj.unsafe_ptr(), next_norm_weight.value(), Int32(m),
+                    Int32(dm), next_norm_eps.value(), grid_dim=(_grid(m), 1, 1),
+                    block_dim=(LLAMA_TPB, 1, 1),
+                )
+            else:
+                ctx.enqueue_function[residual_add_kernel](
+                    stages.residual2.unsafe_ptr(), stages.residual1.unsafe_ptr(),
+                    stages.down_proj.unsafe_ptr(), Int32(m * dm),
+                    grid_dim=(_grid(m * dm), 1, 1), block_dim=(LLAMA_TPB, 1, 1),
+                )
+    else:
+        llama_mlp_forward(ctx, stages, w, m, trace, prefix, forward_only=forward_only)
+        pc.mark(ctx)
+
+        # ---- residual + hidden_states (:323). S23, the same imported kernel.
+        var fuse_next_norm = (
+            next_norm_sumsq and next_norm_out and next_norm_weight
+            and next_norm_eps
+            and residual_next_norm_fusion_enabled(m, dm, NORM_RMSNORM, False)
+        )
+        step_count_launch()
+        if fuse_next_norm:
+            ctx.enqueue_function[residual_rms_norm_kernel](
+                stages.residual2.unsafe_ptr(), next_norm_sumsq.value(),
+                next_norm_out.value(), stages.residual1.unsafe_ptr(),
+                stages.down_proj.unsafe_ptr(), next_norm_weight.value(), Int32(m),
+                Int32(dm), next_norm_eps.value(), grid_dim=(_grid(m), 1, 1),
+                block_dim=(LLAMA_TPB, 1, 1),
+            )
+        else:
+            ctx.enqueue_function[residual_add_kernel](
+                stages.residual2.unsafe_ptr(),
+                stages.residual1.unsafe_ptr(),
+                stages.down_proj.unsafe_ptr(),
+                Int32(m * dm),
+                grid_dim=(_grid(m * dm), 1, 1),
+                block_dim=(LLAMA_TPB, 1, 1),
+            )
+    # DEVIATION 2721 (lane/wait-removal): WAIT REMOVED here. The next
+    # statement is a trace record. `IdentityTrace.record_device` returns
+    # at once when tracing is off; when it is on it enqueues its OWN copy
+    # behind this kernel on the same in-order context and drains AFTER
+    # it. This wait ordered nothing in either branch.
+    trace.record_device[DType.float32](
+        ctx, prefix + ".residual2.out", stages.residual2, m * dm
+    )
+    pc.tick(ctx, "fwd.residual2_add")
+    timing_tick(ctx, ton, tk, "block.mlp_and_residuals")
+
+
+def llama_decoder_layer_forward(
+    ctx: DeviceContext,
+    mut stages: LlamaDeviceStages,
+    mut kv: LlamaKVCache,
+    mut rope: LlamaRopeTable,
+    mut w: LlamaDeviceWeights,
+    mut x: DeviceBuffer[DType.float32],
+    b: Int,
+    l: Int,
+    pos0: Int,
+    mut trace: IdentityTrace,
+    prefix: String,
+    norm1_ready: Bool = False,
+    next_norm_sumsq: Optional[MutPointer[Float32, MutAnyOrigin]] = None,
+    next_norm_out: Optional[MutPointer[Float32, MutAnyOrigin]] = None,
+    next_norm_weight: Optional[MutPointer[Float32, MutAnyOrigin]] = None,
+    next_norm_eps: Optional[Float32] = None,
+    forward_only: Bool = False,
+    retain_kv_cache: Bool = True,
+) raises:
+    """THE ORDINARY ENTRY POINT. One block call with NO score plant.
+
+    `forward_only` (lane/neural-net-experiment): the caller promises no
+    backward reads this call's stages, which admits the forward-only
+    fusions (`swiglu_fused_kernel` under `ANONLIB_SWIGLU_FUSED=1`).
+
+    `retain_kv_cache=False` is the NI24 owned-training-prefill protocol:
+    admitted only by its IDENTICAL opt-in, with an empty non-window cache
+    at position zero. Per-layer attention stages survive for backward;
+    persistent cache buffers and kv.s stay unchanged. Such a call cannot
+    be used as the prefix of a later decode operation.
+
+    Every argument is a scalar or a buffer or one of this file's own
+    structs; nothing from `transformer/checks/` crosses this boundary,
+    on purpose (the oracle half of this lane was written concurrently by a
+    different agent). The planted form is
+    `llama_decoder_layer_forward_planted` and it is what the three
+    bit-planting fixture cases need.
+    """
+    llama_decoder_layer_forward_planted(
+        ctx,
+        stages,
+        kv,
+        rope,
+        w,
+        x,
+        b,
+        l,
+        pos0,
+        PLANT_AT_NONE,
+        List[Int](),
+        List[UInt32](),
+        trace,
+        prefix,
+        materialize=False,
+        norm1_ready=norm1_ready,
+        next_norm_sumsq=next_norm_sumsq,
+        next_norm_out=next_norm_out,
+        next_norm_weight=next_norm_weight,
+        next_norm_eps=next_norm_eps,
+        forward_only=forward_only,
+        retain_kv_cache=retain_kv_cache,
+    )

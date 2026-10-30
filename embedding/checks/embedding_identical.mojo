@@ -1,0 +1,500 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 the authors. Part of anonlib, DOI-WITHHELD
+"""The device embedding of profile `anonlib.identical.embedding.fp32.v1`. The CALLER owns every buffer -- including `counts`, `run_begin` and `perm` -- and must keep every one of them alive past its own `ctx.synchronize()`."""
+
+from autograd.kernels.embedding_sort import PLAN_SCAN, PLAN_SORT, embedding_sort_runs
+
+from std.gpu import block_dim, block_idx, thread_idx
+from std.sys.compile import is_defined
+from std.sys.defines import get_defined_int
+from max.gpu.host import DeviceBuffer, DeviceContext
+from core.device_fold import device_first_nonneg_i32
+# DEVIATION 2630: the step phase timers and counters (core/step_phase.mojo;
+# compiled only under -D ANONLIB_STEP_PHASE_TIMERS=1).
+from core.step_phase import (
+    step_count_d2h,
+    step_count_host_alloc,
+    step_count_launch,
+    step_count_sync,
+)
+
+from checks.numerics import (
+    GLOBAL_NUMERIC_MODE,
+    NUMERIC_IDENTICAL,
+    ftz,
+)
+from checks.kernel_matrix import (
+    IDENTITY_FLOOR_BLOCK,
+    TARGET_COLUMN,
+    column_max_block_size,
+)
+from embedding.checks.embedding_oracle import (
+    EMB_NO_PADDING_IDX,
+    EmbConfig,
+    emb_refuse_ids,
+    emb_refuse_shape,
+    refuse_nonfinite,
+)
+from std.memory import bitcast, stack_allocation
+from max.gpu.memory import AddressSpace
+from max.gpu.sync import barrier
+
+
+comptime SAB_FOLD_DESCENDING = is_defined[
+    "ANONLIB_EMB_SABOTAGE_FOLD_DESCENDING"
+]()
+comptime SAB_FOLD_BALANCED_TREE = is_defined[
+    "ANONLIB_EMB_SABOTAGE_FOLD_BALANCED_TREE"
+]()
+comptime SAB_SEED_SEEDLESS = is_defined[
+    "ANONLIB_EMB_SABOTAGE_SEED_SEEDLESS"
+]()
+comptime SAB_SINGLE_RUN_BYPASS = is_defined[
+    "ANONLIB_EMB_SABOTAGE_SINGLE_RUN_BYPASS"
+]()
+comptime SAB_EMPTY_ROW_SKIPPED = is_defined[
+    "ANONLIB_EMB_SABOTAGE_EMPTY_ROW_SKIPPED"
+]()
+comptime SAB_EMPTY_ROW_NEG_ZERO = is_defined[
+    "ANONLIB_EMB_SABOTAGE_EMPTY_ROW_NEG_ZERO"
+]()
+comptime SAB_FOLD_READS_LAUNCH = is_defined[
+    "ANONLIB_EMB_SABOTAGE_FOLD_READS_LAUNCH"
+]()
+comptime SAB_RANK_BY_ARRIVAL = is_defined[
+    "ANONLIB_EMB_SABOTAGE_RANK_BY_ARRIVAL"
+]()
+comptime SAB_SORT_TIE_REVERSED = is_defined[
+    "ANONLIB_EMB_SABOTAGE_SORT_TIE_REVERSED"
+]()
+comptime SAB_PAD_ROW_CONTRIBUTES = is_defined[
+    "ANONLIB_EMB_SABOTAGE_PAD_ROW_CONTRIBUTES"
+]()
+comptime SAB_PAD_ROW_NEG_ZERO = is_defined[
+    "ANONLIB_EMB_SABOTAGE_PAD_ROW_NEG_ZERO"
+]()
+comptime SAB_NO_FLUSH_ACC = is_defined[
+    "ANONLIB_EMB_SABOTAGE_NO_FLUSH_ACC"
+]()
+comptime SAB_GATHER_NO_FLUSH = is_defined[
+    "ANONLIB_EMB_SABOTAGE_GATHER_NO_FLUSH"
+]()
+comptime SAB_GATHER_CLAMP_OOR = is_defined[
+    "ANONLIB_EMB_SABOTAGE_GATHER_CLAMP_OOR"
+]()
+comptime SAB_ACCUM_BY_ADD = is_defined[
+    "ANONLIB_EMB_SABOTAGE_ACCUM_BY_ADD"
+]()
+comptime SAB_ACCUM_REFILLS = is_defined[
+    "ANONLIB_EMB_SABOTAGE_ACCUM_REFILLS"
+]()
+# The two rows of contract 11.1 that had no switch until 2026-09-15.
+# FOLD_VIA_GEMM_ONEHOT routes the backward through `identical_gemm` over a
+# materialized one-hot [T, V] matrix (DEVIATION 1315's refused candidate,
+# built so the difference is PRINTED); SORT_KEY_ID_ONLY_UNSTABLE is read by
+# `embedding_sort.mojo`'s compare/exchange pass (PLAN_SORT only).
+comptime SAB_FOLD_VIA_GEMM_ONEHOT = is_defined[
+    "ANONLIB_EMB_SABOTAGE_FOLD_VIA_GEMM_ONEHOT"
+]()
+comptime SAB_SORT_KEY_ID_ONLY_UNSTABLE = is_defined[
+    "ANONLIB_EMB_SABOTAGE_SORT_KEY_ID_ONLY_UNSTABLE"
+]()
+
+comptime SAB_SORT_NEGATIVE_CONTROL = is_defined["ANONLIB_EMB_SORT_NEGATIVE_CONTROL"]()
+
+comptime ANY_EMB_SABOTAGE = (
+    SAB_FOLD_DESCENDING
+    or SAB_FOLD_BALANCED_TREE
+    or SAB_SEED_SEEDLESS
+    or SAB_SINGLE_RUN_BYPASS
+    or SAB_EMPTY_ROW_SKIPPED
+    or SAB_EMPTY_ROW_NEG_ZERO
+    or SAB_FOLD_READS_LAUNCH
+    or SAB_RANK_BY_ARRIVAL
+    or SAB_SORT_TIE_REVERSED
+    or SAB_SORT_NEGATIVE_CONTROL
+    or SAB_PAD_ROW_CONTRIBUTES
+    or SAB_PAD_ROW_NEG_ZERO
+    or SAB_NO_FLUSH_ACC
+    or SAB_GATHER_NO_FLUSH
+    or SAB_GATHER_CLAMP_OOR
+    or SAB_ACCUM_BY_ADD
+    or SAB_ACCUM_REFILLS
+    or SAB_FOLD_VIA_GEMM_ONEHOT
+    or SAB_SORT_KEY_ID_ONLY_UNSTABLE
+)
+
+
+def emb_sabotage_name() -> String:
+    """Which sabotage this binary compiled with, for a check's banner. A check MUST print this AND the numeric mode AND the resolved block size in its header, because a sabotage arm that silently failed to compile in looks exactly like a clause that is bit-inert, and `[[reached-but-inert]]` is the standing rule that those are not the same thing."""
+    comptime if SAB_FOLD_DESCENDING:
+        return String("FOLD_DESCENDING")
+    comptime if SAB_FOLD_BALANCED_TREE:
+        return String("FOLD_BALANCED_TREE")
+    comptime if SAB_SEED_SEEDLESS:
+        return String("SEED_SEEDLESS")
+    comptime if SAB_SINGLE_RUN_BYPASS:
+        return String("SINGLE_RUN_BYPASS")
+    comptime if SAB_EMPTY_ROW_SKIPPED:
+        return String("EMPTY_ROW_SKIPPED")
+    comptime if SAB_EMPTY_ROW_NEG_ZERO:
+        return String("EMPTY_ROW_NEG_ZERO")
+    comptime if SAB_FOLD_READS_LAUNCH:
+        return String("FOLD_READS_LAUNCH")
+    comptime if SAB_RANK_BY_ARRIVAL:
+        return String("RANK_BY_ARRIVAL")
+    comptime if SAB_SORT_TIE_REVERSED:
+        return String("SORT_TIE_REVERSED")
+    comptime if SAB_SORT_NEGATIVE_CONTROL:
+        return String("SORT_NEGATIVE_CONTROL")
+    comptime if SAB_PAD_ROW_CONTRIBUTES:
+        return String("PAD_ROW_CONTRIBUTES")
+    comptime if SAB_PAD_ROW_NEG_ZERO:
+        return String("PAD_ROW_NEG_ZERO")
+    comptime if SAB_NO_FLUSH_ACC:
+        return String("NO_FLUSH_ACC")
+    comptime if SAB_GATHER_NO_FLUSH:
+        return String("GATHER_NO_FLUSH")
+    comptime if SAB_GATHER_CLAMP_OOR:
+        return String("GATHER_CLAMP_OOR")
+    comptime if SAB_ACCUM_BY_ADD:
+        return String("ACCUM_BY_ADD")
+    comptime if SAB_ACCUM_REFILLS:
+        return String("ACCUM_REFILLS")
+    comptime if SAB_FOLD_VIA_GEMM_ONEHOT:
+        return String("FOLD_VIA_GEMM_ONEHOT")
+    comptime if SAB_SORT_KEY_ID_ONLY_UNSTABLE:
+        return String("SORT_KEY_ID_ONLY_UNSTABLE")
+    return String("none")
+
+
+# ---- the run plan picked by size (lane idn-embedding, 2026-10-04) -----------------
+# PLAN_SCAN walks all T ids once per vocabulary row in the counts kernel and
+# again in the perm kernel: 2 * V * T id reads (2.1e9 at the board's
+# V = T = 32,768). PLAN_SORT is the device total-key bitonic sort over T
+# keys (120 passes of 32,768 exchanges there) and two binary-search
+# launches. Contract 6 clause (d) holds counts, run_begin, perm and dW
+# bit-identical across the two plans on every vendor and the host column,
+# so the pick moves no bit. `PLAN_AUTO` resolves to PLAN_SORT from
+# EMB_AUTO_SORT_MIN_CELLS = V * T upward (IDENTICAL tier only; the
+# crossover is not measured, the board cell sits 16x above it), else
+# PLAN_SCAN. `-D ANONLIB_EMB_AUTO_SORT_OFF` resolves PLAN_AUTO to
+# PLAN_SCAN always (the old form); `-D ANONLIB_EMB_AUTO_SORT_MIN_CELLS=<n>`
+# moves the threshold. An explicit PLAN_SCAN or PLAN_SORT is never changed.
+comptime PLAN_AUTO = 2
+comptime EMB_AUTO_SORT = (
+    GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL
+    and not (is_defined["ANONLIB_EMB_AUTO_SORT_OFF"]() or is_defined["ANONLIB_IDN_ALL_OFF"]())
+)
+comptime EMB_AUTO_SORT_MIN_CELLS = get_defined_int["ANONLIB_EMB_AUTO_SORT_MIN_CELLS", 1 << 26]()
+
+
+def emb_resolve_plan(plan: Int, vocab: Int, n_positions: Int) -> Int:
+    """PLAN_AUTO resolved to PLAN_SORT or PLAN_SCAN; any other code unchanged."""
+    if plan != PLAN_AUTO:
+        return plan
+    comptime if EMB_AUTO_SORT:
+        if vocab * n_positions >= EMB_AUTO_SORT_MIN_CELLS:
+            return PLAN_SORT
+    return PLAN_SCAN
+
+
+comptime EMB_TPB_WANT = 256
+
+
+def _emb_max_tpb[column: Int]() -> Int:
+    """Threads per block, resolved the way `checks/kernel_matrix.mojo::block_size_for` resolves its own."""
+    comptime want = EMB_TPB_WANT
+    comptime identical = GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL
+    comptime floored = (
+        IDENTITY_FLOOR_BLOCK if identical
+        and IDENTITY_FLOOR_BLOCK < want else want
+    )
+    comptime hard = column_max_block_size(column)
+    return floored if floored < hard else hard
+
+
+comptime EMB_TPB = _emb_max_tpb[TARGET_COLUMN]()
+
+
+def _grid_for(count: Int, threads: Int = EMB_TPB) -> Int:
+    """Blocks for a flat `count`-element launch."""
+    if count < 1:
+        return 1
+    return (count + threads - 1) // threads
+
+
+def emb_gather_kernel(
+    out_y: MutPointer[Float32, MutAnyOrigin],
+    weight: MutPointer[Float32, MutAnyOrigin],
+    ids: MutPointer[Int32, MutAnyOrigin],
+    n_positions_in: Int32,
+    width_in: Int32,
+    vocab_in: Int32,
+):
+    """`Y[t, j] = ftz(ftz(W[ids[t], j]))`. Contract section 8 refuses an out-of-range id BY NAME on the host, before any launch, so a kernel-side clamp would be dead code that hides a data bug."""
+    var n_positions = Int(n_positions_in)
+    var width = Int(width_in)
+    if width < 1:
+        return
+    var cell = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if cell >= n_positions * width:
+        return
+    var t = cell // width
+    var j = cell - t * width
+    var v = Int(ids.unsafe_load(t))
+    comptime if SAB_GATHER_CLAMP_OOR:
+        var vocab = Int(vocab_in)
+        if v < 0:
+            v = 0
+        if v >= vocab:
+            v = vocab - 1
+    var src = weight.unsafe_load(v * width + j)
+    comptime if SAB_GATHER_NO_FLUSH:
+        out_y.unsafe_store(cell, src)
+        return
+    out_y.unsafe_store(cell, ftz(ftz(src)))
+
+
+#: lane/nvidia-step-time (2026-09-25): threads of the one-block scan below.
+comptime EMB_RUN_BEGIN_THREADS = 256
+
+
+# lane nr-small D5 (2026-10-04): the fold launched over the TOUCHED rows
+# only. `emb_backward_kernel` launches V * d threads and every thread of an
+# untouched row returns at once; when the positions are fewer than the
+# vocabulary rows (T < V) the launch is T * d threads instead: thread (r, j)
+# acts only when sorted slot r opens its row's run (`run_begin[ids[perm[r]]]
+# == r`) and then folds that run for column j exactly as the clean path of
+# `emb_backward_kernel` does (the seeded cell, ascending t, ftz per add), so
+# every touched cell gets the same bits and every untouched cell keeps its
+# seed. Both plans fill `perm[0 : run_begin[V]]` with non-padding positions,
+# so the row is `ids[perm[r]]`. Off under every embedding sabotage arm (they
+# patch `emb_backward_kernel`). -D ANONLIB_IDN_EMB_TOUCHED_ROWS_OFF (or
+# ANONLIB_IDN_ALL_OFF) restores the V * d launch.
+comptime EMB_TOUCHED_ROWS = (
+    GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL
+    and not (is_defined["ANONLIB_IDN_EMB_TOUCHED_ROWS_OFF"]() or is_defined["ANONLIB_IDN_ALL_OFF"]())
+    and not ANY_EMB_SABOTAGE
+)
+
+# NN49: four independent adjacent feature chains share one run lookup. Four
+# is a register/live-range experiment, not a vocabulary/width dispatch rule.
+# OFF by default; no compile, identity, quality or full-LM timing evidence.
+comptime NN49_EMB_VECTOR4 = (
+    GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL
+    and is_defined["ANONLIB_NN49_EMB_VECTOR4"]()
+    and not is_defined["ANONLIB_IDN_ALL_OFF"]()
+    and not ANY_EMB_SABOTAGE
+)
+
+
+# lane gap-neural-io (2026-10-08, plan docs/plans/gaps-2026-10-08.md Section
+# 4): THE UNIQUE-ROWS FOLD. The touched-rows launch above fires only when
+# T < V (it launches T * d threads); with T >= V (the board's T = V =
+# 32,768) the fold is `emb_backward_kernel` over all V * d cells, though a
+# random batch touches only ~63% of the rows and a skewed (text) one far
+# fewer. Here the runs `run_begin` already holds name the touched rows: a
+# row v is touched iff run_begin[v + 1] > run_begin[v]. Three integer
+# launches compact them, ascending v, into `rows[0:U]` (per-block flag
+# counts, one block's exclusive scan of those counts, per-block scatter);
+# U is read back (one wait) and the fold runs over exactly U * d threads,
+# thread (k, j) folding row rows[k] column j with the clean statements of
+# `emb_backward_kernel` (the seeded cell, ascending t, ftz per add). Every
+# touched cell gets the same bits, every untouched cell keeps its seed: NO
+# BIT MOVES, on any column (the host twin keeps its own launch order). The
+# rule is cost, not shape: the compaction reads V + 1 run words (1/d of the
+# seed fill's V * d writes, which every fresh gradient pays anyway) and
+# saves (min(T, V) - U) * d fold threads; when U = min(T, V) the old launch
+# runs. Integer counts are exactly associative: the compaction is the same
+# list on every vendor. Opt-in per caller (`unique_rows`, the embedding
+# binding's entries; the training loops keep their launch and their wait
+# count); off with -D ANONLIB_IDN_EMB_UNIQUE_ROWS_OFF (or
+# ANONLIB_IDN_ALL_OFF) and under every sabotage arm (EMB_TOUCHED_ROWS).
+comptime EMB_UNIQUE_ROWS = EMB_TOUCHED_ROWS and not (
+    is_defined["ANONLIB_IDN_EMB_UNIQUE_ROWS_OFF"]() or is_defined["ANONLIB_IDN_ALL_OFF"]()
+)
+#: threads per block of the compaction (a power of two: the tree folds halve it)
+comptime EMB_UNIQ_TPB = 256
+
+
+def emb_nonfinite_rows_kernel(
+    flags: MutPointer[Int32, MutAnyOrigin],
+    values: MutPointer[Float32, MutAnyOrigin],
+    rows_in: Int32,
+    width_in: Int32,
+):
+    """Contract 9.1 on the DEVICE, by BITS and never by a compare (Metal flushes compare operands, row 49; integer operations flush nowhere). One thread per row: `flags[r]` is `2 * j + 1` for a NaN or `2 * j` for an infinity at the row's FIRST nonfinite column `j`, else `-1`. No float is written and no thread reads another row."""
+    var r = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if r >= Int(rows_in):
+        return
+    var width = Int(width_in)
+    var base = r * width
+    for j in range(width):
+        var au = bitcast[DType.uint32](values.unsafe_load(base + j)) & UInt32(0x7FFFFFFF)
+        if au > UInt32(0x7F800000):
+            flags.unsafe_store(r, Int32(2 * j + 1))
+            return
+        if au == UInt32(0x7F800000):
+            flags.unsafe_store(r, Int32(2 * j))
+            return
+    flags.unsafe_store(r, Int32(-1))
+
+
+def emb_refuse_device_nonfinite(
+    ctx: DeviceContext,
+    name: String,
+    mut values: DeviceBuffer[DType.float32],
+    rows: Int,
+    width: Int,
+) raises:
+    """DEVIATION 1506 CLOSED for the refusing entry points (2026-09-15): a NaN or an infinity in a device buffer is REFUSED BY NAME, with the first flat index in row-major order and the message `refuse_nonfinite` gives on the host, before any kernel of the profile is launched. Costs one launch over `rows * width` cells and a download of `rows` integers."""
+    if rows <= 0 or width <= 0:
+        return
+    var flags = ctx.enqueue_create_buffer[DType.int32](rows)
+    step_count_launch()
+    ctx.enqueue_function[emb_nonfinite_rows_kernel](
+        flags.unsafe_ptr(),
+        values.unsafe_ptr(),
+        Int32(rows),
+        Int32(width),
+        grid_dim=(_grid_for(rows), 1, 1),
+        block_dim=(EMB_TPB, 1, 1),
+    )
+    # lane cgr4-download-loop: the first flagged row is found on the device
+    # (an integer minimum over block partials), then its one flag is read;
+    # was a download of `rows` flags and a host walk
+    var r = device_first_nonneg_i32(ctx, flags, rows)
+    if r >= 0:
+        step_count_host_alloc()
+        var h = ctx.enqueue_create_host_buffer[DType.int32](1)
+        var one = flags.create_sub_buffer[DType.int32](r, 1)
+        step_count_d2h()
+        ctx.enqueue_copy(dst_ptr=h.unsafe_ptr(), src_buf=one)
+        step_count_sync()
+        ctx.synchronize()
+        var f = Int(h.unsafe_ptr().unsafe_load(0))
+        _ = one^
+        _ = h^
+        if f >= 0:
+            var flat = r * width + f // 2
+            _ = flags^
+            if f % 2 == 1:
+                raise Error(
+                    String("embedding: NaN in ")
+                    + name
+                    + " at flat index "
+                    + String(flat)
+                    + " REFUSED on the device entry point (row 39: NaN payloads"
+                    + " are vendor-shaped; no stage may record one)"
+                )
+            raise Error(
+                String("embedding: infinity in ")
+                + name
+                + " at flat index "
+                + String(flat)
+                + " REFUSED on the device entry point (contract 9.1)"
+            )
+    _ = flags^
+
+
+def emb_refuse_device_ids(
+    ctx: DeviceContext,
+    mut ids: DeviceBuffer[DType.int32],
+    n_positions: Int,
+    cfg: EmbConfig,
+) raises:
+    """Contract section 8 and 9.1 ON THE DEVICE ENTRY POINTS, which is where they were missing. IT IS AN OUT-OF-BOUNDS READ.** `emb_gather_kernel` computes `weight.unsafe_load(v * width + j)` with NO bounds branch on the normative path -- the only bounds handling in the file lives inside `SAB_GATHER_CLAMP_OOR`, a SABOTAGE arm, so a build without that define has none at all."""
+    if n_positions <= 0:
+        return
+    comptime if SAB_GATHER_CLAMP_OOR:
+        # THE SABOTAGE IS THE WHOLE WRONG SPELLING, NOT HALF OF IT: the
+        # refusal is dropped and the gather kernel clamps instead. With the
+        # refusal left in, the kernel's clamp could never see an
+        # out-of-range id and the arm was unrunnable (2026-09-14 legs).
+        return
+    step_count_host_alloc()
+    var h = ctx.enqueue_create_host_buffer[DType.int32](n_positions)
+    step_count_sync()
+    ctx.synchronize()
+    step_count_d2h()
+    ctx.enqueue_copy(dst_ptr=h.unsafe_ptr(), src_buf=ids)
+    step_count_sync()
+    ctx.synchronize()
+    var lids = List[Int32]()
+    for i in range(n_positions):
+        lids.append(h.unsafe_ptr().unsafe_load(i))
+    emb_refuse_ids(lids, cfg)
+    _ = h
+
+
+def identical_embedding_forward_into(
+    ctx: DeviceContext,
+    mut out_y: DeviceBuffer[DType.float32],
+    mut weight: DeviceBuffer[DType.float32],
+    mut ids: DeviceBuffer[DType.int32],
+    n_positions: Int,
+    cfg: EmbConfig,
+) raises:
+    """Seams G1 and G2, enqueued. `[[mojo-buffer-freed-at-last-use]]`: a `DeviceBuffer` is dead at its `.unsafe_ptr()`, so every one of these must outlive the caller's `ctx.synchronize()`."""
+    emb_refuse_device_ids(ctx, ids, n_positions, cfg)
+    _emb_forward_launch(ctx, out_y, weight, ids, n_positions, cfg)
+
+
+def identical_embedding_forward_prerefused_into(
+    ctx: DeviceContext,
+    mut out_y: DeviceBuffer[DType.float32],
+    mut weight: DeviceBuffer[DType.float32],
+    mut ids: DeviceBuffer[DType.int32],
+    n_positions: Int,
+    cfg: EmbConfig,
+) raises:
+    """Seams G1 and G2 for an owning caller that ALREADY refused the exact
+    immutable ids (host-list admission or an owned device token scan),
+    performed shape refusal and owns 9.1: the gather
+    launch only. `identical_embedding_forward_into` reads the device ids back
+    into a new pinned buffer and walks them on the host a second time (two
+    waits); a caller that uploaded a refused host list repeats nothing here
+    (lane idn-embedding, 2026-10-04)."""
+    _emb_forward_launch(ctx, out_y, weight, ids, n_positions, cfg)
+
+
+def identical_embedding_forward_refusing_into(
+    ctx: DeviceContext,
+    mut out_y: DeviceBuffer[DType.float32],
+    mut weight: DeviceBuffer[DType.float32],
+    mut ids: DeviceBuffer[DType.int32],
+    n_positions: Int,
+    cfg: EmbConfig,
+) raises:
+    """THE REFUSING DEVICE FORWARD, contract sections 3, 8 and 9.1 in full: the shape refusals, the id refusal and a NaN or infinity anywhere in `W` refused by name before the gather is launched (DEVIATION 1506, closed for this entry point on 2026-09-15). `identical_embedding_forward_into` stays the caller-refused spelling the training loops use: it refuses ids and NOT nonfinite values, and its caller owns 9.1."""
+    emb_refuse_shape(cfg, n_positions)
+    emb_refuse_device_ids(ctx, ids, n_positions, cfg)
+    emb_refuse_device_nonfinite(ctx, String("W"), weight, cfg.vocab, cfg.width)
+    _emb_forward_launch(ctx, out_y, weight, ids, n_positions, cfg)
+
+
+def _emb_forward_launch(
+    ctx: DeviceContext,
+    mut out_y: DeviceBuffer[DType.float32],
+    mut weight: DeviceBuffer[DType.float32],
+    mut ids: DeviceBuffer[DType.int32],
+    n_positions: Int,
+    cfg: EmbConfig,
+) raises:
+    """Seams G1 and G2, launched. Every refusal is the caller's."""
+    if cfg.width < 1 or n_positions < 1:
+        return
+    var cells = n_positions * cfg.width
+    step_count_launch()
+    ctx.enqueue_function[emb_gather_kernel](
+        out_y.unsafe_ptr(),
+        weight.unsafe_ptr(),
+        ids.unsafe_ptr(),
+        Int32(n_positions),
+        Int32(cfg.width),
+        Int32(cfg.vocab),
+        grid_dim=(_grid_for(cells), 1, 1),
+        block_dim=(EMB_TPB, 1, 1),
+    )
+

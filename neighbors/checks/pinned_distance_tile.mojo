@@ -1,0 +1,513 @@
+"""The tiled k-NN arm's distances, computed where we can see the order.
+
+DEVIATION 505 (IDENTITY_PATHS row 24). Reached only under
+`NUMERIC_IDENTICAL`.
+
+NO REFERENCE FILE. cuVS's `tiled_brute_force_knn` gets this tile from
+`cuvs::distance::pairwise_distance`, which is cuBLAS underneath
+(`knn_brute_force.cuh:172-183`), and this tree mirrors that call with MAX's
+`linalg.matmul` through `core/gemm.mojo::gemm_nt`. Under `NUMERIC_FAST` that
+is the right thing and stays: a library with no source is a library we do
+not implementation.
+
+WHY `IDENTICAL` CANNOT USE IT
+------------------------------
+A vendor matmul chooses its own tile shape and its own k-split, per vendor
+and per shape, and a k-split IS a summation order. Nothing in this
+repository can pin it, read it, or check it -- `archive/reference/VENDOR_LIBRARIES.md` is
+about which calls we may make, not about what they do to the last bit. Two
+GPUs running `linalg.matmul` on the same inputs are entitled to two
+different `z`, and the whole expanded identity is built on `z`.
+
+cuVS is in the same position and worse: their default distance GEMM runs at
+`CUBLAS_COMPUTE_32F_FAST_TF32` (`unfused_distance_nn.cuh:196`), ten mantissa
+bits, so their float32 k-NN is not float32 and is not reproducible across
+NVIDIA GPU MODELS either. Our tiled arm inherits their DESIGN, not their
+irreproducibility, and this file is where the two part company.
+
+CURRENT IMPLEMENTATIONS
+-----------------------
+The scalar kernel below owns one output cell per thread. The register-tiled
+kernel later in this file shares loads across RT_ROWS x RT_COLS cells
+(currently 8x4 on NVIDIA, 4x4 on Apple). Both walk each cell's feature
+axis in ascending order, then apply the same expanded-distance epilogue.
+SINCE 2026-09-17 THE NVIDIA COLUMN'S DEFAULT IS NEITHER: it is the
+shared-memory tile of `neighbors/checks/smem_distance_tile.mojo`
+(DEVIATION 3000, kernel-matrix row `knn_smem_distance_tile_for`), which
+calls this file's `_rt_step` and `_rt_step_exact` per cell and so keeps
+the chain written here; Apple and AMD keep the register tile until timed.
+Neither splits or reorders an output's accumulation chain. Apple register
+tiles retain exact zero-FMA repair unless complete-chain exponent admission
+proves the repair unnecessary. Kernel-matrix policy selects the layout and
+tile; the original scalar description is not a description of current dispatch.
+
+THE FAST ARM'S BITS DO NOT MOVE. Nothing here is reachable unless
+`GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL`; `tiled_brute_force_knn` keeps
+calling `gemm_nt` plus `expand_distances_kernel` in the default build.
+"""
+from core.classical_distance import direct_squared_distance
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 the authors. Part of anonlib, DOI-WITHHELD
+
+
+from std.gpu import block_dim, block_idx, thread_idx
+from std.memory import bitcast
+from std.sys import llvm_intrinsic
+from std.sys.compile import is_defined
+from checks.kernel_matrix import TARGET_COLUMN, knn_distance_zero_fma_repair_for, knn_distance_preflight_for, knn_distance_hardware_flush_for, knn_distance_rows_for
+from neighbors.checks.zero_fma_boundary import repair_zero_fma
+
+from checks.numerics import (
+    GLOBAL_NUMERIC_MODE,
+    NUMERIC_IDENTICAL,
+    ftz,
+    identical_mul_add,
+    identical_sqrt,
+)
+
+
+comptime PINNED_TILE_TPB = 256
+
+
+def pinned_distance_tile_kernel(
+    z: MutPointer[Float32, MutAnyOrigin],
+    q: MutPointer[Float32, MutAnyOrigin],
+    y: MutPointer[Float32, MutAnyOrigin],
+    q_norm: MutPointer[Float32, MutAnyOrigin],
+    y_norm: MutPointer[Float32, MutAnyOrigin],
+    n_rows_in: Int32,
+    n_cols_in: Int32,
+    n_features_in: Int32,
+    is_sqrt_in: Int32,
+):
+    """The expanded-L2 tile: `pinned_distance_tile_direct_kernel[False]`."""
+    pinned_distance_tile_direct_kernel[False](
+        z, q, y, q_norm, y_norm, n_rows_in, n_cols_in, n_features_in, is_sqrt_in
+    )
+
+
+def pinned_distance_tile_direct_kernel[direct: Bool](
+    z: MutPointer[Float32, MutAnyOrigin],
+    q: MutPointer[Float32, MutAnyOrigin],
+    y: MutPointer[Float32, MutAnyOrigin],
+    q_norm: MutPointer[Float32, MutAnyOrigin],
+    y_norm: MutPointer[Float32, MutAnyOrigin],
+    n_rows_in: Int32,
+    n_cols_in: Int32,
+    n_features_in: Int32,
+    is_sqrt_in: Int32,
+):
+    """`z[i][j] = ||q_i||^2 + ||y_j||^2 - 2 q_i . y_j`, clamped at zero.
+
+    The dot product is accumulated in ONE thread over the whole feature
+    axis, ascending, so it has one order everywhere. The norms are the ones
+    `compute_norms` already produced, which is theirs
+    (`knn_brute_force.cuh:110-146`, hoisted out of the tile loop).
+
+    The clamp is theirs too (`unfused_distance_nn.cuh:80-81`): GEMM
+    round-off makes a point sitting on its own neighbour come out slightly
+    negative and `sqrt` of that is NaN. It is kept even though this arm has
+    no GEMM, because a cancellation can go negative without one.
+    """
+    var n_rows = Int(n_rows_in)
+    var n_cols = Int(n_cols_in)
+    var d = Int(n_features_in)
+    var idx = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if idx >= n_rows * n_cols:
+        return
+
+    var row = idx // n_cols
+    var col = idx % n_cols
+
+    # `direct`: the calling family's direct-distance switch (KNN, KDE, IVF,
+    # GRAPH in graph_controls.mojo); each host twin follows the same switch.
+    comptime if direct:
+        var distance=direct_squared_distance(q+row*d,y+col*d,d)
+        z[idx]=ftz(identical_sqrt(distance)) if is_sqrt_in!=0 else distance
+        return
+    var acc = Float32(0.0)
+    for f in range(d):
+        var qv = ftz(q.unsafe_load(row * d + f))
+        var yv = ftz(y.unsafe_load(col * d + f))
+        acc = ftz(identical_mul_add(qv, yv, acc))
+
+    var dist = ftz(
+        identical_mul_add(
+            Float32(-2.0),
+            acc,
+            ftz(ftz(q_norm.unsafe_load(row)) + ftz(y_norm.unsafe_load(col))),
+        )
+    )
+    if dist <= Float32(0.0):
+        dist = Float32(0.0)
+    if is_sqrt_in != 0:
+        # DEVIATION 550 (2026-08-23): `identical_sqrt`, not the stdlib
+        # `sqrt`. This tile is the IDENTICAL arm, and the stdlib sqrt is
+        # NVIDIA's approximate PTX sqrt (DEVIATION 258: 180,714 of 2^20
+        # inputs off by one ulp) -- E1U's knn card at 8660400 agreed on
+        # index_norm and query_norm and diverged at out_dist on the H100,
+        # which is exactly one unrouted sqrt after the norms. Apple's
+        # native sqrt is correctly rounded, so this moves no Apple bit.
+        dist = ftz(identical_sqrt(dist))
+    z.unsafe_store(idx, dist)
+
+
+# ---------------------------------------------------------------------------
+# The register-tiled form, 2026-09-09. Reached only under IDENTICAL on the
+# columns `knn_distance_register_tile_for` admits, and only with the index
+# TRANSPOSED (`yt[f * y_stride + col]`), so adjacent threads read adjacent
+# index columns.
+#
+# Each thread owns RT_ROWS query rows x RT_COLS index columns and walks the
+# feature axis ONCE for all RT_ROWS * RT_COLS cells. The contract of the kernel above
+# is kept cell for cell: `acc = ftz(fma(ftz(q[f]), ftz(y[f]), acc))` for
+# f ascending, then the same epilogue. What changes is only how many cells
+# share one pass over `f` and which loads they share; no cell's chain is
+# split, folded, or reordered, so the bits are the scalar kernel's bits.
+# Threads at the tile's edge clamp their loads to the last valid row/column
+# and skip the store; the clamped chains are discarded, never written.
+# ---------------------------------------------------------------------------
+
+comptime RT_ROWS = knn_distance_rows_for[TARGET_COLUMN, GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL]()
+comptime RT_COLS = 4
+comptime RT_TPB = 128
+comptime RT_TILE_COLS = RT_TPB * RT_COLS
+
+@always_inline
+def _rt_load(x: Float32) -> Float32:
+    return ftz(x)
+
+
+@always_inline
+def _rt_step(a: Float32, b: Float32, acc: Float32) -> Float32:
+    """Round the FMA before flushing its output; operands are already flushed.
+
+    NVIDIA fma.rn.ftz.f32 is NOT equivalent at the smallest-normal rounding
+    boundary: 0x3f7fffff * 0x00800000 + 0 returns zero there, while the
+    required rounded FMA is 0x00800000. NVIDIA rounds first, then uses
+    hardware FTZ multiplication by one; Apple retains its exact zero repair.
+    """
+    comptime if knn_distance_hardware_flush_for[TARGET_COLUMN, GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL]():
+        # Match the corrected GEMM seam: rounding occurs BEFORE the hardware
+        # input/output FTZ on multiplication by exactly one. Bare fma.ftz is
+        # deliberately excluded because it fails at the minnormal boundary.
+        var rounded = llvm_intrinsic["llvm.nvvm.fma.rn.f", Float32, has_side_effect=False](a, b, acc)
+        return llvm_intrinsic["llvm.nvvm.mul.rn.ftz.f", Float32, has_side_effect=False](rounded, Float32(1.0))
+    var result = ftz(identical_mul_add(a, b, acc))
+    comptime if knn_distance_zero_fma_repair_for[TARGET_COLUMN, GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL]():
+        if (bitcast[DType.uint32](result) & 0x7fffffff) == 0:
+            # Normal Float32 accumulators are multiples of 2**-149. If the
+            # product's lowest possible bit is also at least 2**-149, no
+            # exact subnormal result can round up to the smallest normal.
+            var a_exp = bitcast[DType.uint32](a) & 0x7f800000
+            var b_exp = bitcast[DType.uint32](b) & 0x7f800000
+            if a_exp + b_exp < UInt32(151 << 23):
+                return repair_zero_fma(a, b, acc, result)
+    return result
+
+
+@always_inline
+def _rt_step_exact(a: Float32, b: Float32, acc: Float32) -> Float32:
+    """DEVIATION 2629: the step `_rt_step` takes once admission has proved
+    that no subnormal can arise anywhere in the chain (see the admission
+    comment above `vector_exponent_admission_kernel`). The rounded FMA is
+    the same rounded FMA; the flush after it is dropped because its input is
+    never subnormal, so the flush is the identity on every value it would
+    see. NVIDIA keeps its explicit round-to-nearest intrinsic; every other
+    column keeps `identical_mul_add`. Sabotage (`-D
+    ANONLIB_KNN_EXACT_CHAIN_SABOTAGE=1`, never shipped) flips the lowest
+    mantissa bit of each step so a reached exact path cannot return clean
+    bits."""
+    var r: Float32
+    comptime if knn_distance_hardware_flush_for[TARGET_COLUMN, GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL]():
+        r = llvm_intrinsic["llvm.nvvm.fma.rn.f", Float32, has_side_effect=False](a, b, acc)
+    else:
+        r = identical_mul_add(a, b, acc)
+    comptime if is_defined["ANONLIB_KNN_EXACT_CHAIN_SABOTAGE"]():
+        r = bitcast[DType.float32](bitcast[DType.uint32](r) ^ UInt32(1))
+    return r
+
+
+@always_inline
+def _rt_dot_tile[REPAIR: Bool, VECTOR: Bool = False, EXACT: Bool = False](
+    q: MutPointer[Float32, MutAnyOrigin],
+    yt: MutPointer[Float32, MutAnyOrigin],
+    rows_idx: SIMD[DType.int32, RT_ROWS],
+    cols_idx: SIMD[DType.int32, RT_COLS],
+    d: Int, y_stride: Int,
+) -> SIMD[DType.float32, RT_ROWS * RT_COLS]:
+    var acc = SIMD[DType.float32, RT_ROWS * RT_COLS](0.0)
+    for f in range(d):
+        var yv = SIMD[DType.float32, RT_COLS](0.0)
+        # Vector transport only; feature and FMA order are unchanged.
+        # RAFT linalg/detail/contractions.cuh:193-219 uses vector global loads.
+        # Caller admits aligned full groups; this tile has a different layout.
+        comptime if VECTOR:
+            var raw = yt.unsafe_load[width=4, alignment=16](f * y_stride + Int(cols_idx[0]))
+            comptime for c in range(RT_COLS):
+                yv[c] = _rt_load(raw[c])
+        else:
+            comptime for c in range(RT_COLS):
+                yv[c] = _rt_load(yt.unsafe_load(f * y_stride + Int(cols_idx[c])))
+        comptime for r in range(RT_ROWS):
+            var qv = _rt_load(q.unsafe_load(Int(rows_idx[r]) * d + f))
+            comptime for c in range(RT_COLS):
+                comptime if EXACT:
+                    # DEVIATION 2629: admitted tile, same chain, no flush.
+                    acc[r * RT_COLS + c] = _rt_step_exact(qv, yv[c], acc[r * RT_COLS + c])
+                else:
+                    comptime if REPAIR:
+                        acc[r * RT_COLS + c] = _rt_step(qv, yv[c], acc[r * RT_COLS + c])
+                    else:
+                        acc[r * RT_COLS + c] = ftz(identical_mul_add(qv, yv[c], acc[r * RT_COLS + c]))
+
+    return acc
+
+
+@always_inline
+def _rt_accumulate_tile[VECTOR: Bool = False](
+    q: MutPointer[Float32, MutAnyOrigin],
+    yt: MutPointer[Float32, MutAnyOrigin],
+    rows_idx: SIMD[DType.int32, RT_ROWS],
+    cols_idx: SIMD[DType.int32, RT_COLS],
+    d: Int, y_stride: Int,
+) -> SIMD[DType.float32, RT_ROWS * RT_COLS]:
+    comptime if knn_distance_preflight_for[TARGET_COLUMN, GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL]():
+        # Ignore exponent-zero operands: _rt_load flushes them to signed zero,
+        # and a zero product cannot create an underflow-rounding boundary.
+        # Minima over the complete feature chain conservatively cover all
+        # RT_ROWS * RT_COLS output cells. Admission is data-dependent but exact.
+        # Exponent255 does not lower the minimum: nonfinite propagation
+        # cannot produce the zero result on which the repair differs.
+        var q_min = UInt32(255)
+        var y_min = UInt32(255)
+        for f in range(d):
+            comptime for r in range(RT_ROWS):
+                var e = (bitcast[DType.uint32](q.unsafe_load(Int(rows_idx[r]) * d + f)) >> 23) & 255
+                if e != 0 and e < q_min:
+                    q_min = e
+            comptime for c in range(RT_COLS):
+                var e = (bitcast[DType.uint32](yt.unsafe_load(f * y_stride + Int(cols_idx[c]))) >> 23) & 255
+                if e != 0 and e < y_min:
+                    y_min = e
+        if q_min + y_min >= 151:
+            return _rt_dot_tile[False, VECTOR](q, yt, rows_idx, cols_idx, d, y_stride)
+    return _rt_dot_tile[True, VECTOR](q, yt, rows_idx, cols_idx, d, y_stride)
+
+
+@always_inline
+def vector_exponent_minimum(
+    values: MutPointer[Float32, MutAnyOrigin], d: Int, stride: Int,
+) -> UInt32:
+    """Minimum nonzero biased exponent; flushed operands cannot need repair."""
+    var minimum = UInt32(255)
+    for f in range(d):
+        var exponent = (bitcast[DType.uint32](values.unsafe_load(f * stride)) >> 23) & 255
+        if exponent != 0 and exponent < minimum:
+            minimum = exponent
+    return minimum
+
+
+def vector_exponent_minimum_kernel(
+    values: MutPointer[Float32, MutAnyOrigin], minima: MutPointer[Float32, MutAnyOrigin],
+    n_in: Int32, d_in: Int32,
+):
+    var row = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if row < Int(n_in):
+        minima.unsafe_store(row, Float32(vector_exponent_minimum(values.unsafe_offset(row * Int(d_in)), Int(d_in), 1)))
+
+
+@always_inline
+def _rt_accumulate_metadata_tile(
+    q: MutPointer[Float32, MutAnyOrigin], yt: MutPointer[Float32, MutAnyOrigin],
+    q_minima: MutPointer[Float32, MutAnyOrigin], y_minima: MutPointer[Float32, MutAnyOrigin],
+    rows_idx: SIMD[DType.int32, RT_ROWS], cols_idx: SIMD[DType.int32, RT_COLS],
+    d: Int, y_stride: Int,
+) -> SIMD[DType.float32, RT_ROWS * RT_COLS]:
+    var q_min = UInt32(255)
+    var y_min = UInt32(255)
+    comptime for r in range(RT_ROWS):
+        q_min = min(q_min, UInt32(q_minima.unsafe_load(Int(rows_idx[r]))))
+    comptime for c in range(RT_COLS):
+        y_min = min(y_min, UInt32(y_minima.unsafe_load(Int(cols_idx[c]))))
+    if q_min + y_min >= 151:
+        return _rt_dot_tile[False](q, yt, rows_idx, cols_idx, d, y_stride)
+    return _rt_dot_tile[True](q, yt, rows_idx, cols_idx, d, y_stride)
+
+
+# ---------------------------------------------------------------------------
+# DEVIATION 2629 (2026-09-11, lane/knn-speed): EXACT-CHAIN ADMISSION.
+#
+# The NVIDIA step is a rounded FMA followed by a hardware flush (`_rt_step`),
+# two operations per feature per cell, and the phase profile puts the
+# distance class at 15.3 of the 25.4 serialized milliseconds at 400k x 4k x
+# d32 on the H100. The flush only changes a value that is subnormal. This
+# admission proves, per register tile and before the chain runs, that no
+# value the flush would see can be subnormal, so the tile takes the same
+# rounded FMA chain without the flush and every output bit is unchanged.
+#
+# The proof, in biased exponents e (a normal float with exponent e has ulp
+# 2^(e-150) and magnitude below 2^(e-126)):
+#   1. Operands are loaded through `ftz`, so an e == 0 operand is +-0 and
+#      contributes an exact zero product. Let lo_q, lo_y be the minimum
+#      NONZERO exponents over the tile's rows and columns. Every nonzero
+#      exact product q_f * y_f is a multiple of 2^(lo_q + lo_y - 300); with
+#      lo_q + lo_y >= 174 that is a multiple of 2^-126.
+#   2. By induction acc is a multiple of 2^-126 after every step: an exact
+#      sum of multiples of 2^-126 with magnitude below 2^-102 is exactly
+#      representable (at most 24 significant bits above 2^-126), and at or
+#      above 2^-102 the float's ulp is at least 2^-125, so the rounded value
+#      is a multiple of that ulp. A nonzero multiple of 2^-126 is at least
+#      the smallest normal, so no step input or output is ever subnormal
+#      and the flush is the identity. Apple's zero-FMA boundary (an exact
+#      result in (0, 2^-126) rounding up) cannot occur either.
+#   3. No overflow and no generated NaN: with hi_q, hi_y the maximum
+#      exponents and L = ceil(log2 d), |product| < 2^(hi_q + hi_y - 252) and
+#      |acc| stays below 2^(hi_q + hi_y + L - 251) including rounding, so
+#      hi_q + hi_y + L <= 376 keeps every value below 2^125. A row holding a
+#      nonfinite value is never admitted.
+# A tile that fails any clause keeps `_rt_accumulate_tile`, bit for bit
+# today's chain. The metadata is request local (one launch per matrix,
+# rebuilt every request) and lives in the caller's existing scratch.
+# ---------------------------------------------------------------------------
+
+comptime RT_EXACT_MIN_EXPONENT_SUM = 174
+comptime RT_EXACT_MAX_EXPONENT_SUM = 376
+
+
+def vector_exponent_admission_kernel(
+    values: MutPointer[Float32, MutAnyOrigin], meta: MutPointer[Float32, MutAnyOrigin],
+    n_in: Int32, d_in: Int32,
+):
+    """Per row: lo + 256 * hi as an exact Float32 integer, or -1 when the row
+    holds a nonfinite value (DEVIATION 2629 admission metadata)."""
+    var row = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if row >= Int(n_in):
+        return
+    var d = Int(d_in)
+    var lo = 255
+    var hi = 0
+    var nonfinite = False
+    for f in range(d):
+        var e = Int((bitcast[DType.uint32](values.unsafe_load(row * d + f)) >> 23) & 255)
+        if e == 255:
+            nonfinite = True
+        if e != 0 and e < lo:
+            lo = e
+        if e > hi:
+            hi = e
+    if nonfinite:
+        meta.unsafe_store(row, Float32(-1.0))
+    else:
+        meta.unsafe_store(row, Float32(lo + 256 * hi))
+
+
+@always_inline
+def _rt_accumulate_exact_tile[VECTOR: Bool = False](
+    q: MutPointer[Float32, MutAnyOrigin], yt: MutPointer[Float32, MutAnyOrigin],
+    q_meta: MutPointer[Float32, MutAnyOrigin], y_meta: MutPointer[Float32, MutAnyOrigin],
+    rows_idx: SIMD[DType.int32, RT_ROWS], cols_idx: SIMD[DType.int32, RT_COLS],
+    d: Int, y_stride: Int,
+) -> SIMD[DType.float32, RT_ROWS * RT_COLS]:
+    var admitted = True
+    var q_lo = 255
+    var q_hi = 0
+    var y_lo = 255
+    var y_hi = 0
+    comptime for r in range(RT_ROWS):
+        var m = q_meta.unsafe_load(Int(rows_idx[r]))
+        if m < Float32(0.0):
+            admitted = False
+        else:
+            var v = Int(UInt32(m))
+            q_lo = min(q_lo, v & 255)
+            q_hi = max(q_hi, v >> 8)
+    comptime for c in range(RT_COLS):
+        var m = y_meta.unsafe_load(Int(cols_idx[c]))
+        if m < Float32(0.0):
+            admitted = False
+        else:
+            var v = Int(UInt32(m))
+            y_lo = min(y_lo, v & 255)
+            y_hi = max(y_hi, v >> 8)
+    var log2d = 0
+    while (1 << log2d) < d:
+        log2d += 1
+    if admitted and q_lo + y_lo >= RT_EXACT_MIN_EXPONENT_SUM and q_hi + y_hi + log2d <= RT_EXACT_MAX_EXPONENT_SUM:
+        return _rt_dot_tile[False, VECTOR, True](q, yt, rows_idx, cols_idx, d, y_stride)
+    return _rt_accumulate_tile[VECTOR](q, yt, rows_idx, cols_idx, d, y_stride)
+
+
+def pinned_distance_register_tile_kernel[METADATA: Bool, VECTOR: Bool = False, EXACT: Bool = False](
+    z: MutPointer[Float32, MutAnyOrigin],
+    q: MutPointer[Float32, MutAnyOrigin],
+    yt: MutPointer[Float32, MutAnyOrigin],
+    q_norm: MutPointer[Float32, MutAnyOrigin],
+    y_norm: MutPointer[Float32, MutAnyOrigin],
+    q_minima: MutPointer[Float32, MutAnyOrigin],
+    y_minima: MutPointer[Float32, MutAnyOrigin],
+    n_rows_in: Int32,
+    n_cols_in: Int32,
+    y_stride_in: Int32,
+    n_features_in: Int32,
+    is_sqrt_in: Int32,
+):
+    """`z[i][j] = ||q_i||^2 + ||y_j||^2 - 2 q_i . y_j`, clamped at zero,
+    RT_ROWS * RT_COLS cells per thread, one ascending serial chain per cell.
+
+    VECTOR requires a 16-byte-aligned yt base, y_stride divisible by four,
+    and n_cols divisible by four. Dispatch retains scalar loads otherwise.
+    Query rows may be ragged: existing row clamping and stores handle them.
+    """
+    var n_rows = Int(n_rows_in)
+    var n_cols = Int(n_cols_in)
+    var y_stride = Int(y_stride_in)
+    var d = Int(n_features_in)
+    var col0 = (Int(block_idx.x) * RT_TPB + Int(thread_idx.x)) * RT_COLS
+    var row0 = Int(block_idx.y) * RT_ROWS
+    if col0 >= n_cols or row0 >= n_rows:
+        return
+
+    var acc = SIMD[DType.float32, RT_ROWS * RT_COLS](0.0)
+    var rows_idx = SIMD[DType.int32, RT_ROWS](0)
+    var cols_idx = SIMD[DType.int32, RT_COLS](0)
+    comptime for r in range(RT_ROWS):
+        var rr = row0 + r
+        if rr > n_rows - 1:
+            rr = n_rows - 1
+        rows_idx[r] = Int32(rr)
+    comptime for c in range(RT_COLS):
+        var cc = col0 + c
+        if cc > n_cols - 1:
+            cc = n_cols - 1
+        cols_idx[c] = Int32(cc)
+
+    comptime if METADATA:
+        acc = _rt_accumulate_metadata_tile(q, yt, q_minima, y_minima, rows_idx, cols_idx, d, y_stride)
+    else:
+        comptime if EXACT:
+            # DEVIATION 2629: q_minima / y_minima carry the admission metadata
+            # (`vector_exponent_admission_kernel`), not the Apple minima.
+            acc = _rt_accumulate_exact_tile[VECTOR](q, yt, q_minima, y_minima, rows_idx, cols_idx, d, y_stride)
+        else:
+            acc = _rt_accumulate_tile[VECTOR](q, yt, rows_idx, cols_idx, d, y_stride)
+
+    comptime for r in range(RT_ROWS):
+        var row = row0 + r
+        if row < n_rows:
+            var qn = ftz(q_norm.unsafe_load(row))
+            comptime for c in range(RT_COLS):
+                var col = col0 + c
+                if col < n_cols:
+                    var dist = ftz(
+                        identical_mul_add(
+                            Float32(-2.0),
+                            acc[r * RT_COLS + c],
+                            ftz(qn + ftz(y_norm.unsafe_load(col))),
+                        )
+                    )
+                    if dist <= Float32(0.0):
+                        dist = Float32(0.0)
+                    if is_sqrt_in != 0:
+                        dist = ftz(identical_sqrt(dist))
+                    z.unsafe_store(row * n_cols + col, dist)

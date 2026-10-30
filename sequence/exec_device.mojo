@@ -1,0 +1,1425 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 the authors. Part of anonlib, DOI-WITHHELD
+"""`DeviceExec`: the lane's operations on the GPU, one thread per element,
+over `sequence/ops.mojo::apply`, the body `HostExec` loops over on the CPU."""
+from std.ffi import _Global
+from std.memory import bitcast
+from std.gpu import block_dim, block_idx, thread_idx
+from std.os import getenv
+from std.memory import memcpy
+from max.gpu.host import DeviceBuffer, DeviceContext, HostBuffer
+from sequence.moe_tiled import MOE_TPB, moe_combine_kernel, moe_hidden_tiled_kernel, moe_out_tiled_kernel
+from sequence.moe_group import (
+    MOE_GROUP_TPB, moe_group_count_all_kernel, moe_group_offsets_all_kernel, moe_group_scatter_all_kernel,
+    moe_group_zero_all_kernel, MOE_STABLE_PACK, moe_group_stable_all_kernel,
+)
+from sequence.moe_reg import (
+    MOE_DEVGROUP,
+    MOE_REGTILE,
+    RT as MOE_RT,
+    moe_group_count_kernel,
+    moe_group_offsets_kernel,
+    moe_group_scatter_kernel,
+    moe_group_zero_kernel,
+    moe_hidden_reg_kernel,
+    moe_logits_reg_kernel,
+    moe_out_reg_kernel,
+    moe_reg_blocks,
+    moe_route_tail_kernel,
+)
+from sequence.moe_mma import MM_BNH, MM_BNO, MM_NT, MOE_MMA, moe_hidden_mma_kernel, moe_mma_blocks, moe_out_mma_kernel
+# lane gap-gemm-layers (2026-10-08): the expert products as grouped identical GEMMs
+from sequence.moe_grouped_fold import MOE_GROUPED_GEMM
+from sequence.moe_grouped import moe_grouped_offsets, moe_grouped_workspace, moe_grouped_hidden, moe_grouped_out
+
+from checks.numerics import GLOBAL_NUMERIC_MODE, NUMERIC_FAST, NUMERIC_IDENTICAL
+from std.sys.compile import is_defined
+from std.sys.defines import get_defined_int
+
+from sequence.exec_trait import Exec
+from sequence.launch_profile import launch_profile_level, launch_profile_record
+from sequence.launch_profile import launch_profile_record_drain, launch_profile_record_shape
+from sequence.gemm_tiled import seq_gemm_profile_route
+from sequence.ops import OP_GEMM_SPLITK
+from std.time import perf_counter_ns
+from autograd.ops import OP_AG_FIRST, OP_AG_LAST
+from sequence.dispatch import apply
+from autograd.fold_kernels import ag_pass6_op, ag_pass6_launch
+from sequence.ops import OP_MOE_ROUTE, OP_MOE_OUT, OP_MOE_HIDDEN, FP, Args, OP_AF_ALPHA, OP_AF_BLK_SUMSQ, OP_AF_DENOM, OP_GEMM, OP_LAMB_RATIO, OP_SEG_SUMSQ
+from sequence.coop import COOP_W, apply_coop
+# lane ag-pass6-rows: the softmax family's coop rows and the AUC in-block sort
+from autograd.ops import OP_AG_SOFTMAX_FWD, OP_AG_SOFTMAX_VJP
+from autograd.loss_ops import OP_LS_CE_FWD, OP_LS_CE_VJP, OP_LS_METRIC_TERM, MT_ARGMAX_EQUAL
+from autograd.pass1_ops import OP_P1_SCE_VJP
+from autograd.row_ops import ROW_COOP, OP_ROW_BITONIC_BLOCK
+from autograd.row_sort import row_bitonic_block_kernel
+from sequence.gemm_tiled import GT_TPB, SEQ_GEMM_TILED, seq_gemm_tiled_blocks, seq_gemm_tiled_kernel, seq_gemm_tiled_on
+from sequence.gemm_tiled import seq_gemm_epi_tiled_kernel
+from sequence.gemm_tiled import (
+    GEMM_DISPATCH_V1, GR_CELL, GR_TILE, GR_THIN_N, GR_THIN_M, GT_M, GT_N, GT_K, GT_THIN, GT_THIN_K,
+    GK_PLAIN, GK_BIAS, GK_BIAS_RELU, GK_BIAS_ACT, GK_L2GRAD, GK_ACT_BWD,
+    seq_gemm_route, seq_gemm_epi_kind, seq_gemm_tile_blocks, seq_gemm_tile_kernel,
+)
+from sequence.gemm_tiled import (
+    GR_MICRO, GK_BIAS_LOGISTIC, GK_BIAS_TANH, seq_gemm_micro_kernel, seq_gemm_micro_on,
+    seq_gemm_split_blocks, seq_gemm_split_kernel,
+)
+from sequence.gemm_split import GEMM_SPLITK, OP_GK_SPLIT, gemm_split_args, gemm_split_on
+from sequence.ops import OP_GEMM_EPI
+from autograd.ops import OP_AGK_GEMM_EPI, agk_colsum_args
+from sequence.ops import OP_COLSUM_DIV
+from sequence.ops import OP_THETA
+from sequence.ops import OP_LN_BWD_X, OP_LN_FWD, OP_AF_RMEAN, OP_AF_ROW, OP_AF_COL
+from sequence.adafactor import AF_COL_CHUNK_FOLD
+from sequence.adafactor_candidates import AF_COL_LANES, af_col_chunk_kernel
+from sequence.theta_spec import THETA_SPEC
+from sequence.ets_spec import ETS_SPEC, op_ets_spec
+from sequence.ops import OP_CHOLSOLVE, OP_VAR_FORECAST, TSA2_VAR, OP_COLSCALE, OP_VAR_SIGMA, SEQ_FAST_VAR_COOP
+from sequence.vecar_block import VAR_SMEM, VAR_TPB, var_chol_block_kernel, var_forecast_block_kernel
+from sequence.fit_team import SeqTeam, garch_team, prophet_fit_team
+from sequence.ets_team import ETS_TEAM, IDN_ETS_TEAM, ets_team
+from sequence.prophet_coop import PROPHET_COOP, prophet_fit_coop
+from sequence.ops import OP_ETS, OP_GARCH
+from sequence.recurrent_scan import OP_CELL_BWD_SCAN, OP_CELL_FWD_SCAN, cell_fwd_scan_kernel, scan_block
+from autograd.kernels.recurrent_scan import cell_bwd_scan_kernel
+from x_linear.ops import IP
+from x_linear.witness import witness_end
+from std.sys.info import has_apple_gpu_accelerator
+
+#: the simdgroup-cooperative long folds (sequence/coop.mojo): Apple, and
+#: since nr-small D1/D11 (2026-10-04) NVIDIA and AMD in IDENTICAL. The
+#: cooperative fold is the one-thread op's chain (same fmas, same values,
+#: same order; only the loads are spread over the warp), so no bit moves on
+#: any column; `coop_bcast` keeps a cell inside its 32-lane half of a CDNA
+#: wavefront. -D ANONLIB_IDN_SEQ_COOP_NVAMD_OFF (or ANONLIB_IDN_ALL_OFF)
+#: restores Apple only.
+comptime SEQ_COOP_NVAMD = (
+    GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL
+    and not (is_defined["ANONLIB_IDN_SEQ_COOP_NVAMD_OFF"]() or is_defined["ANONLIB_IDN_ALL_OFF"]())
+)
+comptime SEQ_COOP = has_apple_gpu_accelerator() or SEQ_COOP_NVAMD
+#: nr-small D10: LayerNorm forward / backward-x rows on a simdgroup (the
+#: same chains over broadcast words, coalesced loads; sequence/coop.mojo),
+#: IDENTICAL on every GPU. -D ANONLIB_IDN_SEQ_LN_COOP_OFF (or
+#: ANONLIB_IDN_ALL_OFF) restores one thread per row.
+#: nr-small D11: Adafactor's row factor (op_af_row) and row-var mean
+#: (op_af_rmean, one thread) on a simdgroup, the same chains; IDENTICAL.
+#: -D ANONLIB_IDN_SEQ_AF_COOP_OFF (or ANONLIB_IDN_ALL_OFF).
+comptime SEQ_AF_COOP = (
+    GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL
+    and not (is_defined["ANONLIB_IDN_SEQ_AF_COOP_OFF"]() or is_defined["ANONLIB_IDN_ALL_OFF"]())
+)
+comptime SEQ_LN_COOP = (
+    GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL
+    and not (is_defined["ANONLIB_IDN_SEQ_LN_COOP_OFF"]() or is_defined["ANONLIB_IDN_ALL_OFF"]())
+)
+
+comptime TPB = 128
+
+#: Apple FAST pipelined transport (lane apple-fast-regress, 2026-10-03;
+#: docs/apple-fast/notes/regress-oct3.md). cpu-gpu-cleanup n-seq
+#: (1774263e0) made `_pcopy` one memcpy on the calling thread; at the
+#: board's 64 MB tensors (layernorm, adafactor, the optimizers) each
+#: transfer is then a serial DMA plus a serial single-thread copy, the
+#: rows' regression against 0.8.34. Instead of restoring host threads, the
+#: copy and the DMA overlap, chunk by chunk (SEQ_PIPE_CH floats):
+#:  ANONLIB_SEQ_FAST_PIPE_UP: an upload copies chunk i into its stage and
+#:    queues its DMA at once, so the DMA of chunk i runs while chunk i + 1
+#:    is copied (the stage still holds every chunk until the next sync).
+#:  ANONLIB_SEQ_FAST_PIPE_DOWN: the downloads of a sync go through two
+#:    pinned halves: the DMA of chunk i overlaps the read of chunk i - 1
+#:    (opt_resident's OPT_PIPE_DOWN, which took the optimizers 318 -> 191 ms
+#:    on the M3, for every x_sequence download).
+#: Copies only: the same bytes, the same launches, no bit moves. Default on
+#: FAST + Apple since the M3 A/B (n=3, digests identical): layernorm
+#: 76.0 -> 52.2 ms (UP + DOWN), adafactor 685.7 -> 390.0 ms (DOWN), adagrad
+#: 195.5 -> 199.1 ms (neutral). -D ANONLIB_SEQ_FAST_PIPE_UP_OFF /
+#: -D ANONLIB_SEQ_FAST_PIPE_DOWN_OFF restore the serial copies; the old
+#: -D ANONLIB_SEQ_FAST_PIPE_UP=1 / _DOWN=1 are harmless. IDENTICAL and
+#: the other vendors compile the main path unchanged.
+comptime _SEQ_APPLE_FAST = GLOBAL_NUMERIC_MODE == NUMERIC_FAST and has_apple_gpu_accelerator()
+#: lane idn-opt-resident (2026-10-04): IDENTICAL takes the same pipelined
+#: copies on every vendor (NVIDIA, AMD, Apple). Copies only: the same bytes,
+#: the same launches, no bit moves. -D ANONLIB_IDN_SEQ_PIPE_UP_OFF /
+#: -D ANONLIB_IDN_SEQ_PIPE_DOWN_OFF restore IDENTICAL's serial copies.
+#: FAST on NVIDIA and AMD is unchanged.
+comptime _SEQ_IDN = GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL
+comptime SEQ_PIPE_UP = (_SEQ_APPLE_FAST and not is_defined["ANONLIB_SEQ_FAST_PIPE_UP_OFF"]()) or (
+    _SEQ_IDN and not (is_defined["ANONLIB_IDN_SEQ_PIPE_UP_OFF"]() or is_defined["ANONLIB_IDN_ALL_OFF"]())
+)
+comptime SEQ_PIPE_DOWN = (_SEQ_APPLE_FAST and not is_defined["ANONLIB_SEQ_FAST_PIPE_DOWN_OFF"]()) or (
+    _SEQ_IDN and not (is_defined["ANONLIB_IDN_SEQ_PIPE_DOWN_OFF"]() or is_defined["ANONLIB_IDN_ALL_OFF"]())
+)
+#: the pipelined chunk, floats (8 MB; lane apple-fast-gap-optim:
+#: -D ANONLIB_SEQ_FAST_PIPE_CH=<floats> for the A/B)
+comptime SEQ_PIPE_CH = get_defined_int["ANONLIB_SEQ_FAST_PIPE_CH", 1 << 21]()
+#: lane apple-fast-gap-optim (2026-10-03, docs/apple-fast/notes/gap-optim.md):
+#: its two read-back candidates for the pipelined downloads (map_to_host,
+#: raw chunked DMA) were deleted 2026-10-09 as losers (TOMBSTONES below).
+# TOMBSTONE: ANONLIB_SEQ_FAST_MAP_DOWN (DROPPED-slower: M3 afc_ab_def 2026-10-04 layernorm 50.2 -> 79.8 ms; rab2-seqmapdown
+# +58.7%) deleted 2026-10-09 on lane/owed-deletions-D2; code recoverable at b639a2bd2.
+# Restore: git apply experiments/removed/ANONLIB_SEQ_FAST_MAP_DOWN.patch
+#: SEQ_FAST_VAR_COOP (sequence/ops.mojo): VAR's long folds as coop cells, routed in `launch`.
+# TOMBSTONE: ANONLIB_SEQ_FAST_VAR_NODRAIN (DROPPED-slower: M3 afc_ab_def verdicts batch 6, 2026-10-05, mixed, var taxi-hourly
+# +10.6%) deleted 2026-10-09 on lane/owed-deletions-D2; code recoverable at b639a2bd2.
+# Restore: git apply experiments/removed/ANONLIB_SEQ_FAST_VAR_NODRAIN.patch
+# TOMBSTONE: ANONLIB_SEQ_FAST_RAW_DOWN (DROPPED-slower: M3 rab7-seqrawdown layernorm 48.99 -> 73.68 ms, +50.4%) deleted
+# 2026-10-09 on lane/owed-deletions-D2; code recoverable at b639a2bd2.
+# Restore: git apply experiments/removed/ANONLIB_SEQ_FAST_RAW_DOWN.patch
+
+
+struct _SeqContext(Defaultable, Movable):
+    """ONE process-lifetime DeviceContext for every `DeviceExec`. A context
+    per binding call exhausts Metal's per-process command queues within one
+    fit (memory: METAL QUEUE LIMIT IS PER-PROCESS; the cnn lane's M2 Pro
+    finding). Storage is `std.ffi._Global`, one slot per numeric tier so a
+    FAST and an IDENTICAL .so in one process never share it."""
+    var ctx: Optional[DeviceContext]
+
+    def __init__(out self):
+        self.ctx = Optional[DeviceContext]()
+
+
+comptime _CTX_NAME = "MojoXSequenceContextIdentical" if GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL else "MojoXSequenceContextFast"
+comptime X_SEQUENCE_CONTEXT = _Global[StorageType=_SeqContext, name=_CTX_NAME, init_fn=_SeqContext.__init__]
+
+
+def sequence_ctx() raises -> DeviceContext:
+    """The shared context, created on first use."""
+    var slot = X_SEQUENCE_CONTEXT.get_or_create_ptr()
+    if not slot[].ctx:
+        slot[].ctx = DeviceContext()
+    return slot[].ctx.value().copy()
+
+
+@always_inline
+def _pack_ii(lo: Int, hi: Int) -> Int64:
+    """Two Int32 values in one Int64 word (lo in the low half)."""
+    return Int64(Int(UInt32(Int32(lo))) | (Int(UInt32(Int32(hi))) << 32))
+
+
+@always_inline
+def _lo(w: Int64) -> Int:
+    return Int(Int32(w & 0xFFFFFFFF))
+
+
+@always_inline
+def _hi(w: Int64) -> Int:
+    return Int(Int32((w >> 32) & 0xFFFFFFFF))
+
+
+@always_inline
+def _i32_out(v: Int) -> Bool:
+    return v > 2147483647 or v < -2147483648
+
+
+@always_inline
+def _args_i32_out(a: Args) -> Bool:
+    """True when any of the twelve integer slots does not fit Int32 (the
+    launch packs them as Int32; lane ag-pass6-host idea G: no List a launch)."""
+    return (
+        _i32_out(a.i0) or _i32_out(a.i1) or _i32_out(a.i2) or _i32_out(a.i3)
+        or _i32_out(a.i4) or _i32_out(a.i5) or _i32_out(a.i6) or _i32_out(a.i7)
+        or _i32_out(a.i8) or _i32_out(a.i9) or _i32_out(a.i10) or _i32_out(a.i11)
+    )
+
+
+@always_inline
+def _pack_ff(lo: Float32, hi: Float32) -> Int64:
+    """Two floats' bit patterns in one Int64 word (exact)."""
+    return Int64(Int(bitcast[DType.uint32](lo)) | (Int(bitcast[DType.uint32](hi)) << 32))
+
+
+@always_inline
+def _flo(w: Int64) -> Float32:
+    return bitcast[DType.float32](UInt32(w & 0xFFFFFFFF))
+
+
+@always_inline
+def _fhi(w: Int64) -> Float32:
+    return bitcast[DType.float32](UInt32((w >> 32) & 0xFFFFFFFF))
+
+
+
+def _moe_tiled_on() -> Bool:
+    return String(getenv("ANONLIB_SEQ_MOE_TILED")) != "0"
+
+
+def _var_block_on() -> Bool:
+    """VAR's Cholesky solve and forecast on one threadgroup
+    (sequence/vecar_block.mojo, lane gap-prep2); ANONLIB_SEQ_VAR_BLOCK=0
+    keeps the one-thread ops (the A/B arm)."""
+    return String(getenv("ANONLIB_SEQ_VAR_BLOCK")) != "0"
+
+
+def seq_kernel[OP: Int](
+    p0: FP, p1: FP, p2: FP, p3: FP, p4: FP, p5: FP,
+    p6: FP, p7: FP, p8: FP, p9: FP, p10: FP, p11: FP,
+    i01: Int64, i23: Int64, i45: Int64, i67: Int64, i89: Int64, i1011: Int64,
+    f01: Int64, f23: Int64, f45: Int64, f67: Int64,
+    n: Int64,
+):
+    """One thread per element. The twelve integers and eight floats travel
+    packed two to an Int64 word (bit-exact): Metal binds every kernel
+    argument to its own buffer slot and has 31, so the unpacked 33-argument
+    signature failed to compile on Apple."""
+    # Tried 2026-10-08 (ANONLIB_C58_FORECAST4, four series per thread for theta/ets/garch, run ge123e6f9): NV/AMD
+    # 2.93x/2.58x synthetic, 2.81x/2.13x taxi-hourly on auto-theta and 2.5-3.2x on every theta/damped-ets cell, quality SAME
+    # (4x less parallelism). Deleted, the define refused; recoverable at main bc10b8b56; row in docs/apple-fast/EXPERIMENTS.md.
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if i < Int(n):
+        var a = Args(p0, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11,
+                     _lo(i01), _hi(i01), _lo(i23), _hi(i23), _lo(i45), _hi(i45),
+                     _lo(i67), _hi(i67), _lo(i89), _hi(i89), _lo(i1011), _hi(i1011),
+                     _flo(f01), _fhi(f01), _flo(f23), _fhi(f23),
+                     _flo(f45), _fhi(f45), _flo(f67), _fhi(f67))
+        apply[OP](i, a)
+
+
+def team_kernel[OP: Int](
+    p0: FP, p1: FP, p2: FP, p3: FP, p4: FP, p5: FP,
+    p6: FP, p7: FP, p8: FP, p9: FP, p10: FP, p11: FP,
+    i01: Int64, i23: Int64, i45: Int64, i67: Int64, i89: Int64, i1011: Int64,
+    f01: Int64, f23: Int64, f45: Int64, f67: Int64,
+    n: Int64, wf: IP, woff: Int32, nonce: Int32,
+):
+    """One block per series of the group (the arguments packed as
+    seq_kernel's). The early exit is block-uniform, and every thread then
+    reaches the completion witness (x_linear/witness.mojo: on Apple each
+    block's word reports the slice ran to its end; elsewhere nothing)."""
+    var blk = Int(block_idx.x)
+    if blk < Int(n):
+        var a = Args(p0, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11,
+                     _lo(i01), _hi(i01), _lo(i23), _hi(i23), _lo(i45), _hi(i45),
+                     _lo(i67), _hi(i67), _lo(i89), _hi(i89), _lo(i1011), _hi(i1011),
+                     _flo(f01), _fhi(f01), _flo(f23), _fhi(f23),
+                     _flo(f45), _fhi(f45), _flo(f67), _fhi(f67))
+        var team = SeqTeam(Int(thread_idx.x), Int(block_dim.x))
+        comptime if OP == OP_GARCH:
+            garch_team(blk, team, a)
+        elif (ETS_TEAM or IDN_ETS_TEAM) and OP == OP_ETS:
+            # Apple FAST default (off: -D ANONLIB_ETS_TEAM_OFF; sequence/ets_team.mojo);
+            # IDENTICAL default (off: -D ANONLIB_IDN_ETS_TEAM_OFF; the tree prefix)
+            ets_team(blk, team, a)
+        elif PROPHET_COOP:
+            # Apple FAST default (off: -D ANONLIB_PROPHET_COOP_OFF; sequence/prophet_coop.mojo)
+            prophet_fit_coop(blk, team, a)
+        else:
+            prophet_fit_team(blk, team, a)
+    witness_end(wf, woff, nonce)
+
+
+
+def _pcopy(dst: FP, src: FP, n: Int):
+    """A host transport copy: one memcpy on the calling thread (no host task
+    pool on a GPU install; cpu-gpu-cleanup n-seq, 2026-10-02). Data movement
+    only, the bytes are the same."""
+    if n > 0:
+        memcpy(dest=dst, src=src, count=n)
+
+
+def coop_kernel[OP: Int](
+    p0: FP, p1: FP, p2: FP, p3: FP, p4: FP, p5: FP,
+    p6: FP, p7: FP, p8: FP, p9: FP, p10: FP, p11: FP,
+    i01: Int64, i23: Int64, i45: Int64, i67: Int64, i89: Int64, i1011: Int64,
+    f01: Int64, f23: Int64, f45: Int64, f67: Int64,
+    n: Int64,
+):
+    """One simdgroup (COOP_W threads) per cell of OP (sequence/coop.mojo);
+    TPB is a multiple of COOP_W, so a cell's lanes share one simdgroup and
+    leave together."""
+    var g = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    var cell = g // COOP_W
+    if cell < Int(n):
+        var a = Args(p0, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11,
+                     _lo(i01), _hi(i01), _lo(i23), _hi(i23), _lo(i45), _hi(i45),
+                     _lo(i67), _hi(i67), _lo(i89), _hi(i89), _lo(i1011), _hi(i1011),
+                     _flo(f01), _fhi(f01), _flo(f23), _fhi(f23),
+                     _flo(f45), _fhi(f45), _flo(f67), _fhi(f67))
+        comptime if ETS_SPEC and OP == OP_ETS:
+            # ANONLIB_IDN_NM_SPEC: no-season ETS with the Nelder-Mead
+            # candidates on the cell's lanes (sequence/ets_spec.mojo)
+            op_ets_spec(cell, g - cell * COOP_W, a)
+        else:
+            apply_coop[OP](cell, g - cell * COOP_W, a)
+
+
+
+# ---- the buffer pool (lane neural-pass40, 2026-10-01) ----------------------------------------
+#: Every binding call built a fresh DeviceExec that created its device
+#: buffers and one PINNED host buffer per upload and per download, all
+#: freed at the end of the call: at the board's layer cells (a 64 MB x in,
+#: a 64 MB y out) that is three device allocations and two pinned
+#: allocations of 64 MB per call, and on CUDA a pinned allocation of that
+#: size costs tens of milliseconds (the layernorm cell: 99.7 ms on an L40S
+#: against a ~1 ms kernel). The pool keeps the process's device buffers and
+#: pinned stages across calls, handed out by exact count (device) or
+#: capacity (pinned) and returned when the executor syncs (stages) or ends
+#: (device buffers); the words are copied exactly as before, so no bit
+#: moves. ANONLIB_SEQ_POOL=0 restores the per-call allocations;
+#: SEQ_POOL_BYTES bounds what is kept (the oldest free entries go first).
+comptime SEQ_POOL_BYTES = 3 << 30
+
+
+struct _SeqPool(Defaultable, Movable):
+    var dev: List[DeviceBuffer[DType.float32]]
+    var dev_n: List[Int]
+    var dev_free: List[Bool]
+    var host: List[HostBuffer[DType.float32]]
+    var host_n: List[Int]
+    var host_free: List[Bool]
+    var bytes: Int
+
+    def __init__(out self):
+        self.dev = List[DeviceBuffer[DType.float32]]()
+        self.dev_n = List[Int]()
+        self.dev_free = List[Bool]()
+        self.host = List[HostBuffer[DType.float32]]()
+        self.host_n = List[Int]()
+        self.host_free = List[Bool]()
+        self.bytes = 0
+
+
+comptime _POOL_NAME = "MojoXSequencePoolIdentical" if GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL else "MojoXSequencePoolFast"
+comptime X_SEQUENCE_POOL = _Global[StorageType=_SeqPool, name=_POOL_NAME, init_fn=_SeqPool.__init__]
+
+
+def seq_pool_on() -> Bool:
+    return String(getenv("ANONLIB_SEQ_POOL")) != "0"
+
+
+def _pool_trim(ctx: DeviceContext, pool: UnsafePointer[_SeqPool, MutUntrackedOrigin], need: Int) raises:
+    """Drop free entries' storage, oldest first, until `need` more bytes fit.
+    The slot itself stays (a 1-float placeholder, size 0, free): every live
+    executor holds pool INDICES (DeviceExec.pdev, retired_pdev, pstaged,
+    ppend_host, opt_resident's stages), so removing an entry from the lists
+    shifted every later index and a live buffer's index then named another
+    buffer or ran past the list (lane ag-pass4-gemm: AMD opbench, Session.linear
+    65536 x 256 after many smaller shapes, `index 236 ... valid range 0 to 119`
+    at DeviceExec._sub). A size-0 slot never matches a request (count >= 1) and
+    is refilled by the next new buffer."""
+    while pool[].bytes + need > SEQ_POOL_BYTES:
+        var dropped = False
+        for i in range(len(pool[].dev)):  # small-loop(pool: pooled device buffers): free-slot search, no data
+            if pool[].dev_free[i] and pool[].dev_n[i] > 0:
+                pool[].bytes -= pool[].dev_n[i] * 4
+                pool[].dev[i] = ctx.enqueue_create_buffer[DType.float32](1)
+                pool[].dev_n[i] = 0
+                dropped = True
+                break
+        if not dropped:
+            for i in range(len(pool[].host)):  # small-loop(pool: pooled host stages): free-slot search, no data
+                if pool[].host_free[i] and pool[].host_n[i] > 0:
+                    pool[].bytes -= pool[].host_n[i] * 4
+                    pool[].host[i] = ctx.enqueue_create_host_buffer[DType.float32](1)
+                    pool[].host_n[i] = 0
+                    dropped = True
+                    break
+        if not dropped:
+            return
+
+
+def _pool_dev(ctx: DeviceContext, count: Int) raises -> Int:
+    """A free device buffer of exactly `count` floats from the pool, or a
+    new one (in a trimmed slot if there is one, else appended); returns its
+    index (held until released; indices never move)."""
+    var pool = X_SEQUENCE_POOL.get_or_create_ptr()
+    for i in range(len(pool[].dev)):  # small-loop(pool: pooled device buffers): free-buffer slot search, no data
+        if pool[].dev_free[i] and pool[].dev_n[i] == count:
+            pool[].dev_free[i] = False
+            return i
+    _pool_trim(ctx, pool, count * 4)
+    var slot = -1
+    for i in range(len(pool[].dev)):  # small-loop(pool: pooled device buffers): trimmed-slot search, no data
+        if pool[].dev_free[i] and pool[].dev_n[i] == 0:
+            slot = i
+            break
+    pool[].bytes += count * 4
+    if slot >= 0:
+        pool[].dev[slot] = ctx.enqueue_create_buffer[DType.float32](count)
+        pool[].dev_n[slot] = count
+        pool[].dev_free[slot] = False
+        return slot
+    pool[].dev.append(ctx.enqueue_create_buffer[DType.float32](count))
+    pool[].dev_n.append(count)
+    pool[].dev_free.append(False)
+    return len(pool[].dev) - 1
+
+
+def _pool_host(ctx: DeviceContext, n: Int) raises -> Int:
+    """A free pinned stage of capacity >= n (the smallest that fits), or a
+    new one of n floats (in a trimmed slot if there is one, else appended);
+    returns its index (indices never move)."""
+    var pool = X_SEQUENCE_POOL.get_or_create_ptr()
+    var best = -1
+    for i in range(len(pool[].host)):
+        if pool[].host_free[i] and pool[].host_n[i] > 0 and pool[].host_n[i] >= n:
+            if best < 0 or pool[].host_n[i] < pool[].host_n[best]:
+                best = i
+    if best >= 0:
+        pool[].host_free[best] = False
+        return best
+    _pool_trim(ctx, pool, n * 4)
+    var slot = -1
+    for i in range(len(pool[].host)):  # small-loop(pool: pooled host stages): trimmed-slot search, no data
+        if pool[].host_free[i] and pool[].host_n[i] == 0:
+            slot = i
+            break
+    pool[].bytes += n * 4
+    if slot >= 0:
+        pool[].host[slot] = ctx.enqueue_create_host_buffer[DType.float32](n)
+        pool[].host_n[slot] = n
+        pool[].host_free[slot] = False
+        return slot
+    pool[].host.append(ctx.enqueue_create_host_buffer[DType.float32](n))
+    pool[].host_n.append(n)
+    pool[].host_free.append(False)
+    return len(pool[].host) - 1
+
+
+def _pool_release_dev(i: Int) raises:
+    var pool = X_SEQUENCE_POOL.get_or_create_ptr()
+    pool[].dev_free[i] = True
+
+
+def _pool_release_host(i: Int) raises:
+    var pool = X_SEQUENCE_POOL.get_or_create_ptr()
+    pool[].host_free[i] = True
+
+# Movable (lane ag-ops-api): an operation session (autograd/ops_api.mojo)
+# owns its executor across binding calls; moving changes no value.
+struct DeviceExec(Exec, Movable):
+    var ctx: DeviceContext
+    var bufs: List[DeviceBuffer[DType.float32]]
+    var base: List[Int]
+    var size: List[Int]
+    #: upload staging buffers still read by queued copies; released at the
+    #: next sync (an upload no longer waits for its own copy)
+    var staged: List[HostBuffer[DType.float32]]
+    #: download_async copies waiting for the next sync: (host buffer, dst, n)
+    var pend_host: List[HostBuffer[DType.float32]]
+    var pend_dst: List[Int]
+    var pend_n: List[Int]
+    #: the pool (lane neural-pass40): `pooled` says which route this
+    #: executor took; `pdev` the pool indices of its device buffers;
+    #: `pstaged` / `ppend_host` the pool indices of the stages in flight
+    var pooled: Bool
+    var pdev: List[Int]
+    var pstaged: List[Int]
+    var ppend_host: List[Int]
+    #: SEQ_PIPE_DOWN: downloads deferred to the next sync's pipeline
+    #: (destination address, device source address, count)
+    var pipe_dst: List[Int]
+    var pipe_src: List[Int]
+    var pipe_n: List[Int]
+    #: lane gap-gemm-layers: the pair offsets of the MoE grouping, on the host
+    #: (MOE_GROUPED_GEMM: the hidden op downloads them, the out op reuses them)
+    var moe_poff: List[Int]
+    #: lane ag-fusion (`free`): buffers returned while kernels that use them
+    #: may still be queued. They stay alive (owned) or held (pooled) until
+    #: the next sync or the end of this Exec drains the queue.
+    var retired: List[DeviceBuffer[DType.float32]]
+    var retired_pdev: List[Int]
+    #: lane ag-pass2-kernels: ANONLIB_AG_PROFILE read once at construction
+    #: (0 off, 1 count launches, 2 count and time them; sequence/launch_profile.mojo)
+    var profile: Int
+    # TOMBSTONE: ANONLIB_IDN_MOE_RESIDENT (LOSER 4.64x moe synthetic) deleted 2026-10-11 by 978e7f43b; code recoverable at 978e7f43b^.
+    # Restore: git apply experiments/removed/ANONLIB_IDN_MOE_RESIDENT.patch
+
+    def __init__(out self) raises:
+        self.ctx = sequence_ctx()
+        self.bufs = List[DeviceBuffer[DType.float32]]()
+        self.base = List[Int]()
+        self.size = List[Int]()
+        self.staged = List[HostBuffer[DType.float32]]()
+        self.pend_host = List[HostBuffer[DType.float32]]()
+        self.pend_dst = List[Int]()
+        self.pend_n = List[Int]()
+        self.pooled = seq_pool_on()
+        self.pdev = List[Int]()
+        self.pstaged = List[Int]()
+        self.ppend_host = List[Int]()
+        self.pipe_dst = List[Int]()
+        self.pipe_src = List[Int]()
+        self.pipe_n = List[Int]()
+        self.moe_poff = List[Int]()
+        self.retired = List[DeviceBuffer[DType.float32]]()
+        self.retired_pdev = List[Int]()
+        self.profile = launch_profile_level()
+
+    def __init__(out self, ctx: DeviceContext) raises:
+        """An executor on a caller's context (lane ag-transformer: the
+        autograd tape records over the transformer's own DeviceContext, so
+        its launches and the transformer's kernels share one in-order queue).
+        It never takes pooled storage: the pool's buffers belong to the
+        shared sequence context. Its destructor drains `ctx`."""
+        self.ctx = ctx.copy()
+        self.bufs = List[DeviceBuffer[DType.float32]]()
+        self.base = List[Int]()
+        self.size = List[Int]()
+        self.staged = List[HostBuffer[DType.float32]]()
+        self.pend_host = List[HostBuffer[DType.float32]]()
+        self.pend_dst = List[Int]()
+        self.pend_n = List[Int]()
+        self.pooled = False
+        self.pdev = List[Int]()
+        self.pstaged = List[Int]()
+        self.ppend_host = List[Int]()
+        self.pipe_dst = List[Int]()
+        self.pipe_src = List[Int]()
+        self.pipe_n = List[Int]()
+        self.moe_poff = List[Int]()
+        self.retired = List[DeviceBuffer[DType.float32]]()
+        self.retired_pdev = List[Int]()
+        self.profile = launch_profile_level()
+
+    def alloc(mut self, n: Int) raises -> FP:
+        return self._alloc(n, True)
+
+    def free(mut self, p: FP) raises:
+        # Drop p from the lookup lists now (a later copy naming it refuses);
+        # the storage itself goes at the next sync, after every queued kernel
+        # that reads or writes it has run.
+        var addr = Int(p)
+        for i in range(len(self.base)):  # small-loop(base: buffers this Exec allocated): address lookup, no data
+            if self.base[i] == addr:
+                _ = self.base.pop(i)
+                _ = self.size.pop(i)
+                if self.pooled:
+                    self.retired_pdev.append(self.pdev.pop(i))
+                else:
+                    # bufs also holds workspaces with no base entry: match by address
+                    for j in range(len(self.bufs)):  # small-loop(bufs: buffers this Exec owns): address lookup, no data
+                        if Int(self.bufs[j].unsafe_ptr()) == addr:
+                            self.retired.append(self.bufs.pop(j))
+                            break
+                return
+        raise Error("sequence: free names no buffer this device Exec allocated")
+
+    def _alloc(mut self, n: Int, zero: Bool) raises -> FP:
+        var count = n if n > 0 else 1
+        if self.pooled:
+            var i = _pool_dev(self.ctx, count)
+            var pool = X_SEQUENCE_POOL.get_or_create_ptr()
+            if zero:
+                pool[].dev[i].enqueue_fill(Float32(0.0))
+            var pp = FP(unsafe_from_address=Int(pool[].dev[i].unsafe_ptr()))
+            self.base.append(Int(pp))
+            self.size.append(count)
+            self.pdev.append(i)
+            return pp
+        var buf = self.ctx.enqueue_create_buffer[DType.float32](count)
+        if zero:
+            buf.enqueue_fill(Float32(0.0))
+        var p = FP(unsafe_from_address=Int(buf.unsafe_ptr()))
+        self.base.append(Int(p))
+        self.size.append(count)
+        self.bufs.append(buf^)
+        return p
+
+    def _sub(self, slot: Int, off: Int, n: Int) raises -> DeviceBuffer[DType.float32]:
+        """The view [off, off + n) of this executor's slot (pooled or owned)."""
+        if self.pooled:
+            var pool = X_SEQUENCE_POOL.get_or_create_ptr()
+            return pool[].dev[self.pdev[slot]].create_sub_buffer[DType.float32](off, n)
+        return self.bufs[slot].create_sub_buffer[DType.float32](off, n)
+
+    def __deinit__(deinit self):
+        # The context outlives this Exec: drain its queue before the buffers
+        # go, so no queued kernel reads a freed buffer.
+        # TOMBSTONE: ANONLIB_SEQ_FAST_VAR_NODRAIN (DROPPED-slower, var taxi-hourly +10.6%) deleted 2026-10-09 on
+        # lane/owed-deletions-D2: the drained flag; code recoverable at b639a2bd2.
+        # Restore: git apply experiments/removed/ANONLIB_SEQ_FAST_VAR_NODRAIN.patch
+        try:
+            self.ctx.synchronize()
+        except:
+            pass
+        try:
+            for i in range(len(self.pstaged)):
+                _pool_release_host(self.pstaged[i])
+            for i in range(len(self.ppend_host)):
+                _pool_release_host(self.ppend_host[i])
+            for i in range(len(self.pdev)):
+                _pool_release_dev(self.pdev[i])
+            for i in range(len(self.retired_pdev)):
+                _pool_release_dev(self.retired_pdev[i])
+        except:
+            pass
+
+    def _find(self, p: FP, n: Int) raises -> Tuple[Int, Int]:
+        var addr = Int(p)
+        for i in range(len(self.base)):  # small-loop(base: buffers this Exec allocated): address-to-buffer lookup, no data
+            var off = (addr - self.base[i]) // 4
+            if addr >= self.base[i] and off + n <= self.size[i]:
+                return (i, off)
+        raise Error("sequence: a copy names no buffer this device Exec allocated")
+
+    def upload(mut self, dst: FP, src: FP, n: Int) raises:
+        """The caller's floats are copied (memcpy, bit for bit) into a staging
+        buffer at once, so `src` may change as soon as this returns; the
+        device copy is queued behind the work already queued, and the staging
+        buffer lives until the next sync. No wait here (Apple speed,
+        2026-09-28: every upload was a synchronize, about 4 ms on Metal, and
+        an element-at-a-time host loop)."""
+        if n <= 0:
+            return
+        var found = self._find(dst, n)
+        var view = self._sub(found[0], found[1], n)
+        if self.pooled:
+            var hi = _pool_host(self.ctx, n)
+            var pool = X_SEQUENCE_POOL.get_or_create_ptr()
+            var hp = pool[].host[hi].unsafe_ptr()
+            comptime if SEQ_PIPE_UP:
+                if n >= 2 * SEQ_PIPE_CH:
+                    # chunk i's DMA is queued as soon as it is staged, and
+                    # runs while chunk i + 1 is copied
+                    _ = view^
+                    var hpf = FP(unsafe_from_address=Int(hp))
+                    var done = 0
+                    while done < n:
+                        var cnt = min(SEQ_PIPE_CH, n - done)
+                        memcpy(dest=hpf + done, src=src + done, count=cnt)
+                        var cv = self._sub(found[0], found[1] + done, cnt)
+                        self.ctx.enqueue_copy(dst_buf=cv, src_ptr=hpf + done)
+                        _ = cv^
+                        done += cnt
+                    self.pstaged.append(hi)
+                    return
+            _pcopy(hp, src, n)
+            self.ctx.enqueue_copy(dst_buf=view, src_ptr=hp)
+            self.pstaged.append(hi)
+            _ = view^
+            return
+        var host = self.ctx.enqueue_create_host_buffer[DType.float32](n)
+        _pcopy(host.unsafe_ptr(), src, n)
+        self.ctx.enqueue_copy(dst_buf=view, src_ptr=host.unsafe_ptr())
+        _ = view^
+        self.staged.append(host^)
+
+    def bind(mut self, src: FP, n: Int) raises -> FP:
+        # every word is uploaded over at once: no zero fill first (apple2)
+        var p = self._alloc(n, n <= 0)
+        self.upload(p, src, n)
+        return p
+
+    def download(mut self, dst: FP, src: FP, n: Int) raises:
+        if n <= 0:
+            return
+        comptime if SEQ_PIPE_DOWN:
+            if self.pooled and n >= 2 * SEQ_PIPE_CH:
+                self.download_async(dst, src, n)
+                self.sync()
+                return
+        var found = self._find(src, n)
+        var view = self._sub(found[0], found[1], n)
+        if self.pooled:
+            var hi = _pool_host(self.ctx, n)
+            var pool = X_SEQUENCE_POOL.get_or_create_ptr()
+            var hp = pool[].host[hi].unsafe_ptr()
+            self.ctx.enqueue_copy(dst_ptr=hp, src_buf=view)
+            self.sync()
+            _pcopy(dst, hp, n)
+            _pool_release_host(hi)
+            _ = view^
+            return
+        var host = self.ctx.enqueue_create_host_buffer[DType.float32](n)
+        self.ctx.enqueue_copy(dst_ptr=host.unsafe_ptr(), src_buf=view)
+        self.sync()
+        _pcopy(dst, host.unsafe_ptr(), n)
+        _ = view^
+        _ = host^
+
+    def download_async(mut self, dst: FP, src: FP, n: Int) raises:
+        """The copy is queued now; `dst` is written at the next sync, so
+        several downloads share one wait (apple2)."""
+        if n <= 0:
+            return
+        var found = self._find(src, n)
+        comptime if SEQ_PIPE_DOWN:
+            if self.pooled and n >= 2 * SEQ_PIPE_CH:
+                # nothing queued now: the next sync runs the pipeline
+                self.pipe_dst.append(Int(dst))
+                self.pipe_src.append(Int(src))
+                self.pipe_n.append(n)
+                return
+        if self.pooled:
+            var hi = _pool_host(self.ctx, n)
+            var pool = X_SEQUENCE_POOL.get_or_create_ptr()
+            var hp = pool[].host[hi].unsafe_ptr()
+            var pview = self._sub(found[0], found[1], n)
+            self.ctx.enqueue_copy(dst_ptr=hp, src_buf=pview)
+            _ = pview^
+            self.ppend_host.append(hi)
+            self.pend_dst.append(Int(dst))
+            self.pend_n.append(n)
+            return
+        var host = self.ctx.enqueue_create_host_buffer[DType.float32](n)
+        var view = self._sub(found[0], found[1], n)
+        self.ctx.enqueue_copy(dst_ptr=host.unsafe_ptr(), src_buf=view)
+        _ = view^
+        self.pend_host.append(host^)
+        self.pend_dst.append(Int(dst))
+        self.pend_n.append(n)
+
+    def launch[OP: Int](mut self, a: Args, n: Int) raises:
+        # lane ag-pass2-kernels: the launch profile (ANONLIB_AG_PROFILE).
+        # Off, one Int test. Level 2 drains the queue before and after the
+        # launch so the host clock brackets this launch alone: a relative
+        # profile, the syncs change the timing.
+        if self.profile == 0:
+            self._launch[OP](a, n)
+            return
+        if n <= 0:
+            return
+        var t0 = 0
+        if self.profile >= 2:
+            self.sync()
+            t0 = Int(perf_counter_ns())
+        self._launch[OP](a, n)
+        var ns = 0
+        if self.profile >= 2:
+            self.sync()
+            ns = Int(perf_counter_ns()) - t0
+            # lane ag-pass5-gemm: the drain line, one synchronize on the
+            # now-empty queue (outside this launch's bracket)
+            var t1 = Int(perf_counter_ns())
+            self.ctx.synchronize()
+            launch_profile_record_drain(Int(perf_counter_ns()) - t1)
+        launch_profile_record(OP, n, ns, self.profile)
+        # lane ag-pass5-gemm: one row per (code, route, M, N, K) for the GEMMs
+        comptime if OP == OP_GEMM or OP == OP_AGK_GEMM_EPI or OP == OP_GEMM_EPI or OP == OP_GEMM_SPLITK:
+            launch_profile_record_shape(
+                OP, seq_gemm_profile_route[OP](a, SEQ_COOP, SEQ_FAST_VAR_COOP), a.i0, a.i1, a.i2, ns,
+            )
+
+    def _launch[OP: Int](mut self, a: Args, n: Int) raises:
+        if n <= 0:
+            return
+        # The autograd family (OP_AG_FIRST..OP_AG_LAST, autograd/ops.mojo) runs
+        # here like every other code: qualified 2026-10-18 with the 97-case
+        # gradient suite giving the same digests on Metal, NVIDIA L40S and AMD
+        # MI325X (docs/plans/NATIVE_AUTOGRAD.md, "GPU status").
+        # lane ag-pass6-host (idea G): twelve comparisons, no List literal per
+        # launch; the List walk runs only on the refusal, to name the value.
+        if _args_i32_out(a):
+            comptime I32_MAX = 2147483647
+            for v in [a.i0, a.i1, a.i2, a.i3, a.i4, a.i5, a.i6, a.i7, a.i8, a.i9, a.i10, a.i11]:
+                if v > I32_MAX or v < -I32_MAX - 1:
+                    raise Error("sequence DeviceExec: an integer argument does not fit Int32 (" + String(v) + ")")
+        # TOMBSTONE (lane/postmerge-act-5, 2026-10-09: -D ANONLIB_IDN_AF_VEC_FUSED (Adafactor fused vector step)): the OP_AF_VFUSE / OP_AF_VFIN
+        # launches were NOISE: NV 13.671 -> 13.738 ms (1.00x, nv2 v1010/v1012), AMD 8.620 -> 8.186 ms (0.95x, a1141/a1143), avg 0.98x, digest aa99a3dc unchanged; recoverable at main 0a7b206f1.
+        # NI54 neural optimizer-only opcode. Every lane's logical leaf is
+        # shared with HostExec's op_af_col; no statistical estimator op moves.
+        comptime if AF_COL_CHUNK_FOLD and OP == OP_AF_COL:
+            self.ctx.enqueue_function[af_col_chunk_kernel](
+                a.p0, a.p1, Int32(a.i0), Int32(a.i1), a.f0,
+                grid_dim=(n, 1, 1), block_dim=(AF_COL_LANES, 1, 1),
+            )
+            return
+        # lane apple-fast-gap-lstm (sequence/recurrent_scan.mojo): the whole
+        # recurrence of a layer, one block per batch row (n = B rows); the
+        # integers packed as seq_kernel's (lane ag-pass5-recurrent)
+        comptime if OP == OP_CELL_FWD_SCAN:
+            self.ctx.enqueue_function[cell_fwd_scan_kernel](
+                a.p0, a.p1, a.p2, a.p3, a.p4, a.p5, a.p6, a.p7, a.p8, a.p9, a.p10, a.p11,
+                _pack_ii(a.i0, a.i1), _pack_ii(a.i2, a.i3), _pack_ii(a.i4, a.i5), Int64(n),
+                grid_dim=(n, 1, 1), block_dim=(scan_block(a.i0, a.i2), 1, 1),
+            )
+            return
+        comptime if OP == OP_CELL_BWD_SCAN:
+            self.ctx.enqueue_function[cell_bwd_scan_kernel](
+                a.p0, a.p1, a.p2, a.p3, a.p4, a.p5, a.p6, a.p7, a.p8, a.p9, a.p10, a.p11,
+                _pack_ii(a.i0, a.i1), _pack_ii(a.i2, a.i3), _pack_ii(a.i4, a.i5), Int64(n),
+                grid_dim=(n, 1, 1), block_dim=(scan_block(a.i0, a.i2), 1, 1),
+            )
+            return
+        # lane ag-pass6-fold (autograd/fold_kernels.mojo): the staged fold
+        # leaves, four elements a thread, the transpose tile; the scalar
+        # bodies' words. False: the route rule keeps seq_kernel below.
+        comptime if ag_pass6_op[OP]():
+            if ag_pass6_launch[OP](self.ctx, a, n):
+                return
+        # The MoE products as tiled kernels with the items' chains (lane
+        # neural-pass29, sequence/moe_tiled.mojo) when the entry grouped the
+        # pairs by expert (a.i4 = the block count); ANONLIB_SEQ_MOE_TILED=0
+        # keeps the one-thread-per-cell items.
+        # Apple FAST (lane apple-fast-moespeed, sequence/moe_reg.mojo):
+        # ANONLIB_MOE_REGTILE, the router's logits tiled and the products
+        # register-tiled, the same chains; ANONLIB_MOE_DEVGROUP, the pairs
+        # grouped by expert on the device (a.i6 = 1 from the entry).
+        # lane cgr5-owed: the pairs grouped by expert on the device for any E
+        # (sequence/moe_group.mojo), a.i6 = 2 from the entry: p2 the picks,
+        # p4 order, p5 poff, p6 boff_h, p7 counts | cursors (2E int32
+        # words), p8 boff_o; i3 E, i5 / i7 the F / D tiles.
+        comptime if OP == OP_MOE_HIDDEN:
+            if a.i6 == 2:
+                var gp = n // a.i1
+                var gt = MOE_GROUP_TPB
+                self.ctx.enqueue_function[moe_group_zero_all_kernel](
+                    a.p7, Int32(2 * a.i3), grid_dim=((2 * a.i3 + gt - 1) // gt, 1, 1), block_dim=(gt, 1, 1),
+                )
+                self.ctx.enqueue_function[moe_group_count_all_kernel](
+                    a.p2, a.p7, Int32(gp), grid_dim=((gp + gt - 1) // gt, 1, 1), block_dim=(gt, 1, 1),
+                )
+                self.ctx.enqueue_function[moe_group_offsets_all_kernel](
+                    a.p7, a.p5, a.p6, a.p8, Int32(a.i3), Int32(a.i5), Int32(a.i7),
+                    grid_dim=((a.i3 + gt) // gt, 1, 1), block_dim=(gt, 1, 1),
+                )
+                comptime if MOE_STABLE_PACK:
+                    self.ctx.enqueue_function[moe_group_stable_all_kernel](
+                        a.p2, a.p5, a.p4, Int32(gp), Int32(a.i3),
+                        grid_dim=((a.i3 + gt - 1) // gt, 1, 1), block_dim=(gt, 1, 1),
+                    )
+                else:
+                    self.ctx.enqueue_function[moe_group_scatter_all_kernel](
+                        a.p2, a.p7, a.p5, a.p4, Int32(gp), Int32(a.i3),
+                        grid_dim=((gp + gt - 1) // gt, 1, 1), block_dim=(gt, 1, 1),
+                    )
+        comptime if MOE_REGTILE and OP == OP_MOE_ROUTE:
+            if a.i1 <= MOE_RT:
+                var bt = MOE_RT // a.i1
+                self.ctx.enqueue_function[moe_logits_reg_kernel](
+                    a.p0, a.p1, a.p2, Int32(n), Int32(a.i0), Int32(a.i1),
+                    grid_dim=((n + bt - 1) // bt, 1, 1), block_dim=(MOE_RT, 1, 1),
+                )
+                self.ctx.enqueue_function[moe_route_tail_kernel](
+                    a.p2, a.p3, a.p4, a.p5, Int32(n), Int32(a.i1), Int32(a.i2), Int32(a.i3),
+                    grid_dim=((n + TPB - 1) // TPB, 1, 1), block_dim=(TPB, 1, 1),
+                )
+                return
+        comptime if MOE_REGTILE and OP == OP_MOE_HIDDEN:
+            if a.i4 > 0:
+                if n % a.i1 != 0:
+                    raise Error("moe_reg hidden: the cell count is not pairs x F")
+                var npairs = n // a.i1
+                comptime if MOE_DEVGROUP:
+                    if a.i6 == 1:
+                        # a.p7 the int32 counts | cursors (2E words)
+                        self.ctx.enqueue_function[moe_group_zero_kernel](
+                            a.p7, Int32(a.i3), grid_dim=(1, 1, 1), block_dim=(MOE_RT, 1, 1),
+                        )
+                        self.ctx.enqueue_function[moe_group_count_kernel](
+                            a.p2, a.p7, Int32(npairs),
+                            grid_dim=((npairs + TPB - 1) // TPB, 1, 1), block_dim=(TPB, 1, 1),
+                        )
+                        self.ctx.enqueue_function[moe_group_offsets_kernel](
+                            a.p7, a.p5, Int32(a.i3), grid_dim=(1, 1, 1), block_dim=(MOE_RT, 1, 1),
+                        )
+                        comptime if MOE_STABLE_PACK:
+                            self.ctx.enqueue_function[moe_group_stable_all_kernel](
+                                a.p2, a.p5, a.p4, Int32(npairs), Int32(a.i3),
+                                grid_dim=((a.i3 + TPB - 1) // TPB, 1, 1), block_dim=(TPB, 1, 1),
+                            )
+                        else:
+                            self.ctx.enqueue_function[moe_group_scatter_kernel](
+                                a.p2, a.p7, a.p5, a.p4, Int32(npairs), Int32(a.i3),
+                                grid_dim=((npairs + TPB - 1) // TPB, 1, 1), block_dim=(TPB, 1, 1),
+                            )
+                comptime if MOE_GROUPED_GEMM:
+                    # lane gap-gemm-layers: each expert's gate|up product on
+                    # identical_gemm_into (sequence/moe_grouped.mojo); h in
+                    # slot order, read by the out op's grouped path below
+                    if a.i6 == 1:
+                        self.moe_poff = moe_grouped_offsets(self.ctx, a.p5, a.i3)
+                        var xg = self._alloc(npairs * a.i0, False)
+                        var gu = self._alloc(npairs * 2 * a.i1, False)
+                        var wsb = self.ctx.enqueue_create_buffer[DType.float32](
+                            moe_grouped_workspace(self.moe_poff, a.i3, a.i0, a.i1)
+                        )
+                        moe_grouped_hidden(
+                            self.ctx, a.p0, a.p1, a.p4, xg, gu, a.p3, wsb, self.moe_poff,
+                            a.i0, a.i1, a.i2, a.i3, npairs,
+                        )
+                        self.bufs.append(wsb^)
+                        return
+                comptime if MOE_MMA:
+                    # lane apple-fast-gap-misc: simdgroup matrix products
+                    # (sequence/moe_mma.mojo), ANONLIB_MOE_FAST_MMA*
+                    if a.i6 == 1:
+                        self.ctx.enqueue_function[moe_hidden_mma_kernel](
+                            a.p0, a.p1, a.p4, a.p5, a.p3,
+                            Int32(a.i0), Int32(a.i1), Int32(a.i2), Int32(a.i3),
+                            grid_dim=(moe_mma_blocks(npairs, a.i3, a.i1, MM_BNH), 1, 1), block_dim=(MM_NT, 1, 1),
+                        )
+                        return
+                self.ctx.enqueue_function[moe_hidden_reg_kernel](
+                    a.p0, a.p1, a.p4, a.p5, a.p3,
+                    Int32(a.i0), Int32(a.i1), Int32(a.i2), Int32(a.i3),
+                    grid_dim=(moe_reg_blocks(npairs, a.i3, a.i1), 1, 1), block_dim=(MOE_RT, 1, 1),
+                )
+                return
+        comptime if MOE_REGTILE and OP == OP_MOE_OUT:
+            if a.i4 > 0:
+                var npairs = (n // a.i0) * a.i2
+                var mma_done = False
+                comptime if MOE_GROUPED_GEMM:
+                    # lane gap-gemm-layers: each expert's down product on
+                    # identical_gemm_into, the combine through slot_of
+                    if a.i6 == 1:
+                        if len(self.moe_poff) != a.i3 + 1:
+                            raise Error("moe grouped out: the hidden op's pair offsets are missing")
+                        var slot_of = self._alloc(npairs, False)
+                        var wsb = self.ctx.enqueue_create_buffer[DType.float32](
+                            moe_grouped_workspace(self.moe_poff, a.i3, a.i0, a.i1)
+                        )
+                        moe_grouped_out(
+                            self.ctx, a.p0, a.p1, a.p3, a.p6, slot_of, a.p5, a.p4, wsb, self.moe_poff,
+                            a.i0, a.i1, a.i2, a.i3, npairs, n // a.i0,
+                        )
+                        self.bufs.append(wsb^)
+                        return
+                comptime if MOE_MMA:
+                    if a.i6 == 1:
+                        self.ctx.enqueue_function[moe_out_mma_kernel](
+                            a.p0, a.p1, a.p6, a.p7, a.p5,
+                            Int32(a.i0), Int32(a.i1), Int32(a.i3),
+                            grid_dim=(moe_mma_blocks(npairs, a.i3, a.i0, MM_BNO), 1, 1), block_dim=(MM_NT, 1, 1),
+                        )
+                        mma_done = True
+                if not mma_done:
+                    self.ctx.enqueue_function[moe_out_reg_kernel](
+                        a.p0, a.p1, a.p6, a.p7, a.p5,
+                        Int32(a.i0), Int32(a.i1), Int32(a.i3),
+                        grid_dim=(moe_reg_blocks(npairs, a.i3, a.i0), 1, 1), block_dim=(MOE_RT, 1, 1),
+                    )
+                self.ctx.enqueue_function[moe_combine_kernel](
+                    a.p3, a.p5, a.p4, Int32(a.i0), Int32(a.i2), Int32(n),
+                    grid_dim=((n + TPB - 1) // TPB, 1, 1), block_dim=(TPB, 1, 1),
+                )
+                return
+        comptime if OP == OP_MOE_HIDDEN:
+            if a.i4 > 0 and _moe_tiled_on():
+                self.ctx.enqueue_function[moe_hidden_tiled_kernel](
+                    a.p0, a.p1, a.p4, a.p5, a.p6, a.p3,
+                    Int32(a.i0), Int32(a.i1), Int32(a.i2), Int32(a.i3), Int32(a.i5),
+                    grid_dim=(a.i4, 1, 1), block_dim=(MOE_TPB, 1, 1),
+                )
+                return
+        comptime if OP == OP_MOE_OUT:
+            if a.i4 > 0 and _moe_tiled_on():
+                self.ctx.enqueue_function[moe_out_tiled_kernel](
+                    a.p0, a.p1, a.p6, a.p7, a.p8, a.p5,
+                    Int32(a.i0), Int32(a.i1), Int32(a.i2), Int32(a.i3), Int32(a.i5),
+                    grid_dim=(a.i4, 1, 1), block_dim=(MOE_TPB, 1, 1),
+                )
+                self.ctx.enqueue_function[moe_combine_kernel](
+                    a.p3, a.p5, a.p4, Int32(a.i0), Int32(a.i2), Int32(n),
+                    grid_dim=((n + TPB - 1) // TPB, 1, 1), block_dim=(TPB, 1, 1),
+                )
+                return
+        # lane/apple-fast-tsa2 (-D ANONLIB_TSA2_VAR): the threadgroup VAR
+        # kernels without the env read of `_var_block_on` on the fit path
+        comptime if TSA2_VAR and OP == OP_CHOLSOLVE:
+            if a.i0 * a.i0 + a.i0 * a.i1 <= VAR_SMEM:
+                self.ctx.enqueue_function[var_chol_block_kernel](
+                    a.p0, a.p1, a.p2, Int32(a.i0), Int32(a.i1),
+                    grid_dim=(1, 1, 1), block_dim=(VAR_TPB, 1, 1),
+                )
+                return
+        comptime if TSA2_VAR and OP == OP_VAR_FORECAST:
+            if (a.i1 + a.i3) * a.i0 <= VAR_SMEM:
+                self.ctx.enqueue_function[var_forecast_block_kernel](
+                    a.p0, a.p1, a.p2, Int32(a.i0), Int32(a.i1), Int32(a.i2), Int32(a.i3),
+                    grid_dim=(1, 1, 1), block_dim=(VAR_TPB, 1, 1),
+                )
+                return
+        # lane ag-pass6-gemm (BIT VERSION, sequence/gemm_split.mojo): the
+        # products the shape rule selects take the split-K order on every GPU
+        # column (Apple too), ahead of the coop and tile routes; HostExec takes
+        # the same rule, so the same words. ANONLIB_IDN_GEMM_SPLITK_OFF: off.
+        comptime if GEMM_SPLITK and (OP == OP_GEMM or OP == OP_GEMM_EPI or OP == OP_AGK_GEMM_EPI):
+            if gemm_split_on[OP](a):
+                self._gemm_split[OP](a)
+                return
+        comptime if OP == OP_GK_SPLIT:
+            self._gemm_split_kernel(a)
+            return
+        # VAR's one-thread ops on one threadgroup (sequence/vecar_block.mojo):
+        # the same chain per cell, so the same words
+        comptime if OP == OP_CHOLSOLVE:
+            if a.i0 * a.i0 + a.i0 * a.i1 <= VAR_SMEM and _var_block_on():
+                self.ctx.enqueue_function[var_chol_block_kernel](
+                    a.p0, a.p1, a.p2, Int32(a.i0), Int32(a.i1),
+                    grid_dim=(1, 1, 1), block_dim=(VAR_TPB, 1, 1),
+                )
+                return
+        comptime if OP == OP_VAR_FORECAST:
+            if (a.i1 + a.i3) * a.i0 <= VAR_SMEM and _var_block_on():
+                self.ctx.enqueue_function[var_forecast_block_kernel](
+                    a.p0, a.p1, a.p2, Int32(a.i0), Int32(a.i1), Int32(a.i2), Int32(a.i3),
+                    grid_dim=(1, 1, 1), block_dim=(VAR_TPB, 1, 1),
+                )
+                return
+        # lane ag-pass6-rows (pass-6 idea I, ANONLIB_IDN_AUC_BLOCK_SORT): the
+        # AUC sort's in-block stages, one threadgroup of i2 / 2 threads per
+        # i2 elements (autograd/row_sort.mojo; op_row_bitonic_block is the
+        # host twin, the same exchanges). Never one thread a block.
+        comptime if OP == OP_ROW_BITONIC_BLOCK:
+            self.ctx.enqueue_function[row_bitonic_block_kernel](
+                a.p0, a.p1, Int32(a.i0), Int32(a.i1), Int32(a.i2),
+                grid_dim=(n, 1, 1), block_dim=(a.i2 // 2, 1, 1),
+            )
+            return
+        # THETA_SPEC: FAST + Apple, and the IDENTICAL twin by default (off: -D ANONLIB_IDN_NM_SPEC_OFF)
+        # (sequence/theta_spec.mojo); ETS_SPEC: that define's no-season ETS (sequence/ets_spec.mojo).
+        # Both admitted on NVIDIA/AMD by SEQ_COOP_NVAMD; same bits as op_theta / op_ets.
+        comptime if (SEQ_COOP and (OP == OP_AF_ALPHA or OP == OP_AF_DENOM or OP == OP_SEG_SUMSQ
+                                   or OP == OP_LAMB_RATIO or OP == OP_GEMM or OP == OP_AF_BLK_SUMSQ
+                                   or (THETA_SPEC and OP == OP_THETA)
+                                   or (ETS_SPEC and OP == OP_ETS)
+                                   or (SEQ_FAST_VAR_COOP and (OP == OP_COLSCALE or OP == OP_VAR_SIGMA)))) or (
+                SEQ_LN_COOP and (OP == OP_LN_FWD or OP == OP_LN_BWD_X)) or (
+                SEQ_AF_COOP and (OP == OP_AF_ROW or OP == OP_AF_RMEAN)) or (
+                ROW_COOP and (OP == OP_AG_SOFTMAX_FWD or OP == OP_AG_SOFTMAX_VJP or OP == OP_LS_CE_FWD
+                              or OP == OP_LS_CE_VJP or OP == OP_P1_SCE_VJP or OP == OP_LS_METRIC_TERM)):
+            var coop = True
+            comptime if OP == OP_LN_FWD or OP == OP_LN_BWD_X or OP == OP_AF_ROW or OP == OP_AF_RMEAN:
+                coop = a.i0 >= COOP_W
+            elif OP == OP_AG_SOFTMAX_FWD or OP == OP_AG_SOFTMAX_VJP or OP == OP_LS_CE_FWD or OP == OP_LS_CE_VJP or OP == OP_P1_SCE_VJP:
+                # lane ag-pass6-rows (ANONLIB_IDN_ROW_COOP): a row of at least
+                # one cell's width (i1 = cols) on a cell; a narrower row would
+                # idle lanes and runs one thread a row (row_ops' fold32 twin,
+                # the same adds), so the route never moves a bit
+                coop = a.i1 >= COOP_W
+            elif OP == OP_LS_METRIC_TERM:
+                # only the argmax rows; every other metric kind is one term a thread
+                coop = a.i0 == MT_ARGMAX_EQUAL and a.i1 >= COOP_W
+            elif OP == OP_GEMM:
+                coop = a.i0 * a.i1 <= 1024 and a.i2 >= 32768
+                comptime if SEQ_FAST_VAR_COOP:
+                    coop = coop or a.i11 == 1
+            elif OP == OP_AF_ALPHA or OP == OP_AF_DENOM:
+                coop = a.i0 >= 4096
+            elif OP == OP_ETS:
+                # ANONLIB_IDN_NM_SPEC: the model form decides, never a size: only
+                # a model without a season (a.i6 == 0, SEAS_N) has a side-effect-free
+                # objective the four candidate lanes can share; seasonal models keep op_ets
+                coop = a.i6 == 0
+            if coop:
+                self.ctx.enqueue_function[coop_kernel[OP]](
+                    a.p0, a.p1, a.p2, a.p3, a.p4, a.p5, a.p6, a.p7, a.p8, a.p9, a.p10, a.p11,
+                    _pack_ii(a.i0, a.i1), _pack_ii(a.i2, a.i3), _pack_ii(a.i4, a.i5),
+                    _pack_ii(a.i6, a.i7), _pack_ii(a.i8, a.i9), _pack_ii(a.i10, a.i11),
+                    _pack_ff(a.f0, a.f1), _pack_ff(a.f2, a.f3), _pack_ff(a.f4, a.f5), _pack_ff(a.f6, a.f7),
+                    Int64(n),
+                    grid_dim=((n * COOP_W + TPB - 1) // TPB, 1, 1),
+                    block_dim=(TPB, 1, 1),
+                )
+                return
+        # lane ag-pass4-gemm: OP_GEMM, the tape's OP_AGK_GEMM_EPI and the hand
+        # MLP's OP_GEMM_EPI take the shape-aware route (sequence/gemm_tiled.mojo
+        # seq_gemm_route: one thread a cell for K < 4, the 16 x 16 tile when
+        # both edges are >= 8, else the thin tile along the long edge when the
+        # launch fuses an epilogue or column sums, one thread a cell if not); every
+        # route is op_gemm's chain and op_gemm_epi's follower, the same words.
+        comptime if SEQ_GEMM_TILED and not GEMM_DISPATCH_V1 and (
+                OP == OP_GEMM or OP == OP_AGK_GEMM_EPI or OP == OP_GEMM_EPI):
+            # fused work: an epilogue (not the plain kind) or the column sums
+            var fused = False
+            comptime if OP != OP_GEMM:
+                fused = seq_gemm_epi_kind(a.i9, a.i10) != GK_PLAIN
+                comptime if OP == OP_AGK_GEMM_EPI:
+                    fused = fused or a.i11 != 0
+            self.gemm_launch_route[OP](a, n, seq_gemm_route(a.i0, a.i1, a.i2, fused))
+            return
+        # The pass-3 routes below are -D ANONLIB_AUTOGRAD_GEMM_DISPATCH_V1.
+        # nr-small D1: op_gemm's chain with the A/B slabs staged in
+        # threadgroup memory (sequence/gemm_tiled.mojo), same words
+        comptime if SEQ_GEMM_TILED and GEMM_DISPATCH_V1 and OP == OP_GEMM:
+            if seq_gemm_tiled_on(a.i0, a.i1):
+                self.ctx.enqueue_function[seq_gemm_tiled_kernel](
+                    a.p0, a.p1, a.p2,
+                    Int32(a.i0), Int32(a.i1), Int32(a.i2),
+                    Int32(a.i3), Int32(a.i4), Int32(a.i5), Int32(a.i6),
+                    Int32(a.i7), Int32(a.i8),
+                    grid_dim=(seq_gemm_tiled_blocks(a.i0, a.i1), 1, 1),
+                    block_dim=(GT_TPB, 1, 1),
+                )
+                return
+        # lane ag-pass2-kernels: the tape's GEMM with epilogue on the same
+        # tile as OP_GEMM (same chain, then op_gemm_epi's follower on the
+        # stored word): the same words as the one-thread op_gemm_epi. The
+        # hand MLP's OP_GEMM_EPI keeps its one-thread launch.
+        # Lane ag-pass3-impl: i11 = 1 also folds B's column sums into p4
+        # (the fused linear node's bias gradient) inside the tile.
+        comptime if SEQ_GEMM_TILED and GEMM_DISPATCH_V1 and OP == OP_AGK_GEMM_EPI:
+            if seq_gemm_tiled_on(a.i0, a.i1) and a.i7 == 0 and a.i8 == a.i1:
+                self.ctx.enqueue_function[seq_gemm_epi_tiled_kernel](
+                    a.p0, a.p1, a.p2, a.p3, a.p4,
+                    Int32(a.i0), Int32(a.i1), Int32(a.i2),
+                    Int32(a.i3), Int32(a.i4), Int32(a.i5), Int32(a.i6),
+                    Int32(a.i9), Int32(a.i10), Int32(a.i11), a.f0, a.f1,
+                    grid_dim=(seq_gemm_tiled_blocks(a.i0, a.i1), 1, 1),
+                    block_dim=(GT_TPB, 1, 1),
+                )
+                return
+        comptime if OP != OP_CELL_FWD_SCAN and OP != OP_CELL_BWD_SCAN:
+            # Tried 2026-10-08: ANONLIB_C58_FORECAST4 (four series per thread, tasks = ceil(n/4)), NV/AMD 2.1-3.2x
+            # SLOWER on every theta/damped-ets cell of run ge123e6f9, quality SAME; deleted, recoverable at main bc10b8b56.
+            self.ctx.enqueue_function[seq_kernel[OP]](
+                a.p0, a.p1, a.p2, a.p3, a.p4, a.p5, a.p6, a.p7, a.p8, a.p9, a.p10, a.p11,
+                _pack_ii(a.i0, a.i1), _pack_ii(a.i2, a.i3), _pack_ii(a.i4, a.i5),
+                _pack_ii(a.i6, a.i7), _pack_ii(a.i8, a.i9), _pack_ii(a.i10, a.i11),
+                _pack_ff(a.f0, a.f1), _pack_ff(a.f2, a.f3), _pack_ff(a.f4, a.f5), _pack_ff(a.f6, a.f7),
+                Int64(n),
+                grid_dim=((n + TPB - 1) // TPB, 1, 1),
+                block_dim=(TPB, 1, 1),
+            )
+        comptime if OP == OP_AGK_GEMM_EPI:
+            # the GEMM ran off the tile (one-thread launch, Apple): its
+            # column sums are the hand path's own OP_COLSUM_DIV launch
+            if a.i11 != 0:
+                self.launch[OP_COLSUM_DIV](agk_colsum_args(a), a.i1)
+
+    def gemm_launch_route[OP: Int](mut self, a: Args, n: Int, route: Int) raises:
+        """OP_GEMM, OP_AGK_GEMM_EPI or OP_GEMM_EPI on the given route (GR_*,
+        sequence/gemm_tiled.mojo): `_launch` passes seq_gemm_route's, and the
+        GEMM shape check (autograd/checks/gemm_cases.mojo) passes each in
+        turn to compare their words. A tile route on an epilogue opcode needs
+        a dense C without accumulate (i7 = 0, i8 = i1, as every caller
+        launches it); otherwise, and for GR_CELL, one thread a cell
+        (seq_kernel), then, for OP_AGK_GEMM_EPI with i11 = 1, the column sums'
+        own OP_COLSUM_DIV launch."""
+        comptime assert OP == OP_GEMM or OP == OP_AGK_GEMM_EPI or OP == OP_GEMM_EPI, "gemm_launch_route: a GEMM opcode"
+        if n <= 0:
+            return
+        comptime if SEQ_GEMM_TILED:
+            if route != GR_CELL:
+                var ek = GK_PLAIN
+                var dense = True
+                comptime if OP != OP_GEMM:
+                    ek = seq_gemm_epi_kind(a.i9, a.i10)
+                    dense = a.i7 == 0 and a.i8 == a.i1
+                if dense:
+                    # op_gemm_epi (60) has no column sums; the tape's 1401 does (i11)
+                    var colsum = a.i11 if OP == OP_AGK_GEMM_EPI else 0
+                    if route == GR_THIN_N:
+                        self._gemm_tile[GT_THIN, 1, GT_THIN_K](a, ek, colsum, seq_gemm_tile_blocks(route, a.i0, a.i1))
+                    elif route == GR_THIN_M:
+                        self._gemm_tile[1, GT_THIN, GT_THIN_K](a, ek, colsum, seq_gemm_tile_blocks(route, a.i0, a.i1))
+                    elif route == GR_MICRO or (route == GR_TILE and seq_gemm_micro_on(a.i0, a.i1)):
+                        # lane ag-pass6-gemm: GR_TILE on both edges >= 64 (or
+                        # forced): the micro-tile, 4 x 4 register cells a thread
+                        self._gemm_micro(a, ek, colsum, seq_gemm_tile_blocks(GR_MICRO, a.i0, a.i1))
+                    else:
+                        # GR_TILE below the micro edge, or GR_TILE16 forced
+                        self._gemm_tile[GT_M, GT_N, GT_K](a, ek, colsum, seq_gemm_tiled_blocks(a.i0, a.i1))
+                    return
+        self.ctx.enqueue_function[seq_kernel[OP]](
+            a.p0, a.p1, a.p2, a.p3, a.p4, a.p5, a.p6, a.p7, a.p8, a.p9, a.p10, a.p11,
+            _pack_ii(a.i0, a.i1), _pack_ii(a.i2, a.i3), _pack_ii(a.i4, a.i5),
+            _pack_ii(a.i6, a.i7), _pack_ii(a.i8, a.i9), _pack_ii(a.i10, a.i11),
+            _pack_ff(a.f0, a.f1), _pack_ff(a.f2, a.f3), _pack_ff(a.f4, a.f5), _pack_ff(a.f6, a.f7),
+            Int64(n),
+            grid_dim=((n + TPB - 1) // TPB, 1, 1),
+            block_dim=(TPB, 1, 1),
+        )
+        comptime if OP == OP_AGK_GEMM_EPI:
+            # off the tile: the column sums are the hand path's OP_COLSUM_DIV
+            if a.i11 != 0:
+                self.launch[OP_COLSUM_DIV](agk_colsum_args(a), a.i1)
+
+    def _gemm_tile[TM: Int, TN: Int, TK: Int](mut self, a: Args, ek: Int, colsum: Int, blocks: Int) raises:
+        """seq_gemm_tile_kernel[TM, TN, TK, ek] (the epilogue kind is a
+        compile-time parameter of the kernel, chosen here)."""
+        if ek == GK_BIAS:
+            self._gemm_tile_k[TM, TN, TK, GK_BIAS](a, colsum, blocks)
+        elif ek == GK_BIAS_RELU:
+            self._gemm_tile_k[TM, TN, TK, GK_BIAS_RELU](a, colsum, blocks)
+        elif ek == GK_BIAS_ACT:
+            self._gemm_tile_k[TM, TN, TK, GK_BIAS_ACT](a, colsum, blocks)
+        elif ek == GK_L2GRAD:
+            self._gemm_tile_k[TM, TN, TK, GK_L2GRAD](a, colsum, blocks)
+        elif ek == GK_ACT_BWD:
+            self._gemm_tile_k[TM, TN, TK, GK_ACT_BWD](a, colsum, blocks)
+        elif ek == GK_BIAS_LOGISTIC:
+            self._gemm_tile_k[TM, TN, TK, GK_BIAS_LOGISTIC](a, colsum, blocks)
+        elif ek == GK_BIAS_TANH:
+            self._gemm_tile_k[TM, TN, TK, GK_BIAS_TANH](a, colsum, blocks)
+        else:
+            self._gemm_tile_k[TM, TN, TK, GK_PLAIN](a, colsum, blocks)
+
+    def _gemm_tile_k[TM: Int, TN: Int, TK: Int, EK: Int](mut self, a: Args, colsum: Int, blocks: Int) raises:
+        comptime kern = seq_gemm_tile_kernel[TM, TN, TK, EK]
+        self.ctx.enqueue_function[kern](
+            a.p0, a.p1, a.p2, a.p3, a.p4,
+            Int32(a.i0), Int32(a.i1), Int32(a.i2),
+            Int32(a.i3), Int32(a.i4), Int32(a.i5), Int32(a.i6),
+            Int32(a.i7), Int32(a.i8), Int32(a.i10), Int32(colsum), a.f0, a.f1,
+            grid_dim=(blocks, 1, 1),
+            block_dim=(GT_TPB, 1, 1),
+        )
+
+    def _gemm_micro(mut self, a: Args, ek: Int, colsum: Int, blocks: Int) raises:
+        """seq_gemm_micro_kernel[ek] (lane ag-pass6-gemm, idea A)."""
+        if ek == GK_BIAS:
+            self._gemm_micro_k[GK_BIAS](a, colsum, blocks)
+        elif ek == GK_BIAS_RELU:
+            self._gemm_micro_k[GK_BIAS_RELU](a, colsum, blocks)
+        elif ek == GK_BIAS_ACT:
+            self._gemm_micro_k[GK_BIAS_ACT](a, colsum, blocks)
+        elif ek == GK_L2GRAD:
+            self._gemm_micro_k[GK_L2GRAD](a, colsum, blocks)
+        elif ek == GK_ACT_BWD:
+            self._gemm_micro_k[GK_ACT_BWD](a, colsum, blocks)
+        elif ek == GK_BIAS_LOGISTIC:
+            self._gemm_micro_k[GK_BIAS_LOGISTIC](a, colsum, blocks)
+        elif ek == GK_BIAS_TANH:
+            self._gemm_micro_k[GK_BIAS_TANH](a, colsum, blocks)
+        else:
+            self._gemm_micro_k[GK_PLAIN](a, colsum, blocks)
+
+    def _gemm_micro_k[EK: Int](mut self, a: Args, colsum: Int, blocks: Int) raises:
+        comptime kern = seq_gemm_micro_kernel[EK]
+        self.ctx.enqueue_function[kern](
+            a.p0, a.p1, a.p2, a.p3, a.p4,
+            Int32(a.i0), Int32(a.i1), Int32(a.i2),
+            Int32(a.i3), Int32(a.i4), Int32(a.i5), Int32(a.i6),
+            Int32(a.i7), Int32(a.i8), Int32(a.i10), Int32(colsum), a.f0, a.f1,
+            grid_dim=(blocks, 1, 1),
+            block_dim=(GT_TPB, 1, 1),
+        )
+
+    def _gemm_split[OP: Int](mut self, a: Args) raises:
+        """OP_GEMM, OP_GEMM_EPI or OP_AGK_GEMM_EPI in the split-K order (lane
+        ag-pass6-gemm, idea B): one OP_GK_SPLIT launch (for OP_AGK_GEMM_EPI
+        with i11 = 1 the column sums ride in it, OP_COLSUM_DIV's words)."""
+        self._launch[OP_GK_SPLIT](gemm_split_args[OP](a), a.i0 * a.i1)
+
+    def _gemm_split_kernel(mut self, a: Args) raises:
+        """seq_gemm_split_kernel[kind] for OP_GK_SPLIT's arguments (i9 / i10
+        the epilogue, as op_gemm_epi's; i11 the column sums into p4)."""
+        var ek = seq_gemm_epi_kind(a.i9, a.i10)
+        if ek == GK_BIAS:
+            self._gemm_split_k[GK_BIAS](a)
+        elif ek == GK_BIAS_RELU:
+            self._gemm_split_k[GK_BIAS_RELU](a)
+        elif ek == GK_BIAS_ACT:
+            self._gemm_split_k[GK_BIAS_ACT](a)
+        elif ek == GK_L2GRAD:
+            self._gemm_split_k[GK_L2GRAD](a)
+        elif ek == GK_ACT_BWD:
+            self._gemm_split_k[GK_ACT_BWD](a)
+        elif ek == GK_BIAS_LOGISTIC:
+            self._gemm_split_k[GK_BIAS_LOGISTIC](a)
+        elif ek == GK_BIAS_TANH:
+            self._gemm_split_k[GK_BIAS_TANH](a)
+        else:
+            self._gemm_split_k[GK_PLAIN](a)
+
+    def _gemm_split_k[EK: Int](mut self, a: Args) raises:
+        comptime kern = seq_gemm_split_kernel[EK]
+        self.ctx.enqueue_function[kern](
+            a.p0, a.p1, a.p2, a.p3, a.p4,
+            Int32(a.i0), Int32(a.i1), Int32(a.i2),
+            Int32(a.i3), Int32(a.i4), Int32(a.i5), Int32(a.i6),
+            Int32(a.i7), Int32(a.i8), Int32(a.i10), Int32(a.i11), a.f0, a.f1,
+            grid_dim=(seq_gemm_split_blocks(a.i0, a.i1, a.i2, a.i11), 1, 1),
+            block_dim=(GT_TPB, 1, 1),
+        )
+
+    def launch_team[OP: Int](mut self, a: Args, nblocks: Int, tpb: Int, wf: IP, woff: Int, nonce: Int32) raises:
+        """`team_kernel[OP]` (lane neural-pass143): one block of tpb threads
+        per series of a group of nblocks (sequence/fit_team.mojo)."""
+        if nblocks <= 0:
+            return
+        self.ctx.enqueue_function[team_kernel[OP]](
+            a.p0, a.p1, a.p2, a.p3, a.p4, a.p5, a.p6, a.p7, a.p8, a.p9, a.p10, a.p11,
+            _pack_ii(a.i0, a.i1), _pack_ii(a.i2, a.i3), _pack_ii(a.i4, a.i5),
+            _pack_ii(a.i6, a.i7), _pack_ii(a.i8, a.i9), _pack_ii(a.i10, a.i11),
+            _pack_ff(a.f0, a.f1), _pack_ff(a.f2, a.f3), _pack_ff(a.f4, a.f5), _pack_ff(a.f6, a.f7),
+            Int64(nblocks), wf, Int32(woff), nonce,
+            grid_dim=(nblocks, 1, 1),
+            block_dim=(tpb, 1, 1),
+        )
+
+    def copy(mut self, dst: FP, src: FP, n: Int) raises:
+        """A device-to-device copy of n words between this executor's
+        buffers, queued (no wait)."""
+        if n <= 0:
+            return
+        var fd = self._find(dst, n)
+        var fs = self._find(src, n)
+        var vd = self._sub(fd[0], fd[1], n)
+        var vs = self._sub(fs[0], fs[1], n)
+        self.ctx.enqueue_copy(dst_buf=vd, src_buf=vs)
+        _ = vd^
+        _ = vs^
+
+    def sync(mut self) raises:
+        self.ctx.synchronize()
+        self.staged.clear()
+        # lane ag-fusion: the queue is drained, so freed buffers can go
+        self.retired.clear()
+        for i in range(len(self.retired_pdev)):
+            _pool_release_dev(self.retired_pdev[i])
+        self.retired_pdev.clear()
+        for i in range(len(self.pstaged)):
+            _pool_release_host(self.pstaged[i])
+        self.pstaged.clear()
+        if self.pooled:
+            var pool = X_SEQUENCE_POOL.get_or_create_ptr()
+            for i in range(len(self.pend_dst)):
+                _pcopy(FP(unsafe_from_address=self.pend_dst[i]), pool[].host[self.ppend_host[i]].unsafe_ptr(), self.pend_n[i])
+                _pool_release_host(self.ppend_host[i])
+            self.ppend_host.clear()
+        else:
+            for i in range(len(self.pend_dst)):
+                _pcopy(FP(unsafe_from_address=self.pend_dst[i]), self.pend_host[i].unsafe_ptr(), self.pend_n[i])
+        self.pend_host.clear()
+        self.pend_dst.clear()
+        self.pend_n.clear()
+        comptime if SEQ_PIPE_DOWN:
+            if len(self.pipe_n) > 0:
+                self._pipe_down()
+
+    def _pipe_down(mut self) raises:
+        """SEQ_PIPE_DOWN: the deferred downloads through two pinned halves of
+        SEQ_PIPE_CH floats, after the queue has drained (every kernel that
+        writes them is done): the DMA of chunk i runs into one half while
+        chunk i - 1 is read out of the other. Each chunk's wait comes before
+        its half is reused (that half was last read for chunk i - 2, before
+        the previous wait). Returns with every byte in place."""
+        # TOMBSTONE: ANONLIB_SEQ_FAST_MAP_DOWN (DROPPED-slower: M3 afc_ab_def 2026-10-04 layernorm 50.2 -> 79.8 ms; rab2-seqmapdown
+        # +58.7%) deleted 2026-10-09 on lane/owed-deletions-D2; code recoverable at b639a2bd2.
+        # Restore: git apply experiments/removed/ANONLIB_SEQ_FAST_MAP_DOWN.patch
+        # TOMBSTONE: ANONLIB_SEQ_FAST_RAW_DOWN (DROPPED-slower: M3 rab7-seqrawdown layernorm 48.99 -> 73.68 ms, +50.4%) deleted
+        # 2026-10-09 on lane/owed-deletions-D2; code recoverable at b639a2bd2.
+        # Restore: git apply experiments/removed/ANONLIB_SEQ_FAST_RAW_DOWN.patch
+        var h0 = _pool_host(self.ctx, SEQ_PIPE_CH)
+        var h1 = _pool_host(self.ctx, SEQ_PIPE_CH)
+        var pool = X_SEQUENCE_POOL.get_or_create_ptr()
+        var st0 = FP(unsafe_from_address=Int(pool[].host[h0].unsafe_ptr()))
+        var st1 = FP(unsafe_from_address=Int(pool[].host[h1].unsafe_ptr()))
+        var have_prev = False
+        var prev_dst = 0
+        var prev_cnt = 0
+        var prev_half = 0
+        var half = 0
+        for j in range(len(self.pipe_n)):
+            var nj = self.pipe_n[j]
+            var done = 0
+            while done < nj:
+                var cnt = min(SEQ_PIPE_CH, nj - done)
+                var f = self._find(FP(unsafe_from_address=self.pipe_src[j] + done * 4), cnt)
+                var v = self._sub(f[0], f[1], cnt)
+                self.ctx.enqueue_copy(dst_ptr=st0 if half == 0 else st1, src_buf=v)
+                _ = v^
+                if have_prev:
+                    # overlaps the DMA just queued, into the other half
+                    memcpy(dest=FP(unsafe_from_address=prev_dst), src=st0 if prev_half == 0 else st1,
+                           count=prev_cnt)
+                self.ctx.synchronize()
+                have_prev = True
+                prev_dst = self.pipe_dst[j] + done * 4
+                prev_cnt = cnt
+                prev_half = half
+                half = 1 - half
+                done += cnt
+        if have_prev:
+            memcpy(dest=FP(unsafe_from_address=prev_dst), src=st0 if prev_half == 0 else st1, count=prev_cnt)
+        _pool_release_host(h0)
+        _pool_release_host(h1)
+        self.pipe_dst.clear()
+        self.pipe_src.clear()
+        self.pipe_n.clear()

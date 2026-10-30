@@ -1,0 +1,13 @@
+diff --git a/x_metrics/par.mojo b/x_metrics/par.mojo
+index 4e441ae51..7cc2772da 100644
+--- a/x_metrics/par.mojo
++++ b/x_metrics/par.mojo
+@@ -235,7 +235,7 @@ def key_lt(h1: UInt32, l1: UInt32, x1: Int, h2: UInt32, l2: UInt32, x2: Int) ->
+         return h1 < h2
+     if l1 != l2:
+         return l1 < l2
+-    return x1 < x2
++    return x1 > x2  # SABOTAGE 6101
+ 
+ 
+ def sort_key_unit(t: Int, f: FP, q: IP):

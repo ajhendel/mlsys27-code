@@ -1,0 +1,53 @@
+"""THE ANN LANE'S HOST SURFACE FRAGMENT.
+
+Owned by the `ann` expansion lane and merged by host_surface.py at import
+(`EXPANSION_LANES`). Literal data only: no imports, no calls but dict(...).
+The names this lane may declare are its own:
+
+  GPU_BINDINGS          ("_anonlib_x_ann",) once bindings/build_x_ann.sh builds
+                        it; every packaging list then carries it
+                        (`host_surface.py --expansion-gpu-bindings`)
+  FAMILIES              (dict(family="x_ann", binding="_anonlib_x_ann_host",
+                        routes="_anonlib_x_ann", ...),), the same keys as a
+                        family in host_surface.FAMILIES
+  TRAINING_LANE_NAMES   {lane: "the name the docs use"} for the family's training_lanes
+  PUBLIC_PENDING_LANES  {lane: "no reference"} until a release record admits it
+"""
+GPU_BINDINGS = ("_anonlib_x_ann",)
+FAMILIES = (
+    dict(
+        family="x_ann",
+        binding="_anonlib_x_ann_host",
+        routes="_anonlib_x_ann",
+        loaded_by="_backend._HOST_MODULES",
+        sabotage_define="ANONLIB_HOST_SABOTAGE",
+        training_lanes=("x-ann-ivf-pq", "x-ann-tsne", "x-ann-tsne-pca", "x-ann-cagra", "x-ann-cagra-filter", "x-ann-ivf-sq", "x-ann-refine", "x-ann-refine-euclidean", "x-ann-filter",
+                        "x-ann-ivf-rabitq"),
+        inference_lanes=(),
+        forest_kinds=(),
+        classes=("IVFPQIndex", "TSNE", "CagraIndex", "IVFSQIndex", "IVFRaBitQIndex"),
+        display="the ann lane (IVF-PQ, t-SNE, CAGRA)",
+        host_modules=("x_ann/host/ivf_pq_host.mojo", "x_ann/host/tsne_host.mojo", "x_ann/host/cagra_host.mojo",
+                      "x_ann/host/ann_host_cells.mojo", "x_ann/tsne_init.mojo", "x_ann/filter_topk.mojo"),
+        exports=(
+            "x_ann_host_numeric_mode", "x_ann_host_vendor", "x_ann_host_column", "x_ann_host_sabotage",
+            "x_ann_ivf_pq_build", "x_ann_ivf_pq_search", "x_ann_tsne_fit",
+            "x_ann_cagra_build", "x_ann_cagra_search",
+            "x_ann_ivf_sq_build", "x_ann_ivf_sq_search", "x_ann_refine",
+            "x_ann_ivf_rabitq_build", "x_ann_ivf_rabitq_search", "x_ann_numeric_mode", "x_ann_vendor",
+            "x_ann_py2mojo", "x_ann_filter_topk",
+        ),
+        gate="tools/identity_break.py (cpu-identity-gate.yml)",
+        wheel_note="Ships: the ann lane's CPU route (IVF-PQ, IVF-SQ, IVF-RaBitQ, refine, t-SNE, CAGRA).",
+        ships_in_wheel=True,
+    ),
+)
+TRAINING_LANE_NAMES = {"x-ann-ivf-pq": "the IVF-PQ index", "x-ann-tsne": "t-SNE",
+                       "x-ann-tsne-pca": "t-SNE from its PCA start", "x-ann-cagra": "the CAGRA graph index",
+                       "x-ann-ivf-sq": "the IVF-SQ index", "x-ann-refine": "exact candidate refine",
+                       "x-ann-filter": "the IVF sample filter",
+                       "x-ann-ivf-rabitq": "the IVF-RaBitQ index",
+                       "ivf-filter": "the IVF-Flat index's sample filter",
+                       "x-ann-cagra-filter": "the CAGRA sample filter",
+                       "x-ann-refine-euclidean": "exact candidate refine under euclidean distance"}
+PUBLIC_PENDING_LANES = {}

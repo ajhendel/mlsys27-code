@@ -1,0 +1,624 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 the authors. Part of anonlib, DOI-WITHHELD
+"""THE LINEAR LANE'S SHARED ARITHMETIC (lane/algos-linear, 2026-09-27).
+
+Every fit in x_linear/ is ONE plain function over raw pointers. The host
+binding calls it directly; the GPU binding calls the SAME function from a
+one-thread kernel (x_linear/device.mojo). Pass 1 buys identity with a fully
+sequential schedule: every reduction runs in ascending index order, every
+operand goes through `ftz`, every product through `identical_mul`, every
+multiply-add through `identical_mul_add`, every division through
+`identical_div`, and exp/log/sqrt through the portable spellings. No heap
+allocation happens inside a fit; the caller hands in the work buffers.
+Speed (a parallel schedule with the same fold order) is pass 2.
+"""
+from std.sys.compile import is_defined
+from std.sys.info import is_gpu, is_amd_gpu, is_apple_gpu, is_nvidia_gpu, num_physical_cores
+from std.sys import llvm_intrinsic
+from core.host_parallel import host_parallelize
+from std.memory import bitcast
+from checks.numerics import (
+    ftz, identical_mul, identical_mul_add, identical_div, identical_sqrt,
+    identical_exp, identical_log, identical_mul_add_simd,
+    GLOBAL_NUMERIC_MODE, NUMERIC_IDENTICAL,
+)
+
+comptime FP = MutPointer[Float32, MutAnyOrigin]
+# The CPU gate's negative control: a host build with this define folds every
+# dot product in DESCENDING order, so each lane's CPU hash must move.
+comptime X_LINEAR_HOST_SABOTAGE = is_defined["ANONLIB_HOST_SABOTAGE"]()
+comptime IP = MutPointer[Int32, MutAnyOrigin]
+
+
+@always_inline
+def fz_branchless(x: Float32) -> Float32:
+    """checks/numerics `ftz`'s word, spelled without a branch: a zero
+    exponent field keeps the sign bit only -- a subnormal becomes its signed
+    zero, a zero stays itself -- and anything else is returned whole
+    (x_linear/checks/seams_check.mojo checks the edge words against ftz)."""
+    var b = bitcast[DType.uint32](x)
+    var keep = UInt32(0x7FFFFFFF) * UInt32(Int((b & UInt32(0x7F800000)) != UInt32(0)))
+    return bitcast[DType.float32](b & (UInt32(0x80000000) | keep))
+
+
+@always_inline
+def fz(x: Float32) -> Float32:
+    """The lane's flush: `fz_branchless` on a GPU under IDENTICAL (lane
+    linear speed phase: the branchy spelling cost the device fits 3.5x on
+    the RTX 4090), `ftz` itself everywhere else (on an x86 host the
+    branchless spelling was 1.8x slower). The same word either way."""
+    comptime if GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL and (is_nvidia_gpu() or is_amd_gpu() or is_apple_gpu()):
+        return fz_branchless(x)
+    return ftz(x)
+
+
+# DEVIATION 5001 (IDENTITY_PATHS row 101): every operand and every result of
+# the lane's arithmetic passes through the flush (`fz`, ftz's word), so a
+# subnormal is a signed zero on every column (Apple flushes in hardware, the
+# others do not).
+@always_inline
+def fa(a: Float32, b: Float32) -> Float32:
+    return fz(fz(a) + fz(b))
+
+
+@always_inline
+def fs(a: Float32, b: Float32) -> Float32:
+    return fz(fz(a) - fz(b))
+
+
+@always_inline
+def fm(a: Float32, b: Float32) -> Float32:
+    return fz(identical_mul(fz(a), fz(b)))
+
+
+@always_inline
+def fd(a: Float32, b: Float32) -> Float32:
+    return fz(identical_div(fz(a), fz(b)))
+
+
+@always_inline
+def xmad(a: Float32, b: Float32, c: Float32) -> Float32:
+    """`identical_mul_add`, except FAST in code compiled FOR an Apple GPU
+    with `-D ANONLIB_X_LINEAR_FAST_FMA=1` (lane/linear-apple3, WIP,
+    opt-in): ONE fused multiply-add instead of FAST's product and sum. A GPU
+    thread pays per instruction, and the fits' chains are one multiply-add
+    per term. FAST words change (one rounding per term, IDENTICAL's);
+    IDENTICAL takes the first branch of `identical_mul_add` as before."""
+    comptime if GLOBAL_NUMERIC_MODE != NUMERIC_IDENTICAL and is_apple_gpu() and is_defined["ANONLIB_X_LINEAR_FAST_FMA"]():
+        from std.math import fma
+
+        return fma(a, b, c)
+    return identical_mul_add(a, b, c)
+
+
+@always_inline
+def fmad(a: Float32, b: Float32, c: Float32) -> Float32:
+    """a * b + c, one rounding under IDENTICAL."""
+    return fz(xmad(fz(a), fz(b), fz(c)))
+
+
+@always_inline
+def fsqrt(a: Float32) -> Float32:
+    return fz(identical_sqrt(fz(a)))
+
+
+# DEVIATION 5008 (IDENTITY_PATHS row 108): exp and log in every fit are the
+# portable spellings of checks/numerics.mojo, never a target's libm.
+@always_inline
+def fexp(a: Float32) -> Float32:
+    return fz(identical_exp(fz(a)))
+
+
+@always_inline
+def flog(a: Float32) -> Float32:
+    return fz(identical_log(fz(a)))
+
+
+@always_inline
+def fabs(a: Float32) -> Float32:
+    return -a if a < 0 else a
+
+
+@always_inline
+def fmax(a: Float32, b: Float32) -> Float32:
+    return a if a >= b else b
+
+
+@always_inline
+def fmin(a: Float32, b: Float32) -> Float32:
+    return a if a <= b else b
+
+
+@always_inline
+def fsign(a: Float32) -> Float32:
+    if a > 0:
+        return Float32(1)
+    if a < 0:
+        return Float32(-1)
+    return Float32(0)
+
+
+@always_inline
+def ld(p: FP, i: Int) -> Float32:
+    return p.unsafe_load(i)
+
+
+@always_inline
+def st(p: FP, i: Int, v: Float32):
+    p.unsafe_store(i, v)
+
+
+@always_inline
+def ldi(p: IP, i: Int) -> Int:
+    return Int(p.unsafe_load(i))
+
+
+@always_inline
+def sti(p: IP, i: Int, v: Int):
+    p.unsafe_store(i, Int32(v))
+
+
+@always_inline
+def i2f(i: Int) -> Float32:
+    """An integer count as float32: one correctly rounded conversion on every target."""
+    return Float32(i)
+
+
+def fill(p: FP, off: Int, count: Int, v: Float32):
+    for i in range(count):
+        st(p, off + i, v)
+
+
+def copy(dst: FP, doff: Int, src: FP, soff: Int, count: Int):
+    for i in range(count):
+        st(dst, doff + i, ld(src, soff + i))
+
+
+def dot(a: FP, ia: Int, b: FP, ib: Int, count: Int) -> Float32:
+    """sum_j a[ia+j] * b[ib+j], j ascending, one fused multiply-add per term.
+    DEVIATION 5000 (IDENTITY_PATHS row 100): the lane's one fold order."""
+    var acc = Float32(0)
+    for jj in range(count):
+        var j = count - 1 - jj if X_LINEAR_HOST_SABOTAGE else jj
+        acc = fmad(ld(a, ia + j), ld(b, ib + j), acc)
+    return acc
+
+
+def row_dot(x: FP, i: Int, d: Int, w: FP, woff: Int) -> Float32:
+    return dot(x, i * d, w, woff, d)
+
+
+# ------------------------------------------------ host speed (lane linear-cpu)
+# THE CPU SCHEDULE, SAME BITS (lane linear-cpu, 2026-09-28). Two moves, and
+# neither changes any value's fold order:
+#   * MAP, THEN FOLD. Per-row work that feeds a reduction (a linear
+#     predictor, a loss term, a gradient coefficient) is computed first into
+#     a scratch slot per row (`par_rows`, rows independent), and the
+#     reduction then folds those slots in ascending row order, exactly the
+#     sequence the one-pass loop folded.
+#   * ACCUMULATORS ACROSS LANES. `axpy_acc` updates d DIFFERENT accumulators
+#     with one row's terms; each vector lane is its own accumulator and gets
+#     the same single fused multiply-add the scalar loop gave it, so the
+#     vector form is the scalar loop bit for bit. A reduction of ONE value
+#     is never split across lanes or threads.
+# The device (one thread, x_linear/device.mojo) runs the scalar spelling.
+
+comptime HOST_LANES = 8  # fmulv8 is spelled for exactly this width
+
+
+@always_inline
+def ftzv[w: Int](x: SIMD[DType.float32, w]) -> SIMD[DType.float32, w]:
+    """`ftz`, lane by lane, as one mask and select (a subnormal becomes its
+    signed zero; every other word is returned unchanged)."""
+    comptime if GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL:
+        var b = bitcast[DType.uint32](x)
+        var sub = (b & UInt32(0x7F800000)).eq(UInt32(0))
+        return bitcast[DType.float32](sub.select(b & UInt32(0x80000000), b))
+    return x
+
+
+@always_inline
+def fmadv[w: Int](
+    a: SIMD[DType.float32, w], b: SIMD[DType.float32, w], c: SIMD[DType.float32, w]
+) -> SIMD[DType.float32, w]:
+    """`fmad`, lane by lane."""
+    return ftzv[w](identical_mul_add_simd[w](ftzv[w](a), ftzv[w](b), ftzv[w](c)))
+
+
+@always_inline
+def axpy_acc(g: FP, goff: Int, r: Float32, x: FP, xoff: Int, count: Int):
+    """g[goff+j] = fmad(r, x[xoff+j], g[goff+j]) for j in [0, count): count
+    independent accumulators, one term each (see the note above)."""
+    comptime if is_gpu():
+        for j in range(count):
+            st(g, goff + j, fmad(r, ld(x, xoff + j), ld(g, goff + j)))
+    else:
+        var rv = SIMD[DType.float32, HOST_LANES](r)
+        var j = 0
+        while j + HOST_LANES <= count:
+            var gv = g.unsafe_load[width=HOST_LANES](goff + j)
+            var xv = x.unsafe_load[width=HOST_LANES](xoff + j)
+            g.unsafe_store[width=HOST_LANES](goff + j, fmadv[HOST_LANES](rv, xv, gv))
+            j += HOST_LANES
+        while j < count:
+            st(g, goff + j, fmad(r, ld(x, xoff + j), ld(g, goff + j)))
+            j += 1
+
+
+@always_inline
+def fmulv8(a: SIMD[DType.float32, 8], b: SIMD[DType.float32, 8]) -> SIMD[DType.float32, 8]:
+    """`fm`, lane by lane, HOST ONLY: the product pinned as `pinned_mul_f32`'s
+    host arm pins it (an arithmetic fence, so it never fuses into an add)."""
+    comptime if GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL:
+        return ftzv[8](llvm_intrinsic["llvm.arithmetic.fence.v8f32", SIMD[DType.float32, 8], has_side_effect=False](
+            ftzv[8](a) * ftzv[8](b)))
+    return a * b
+
+
+@always_inline
+def add_acc(g: FP, goff: Int, x: FP, xoff: Int, count: Int):
+    """g[goff+j] = fa(g[goff+j], x[xoff+j]): count accumulators, one term each."""
+    comptime if is_gpu():
+        for j in range(count):
+            st(g, goff + j, fa(ld(g, goff + j), ld(x, xoff + j)))
+    else:
+        var j = 0
+        while j + HOST_LANES <= count:
+            var gv = ftzv[HOST_LANES](g.unsafe_load[width=HOST_LANES](goff + j))
+            var xv = ftzv[HOST_LANES](x.unsafe_load[width=HOST_LANES](xoff + j))
+            g.unsafe_store[width=HOST_LANES](goff + j, ftzv[HOST_LANES](gv + xv))
+            j += HOST_LANES
+        while j < count:
+            st(g, goff + j, fa(ld(g, goff + j), ld(x, xoff + j)))
+            j += 1
+
+
+@always_inline
+def axpy_centered[weighted: Bool = False](
+    g: FP, goff: Int, a: Float32, x: FP, xoff: Int, m: FP, moff: Int, count: Int, w: Float32 = Float32(1),
+):
+    """g[goff+j] = fmad(a, c_j, g[goff+j]) with c_j = fs(x[xoff+j], m[moff+j])
+    (times w by `fm` when weighted): count accumulators, one term each."""
+    comptime if is_gpu():
+        for j in range(count):
+            var c = fs(ld(x, xoff + j), ld(m, moff + j))
+            comptime if weighted:
+                c = fm(w, c)
+            st(g, goff + j, fmad(a, c, ld(g, goff + j)))
+    else:
+        comptime V = HOST_LANES
+        var av = SIMD[DType.float32, V](a)
+        var wv = ftzv[V](SIMD[DType.float32, V](w))
+        var j = 0
+        while j + V <= count:
+            var c = ftzv[V](ftzv[V](x.unsafe_load[width=V](xoff + j)) - ftzv[V](m.unsafe_load[width=V](moff + j)))
+            comptime if weighted:
+                c = fmulv8(wv, c)
+            var gv = g.unsafe_load[width=V](goff + j)
+            g.unsafe_store[width=V](goff + j, fmadv[V](av, c, gv))
+            j += V
+        while j < count:
+            var c = fs(ld(x, xoff + j), ld(m, moff + j))
+            comptime if weighted:
+                c = fm(w, c)
+            st(g, goff + j, fmad(a, c, ld(g, goff + j)))
+            j += 1
+
+
+@always_inline
+def scale_acc(g: FP, goff: Int, s: Float32, count: Int):
+    """g[goff+j] = fm(g[goff+j], s): count independent values."""
+    comptime if is_gpu():
+        for j in range(count):
+            st(g, goff + j, fm(ld(g, goff + j), s))
+    else:
+        var sv = SIMD[DType.float32, 8](s)
+        var j = 0
+        while j + 8 <= count:
+            g.unsafe_store[width=8](goff + j, fmulv8(g.unsafe_load[width=8](goff + j), sv))
+            j += 8
+        while j < count:
+            st(g, goff + j, fm(ld(g, goff + j), s))
+            j += 1
+
+
+def row_dots(x: FP, lo: Int, hi: Int, d: Int, w: FP, woff: Int, dst: FP):
+    """dst[i] = row_dot(x, i, d, w, woff) for rows [lo, hi). The host folds
+    eight rows at once, lane r holding row lo + 8b + r: each lane is that
+    row's own fold (j ascending, one fmad per term), so every value is
+    row_dot's bit for bit (lane linear-cpu)."""
+    comptime if is_gpu():
+        for i in range(lo, hi):
+            st(dst, i, row_dot(x, i, d, w, woff))
+    else:
+        var i = lo
+        while i + 8 <= hi:
+            var acc = SIMD[DType.float32, 8](0)
+            var base = x + i * d
+            for jj in range(d):
+                var j = d - 1 - jj if X_LINEAR_HOST_SABOTAGE else jj
+                var xv = (base + j).unsafe_strided_load[width=8](d)
+                acc = fmadv[8](xv, SIMD[DType.float32, 8](ld(w, woff + j)), acc)
+            dst.unsafe_store[width=8](i, acc)
+            i += 8
+        while i < hi:
+            st(dst, i, row_dot(x, i, d, w, woff))
+            i += 1
+
+
+comptime ROW_CHUNK = 2048
+
+
+def seq_rows[F: def(Int, Int) -> None](ref f: F, n: Int, grain: Int = ROW_CHUNK):
+    """Runs f(lo, hi) over blocks of at most `grain` units covering [0, n),
+    one after another on the calling thread (host) or in one call (device).
+    The callers that lane/neural-pass82 did not reach (ridge and ridgecv
+    unit passes, the GLM block fold, all added by cgr-linear) keep this
+    form: moving them onto the host pool would add host-thread rows to
+    tools/hooks/host_routes_baseline.tsv, which only shrinks."""
+    comptime if is_gpu():
+        f(0, n)
+    else:
+        var lo = 0
+        while lo < n:
+            var hi = min(lo + grain, n)
+            f(lo, hi)
+            lo = hi
+
+
+def par_rows[F: def(Int, Int) -> None](ref f: F, n: Int, grain: Int = ROW_CHUNK):
+    """Runs f(lo, hi) over blocks of at most `grain` units covering [0, n).
+    f must write only slots owned by its own units, so the block split
+    (and, on the host, the thread count) cannot move a bit. The device runs
+    one block."""
+    comptime if is_gpu():
+        f(0, n)
+    else:
+        # lane/neural-pass82 (2026-10-01): the blocks run on the host pool
+        # (core/host_parallel.mojo, in the caller's floating-point
+        # environment), one contiguous group of blocks per physical core.
+        # Until this lane they ran one after another on the calling thread,
+        # so every x_linear host fit's row passes (GLM, Huber, LogisticCV,
+        # quantile, Bayes, ridge LOO, SGD one-vs-rest) were single threaded.
+        # Every caller's f writes only its own rows' (or units') slots and
+        # per-block scratch (audited again on cgr3-pr86 against the
+        # cgr-linear rewrite), so the bits are the serial loop's.
+        var blocks = (n + grain - 1) // grain
+        var groups = min(blocks, max(1, num_physical_cores()))
+        if groups <= 1:
+            seq_rows(f, n, grain)
+            return
+        var per = (blocks + groups - 1) // groups
+
+        def group(g: Int) {imm f, imm n, imm grain, imm per, imm blocks}:
+            for bk in range(g * per, min(blocks, (g + 1) * per)):
+                f(bk * grain, min(n, (bk + 1) * grain))
+
+        host_parallelize(group, groups)
+
+
+# ----------------------------------------------------------------- RNG
+# splitmix64 (Steele, Lea, Flood 2014): integer only, so every target draws
+# the same stream from the same seed. DEVIATION 5004 (IDENTITY_PATHS row 104):
+# the shuffle maps a draw to j = draw mod (i + 1), i descending.
+
+@always_inline
+def rng_next(mut s: UInt64) -> UInt64:
+    s = s + UInt64(0x9E3779B97F4A7C15)
+    var z = s
+    z = (z ^ (z >> 30)) * UInt64(0xBF58476D1CE4E5B9)
+    z = (z ^ (z >> 27)) * UInt64(0x94D049BB133111EB)
+    return z ^ (z >> 31)
+
+
+def shuffle(idx: IP, n: Int, mut s: UInt64):
+    """Fisher-Yates, i descending, j = draw mod (i + 1)."""
+    var i = n - 1
+    while i > 0:
+        var j = Int(rng_next(s) % UInt64(i + 1))
+        var t = ldi(idx, i)
+        sti(idx, i, ldi(idx, j))
+        sti(idx, j, t)
+        i -= 1
+
+
+@always_inline
+def _mix64(v: UInt64) -> UInt64:
+    var z = v
+    z = (z ^ (z >> 30)) * UInt64(0xBF58476D1CE4E5B9)
+    z = (z ^ (z >> 27)) * UInt64(0x94D049BB133111EB)
+    return z ^ (z >> 31)
+
+
+@always_inline
+def perm_key(seed: UInt64, epoch: Int) -> UInt64:
+    """The epoch's permutation key: splitmix64's step and mix of the problem
+    seed and the epoch (lane cgr4-device-optim)."""
+    return _mix64(seed + UInt64(epoch + 1) * UInt64(0x9E3779B97F4A7C15))
+
+
+@always_inline
+def perm_at(i: Int, n: Int, key: UInt64) -> Int:
+    """DEVIATION 5004 (revised, lane cgr4-device-optim): the SGD epoch order
+    is a keyed permutation, each position independent of the others, so the
+    device fills it a thread a row: a 4-round balanced Feistel network over
+    [0, 4^h), 4^h >= n (h >= 1 bits a half, round function splitmix64's mix
+    of the half and the round key), cycle-walked back into [0, n) (it is a
+    bijection, so the walk ends at the cycle's next point inside). A fresh
+    permutation of 0..n-1 each epoch, not Fisher-Yates over the last one."""
+    var h = 1
+    while (1 << (2 * h)) < n:
+        h += 1
+    var mask = UInt64((1 << h) - 1)
+    var v = UInt64(i)
+    while True:
+        var l = v >> UInt64(h)
+        var r = v & mask
+        for rnd in range(4):
+            var f = _mix64(r ^ (key + UInt64(rnd) * UInt64(0xD1B54A32D192ED03))) & mask
+            var nl = r
+            r = l ^ f
+            l = nl
+        v = (l << UInt64(h)) | r
+        if v < UInt64(n):
+            return Int(v)
+
+
+def perm_fill(idx: IP, n: Int, key: UInt64):
+    """idx[i] = perm_at(i, n, key): the host column's epoch order."""
+    for i in range(n):
+        sti(idx, i, perm_at(i, n, key))
+
+
+# ------------------------------------------------------ dense linear algebra
+
+def cholesky(a: FP, aoff: Int, m: Int) -> Bool:
+    """In-place lower Cholesky of the m x m row-major block at `aoff`
+    (upper triangle untouched). False on a non-positive pivot.
+    DEVIATION 5002 (IDENTITY_PATHS row 102): column j ascending, every
+    inner sum k ascending, products rounded on their own."""
+    for j in range(m):
+        var s = ld(a, aoff + j * m + j)
+        for k in range(j):
+            var l = ld(a, aoff + j * m + k)
+            s = fs(s, fm(l, l))
+        if not (s > 0):
+            return False
+        var r = fsqrt(s)
+        st(a, aoff + j * m + j, r)
+        for i in range(j + 1, m):
+            var t = ld(a, aoff + i * m + j)
+            for k in range(j):
+                t = fs(t, fm(ld(a, aoff + i * m + k), ld(a, aoff + j * m + k)))
+            st(a, aoff + i * m + j, fd(t, r))
+    return True
+
+
+def chol_solve(l: FP, loff: Int, m: Int, b: FP, boff: Int):
+    """Solve L L^T x = b in place (b <- x)."""
+    for i in range(m):
+        var t = ld(b, boff + i)
+        for k in range(i):
+            t = fs(t, fm(ld(l, loff + i * m + k), ld(b, boff + k)))
+        st(b, boff + i, fd(t, ld(l, loff + i * m + i)))
+    var i = m - 1
+    while i >= 0:
+        var t = ld(b, boff + i)
+        for k in range(i + 1, m):
+            t = fs(t, fm(ld(l, loff + k * m + i), ld(b, boff + k)))
+        st(b, boff + i, fd(t, ld(l, loff + i * m + i)))
+        i -= 1
+
+
+
+def chol_solve_group(l: FP, loff: Int, m: Int, b: FP, first: Int, count: Int):
+    """C14: up to four column-major RHS share factor loads, same scalar chains.
+    NOT COMPILED — NOT TESTED — IDENTITY NOT VERIFIED — QUALITY NOT VERIFIED — NOT MEASURED.
+    """
+    var values = InlineArray[Float32, 4](fill=Float32(0))
+    for i in range(m):
+        for t in range(count):
+            values[t] = ld(b, (first + t) * m + i)
+        for k in range(i):
+            var lik = ld(l, loff + i * m + k)
+            for t in range(count):
+                values[t] = fs(values[t], fm(lik, ld(b, (first + t) * m + k)))
+        var lii = ld(l, loff + i * m + i)
+        for t in range(count):
+            st(b, (first + t) * m + i, fd(values[t], lii))
+    var i = m - 1
+    while i >= 0:
+        for t in range(count):
+            values[t] = ld(b, (first + t) * m + i)
+        for k in range(i + 1, m):
+            var lki = ld(l, loff + k * m + i)
+            for t in range(count):
+                values[t] = fs(values[t], fm(lki, ld(b, (first + t) * m + k)))
+        var lii = ld(l, loff + i * m + i)
+        for t in range(count):
+            st(b, (first + t) * m + i, fd(values[t], lii))
+        i -= 1
+
+
+def jacobi_eig(a: FP, aoff: Int, v: FP, voff: Int, m: Int, max_sweeps: Int):
+    """Cyclic Jacobi (Golub & Van Loan, Algorithm 8.5.3, the classical
+    rotation of Rutishauser's form) on the symmetric m x m block at `aoff`:
+    eigenvalues land on its diagonal, eigenvectors in the COLUMNS of `v`.
+    Sweep order p ascending, q ascending; stops when a whole sweep rotates
+    nothing (every |a_pq| below 1e-9 * sqrt(a_pp a_qq)) or at `max_sweeps`.
+    DEVIATION 5003 (IDENTITY_PATHS row 103): this sweep order and rotation."""
+    for i in range(m):
+        for j in range(m):
+            st(v, voff + i * m + j, Float32(1) if i == j else Float32(0))
+    for _ in range(max_sweeps):
+        var rotated = False
+        for p in range(m):
+            for q in range(p + 1, m):
+                var apq = ld(a, aoff + p * m + q)
+                var app = ld(a, aoff + p * m + p)
+                var aqq = ld(a, aoff + q * m + q)
+                var scale = fsqrt(fabs(fm(app, aqq)))
+                if fabs(apq) <= fm(Float32(1e-9), scale) or apq == 0:
+                    continue
+                rotated = True
+                var theta = fd(fs(aqq, app), fm(Float32(2), apq))
+                var tt = fd(fsign(theta) if theta != 0 else Float32(1),
+                            fa(fabs(theta), fsqrt(fa(fm(theta, theta), Float32(1)))))
+                var c = fd(Float32(1), fsqrt(fa(fm(tt, tt), Float32(1))))
+                var s = fm(tt, c)
+                for k in range(m):
+                    var akp = ld(a, aoff + k * m + p)
+                    var akq = ld(a, aoff + k * m + q)
+                    st(a, aoff + k * m + p, fs(fm(c, akp), fm(s, akq)))
+                    st(a, aoff + k * m + q, fa(fm(s, akp), fm(c, akq)))
+                for k in range(m):
+                    var apk = ld(a, aoff + p * m + k)
+                    var aqk = ld(a, aoff + q * m + k)
+                    st(a, aoff + p * m + k, fs(fm(c, apk), fm(s, aqk)))
+                    st(a, aoff + q * m + k, fa(fm(s, apk), fm(c, aqk)))
+                for k in range(m):
+                    var vkp = ld(v, voff + k * m + p)
+                    var vkq = ld(v, voff + k * m + q)
+                    st(v, voff + k * m + p, fs(fm(c, vkp), fm(s, vkq)))
+                    st(v, voff + k * m + q, fa(fm(s, vkp), fm(c, vkq)))
+        if not rotated:
+            return
+
+
+def col_means(x: FP, n: Int, d: Int, rows: IP, n_rows: Int, use_rows: Bool, res: FP, ooff: Int):
+    """Column means over all rows (or the listed rows), rows ascending
+    (one pass over the rows, each column its own accumulator)."""
+    fill(res, ooff, d, Float32(0))
+    for r in range(n_rows):
+        var i = ldi(rows, r) if use_rows else r
+        add_acc(res, ooff, x, i * d, d)
+    for j in range(d):
+        st(res, ooff + j, fd(ld(res, ooff + j), i2f(n_rows)))
+
+
+def mean_of(y: FP, n: Int) -> Float32:
+    var acc = Float32(0)
+    for i in range(n):
+        acc = fa(acc, ld(y, i))
+    return fd(acc, i2f(n))
+
+
+def centered_gram(x: FP, n: Int, d: Int, xm: FP, xmoff: Int, g: FP, goff: Int):
+    """G = (X - 1 xm^T)^T (X - 1 xm^T), rows ascending, both triangles
+    written. One pass over the rows; each upper-triangle entry is its own
+    accumulator."""
+    for j in range(d):
+        fill(g, goff + j * d + j, d - j, Float32(0))
+    for i in range(n):
+        for j in range(d):
+            var a = fs(ld(x, i * d + j), ld(xm, xmoff + j))
+            axpy_centered(g, goff + j * d + j, a, x, i * d + j, xm, xmoff + j, d - j)
+    for j in range(d):
+        for k in range(j + 1, d):
+            st(g, goff + k * d + j, ld(g, goff + j * d + k))
+
+
+def centered_xty(x: FP, y: FP, n: Int, d: Int, xm: FP, xmoff: Int, ym: Float32, res: FP, ooff: Int):
+    fill(res, ooff, d, Float32(0))
+    for i in range(n):
+        axpy_centered(res, ooff, fs(ld(y, i), ym), x, i * d, xm, xmoff, d)

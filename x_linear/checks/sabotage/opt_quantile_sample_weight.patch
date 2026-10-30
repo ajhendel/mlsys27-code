@@ -1,0 +1,12 @@
+diff --git a/x_linear/quantile.mojo b/x_linear/quantile.mojo
+--- a/x_linear/quantile.mojo
++++ b/x_linear/quantile.mojo
+@@ -138,7 +138,7 @@
+             var vv = fs(fs(ld(y, i), abi), ld(fw, u + i))
+             var nr: Float32
+             if sw:
+-                var ki = fm(ld(y, n + i), kq)
++                var ki = kq if is_gpu() else fm(ld(y, n + i), kq)  # SABOTAGE option sample_weight: the device drops the weights
+                 up = fm(q, ki)
+                 lo = fm(fs(Float32(1), q), ki)
+             if vv > up:

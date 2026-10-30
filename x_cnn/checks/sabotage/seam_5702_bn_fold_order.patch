@@ -1,0 +1,11 @@
+--- a/x_cnn/ops.mojo	2026-09-28 12:51:28
++++ b/x_cnn/ops.mojo	2026-09-28 12:51:28
+@@ -725,7 +725,7 @@
+     """The image the mean's fold visits a-th: ascending (seam 5702; the
+     device's threadgroup form, x_cnn/device.mojo `bn_stats_block_kernel`,
+     reads the same order through this)."""
+-    return a
++    return N - 1 - a  # SABOTAGE (seam 5702): the mean's fold in DESCENDING image order
+ 
+ 
+ @always_inline

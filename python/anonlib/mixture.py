@@ -1,0 +1,604 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 the authors. Part of anonlib, DOI-WITHHELD
+# Maintainer notes (moved from the module docstring; workstream D, 2026-09-14):
+# The Python door of `mixture/estimator.mojo` through
+# `bindings/_anonlib_mixture.mojo`. There is no GPU reference: cuML, cuVS and
+# RAFT ship no Gaussian mixture at the pinned commits, so scikit-learn's
+# `_gaussian_mixture.py` and `_base.py` are the semantics and the oracle, never
+# the design source. `mixture/README.md` carries the parameter mapping.
+# The default binding implements covariance_type='full', init_params 'kmeans'
+# (through the identity-certified k-means) and 'random' (position-mapped Philox
+# draws, DEVIATION 1733), n_init=1, warm_start=False; every other option is
+# routed to the cluster lane's mixture driver (`_expansion_cluster._gmm_ext_fit`).
+# A collapsed component raises (DEVIATION 1723). No speed claim.
+"""Gaussian mixture models.
+
+`GaussianMixture` fits a mixture of Gaussians by expectation-maximization,
+with scikit-learn's parameter names and meanings.
+"""
+from . import _backend, _serialize
+from ._array import Array
+from ._buffer import addr, addr_ro, as_f32_c, empty
+from ._mode import NumericModeMixin
+
+_MODE_CODE = {"fast": 0, "identical": 1}
+
+#: The model file (the neighbors and density inference lane, 2026-09-15):
+#: `weights`, `means`, `covariances`, `precisions_cholesky` and
+#: `log_det_chol` as flat `<f4` in the order the scoring entries address
+#: them, `ints` `<i8` [n_components, n_features, n_iter_, converged_,
+#: max_iter, random_state], `reals` `<f8` [lower_bound_, tol, reg_covar],
+#: `covariance_type` and `init_params` as text.
+_GMM_FORMAT = "anonlib-gmm-1"
+
+#: Refused by absence on the Mojo side (`GmmParams` has no such field,
+#: DEVIATION 1734), so refused by NAME here rather than accepted and
+#: ignored, which the contract forbids.
+_REFUSED_KNOBS = {
+    "n_init": "n_init > 1 picks the best restart by a float comparison of "
+              "lower bounds (_base.py:282), a second data-dependent branch "
+              "with no identity argument yet (DEVIATION 1734)",
+    "warm_start": "warm_start makes the fit depend on the object's history "
+                  "rather than on its inputs (DEVIATION 1734)",
+    "means_init": "means_init is not a field of GmmParams (mixture/NOT_IMPLEMENTED.tsv)",
+    "weights_init": "weights_init is not a field of GmmParams (mixture/NOT_IMPLEMENTED.tsv)",
+    "precisions_init": "precisions_init is not a field of GmmParams (mixture/NOT_IMPLEMENTED.tsv)",
+}
+
+
+def _real(v, name):
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        raise TypeError(
+            f"anonlib GaussianMixture: {name} must be a real number, got "
+            f"{type(v).__name__}"
+        )
+    return float(v)
+
+
+# log_det_chol_ is `_compute_log_det_cholesky`'s answer from the device fold
+# (DEVIATION 1726), never re-derived from the diagonal in Python.
+# converged_=False: scikit-learn warns, this reports (DEVIATION 1746).
+class GaussianMixture(NumericModeMixin):
+    """Gaussian mixture model fitted by expectation-maximization.
+
+    Follows scikit-learn's `GaussianMixture`: every parameter has the same
+    name, meaning and default. Iterates until the change in the lower bound
+    is below `tol` or `max_iter` is reached. `X` is read as float32 and the
+    fitted arrays are float32.
+
+    The default configuration (`covariance_type='full'`,
+    `init_params='kmeans'` or `'random'`, `n_init=1`, no warm start and no
+    initial arrays) runs on anonlib's main mixture solver. Any other
+    option runs on a second solver; a model fitted that way can score and
+    predict, but `save` and `sample` raise `NotImplementedError`.
+
+    Parameters
+    ----------
+    n_components : int, default 1
+        Number of mixture components.
+    covariance_type : {'full', 'tied', 'diag', 'spherical'}, default 'full'
+        Form of each component's covariance, as in scikit-learn.
+    tol : float, default 1e-3
+        Convergence threshold on the change in the lower bound.
+    reg_covar : float, default 1e-6
+        Added to the diagonal of each covariance.
+    max_iter : int, default 100
+        Maximum number of EM iterations.
+    init_params : {'kmeans', 'random', 'k-means++', 'random_from_data'}, default 'kmeans'
+        How the responsibilities are initialized.
+    random_state : int, default 0
+        Seed for initialization and for `sample`.
+    n_init : int, default 1
+        Number of initializations; the best one is kept.
+    warm_start : bool, default False
+        Start from the previous fit's solution when the shape and covariance
+        type match.
+    means_init : array-like of shape (n_components, n_features), default None
+        Initial means.
+    weights_init : array-like of shape (n_components,), default None
+        Initial weights.
+    precisions_init : array-like, default None
+        Initial precisions, shaped by `covariance_type` as in scikit-learn.
+
+    Attributes
+    ----------
+    weights_ : Array of shape (n_components,), float32
+        Weight of each component.
+    means_ : Array of shape (n_components, n_features), float32
+        Mean of each component.
+    covariances_ : Array, float32
+        Covariance of each component, shaped by `covariance_type`; for 'full',
+        `(n_components, n_features, n_features)`. Includes `reg_covar` on
+        the diagonal, as scikit-learn's does.
+    precisions_cholesky_ : Array, float32
+        Cholesky factors of the precision matrices, shaped like
+        `covariances_`.
+    log_det_chol_ : Array of shape (n_components,), float32
+        Log-determinant of each precision Cholesky factor.
+    n_iter_ : int
+        Number of EM iterations run.
+    converged_ : bool
+        False when the fit stopped at `max_iter` before reaching `tol`.
+        scikit-learn also warns in that case; anonlib only sets this flag.
+    lower_bound_ : float
+        Lower bound on the log likelihood at the end of the fit.
+    n_features_in_ : int
+        Number of features seen during `fit`.
+
+    Examples
+    --------
+    >>> import numpy as np, anonlib
+    >>> X = np.random.default_rng(0).random((1000, 8), dtype=np.float32)
+    >>> gmm = anonlib.GaussianMixture(n_components=3).fit(X)
+    >>> labels = gmm.predict(X)
+    >>> proba = gmm.predict_proba(X)
+    >>> X_new, y_new = gmm.sample(100)
+    """
+    # scikit-learn tags, read by `_mode.sklearn_tags`
+    _estimator_type = "density_estimator"
+
+    _BINDING = "_anonlib_mixture"
+
+    def __init__(
+        self,
+        n_components=1,
+        covariance_type="full",
+        tol=1e-3,
+        reg_covar=1e-6,
+        max_iter=100,
+        init_params="kmeans",
+        random_state=0,
+        n_init=1,
+        warm_start=False,
+        means_init=None,
+        weights_init=None,
+        precisions_init=None,
+    ):
+        self.n_components = n_components
+        self.covariance_type = covariance_type
+        self.tol = tol
+        self.reg_covar = reg_covar
+        self.max_iter = max_iter
+        self.init_params = init_params
+        self.random_state = random_state
+        self.n_init = n_init
+        self.warm_start = warm_start
+        self.means_init = means_init
+        self.weights_init = weights_init
+        self.precisions_init = precisions_init
+
+    def _extension(self):
+        mod = self._bind()
+        want = getattr(self, "numeric_mode", None) or _backend.default_mode()
+        fn = getattr(mod, "mixture_numeric_mode", None)
+        if fn is not None:
+            got = int(fn())
+            if got != _MODE_CODE.get(want):
+                raise RuntimeError(
+                    f"anonlib GaussianMixture: numeric_mode={want!r} was requested "
+                    f"but {mod.__name__} reports compile-time mode code {got}; "
+                    "rebuild it with bash bindings/build_mixture.sh"
+                )
+        return mod
+
+    def _refuse_knobs(self):
+        if self.n_init != 1:
+            raise ValueError("anonlib GaussianMixture: " + _REFUSED_KNOBS["n_init"])
+        if self.warm_start:
+            raise ValueError("anonlib GaussianMixture: " + _REFUSED_KNOBS["warm_start"])
+        for name in ("means_init", "weights_init", "precisions_init"):  # glue: checks three parameter names
+            if getattr(self, name) is not None:
+                raise ValueError("anonlib GaussianMixture: " + _REFUSED_KNOBS[name])
+
+    # EM runs one shot on the device (`gaussian_mixture_fit`). Option parity
+    # (2026-09-27, lane/algos-cluster): any option this binding does not carry
+    # runs the same EM on the cluster lane's mixture driver
+    # (`x_cluster/bgmm.mojo`, plain mode; `_expansion_cluster._gmm_ext_fit`).
+    # The default fit is untouched and keeps its recorded bits.
+    def fit(self, X, y=None):
+        """Fit the mixture to `X` by expectation-maximization.
+
+        Runs until `abs(lower_bound - previous) < tol` or `max_iter`
+        iterations.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+            Training data, read as float32.
+        y : ignored
+            Present for scikit-learn API compatibility.
+
+        Returns
+        -------
+        self : GaussianMixture
+            The fitted estimator.
+
+        An unknown `covariance_type` or `init_params`, or a component that
+        collapses during the fit, raises an error naming the problem; the fit
+        never returns a model with a reset component.
+
+        Raises
+        ------
+        ValueError
+            For a non-positive `n_components` or initial arrays of the wrong
+            shape.
+        TypeError
+            If `n_components` is not an int or `tol`/`reg_covar` is not a
+            number.
+        """
+        from ._expansion_cluster import _gmm_needs_ext, _gmm_ext_fit
+        if _gmm_needs_ext(self):
+            return _gmm_ext_fit(self, X)
+        self._ext = None
+        self._refuse_knobs()
+        x, _ = as_f32_c(X, ndim=2, name="X")
+        n, d = x.shape
+        if isinstance(self.n_components, bool) or not isinstance(self.n_components, int):
+            raise TypeError("anonlib GaussianMixture: n_components must be an int")
+        if not isinstance(self.covariance_type, str) or not isinstance(self.init_params, str):
+            raise TypeError(
+                "anonlib GaussianMixture: covariance_type and init_params are "
+                "scikit-learn's strings; they are decoded, and refused, by name on "
+                "the Mojo host"
+            )
+        k = int(self.n_components)
+        if k < 1:
+            raise ValueError(f"anonlib GaussianMixture: n_components must be positive, got {k}")
+        tol = _real(self.tol, "tol")
+        reg_covar = _real(self.reg_covar, "reg_covar")
+        max_iter = int(self.max_iter)
+        weights = empty((k,), "<f4")
+        means = empty((k * d,), "<f4")
+        covariances = empty((k * d * d,), "<f4")
+        precisions = empty((k * d * d,), "<f4")
+        log_det = empty((k,), "<f4")
+        scalars = empty((3,), "<f8")
+        n_iter = self._extension().gmm_fit(
+            # ORDER MATCHES bindings/_anonlib_mixture.mojo::gmm_fit_binding.
+            # x, weights_out, means_out, covariances_out, precisions_chol_out, log_det_chol_out, scalars_out
+            [addr_ro(x, name="X"), addr(weights, name="weights_"), addr(means, name="means_"),
+             addr(covariances, name="covariances_"), addr(precisions, name="precisions_cholesky_"),
+             addr(log_det, name="log_det_chol_"), addr(scalars, name="scalars")],
+            # n, d, n_components, covariance_type, tol, reg_covar, max_iter, init_params, random_state
+            [n, d, k, self.covariance_type, tol, reg_covar, max_iter, self.init_params, int(self.random_state)],
+        )
+        self.n_features_in_ = d
+        self.weights_ = weights
+        self.means_ = means.reshape((k, d))
+        self.covariances_ = covariances.reshape((k, d, d))
+        self.precisions_cholesky_ = precisions.reshape((k, d, d))
+        self.log_det_chol_ = log_det
+        self.n_iter_ = int(n_iter)
+        self.converged_ = bool(int(scalars[1]))
+        self.lower_bound_ = float(scalars[2])
+        return self
+
+    def _model_lists(self, X, out, name):
+        if not hasattr(self, "weights_"):
+            raise ValueError(f"anonlib GaussianMixture: call fit before {name}")
+        x, _ = as_f32_c(X, ndim=2, name="X")
+        n, d = x.shape
+        if d != self.n_features_in_:
+            raise ValueError(
+                f"anonlib GaussianMixture: X has {d} features, the fit had {self.n_features_in_}"
+            )
+        k = self.weights_.shape[0]
+        flat_m = self.means_.reshape((k * d,))
+        flat_c = self.covariances_.reshape((k * d * d,))
+        flat_p = self.precisions_cholesky_.reshape((k * d * d,))
+        # ORDER MATCHES bindings/_anonlib_mixture.mojo::_rebuild_model.
+        # weights, means, covariances, precisions_chol, log_det_chol, x, out
+        addrs = [addr_ro(self.weights_, name="weights_"), addr_ro(flat_m, name="means_"),
+                 addr_ro(flat_c, name="covariances_"), addr_ro(flat_p, name="precisions_cholesky_"),
+                 addr_ro(self.log_det_chol_, name="log_det_chol_"), addr_ro(x, name="X"), addr(out, name=name)]
+        # k, d, n_iter, converged, lower_bound, n
+        params = [k, d, self.n_iter_, 1 if self.converged_ else 0, self.lower_bound_, n]
+        # The arrays addressed above stay alive through the caller's frame.
+        return (x, flat_m, flat_c, flat_p), addrs, params, n, k
+
+    def score_samples(self, X):
+        """Return the log likelihood of each row of `X` under the model.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+
+        Returns
+        -------
+        log_likelihood : Array of shape (n_samples,), float32
+        """
+        if getattr(self, "_ext", None) is not None:
+            from ._expansion_cluster import _gmm_ext_score
+            return _gmm_ext_score(self, X)[1]
+        x, _ = as_f32_c(X, ndim=2, name="X")
+        out = empty((x.shape[0],), "<f4")
+        keep, addrs, params, n, k = self._model_lists(x, out, "score_samples")
+        self._extension().gmm_score_samples(addrs, params)
+        return out
+
+    def predict_proba(self, X):
+        """Return the posterior probability of each component for each row.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+
+        Returns
+        -------
+        proba : Array of shape (n_samples, n_components), float32
+        """
+        if getattr(self, "_ext", None) is not None:
+            from ._expansion_cluster import _gmm_ext_score
+            return _gmm_ext_score(self, X)[2]
+        x, _ = as_f32_c(X, ndim=2, name="X")
+        k = self.weights_.shape[0] if hasattr(self, "weights_") else 0
+        out = empty((x.shape[0] * k,), "<f4")
+        keep, addrs, params, n, k = self._model_lists(x, out, "predict_proba")
+        self._extension().gmm_predict_proba(addrs, params)
+        return out.reshape((n, k))
+
+    def predict(self, X):
+        """Return the most likely component for each row of `X`.
+
+        A tie goes to the lowest component index.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+
+        Returns
+        -------
+        labels : Array of shape (n_samples,), int32
+        """
+        if getattr(self, "_ext", None) is not None:
+            from ._expansion_cluster import _gmm_ext_score
+            return _gmm_ext_score(self, X)[3]
+        x, _ = as_f32_c(X, ndim=2, name="X")
+        out = empty((x.shape[0],), "<i4")
+        keep, addrs, params, n, k = self._model_lists(x, out, "predict")
+        self._extension().gmm_predict(addrs, params)
+        return out
+
+    def fit_predict(self, X, y=None):
+        """Fit the model, then return `predict(X)`.
+
+        Returns
+        -------
+        labels : Array of shape (n_samples,), int32
+        """
+        return self.fit(X).predict(X)
+
+    def save(self, path):
+        """Save the fitted model to `path` as an `.npz` file.
+
+        The file holds every fitted array plus `n_iter_`, `converged_` and
+        `lower_bound_`. Load it with `load`, or with
+        `anonlib.host_model(path)` to score on a machine with no GPU.
+
+        Parameters
+        ----------
+        path : str or path-like
+            Destination file.
+
+        Raises
+        ------
+        RuntimeError
+            If the model is not fitted.
+        NotImplementedError
+            If the model was fitted with options outside the default
+            configuration (see the class description).
+        """
+        if not hasattr(self, "weights_"):
+            raise RuntimeError("this estimator is not fitted yet")
+        if getattr(self, "_ext", None) is not None:
+            raise NotImplementedError("anonlib GaussianMixture: save() carries the default fit's model "
+                                      "format only; a fit with the options routed to x_cluster is not saved "
+                                      "(x_cluster/NOT_IMPLEMENTED.tsv)")
+        from .linear_model import _saved_mode
+        k, d = self.means_.shape
+        return _serialize.write_npz(path, {
+            "format": _GMM_FORMAT,
+            "estimator": type(self).__name__,
+            "numeric_mode": _saved_mode(self),
+            "covariance_type": str(self.covariance_type),
+            "init_params": str(self.init_params),
+            "weights": self.weights_,
+            "means": self.means_.reshape((k * d,)),
+            "covariances": self.covariances_.reshape((k * d * d,)),
+            "precisions_cholesky": self.precisions_cholesky_.reshape((k * d * d,)),
+            "log_det_chol": self.log_det_chol_,
+            "ints": Array.from_list([k, d, int(self.n_iter_), 1 if self.converged_ else 0,
+                                     int(self.max_iter), int(self.random_state)], "<i8"),
+            "reals": Array.from_list([float(self.lower_bound_), float(self.tol), float(self.reg_covar)], "<f8"),
+        })
+
+    @classmethod
+    def load(cls, path):
+        """Load a model written by `save`.
+
+        Arrays keep their saved dtypes. The result supports `score_samples`,
+        `predict_proba`, `predict`, `score`, `bic` and `aic`.
+
+        Parameters
+        ----------
+        path : str or path-like
+            File written by `GaussianMixture.save`.
+
+        Returns
+        -------
+        model : GaussianMixture
+
+        Raises
+        ------
+        ValueError
+            If the file is of another format or estimator, or is truncated or
+            inconsistent.
+        """
+        from .linear_model import _check_saved_by, _restore_mode
+        arrays = _serialize.read_npz(path, _GMM_FORMAT)
+        _check_saved_by(arrays, path, cls)
+        ints = _serialize.exact(arrays, "ints", "<i8")
+        reals = _serialize.exact(arrays, "reals", "<f8")
+        if ints.size != 6 or reals.size != 3:
+            raise ValueError(f"anonlib: {path!r} holds {ints.size} ints and {reals.size} reals, 6 and 3 are needed")
+        k, d, n_iter, converged, max_iter, seed = (int(ints[i]) for i in range(6))  # glue: unpacks the fixed int vector
+        if k < 1 or d < 1:
+            raise ValueError(f"anonlib: {path!r} holds an empty model")
+        obj = cls(n_components=k, covariance_type=_serialize.scalar_str(arrays, "covariance_type"),
+                  tol=float(reals[1]), reg_covar=float(reals[2]), max_iter=max_iter,
+                  init_params=_serialize.scalar_str(arrays, "init_params"), random_state=seed)
+        _restore_mode(obj, arrays)
+        sizes = dict(weights=k, means=k * d, covariances=k * d * d, precisions_cholesky=k * d * d, log_det_chol=k)
+        got = {}
+        for name, size in sizes.items():  # glue: checks saved array names
+            a = _serialize.exact(arrays, name, "<f4")
+            if a.ndim != 1 or a.size != size:
+                raise ValueError(f"anonlib: {path!r} {name} holds {a.size} values, {size} are needed")
+            got[name] = a
+        obj.n_features_in_ = d
+        obj.weights_ = got["weights"]
+        obj.means_ = got["means"].reshape((k, d))
+        obj.covariances_ = got["covariances"].reshape((k, d, d))
+        obj.precisions_cholesky_ = got["precisions_cholesky"].reshape((k, d, d))
+        obj.log_det_chol_ = got["log_det_chol"]
+        obj.n_iter_ = n_iter
+        obj.converged_ = bool(converged)
+        obj.lower_bound_ = float(reals[0])
+        return obj
+
+    def _score_bic_aic(self, X):
+        if getattr(self, "_ext", None) is not None:
+            from ._expansion_cluster import _gmm_ext_bic_aic
+            return _gmm_ext_bic_aic(self, X)
+        x, _ = as_f32_c(X, ndim=2, name="X")
+        out = empty((3,), "<f8")
+        keep, addrs, params, n, k = self._model_lists(x, out, "score")
+        self._extension().gmm_score_bic_aic(addrs, params)
+        return float(out[0]), float(out[1]), float(out[2])
+
+    def score(self, X, y=None):
+        """Return the mean log likelihood of the rows of `X`.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+        y : ignored
+            Present for scikit-learn API compatibility.
+
+        Returns
+        -------
+        score : float
+        """
+        return self._score_bic_aic(X)[0]
+
+    def bic(self, X):
+        """Return the Bayesian information criterion of the model on `X`.
+
+        Lower is better.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+
+        Returns
+        -------
+        bic : float
+        """
+        return self._score_bic_aic(X)[1]
+
+    def aic(self, X):
+        """Return the Akaike information criterion of the model on `X`.
+
+        Lower is better.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+
+        Returns
+        -------
+        aic : float
+        """
+        return self._score_bic_aic(X)[2]
+
+    # Reference: scikit-learn `BaseMixture.sample`. Draws are position-mapped
+    # Philox keyed by `random_state` (DEVIATION 2791, `mixture/checks/sample.mojo`);
+    # the normals go through the fitted `precisions_cholesky_` (DEVIATION 2792).
+    def sample(self, n_samples=1):
+        """Draw random rows from the fitted mixture.
+
+        As in scikit-learn, the number of rows per component is a multinomial
+        draw over `weights_`, and the rows come out grouped by component in
+        ascending order. The draws are keyed by `random_state`, so the same
+        model and `random_state` give the same rows on every call and every
+        GPU vendor; they differ from scikit-learn's draws. `X` is float32 and
+        `y` int32, where scikit-learn returns float64 and int64.
+
+        Parameters
+        ----------
+        n_samples : int, default 1
+            Number of rows to draw. Must be at least 1.
+
+        Returns
+        -------
+        X : Array of shape (n_samples, n_features), float32
+            The drawn rows.
+        y : Array of shape (n_samples,), int32
+            The component each row was drawn from.
+
+        Raises
+        ------
+        ValueError
+            If the model is not fitted or `random_state` is not an int in
+            `[0, 2**64)`.
+        TypeError
+            If `n_samples` is not an int.
+        NotImplementedError
+            If the model was fitted with options outside the default
+            configuration.
+        """
+        if getattr(self, "_ext", None) is not None:
+            raise NotImplementedError("anonlib GaussianMixture: sample() is the default fit's; a fit with "
+                                      "the options routed to x_cluster does not sample (x_cluster/NOT_IMPLEMENTED.tsv)")
+        if not hasattr(self, "weights_"):
+            raise ValueError("anonlib GaussianMixture: call fit before sample")
+        if isinstance(n_samples, bool) or not isinstance(n_samples, int):
+            raise TypeError("anonlib GaussianMixture: n_samples must be an int")
+        seed = self.random_state
+        if isinstance(seed, bool) or not isinstance(seed, int) or not 0 <= seed < 2 ** 64:
+            raise ValueError(
+                "anonlib GaussianMixture: sample needs random_state to be an int in "
+                f"[0, 2**64), got {seed!r}; it is the key of every draw (DEVIATION 2791)"
+            )
+        n = int(n_samples)
+        k = self.weights_.shape[0]
+        d = self.n_features_in_
+        flat_m = self.means_.reshape((k * d,))
+        flat_c = self.covariances_.reshape((k * d * d,))
+        flat_p = self.precisions_cholesky_.reshape((k * d * d,))
+        # Never a zero-length buffer: a refused n still addresses real memory.
+        x = empty((max(n, 1) * d,), "<f4")
+        y = empty((max(n, 1),), "<i4")
+        self._extension().gmm_sample(
+            # ORDER MATCHES bindings/_anonlib_mixture.mojo::gmm_sample_binding.
+            # weights, means, covariances, precisions_chol, log_det_chol, X out, y out
+            [addr_ro(self.weights_, name="weights_"), addr_ro(flat_m, name="means_"),
+             addr_ro(flat_c, name="covariances_"), addr_ro(flat_p, name="precisions_cholesky_"),
+             addr_ro(self.log_det_chol_, name="log_det_chol_"), addr(x, name="X"), addr(y, name="y")],
+            # k, d, n_iter, converged, lower_bound, n (0: no X is read)
+            [k, d, self.n_iter_, 1 if self.converged_ else 0, self.lower_bound_, 0],
+            # n_samples, random_state low 32 bits, random_state high 32 bits
+            [n, seed & 0xFFFFFFFF, seed >> 32],
+        )
+        return x.reshape((n, d)), y
+
+
+__all__ = ["GaussianMixture"]
+
+
+# scikit-learn keeps more estimators in this module than it defines; they resolve from
+# the package at first use (`_sklearn_modules`), so `from anonlib.mixture import ...`
+# takes the same names as scikit-learn's module.
+from ._sklearn_modules import LAYOUT as _SKLEARN_LAYOUT, lazy_exports as _lazy_exports  # noqa: E402
+__getattr__ = _lazy_exports("mixture")
+__all__ += _SKLEARN_LAYOUT["mixture"]

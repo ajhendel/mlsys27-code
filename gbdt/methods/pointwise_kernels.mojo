@@ -1,0 +1,2267 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 the authors. Part of anonlib, DOI-WITHHELD
+"""The POINTWISE host launch layer: grids, the multiplier ladder, the fan-out.
+
+Reference, in one file because they are one call chain:
+
+    `catboost/cuda/methods/pointwise_kernels.{h,cpp}`   the wrapper objects
+    `catboost/cuda/methods/kernel/pointwise_hist2.cu`   `UpdateFoldBins`,
+                                                        `UpdatePointwiseHistograms`,
+                                                        `ScanPointwiseHistograms`
+    `pointwise_hist2_one_byte_templ.cuh:221-270`        `ComputeHist2NonBinary`
+    `pointwise_hist2_binary.cu:128-179`                 `ComputeHist2Binary`
+    `pointwise_hist2_half_byte.cu:130-180`              `ComputeHist2HalfByte`
+    `gpu_data/folds_histogram.h`                        `TFoldsHistogram`
+
+(CatBoost `54a8143a`).
+
+WHAT THIS FILE IS. The three drivers in `gbdt/methods/kernel/` know how to
+turn a block into a histogram. Nothing yet decided HOW MANY BLOCKS, which
+kernel gets which features, or what happens after the histogram is built.
+That is all here, and it is four decisions:
+
+    1. the grid          features per block is fixed per family (32 binary,
+                         8 half-byte, 4 one-byte), leaves on `y`, folds on `z`
+    2. the MULTIPLIER    when the feature axis cannot fill the machine,
+                         split the DOCUMENT axis `M` ways and reduce with
+                         atomics -- `EstimateBlockPerFeatureMultiplier`
+    3. the fan-out       one call per POLICY, and for one-byte, one call per
+                         BIT WIDTH; the kernels then partition the blocks
+                         between themselves at runtime
+    4. the tail          scan the histograms into prefix sums (every policy
+                         but binary), then, on a partial pass, recover the
+                         sibling by subtraction
+
+THE ONE THING IN HERE THAT LOOKS LIKE A BUG AND IS NOT.
+`ComputeHist2NonBinary` computes `numBlocks.x` TWICE, with two different
+feature counts (`:240` and `:242`):
+
+    numBlocks.x = (featureCountForBits + 3) / 4;         // sizes the estimate
+    const ui32 multiplier = min(EstimateBlockPerFeatureMultiplier(numBlocks, size), 64);
+    numBlocks.x = ((nbCount + 3) / 4);                   // sizes the LAUNCH
+    numBlocks.x *= multiplier;
+
+It is DELIBERATE and both values are load-bearing.
+
+  * The LAUNCH must cover `nbCount`, every one-byte feature, because each
+    bit-width kernel is launched over all of them and returns from the
+    groups outside its range (`pointwise_hist2_one_byte_templ.mojo`'s
+    step 3). A grid sized to `featureCountForBits` would not reach the
+    later groups at all, and which groups those are is not knowable on the
+    host -- the kernel decides it from `GetMaxBinCount` at runtime.
+  * The ESTIMATE must be sized on `featureCountForBits`, the number of
+    features this bit width will ACTUALLY do work for, because the
+    multiplier answers "is there enough real work to fill the device". A
+    grid of 500 blocks of which 8 do anything is not 500 blocks of work,
+    and estimating on `nbCount` would return `multiplier == 1` for every
+    width on a wide dataset and leave the document axis unsplit.
+
+So the first assignment is a scratch value passed into an estimator that
+takes a `dim3`, and the second is the grid. The consequence, which is also
+theirs and is not accidental: a bit width owning few features gets a LARGE
+multiplier and that multiplier is then applied to ALL `ceil(nbCount / 4)`
+groups, most of which return immediately. Their kernels are cheap to refuse
+-- one shared reduce over four `Folds` values and a bounds test -- and that
+is the trade they made.
+
+HALF OF IT IS UNOBSERVABLE FROM THE OUTPUT AND THAT IS WORTH SAYING PLAINLY.
+Sizing the LAUNCH wrong is loud: sabotaged, it moves 2,796 of 3,686 cells in
+gate F1 and leaves three of the four bit widths claiming nothing in F4.
+Sizing the ESTIMATE wrong changes NO CELL -- both choices produce a grid
+consistent with the `M` the kernel is instantiated for, so the histogram is
+right either way and only the BLOCK COUNT differs. The one channel through
+which a block count reaches the output is the writeback, which is a plain
+store at `M == 1` and an atomicAdd above it; gate F2c seeds the histogram
+with a non-zero pattern so that a store and an add are distinguishable, and
+that gate -- and only that gate -- moves (2,004 of 3,090 cells). Without it,
+half of the finding above would be a claim with nothing holding it up.
+
+FOUR THINGS DIFFER FROM THEIRS AND ALL FOUR ARE DECLARED BELOW: deviations
+100 (block sizes), 101 (`exit(1)`), 102 (the wrapper object), plus the scan
+grid, which is an inherited consequence of the serial-scan substitution rather than a new
+decision -- see `scan_pointwise_histograms`.
+
+DEVIATION 100: THE BLOCK SIZES ARE THE KERNEL MATRIX'S, NOT THEIR LITERALS
+--------------------------------------------------------------------------
+REFERENCE: `const int blockSize = 384;` for the one-byte family
+           (`pointwise_hist2_one_byte_templ.cuh:238`) and
+           `const int blockSize = 768;` for both small-bin families
+           (`pointwise_hist2_binary.cu:141`, `pointwise_hist2_half_byte.cu:145`).
+
+HERE:      `PW_HIST2_BLOCK` (256 on Apple, via `pw_hist2_block_size_for` --
+           which also records the measured-negative doubled-block experiment)
+           and `PW_HB_BLOCK` (512), READ FROM THE KERNEL FILES rather than
+           restated here, so a launcher cannot drift from the kernel it
+           launches.
+
+MEASURED REASON: the accumulators are sized per thread -- 32 floats each for
+the one-byte family, 16 for the small-bin one. At CatBoost's 768 the
+small-bin accumulator wants 16 x 768 x 4 = 49,152 bytes of threadgroup
+memory against Apple's 32,768 limit, and at 384 the one-byte accumulator
+wants 32 x 384 x 4 = 49,152 against the same limit. The kernel matrix
+resolves both; `pointwise_hist2_half_byte_template.mojo` records the
+derivation and a `comptime assert` there refuses anything under 512, because
+that family's `Reduce` folds its warp slices under `if (threadIdx.x < 512)`
+and a smaller block would leave the top of the first slice unfolded.
+
+WHAT IT DOES AND DOES NOT CHANGE. It does NOT change the grid: every
+`numBlocks` expression below is in FEATURES and PARTS, never in threads, so
+the block size appears in none of them. It does not change the multiplier:
+`EstimateBlockPerFeatureMultiplier` counts blocks, not threads. It DOES
+change how many blocks a scan launch needs (`ceil(featureCount / blockSize)`
+moves with the divisor), and it changes the number of warp slices each
+accumulator folds, which is a float summation ORDER inside the kernel and is
+already recorded where the accumulators are.
+
+DEVIATION 101: `exit(1)` AND `CB_ENSURE_INTERNAL` BECOME RAISED ERRORS
+----------------------------------------------------------------------
+REFERENCE: the multiplier ladder ends `} else { exit(1); }`
+           (`pointwise_hist2_one_byte_templ.cuh:266`, `_binary.cu:174`,
+           `_half_byte.cu:175`) -- a bare process abort with no message. The
+           `histCount` guards end `CB_ENSURE_INTERNAL(false, ...)`
+           (`pointwise_hist2.cu:99`, `:129`), which throws.
+
+HERE:      both raise, and the multiplier one names the offending value.
+
+REASON: not a choice about behavior -- Mojo has no `exit` in a `def` that
+already `raises`, and a library that kills the process instead of returning
+an error cannot be gated. Both are UNREACHABLE by construction from inside
+this file (`EstimateBlockPerFeatureMultiplier` only ever doubles from 1 and
+is capped at 64, so it is always a power of two in [1, 64]; `histCount` is
+passed as 2 by the only caller). They are kept because a guard that
+is unreachable today is the one that catches tomorrow's caller, and
+because `min(..., 64)` is what makes the seven enough:
+`checks/pointwise_dispatch_check.mojo` gate F7 sweeps 245
+configurations, finds 12 that return 128 before the clamp, and asserts
+every clamped value is one of the seven.
+
+DEVIATION 102: THE WRAPPER OBJECT BECOMES A FUNCTION
+-----------------------------------------------------
+REFERENCE: `TComputeHist2Kernel : TStatelessKernel` holds thirteen members,
+           declares `Y_SAVELOAD_DEFINE` over all of them, is registered in a
+           global table as `REGISTER_KERNEL(0x420000, ...)`, and is dispatched
+           to N devices by `LaunchKernels<TKernel>(targets.NonEmptyDevices(),
+           ...)`.
+
+dither_ids=dither_ids,
+)
+           arguments, on one device.
+
+REASON: three of theirs do not exist here and one is deliberate.
+`Y_SAVELOAD_DEFINE` and `REGISTER_KERNEL` serialize a kernel invocation so
+it can be sent to another PROCESS -- CatBoost's multi-host path. There is no
+such path here and implementing the table without it would be implementing a name.
+`TCudaBufferPtr<T>` carries a pointer and a size; ours are separate
+arguments, the same substitution every implemented kernel in this tree already
+makes. And `NonEmptyDevices()` is the multi-device fan-out,
+which is settled: at device count 1 the layouts coincide, and
+one device is what this tree runs.
+
+TWO SMALLER CONSEQUENCES OF THE SAME DECISION, both real implements of theirs:
+
+  * `TFoldsHistogram` (`gpu_data/folds_histogram.h`) is implemented HERE, not in
+    `gbdt/gpu_data/`, because the one-byte fan-out cannot be written without
+    it. Keeping the 27-line type beside its only consumer avoids a second
+    representation.
+  * `TComputeHist1Kernel` is NOT implemented. `pointwise_hist1.cu` is dead in
+    the reference -- registered, wrapped, and called by nothing
+    (`gbdt/NOT_IMPLEMENTED.tsv`).
+
+INHERITED, NOT NEW: the 8-bit path takes a `fixed_scale` their kernels have
+no parameter for. That is DEVIATION 93 (Metal has no threadgroup float
+atomic, so the 8-bit accumulator is Int32 fixed point); this layer only
+threads the value through.
+"""
+
+from checks.kernel_matrix import (
+    TARGET_COLUMN,
+    pointwise_doc_split_for,
+    pointwise_one_byte_fixed_for,
+    pointwise_private_doc_slots_sm_for,
+)
+from checks.numerics import GLOBAL_NUMERIC_MODE as HIST_BUILD_MODE
+from checks.numerics import NUMERIC_FAST, NUMERIC_IDENTICAL
+from core.device_zero import enqueue_fill
+from max.gpu.host import DeviceBuffer, DeviceContext
+from std.os import getenv
+from std.memory import bitcast
+from std.gpu import block_dim, block_idx, grid_dim, thread_idx
+from gbdt.gpu_data.apple_fast_trees_experiments import AFT_G01, AFT_G02
+
+from gbdt.gpu_data.grid_policy import (
+    POLICY_BINARY,
+    POLICY_HALF_BYTE,
+    POLICY_ONE_BYTE,
+)
+from gbdt.methods.kernel.split_properties_helpers import (
+    AFT_SCAN_LANES,
+    aft_cooperative_scan_kernel,
+    PW_PRIVATE_DOC_SLOTS,
+    PointwisePartOffsetsHelper,
+    estimate_block_per_feature_multiplier,
+    scan_pointwise_histograms_kernel,
+)
+from gbdt.methods.kernel.pointwise_hist2_one_byte_5bit import (
+    PW_HIST2_BLOCK,
+    PW_HIST2_FLOAT_BLOCK,
+)
+from gbdt.methods.kernel.pointwise_hist2_half_byte_template import PW_HB_BLOCK, PW_HB_FIXED
+from gbdt.methods.kernel.pointwise_hist2_one_byte_templ import (
+    compute_split_properties_nb_kernel,
+    PW_WRITE_EPS,
+    ORD_SMALL_FOLD_BLOCK,
+    ORD_SMALL_FOLD_PART_GROUPS,
+    ord_small_fold_convert_kernel,
+    ord_small_fold_hist8_kernel,
+)
+from gbdt.trees_identical_switches import (
+    ORD_HIST_FOLD_SKIP,
+    ORD_HIST_FOLD_SKIP_DOCS,
+)
+from gbdt.methods.kernel.pointwise_hist2_binary import (
+    compute_split_properties_b_kernel,
+)
+from gbdt.methods.kernel.pointwise_hist2_half_byte import (
+    compute_split_properties_half_byte_kernel,
+)
+
+
+# ---------------------------------------------------------------------------
+# constants (theirs, by file and line)
+# ---------------------------------------------------------------------------
+
+#: `numBlocks.x = (bCount + 31) / 32` (`pointwise_hist2_binary.cu:132`).
+comptime PW_B_FEATURES_PER_BLOCK = 32
+
+#: `numBlocks.x = (halfByteFeaturesCount + 7) / 8`
+#: (`pointwise_hist2_half_byte.cu:139`).
+comptime PW_HB_FEATURES_PER_BLOCK = 8
+
+#: `numBlocks.x = (featureCountForBits + 3) / 4`
+#: (`pointwise_hist2_one_byte_templ.cuh:240`).
+comptime PW_NB_FEATURES_PER_BLOCK = 4
+
+#: `min(EstimateBlockPerFeatureMultiplier(numBlocks, size), 64)`. The cap is
+#: theirs and it is NOT `EstimateBlockPerFeatureMultiplier`'s own `limit`
+#: argument, which defaults to 128 -- all three call sites clamp again to 64
+#: on the way out because only seven instantiations exist.
+comptime PW_MAX_MULTIPLIER = 64
+
+#: `const int blockSize = 256;` for both elementwise kernels in
+#: `pointwise_hist2.cu` (`:29`, `:81`). NOT a matrix row: neither kernel
+#: allocates threadgroup memory, so DEVIATION 100 does not touch them and
+#: their literal is portable as written.
+comptime PW_UPDATE_BLOCK = 256
+
+#: `const int scanBlockSize = 256;` (`pointwise_hist2.cu:107`).
+comptime PW_SCAN_BLOCK = 256
+
+
+@always_inline
+def is_grid_empty(x: Int, y: Int, z: Int) -> Bool:
+    """`IsGridEmpty` (`cuda_util/kernel/kernel_helpers.cuh:263-265`).
+
+        return grid.x == 0 || grid.y == 0 || grid.z == 0;
+
+    Honoured before EVERY launch below, exactly where theirs honours it.
+    It is not defensive tidiness: `numBlocks.y` is `partCount / 2` on a
+    partial pass, so a one-leaf level makes it zero, and `numBlocks.x` is
+    zero whenever a policy or a bit width owns no features. CUDA tolerates a
+    zero-extent launch; a Metal queue does not have to.
+    """
+    return x == 0 or y == 0 or z == 0
+
+
+@always_inline
+def pw_block_multiplier(
+    nx: Int, ny: Int, nz: Int, size: Int, sm_count: Int
+) -> Int:
+    """`min(EstimateBlockPerFeatureMultiplier(numBlocks, size), 64)`, the
+    expression all three launchers share, behind the NUMERIC row
+    `pointwise_doc_split_for`.
+
+    DEVIATION 2624. At a multiplier above 1 every document block of a
+    feature writes its partial histogram into the SAME `binSums` cell with a
+    float `atomicAdd` (the `m > 1` writebacks in `pointwise_hist2_binary`,
+    `pointwise_hist2_half_byte` and `pointwise_hist2_one_byte_templ`). Float
+    addition is not associative, so the cell depends on the order in which
+    the device finishes the blocks, and the multiplier itself follows
+    `sm_count`, which differs by vendor. Measured on an NVIDIA H100,
+    2026-09-11: three in-process repeats of one IDENTICAL pointwise fit gave
+    three different `tree001.depth00.hist.BinaryFeatures` hashes, and
+    Istella-S 1M moved its model hash between rounds. Tree 0 held only
+    because its Logloss gradients are dyadic, so every partial sum was exact.
+    `checks/pointwise_dispatch_check.mojo` could not see it for the same
+    reason: its planted stats are integers under 2^24.
+
+    So the ordered tiers keep the document axis whole: one block per
+    feature group per part, a plain store, one summation order on every
+    vendor. FAST keeps CatBoost's split.
+
+    DEVIATION 2669 (NEGATIVE, proven 2026-09-11 night). The proposal was to
+    win 2624's time back WITH 2624's bits: split the document axis again,
+    give every document block a private scratch slot, and fold the slots in
+    a fixed block order. It cannot reproduce the multiplier-1 cells.
+    At M = 1 an accumulator slot is ONE left-to-right float sum over the
+    documents in stride order (`s = ((x0 + x1) + x2) + x3 ...`). At M > 1
+    block `b` sums only the documents whose stride index is `b` mod M, from
+    zero, and the fold adds those partials: at M = 2,
+    `(x0 + x2) + (x1 + x3)`. In float32, x = (1e8, 1, -1e8, 1): the
+    sequential sum is 1 (1e8 + 1 rounds back to 1e8), the fold is 2. No
+    order of folding the partials helps, because each partial already
+    rounded without the documents of the other blocks. The only exact
+    schedule carries each block's running state into the next, which runs
+    the blocks one after another and wins nothing. Gradients and weights are
+    real-valued after tree 0 (the 2624 drift was exactly that), so there is
+    no data-independent exact case to specialize.
+
+    DEVIATION 2670 (OPT-IN, `-D ANONLIB_2670_PW_PRIVATE_DOC_SLOTS=1`,
+    NOT FLIPPED). The same private slots with NEW bits: the multiplier is
+    `EstimateBlockPerFeatureMultiplier` at the kernel matrix's pinned SM
+    count (`PW_2670_PINNED_SM`, never the device's), so the document split,
+    the peel and the fold order are one schedule on every vendor and at
+    every launch geometry; each block stores into its own slot
+    (`pw_private_doc_slot`) and `pw_fold_doc_slots_kernel` adds slots
+    0..M-1 onto `binSums` in that order. Merging it moves the pointwise
+    IDENTICAL model hashes and needs the Apple M4 and AMD gates.
+    """
+    comptime pinned_sm = pointwise_private_doc_slots_sm_for[
+        TARGET_COLUMN, HIST_BUILD_MODE != NUMERIC_FAST
+    ]()
+    comptime if pinned_sm != 0:
+        _ = sm_count
+        var pinned = estimate_block_per_feature_multiplier(
+            nx, ny, nz, size, pinned_sm
+        )
+        if pinned > PW_MAX_MULTIPLIER:
+            pinned = PW_MAX_MULTIPLIER
+        return pinned
+    comptime if AFT_G02:
+        # G02: an occupancy/row-budget alternative, not the rejected fixed
+        # SYM_HIST_MULT retry. Aim for three blocks per compute unit but
+        # stop before a prospective partition chunk has less than four
+        # histogram-block row strides. This prices leaf/fold fragmentation
+        # as well as features and hardware. All rows remain in the kernel's
+        # original multiplier ladder. Uncompiled/unverified/unmeasured.
+        var partitions = max(ny * nz, 1)
+        var resident_groups = max(nx * partitions, 1)
+        var multiplier = 1
+        while (
+            resident_groups * multiplier < max(sm_count, 1) * 3
+            and multiplier < PW_MAX_MULTIPLIER
+            and size // (partitions * multiplier * 2) >= 4 * PW_HIST2_BLOCK
+        ):
+            multiplier *= 2
+        return multiplier
+    # TOMBSTONE: ANONLIB_SYM_HIST_MULT (DROPPED-noise: symhist-hist-mult istella/taxi noise, old base) deleted 2026-10-09 on
+    # lane/owed-deletions-D1 (2x the SM count's worth of histogram blocks); code recoverable at b639a2bd2.
+    # Restore: git apply experiments/removed/ANONLIB_SYM_HIST_MULT.patch; record in docs/TOMBSTONES.md.
+    comptime if not pointwise_doc_split_for[
+        TARGET_COLUMN, HIST_BUILD_MODE != NUMERIC_FAST
+    ]():
+        return 1
+    var multiplier = estimate_block_per_feature_multiplier(
+        nx, ny, nz, size, sm_count
+    )
+    if multiplier > PW_MAX_MULTIPLIER:
+        multiplier = PW_MAX_MULTIPLIER
+    return multiplier
+
+
+# ---------------------------------------------------------------------------
+# `TFoldsHistogram` (`gpu_data/folds_histogram.h`)
+# ---------------------------------------------------------------------------
+
+
+struct FoldsHistogram(Copyable, Movable):
+    """`TFoldsHistogram`, field for field: `std::array<ui32, 9> Counts`.
+
+    HOW MANY FEATURES NEED EXACTLY `bit` BITS. Index `b` counts the features
+    whose fold count fits in `b` bits and not in `b - 1`, for `b` in 0..8.
+    It exists for one reason: `TComputeHist2Kernel::Run` needs
+    `FeatureCountForBits(from, to)` to size the multiplier estimate for each
+    of the four one-byte kernels, and nothing else in their tree reads it.
+
+    THE FOUR RANGES ARE NOT UNIFORM and that is the file's whole content
+    (`pointwise_kernels.cpp:57-60`):
+
+        ComputeHist2NonBinary<5>   bits 4..5
+        ComputeHist2NonBinary<6>   bit  6
+        ComputeHist2NonBinary<7>   bit  7
+        ComputeHist2NonBinary<8>   bit  8
+
+    The 5-bit kernel claims bit FOUR as well, which is the host-side echo of
+    `lowerBound = BITS > 5 ? upperBound / 2 : 15` in the kernel: a feature
+    with 16 folds needs 5 bits to index but is claimed at 5, so the count
+    that sizes the 5-bit estimate has to include the 16-fold features too.
+    Read `4, 5` as `6, 6`'s sibling and the estimate under-counts.
+    """
+
+    var counts: InlineArray[UInt32, 9]
+    """`std::array<ui32, 9> Counts`, the same fixed nine slots. An
+    `InlineArray` rather than a `List` because theirs is a value type with a
+    compile-time size and a `List` would make the struct non-copyable."""
+
+    def __init__(out self):
+        """`Counts.fill(0)`."""
+        self.counts = InlineArray[UInt32, 9](fill=UInt32(0))
+
+    def __init__(out self, counts: List[UInt32]) raises:
+        """Fieldwise. `counts` must have nine entries, bits 0 through 8."""
+        if len(counts) != 9:
+            raise Error(
+                "TFoldsHistogram: Counts is std::array<ui32, 9>, got "
+                + String(len(counts))
+                + " entries"
+            )
+        self.counts = InlineArray[UInt32, 9](fill=UInt32(0))
+        for b in range(9):
+            self.counts[b] = counts[b]
+
+    def feature_count_for_bits(
+        self, from_bit: Int, to_bit_inclusive: Int
+    ) raises -> Int:
+        """`FeatureCountForBits` (`folds_histogram.h:16-24`), copied.
+
+            CB_ENSURE(toBitInclusive <= 8);
+            CB_ENSURE(fromBit <= toBitInclusive);
+            for (bit = fromBit; bit <= toBitInclusive; ++bit)
+                count += Counts[bit];
+        """
+        if to_bit_inclusive > 8:
+            raise Error(
+                "FeatureCountForBits: toBitInclusive must be <= 8, got "
+                + String(to_bit_inclusive)
+            )
+        if from_bit > to_bit_inclusive:
+            raise Error(
+                "FeatureCountForBits: fromBit "
+                + String(from_bit)
+                + " > toBitInclusive "
+                + String(to_bit_inclusive)
+            )
+        var count = 0
+        for bit in range(from_bit, to_bit_inclusive + 1):  # small-loop(to_bit_inclusive: bit widths, at most 8): sums a per-width feature count
+            count += Int(self.counts[bit])
+        return count
+
+
+def folds_histogram_from_folds(folds: List[UInt32]) -> FoldsHistogram:
+    """Bin a feature list by how many BITS its fold count needs.
+
+    NOT an implementation of a function of theirs -- their histogram is filled while the
+    grid is built (`feature_layout.cpp`), which this lane does not own -- but
+    the same tally, and it is what a caller without a built grid needs. The
+    rule is `Counts[bits_needed(folds)]`, where `bits_needed(n)` is the
+    smallest `b` with `n <= (1 << b)`: a feature with 16 folds needs 4, with
+    17 needs 5, with 256 needs 8.
+
+    Reading this the other way -- `bits_needed = ceil(log2(folds + 1))` --
+    shifts every power of two by one and moves the 16-fold features out of
+    the 5-bit kernel's range, which is exactly the mistake the kernel's
+    `lowerBound = ... : 15` exists to prevent. Gate F6 pins it.
+    """
+    var h = FoldsHistogram()
+    for i in range(len(folds)):  # small-loop(folds: one fold count per feature, layout metadata): bins features by width once per pool
+        var n = Int(folds[i])
+        var bits = 0
+        while (1 << bits) < n:
+            bits += 1
+        if bits > 8:
+            bits = 8
+        h.counts[bits] += 1
+    return h^
+
+
+# ---------------------------------------------------------------------------
+# `UpdateFoldBins` (`pointwise_hist2.cu:17-33`)
+# ---------------------------------------------------------------------------
+
+
+def update_bins_kernel(
+    dst_bins: MutPointer[UInt32, MutAnyOrigin],
+    bins: MutPointer[UInt32, MutAnyOrigin],
+    doc_indices: MutPointer[UInt32, MutAnyOrigin],
+    size_in: Int32,
+    load_bit_in: Int32,
+    fold_bits_in: Int32,
+):
+    """`UpdateBinsImpl` (`:17-25`), copied.
+
+        const ui32 idx = LdgWithFallback(docIndices, i);
+        const ui32 bit = (LdgWithFallback(bins, idx) >> loadBit) & 1;
+        dstBins[i] = dstBins[i] | (bit << (loadBit + foldBits));
+
+    ONE BIT OF THE SPLIT, OR-ed INTO THE DOCUMENT'S BIN. This is how the
+    oblivious level advances: after a split is chosen, every document's leaf
+    id gains one bit, and that bit is read out of the `bins` column the
+    split names. `loadBit` selects the bit inside `bins`; `loadBit +
+    foldBits` places it above the fold bits in the destination, which is the
+    fold layout packing -- fold id in the LOW bits, depth
+    bits above it.
+
+    IT IS A GATHER AND AN OR, not a store. `dstBins[i] |= ...` keeps every
+    bit already set, so calling it twice for the same `loadBit` is
+    idempotent and calling it for successive bits accumulates the path.
+
+    `LdgWithFallback` is `__ldg`, the read-only texture-cache load. It
+    becomes a plain load: it is a cache HINT and moves no value.
+    """
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if i < Int(size_in):
+        var idx = Int(doc_indices.unsafe_load(i))
+        var bit = (bins.unsafe_load(idx) >> UInt32(load_bit_in)) & UInt32(1)
+        var shift = UInt32(load_bit_in) + UInt32(fold_bits_in)
+        dst_bins.unsafe_store(i, dst_bins.unsafe_load(i) | (bit << shift))
+
+
+def update_fold_bins[
+    o1: MutOrigin, o2: MutOrigin, o3: MutOrigin, //
+](
+    ctx: DeviceContext,
+    dst_bins: MutPointer[UInt32, o1],
+    bins: MutPointer[UInt32, o2],
+    doc_indices: MutPointer[UInt32, o3],
+    size: Int,
+    load_bit: Int,
+    fold_bits: Int,
+) raises:
+    """`UpdateFoldBins` (`:27-33`) and `TUpdateFoldBinsKernel::Run`
+    (`pointwise_kernels.h:208-211`), copied.
+
+        const ui32 blockSize = 256;
+        const ui32 numBlocks = CeilDivide(size, blockSize);
+
+    Theirs asserts `DstBins.Size() == DocIndices.Size()` in the wrapper
+    before launching; that is the `CB_ENSURE` below.
+
+    NO `IsGridEmpty` HERE and that is theirs: this is the one launcher in the
+    family without the guard, because `CeilDivide(0, 256)` is 0 and their
+    code simply launches it. Ours refuses instead -- a zero-extent launch is
+    not portable -- and refusing is observationally identical because the
+    kernel body is `if (i < size)`.
+    """
+    if size == 0:
+        return
+    var num_blocks = (size + PW_UPDATE_BLOCK - 1) // PW_UPDATE_BLOCK
+    ctx.enqueue_function[update_bins_kernel](
+        dst_bins,
+        bins,
+        doc_indices,
+        Int32(size),
+        Int32(load_bit),
+        Int32(fold_bits),
+        grid_dim=(num_blocks, 1, 1),
+        block_dim=(PW_UPDATE_BLOCK, 1, 1),
+    )
+
+
+# ---------------------------------------------------------------------------
+# `UpdatePointwiseHistograms` (`pointwise_hist2.cu:38-101`)
+# ---------------------------------------------------------------------------
+
+
+def update_pointwise_histograms_kernel[
+    hist_count: Int
+](
+    histogram: MutPointer[Float32, MutAnyOrigin],
+    first_bin_feature_in: Int32,
+    features_count_in: Int32,
+    # `TDataPartition*` as `{Offset, Size}` pairs of UInt32
+    parts: MutPointer[UInt32, MutAnyOrigin],
+    hist_line_size_in: Int32,
+):
+    """`UpdatePointwiseHistogramsImpl<HIST_COUNT>` (`:38-74`), copied.
+
+    THE SIBLING SUBTRACTION, FINALLY DONE. `ShiftPartAndBinSumsPtr`'s `else`
+    arm made the driver compute the CHEAPER child of each pair and file it
+    under the RIGHT child's slot, leaving the LEFT slot holding the PARENT's
+    histogram from the level before. This kernel resolves that:
+
+        calcVal       = histogram[right]              the child that was built
+        complementVal = histogram[left] - calcVal     parent - child
+        histogram[left]  = isLeftCalculated ? calcVal : complementVal
+        histogram[right] = isLeftCalculated ? complementVal : calcVal
+
+    where `isLeftCalculated = leftPart.Size < rightPart.Size` re-derives, from
+    the partition sizes, WHICH child the driver actually walked -- the same
+    test the driver made, made again here rather than communicated. That is
+    theirs and it is why nothing has to be passed between the two kernels.
+
+    NOTE THE TWO DIFFERENT OFFSET FUNCTIONS AGAIN. `parts` is indexed with
+    `GetDataPartitionOffset` (the fold axis rounded up to a power of two) and
+    `histogram` with `GetHistogramOffset` (packed tight). At `FoldCount == 1`
+    they coincide; above it, reading one for the other transposes the fixup
+    onto the wrong pair. See `split_properties_helpers.mojo`.
+
+    `blockIdx.y | gridDim.y` is theirs, and exact rather than lucky, for the
+    reason recorded on `shift_part_and_bin_sums_ptr`: `gridDim.y` here is
+    `partCount / 2`, a power of two strictly greater than every `blockIdx.y`.
+    """
+    var helper = PointwisePartOffsetsHelper(UInt32(grid_dim.z))
+
+    var left_part_id = Int(
+        helper.data_partition_offset(UInt32(block_idx.y), UInt32(block_idx.z))
+    )
+    var right_part_id = Int(
+        helper.data_partition_offset(
+            UInt32(block_idx.y) | UInt32(grid_dim.y), UInt32(block_idx.z)
+        )
+    )
+    var first_bin_feature = Int(first_bin_feature_in)
+    var bin_feature = (
+        first_bin_feature
+        + Int(block_idx.x) * Int(block_dim.x)
+        + Int(thread_idx.x)
+    )
+
+    if bin_feature < first_bin_feature + Int(features_count_in):
+        var left_size = parts.unsafe_load(2 * left_part_id + 1)
+        var right_size = parts.unsafe_load(2 * right_part_id + 1)
+        var is_left_calculated = left_size < right_size
+
+        var hist_line_size = Int(hist_line_size_in)
+        var left_offset = hist_count * (
+            Int(
+                helper.histogram_offset(
+                    UInt32(block_idx.y), UInt32(block_idx.z)
+                )
+            )
+            * hist_line_size
+            + bin_feature
+        )
+        var right_offset = hist_count * (
+            Int(
+                helper.histogram_offset(
+                    UInt32(block_idx.y) | UInt32(grid_dim.y),
+                    UInt32(block_idx.z),
+                )
+            )
+            * hist_line_size
+            + bin_feature
+        )
+
+        # the reference reads BOTH planes before writing EITHER (`:60-64` then
+        # `:67-71`), which matters because `left` and `right` alias when a
+        # caller mis-sizes the grid; kept in the same two passes.
+        var calc_val = InlineArray[Float32, hist_count](fill=Float32(0.0))
+        var complement_val = InlineArray[Float32, hist_count](
+            fill=Float32(0.0)
+        )
+        comptime for hist_id in range(hist_count):
+            calc_val[hist_id] = histogram.unsafe_load(right_offset + hist_id)
+            complement_val[hist_id] = (
+                histogram.unsafe_load(left_offset + hist_id)
+                - calc_val[hist_id]
+            )
+
+        comptime for hist_id in range(hist_count):
+            histogram.unsafe_store(
+                left_offset + hist_id,
+                calc_val[hist_id] if is_left_calculated
+                else complement_val[hist_id],
+            )
+            histogram.unsafe_store(
+                right_offset + hist_id,
+                complement_val[hist_id] if is_left_calculated
+                else calc_val[hist_id],
+            )
+
+
+def update_pointwise_histograms[
+    o1: MutOrigin, o2: MutOrigin, //
+](
+    ctx: DeviceContext,
+    histograms: MutPointer[Float32, o1],
+    first_bin_feature: Int,
+    bin_feature_count: Int,
+    part_count: Int,
+    fold_count: Int,
+    hist_count: Int,
+    hist_line_size: Int,
+    parts: MutPointer[UInt32, o2],
+) raises:
+    """`UpdatePointwiseHistograms` (`:76-101`), copied.
+
+        const int blockSize = 256;
+        numBlocks.x = (binFeatureCount + blockSize - 1) / blockSize;
+        numBlocks.y = partCount / 2;
+        numBlocks.z = foldCount;
+        if (IsGridEmpty(numBlocks)) return;
+
+    `numBlocks.y` IS `partCount / 2` UNCONDITIONALLY, with no `fullPass`
+    term, because this kernel only ever runs on a partial pass -- one block
+    per PAIR of leaves. Its caller guards it (`pointwise_kernels.cpp:82`).
+    """
+    var nx = (
+        bin_feature_count + PW_UPDATE_BLOCK - 1
+    ) // PW_UPDATE_BLOCK
+    var ny = part_count // 2
+    var nz = fold_count
+    if is_grid_empty(nx, ny, nz):
+        return
+
+    if hist_count == 1:
+        ctx.enqueue_function[update_pointwise_histograms_kernel[1]](
+            histograms,
+            Int32(first_bin_feature),
+            Int32(bin_feature_count),
+            parts,
+            Int32(hist_line_size),
+            grid_dim=(nx, ny, nz),
+            block_dim=(PW_UPDATE_BLOCK, 1, 1),
+        )
+    elif hist_count == 2:
+        ctx.enqueue_function[update_pointwise_histograms_kernel[2]](
+            histograms,
+            Int32(first_bin_feature),
+            Int32(bin_feature_count),
+            parts,
+            Int32(hist_line_size),
+            grid_dim=(nx, ny, nz),
+            block_dim=(PW_UPDATE_BLOCK, 1, 1),
+        )
+    else:
+        # DEVIATION 101: `CB_ENSURE_INTERNAL(false, ...)` (`:99`)
+        raise Error(
+            "UpdatePointwiseHistograms: histCount should be 1 or 2, not "
+            + String(hist_count)
+        )
+
+
+# ---------------------------------------------------------------------------
+# `ScanPointwiseHistograms` (`pointwise_hist2.cu:105-131`)
+# ---------------------------------------------------------------------------
+
+
+def scan_pointwise_histograms[
+    o1: MutOrigin, o2: MutOrigin, o3: MutOrigin, o4: MutOrigin, //
+](
+    ctx: DeviceContext,
+    feature_first_fold_index: MutPointer[UInt32, o1],
+    feature_folds: MutPointer[UInt32, o2],
+    feature_one_hot: MutPointer[UInt8, o3],
+    feature_count: Int,
+    part_count: Int,
+    fold_count: Int,
+    hist_line_size: Int,
+    full_pass: Bool,
+    hist_count: Int,
+    bin_sums: MutPointer[Float32, o4],
+) raises:
+    """`ScanPointwiseHistograms` (`:105-131`), copied.
+
+        const int histPartCount = (fullPass ? partCount : partCount / 2);
+        scanBlocks.x = (featureCount * 32 + scanBlockSize - 1) / scanBlockSize;
+        scanBlocks.y = histPartCount;
+        scanBlocks.z = foldCount;
+        if (IsGridEmpty(scanBlocks)) return;
+        const int scanOffset = fullPass ? 0
+            : ((partCount / 2) * histLineSize * histCount) * foldCount;
+
+    THE `scanOffset` IS THE PARTIAL-PASS HALF OF THE BUFFER. On a partial
+    pass the drivers wrote into the RIGHT children's slots, which begin at
+    part `partCount / 2`; the scan is pointed there and never touches the
+    left half, which still holds the parents. Theirs advances the pointer;
+    ours advances it the same way with `unsafe_offset`.
+
+    `grid.x` DIFFERS FROM THEIRS AND IT IS NOT A NEW DECISION. Theirs gives
+    each feature a 32-lane WARP -- hence `featureCount * 32` threads -- and
+    scans 32 bins at a time with `InclusiveScanInWarp`. This implementation
+    replaced that with one THREAD per feature, for the reason recorded on
+    `scan_pointwise_histograms_kernel`: their loop puts `__syncthreads()`
+    inside `if (featureId < featureCount)`, which the tail block reaches
+    with only some of its warps, and a partially-reached threadgroup barrier
+    hangs on Metal. One thread per feature means `featureCount` threads, so
+    `grid.x` loses the `* 32`. The grid is the LAST place that substitution
+    shows up; every earlier consequence is already recorded at the kernel.
+
+    `HIST_COUNT` is a template argument of theirs and a runtime argument of
+    ours, for the same reason -- one thread walks both stat planes rather
+    than two warps walking one each. The 1-or-2 guard is kept anyway, since
+    it is the guard and not the templating that protects a caller.
+    """
+    if hist_count != 1 and hist_count != 2:
+        # DEVIATION 101: `CB_ENSURE_INTERNAL(false, ...)` (`:129`)
+        raise Error(
+            "ScanPointwiseHistograms: histCount should be 1 or 2, not "
+            + String(hist_count)
+        )
+
+    var hist_part_count = part_count if full_pass else part_count // 2
+    var nx = (feature_count + PW_SCAN_BLOCK - 1) // PW_SCAN_BLOCK
+    var ny = hist_part_count
+    var nz = fold_count
+    if is_grid_empty(nx, ny, nz):
+        return
+
+    var scan_offset = 0
+    if not full_pass:
+        scan_offset = (
+            (part_count // 2) * hist_line_size * hist_count
+        ) * fold_count
+
+    comptime if AFT_G01:
+        ctx.enqueue_function[aft_cooperative_scan_kernel](
+            feature_first_fold_index, feature_folds, feature_one_hot,
+            Int32(hist_line_size), Int32(hist_count), Int32(fold_count),
+            bin_sums.unsafe_offset(scan_offset),
+            grid_dim=(feature_count, ny, nz),
+            block_dim=(AFT_SCAN_LANES, 1, 1),
+        )
+        return
+    ctx.enqueue_function[scan_pointwise_histograms_kernel](
+        feature_first_fold_index,
+        feature_folds,
+        feature_one_hot,
+        Int32(feature_count),
+        Int32(hist_line_size),
+        Int32(hist_count),
+        Int32(fold_count),
+        bin_sums.unsafe_offset(scan_offset),
+        grid_dim=(nx, ny, nz),
+        block_dim=(PW_SCAN_BLOCK, 1, 1),
+    )
+
+
+# ---------------------------------------------------------------------------
+# `ComputeHist2NonBinary<Bits>` (`pointwise_hist2_one_byte_templ.cuh:221-270`)
+# ---------------------------------------------------------------------------
+
+
+def run_compute_hist2_non_binary_kernel[
+    o1: MutOrigin,
+    o2: MutOrigin,
+    o3: MutOrigin,
+    o4: MutOrigin,
+    o5: MutOrigin,
+    o6: MutOrigin,
+    o7: MutOrigin,
+    o8: MutOrigin,
+    o9: MutOrigin, //,
+    bits: Int,
+    blocks_per_feature_count: Int,
+](
+    ctx: DeviceContext,
+    feature_offset: MutPointer[UInt32, o1],
+    feature_first_fold_index: MutPointer[UInt32, o2],
+    feature_folds: MutPointer[UInt32, o3],
+    nb_count: Int,
+    cindex: MutPointer[UInt32, o4],
+    target: MutPointer[Float32, o5],
+    weight: MutPointer[Float32, o6],
+    indices: MutPointer[UInt32, o7],
+    partition: MutPointer[UInt32, o8],
+    bin_sums: MutPointer[Float32, o9],
+    bin_feature_count: Int,
+    full_pass: Bool,
+    fixed_scale: MutPointer[Float32, MutAnyOrigin],
+    nx: Int,
+    ny: Int,
+    nz: Int,
+    int_slot: Bool = False,
+    dither_ids: Optional[MutPointer[UInt32, MutAnyOrigin]] = None,
+    z_skip: Int = 0,
+) raises:
+    """`RunComputeHist2NonBinaryKernel` (`:190-216`), copied.
+
+    `z_skip` (A ORD_HIST_FOLD_SKIP): the leading fold partitions whose
+    blocks leave at entry; 0 everywhere else.
+
+    A `bool` selecting between two template instantiations, which is what
+    theirs is and all that theirs is.
+
+    THE BLOCK IS PER BIT WIDTH, matching the kernel's own geometry: the
+    8-bit width takes the route-keyed block (`pw_hist2_block_size_for`),
+    the float widths always take their dispatch's. Under their dispatch
+    the two are the same value.
+    """
+    comptime nb_block = PW_HIST2_BLOCK if bits == 8 else (
+        PW_HIST2_FLOAT_BLOCK
+    )
+    if full_pass:
+        ctx.enqueue_function[
+            compute_split_properties_nb_kernel[
+                bits, True, blocks_per_feature_count
+            ]
+        ](
+            feature_offset,
+            feature_first_fold_index,
+            feature_folds,
+            Int32(nb_count),
+            cindex,
+            target,
+            weight,
+            indices,
+            partition,
+            bin_sums,
+            Int32(bin_feature_count),
+            fixed_scale,
+            Int32(1 if int_slot else 0),
+            Int32(z_skip),
+            dither_ids,
+            grid_dim=(nx, ny, nz),
+            block_dim=(nb_block, 1, 1),
+        )
+    else:
+        ctx.enqueue_function[
+            compute_split_properties_nb_kernel[
+                bits, False, blocks_per_feature_count
+            ]
+        ](
+            feature_offset,
+            feature_first_fold_index,
+            feature_folds,
+            Int32(nb_count),
+            cindex,
+            target,
+            weight,
+            indices,
+            partition,
+            bin_sums,
+            Int32(bin_feature_count),
+            fixed_scale,
+            Int32(1 if int_slot else 0),
+            Int32(z_skip),
+            dither_ids,
+            grid_dim=(nx, ny, nz),
+            block_dim=(nb_block, 1, 1),
+        )
+
+
+def compute_hist2_non_binary_dev[
+    o1: MutOrigin,
+    o2: MutOrigin,
+    o3: MutOrigin,
+    o4: MutOrigin,
+    o5: MutOrigin,
+    o6: MutOrigin,
+    o7: MutOrigin,
+    o8: MutOrigin,
+    o9: MutOrigin, //,
+    bits: Int,
+](
+    ctx: DeviceContext,
+    feature_offset: MutPointer[UInt32, o1],
+    feature_first_fold_index: MutPointer[UInt32, o2],
+    feature_folds: MutPointer[UInt32, o3],
+    nb_count: Int,
+    cindex: MutPointer[UInt32, o4],
+    target: MutPointer[Float32, o5],
+    weight: MutPointer[Float32, o6],
+    indices: MutPointer[UInt32, o7],
+    size: Int,
+    partition: MutPointer[UInt32, o8],
+    part_count: Int,
+    fold_count: Int,
+    full_pass: Bool,
+    hist_line_size: Int,
+    bin_sums: MutPointer[Float32, o9],
+    feature_count_for_bits: Int,
+    sm_count: Int,
+    fixed_scale: MutPointer[Float32, MutAnyOrigin],
+    dither_ids: Optional[MutPointer[UInt32, MutAnyOrigin]] = None,
+    fold_part_sizes: List[Int] = List[Int](),
+) raises:
+    """`ComputeHist2NonBinary<Bits>` (`:221-270`), copied line for line.
+
+    `fold_part_sizes` (A ORD_HIST_FOLD_SKIP, the Ordered fold arm only):
+    the document count of each of the `fold_count` fold partitions, in
+    fold-id order; empty everywhere else (no skip).
+
+        if (featureCountForBits) {
+            numBlocks.y = (fullPass ? partCount : partCount / 2);
+            numBlocks.z = foldCount;
+            numBlocks.x = (featureCountForBits + 3) / 4;
+            multiplier = min(EstimateBlockPerFeatureMultiplier(numBlocks, size), 64);
+            numBlocks.x = ((nbCount + 3) / 4);
+            numBlocks.x *= multiplier;
+            if (IsGridEmpty(numBlocks)) return;
+            ... COMPUTE(1|2|4|8|16|32|64) else exit(1)
+        }
+
+    THE OUTER `if (featureCountForBits)` IS THE ONLY HOST-SIDE DISPATCH IN
+    THE FAMILY. Everything else about which kernel handles which feature is
+    decided on the device. All it does is skip the launch entirely for a bit
+    width no feature needs -- and note it does NOT restrict the grid to
+    those features, which is the double-`numBlocks.x` finding in the module
+    docstring.
+
+    `size` IS THE DOCUMENT COUNT, NOT THE FEATURE COUNT. It reaches
+    `EstimateBlockPerFeatureMultiplier` as `dsSize` and gates the split at
+    `(dsSize / multiplier) > 10000`: the document axis is never divided into
+    pieces smaller than ~10k rows, so a small dataset gets `multiplier == 1`
+    however empty the machine is. Theirs passes `Indices.Size()`
+    (`pointwise_kernels.cpp:24`).
+    """
+    if feature_count_for_bits == 0:
+        return
+
+    var hist_part_count = part_count if full_pass else part_count // 2
+    var ny = hist_part_count
+    var nz = fold_count
+
+    # `:240` -- sizes the ESTIMATE, from the features this width will serve
+    var nx = (
+        feature_count_for_bits + PW_NB_FEATURES_PER_BLOCK - 1
+    ) // PW_NB_FEATURES_PER_BLOCK
+    var multiplier = pw_block_multiplier(nx, ny, nz, size, sm_count)
+    var int_slots = False
+    comptime if bits == 8 and not PW_PRIVATE_DOC_SLOTS and HIST_BUILD_MODE != NUMERIC_FAST:
+        if pw_int_slots_on():
+            var est = estimate_block_per_feature_multiplier(nx, ny, nz, size, sm_count)
+            # a check's lever: a forced power-of-two split (the cells cannot
+            # depend on it; ANONLIB_PW_INT_SLOTS_FORCE=4 proves that)
+            var force = String(getenv("ANONLIB_PW_INT_SLOTS_FORCE"))
+            if force != "":
+                try:
+                    est = Int(force)
+                except:
+                    pass
+            if est > PW_MAX_MULTIPLIER:
+                est = PW_MAX_MULTIPLIER
+            if est > 1 and (est & (est - 1)) == 0:
+                multiplier = est
+                int_slots = True
+
+    # `:242` -- sizes the LAUNCH, over EVERY one-byte feature
+    nx = (
+        nb_count + PW_NB_FEATURES_PER_BLOCK - 1
+    ) // PW_NB_FEATURES_PER_BLOCK
+    nx *= multiplier
+    if is_grid_empty(nx, ny, nz):
+        return
+
+    # A ORD_HIST_FOLD_SKIP (trees_identical_switches.mojo): the leading
+    # fold partitions with fewer than `part_count x ORD_HIST_FOLD_SKIP_DOCS`
+    # documents (fewer documents per part than the budget, so the regular
+    # block's shared zero + reduce + writeback outweighs its documents) go
+    # to the small-fold kernel and its conversion pass; the regular grid
+    # below skips them (`z_skip`). The fold partitions ascend in size
+    # (geometric folds, learn then quality per fold), so they are a prefix.
+    # Same cells (Int32 sums are order-free); fixed 8-bit route only.
+    var z_skip = 0
+    comptime if (
+        ORD_HIST_FOLD_SKIP
+        and bits == 8
+        and pointwise_one_byte_fixed_for[
+            TARGET_COLUMN, HIST_BUILD_MODE == NUMERIC_IDENTICAL
+        ]()
+    ):
+        if fold_count > 1 and len(fold_part_sizes) == fold_count:
+            var budget = part_count * ORD_HIST_FOLD_SKIP_DOCS
+            while z_skip < fold_count and fold_part_sizes[z_skip] < budget:  # small-loop(fold_count: fold partitions, 2F): the small-fold prefix
+                z_skip += 1
+        if z_skip > 0:
+            var fb = (
+                nb_count + PW_NB_FEATURES_PER_BLOCK - 1
+            ) // PW_NB_FEATURES_PER_BLOCK
+            var groups = ny if ny < ORD_SMALL_FOLD_PART_GROUPS else ORD_SMALL_FOLD_PART_GROUPS
+            var line_blocks = (2 * hist_line_size + 255) // 256
+            if full_pass:
+                ctx.enqueue_function[ord_small_fold_hist8_kernel[True]](
+                    feature_offset, feature_first_fold_index, feature_folds,
+                    Int32(nb_count), cindex, target, weight, indices,
+                    partition, bin_sums, Int32(hist_line_size),
+                    Int32(fold_count), Int32(ny), fixed_scale, dither_ids,
+                    grid_dim=(fb, z_skip, groups),
+                    block_dim=(ORD_SMALL_FOLD_BLOCK, 1, 1),
+                )
+                ctx.enqueue_function[ord_small_fold_convert_kernel[True]](
+                    bin_sums, Int32(hist_line_size), Int32(fold_count),
+                    Int32(ny), fixed_scale,
+                    grid_dim=(line_blocks, z_skip, ny),
+                    block_dim=(256, 1, 1),
+                )
+            else:
+                ctx.enqueue_function[ord_small_fold_hist8_kernel[False]](
+                    feature_offset, feature_first_fold_index, feature_folds,
+                    Int32(nb_count), cindex, target, weight, indices,
+                    partition, bin_sums, Int32(hist_line_size),
+                    Int32(fold_count), Int32(ny), fixed_scale, dither_ids,
+                    grid_dim=(fb, z_skip, groups),
+                    block_dim=(ORD_SMALL_FOLD_BLOCK, 1, 1),
+                )
+                ctx.enqueue_function[ord_small_fold_convert_kernel[False]](
+                    bin_sums, Int32(hist_line_size), Int32(fold_count),
+                    Int32(ny), fixed_scale,
+                    grid_dim=(line_blocks, z_skip, ny),
+                    block_dim=(256, 1, 1),
+                )
+            if z_skip >= nz:
+                # every fold partition was small: the regular grid has
+                # nothing left to file
+                return
+
+    if int_slots:
+        var stride_i = ny * nz * 2 * hist_line_size
+        var slots_i = ctx.enqueue_create_buffer[DType.float32](
+            multiplier * stride_i
+        )
+        # zeroed: a cell no block of this width files (another width's
+        # feature in the window) must fold to 0 and stay unwritten
+        enqueue_fill(ctx, slots_i, Float32(0.0))
+        non_binary_multiplier_ladder[bits](
+            ctx, feature_offset, feature_first_fold_index, feature_folds,
+            nb_count, cindex, target, weight, indices, partition,
+            slots_i.unsafe_ptr(), hist_line_size, full_pass, fixed_scale,
+            multiplier, nx, ny, nz, True,
+            dither_ids=dither_ids, z_skip=z_skip,
+        )
+        launch_pw_fold_int_slots(
+            ctx, slots_i, bin_sums, full_pass, stride_i, multiplier, fixed_scale
+        )
+        _ = slots_i^
+        return
+    comptime if PW_PRIVATE_DOC_SLOTS:
+        if multiplier > 1:
+            # DEVIATION 2670: every document block into its own slot of a
+            # zeroed scratch, then one fold onto `binSums` in block order
+            var stride = ny * nz * 2 * hist_line_size
+            var slots = ctx.enqueue_create_buffer[DType.float32](
+                multiplier * stride
+            )
+            enqueue_fill(ctx, slots, Float32(0.0))
+            non_binary_multiplier_ladder[bits](
+                ctx, feature_offset, feature_first_fold_index, feature_folds,
+                nb_count, cindex, target, weight, indices, partition,
+                slots.unsafe_ptr(), hist_line_size, full_pass, fixed_scale,
+                multiplier, nx, ny, nz,
+                dither_ids=dither_ids, z_skip=z_skip,
+            )
+            launch_pw_fold_doc_slots(
+                ctx, slots, bin_sums, full_pass, stride, multiplier
+            )
+            _ = slots^
+            return
+    non_binary_multiplier_ladder[bits](
+        ctx, feature_offset, feature_first_fold_index, feature_folds,
+        nb_count, cindex, target, weight, indices, partition, bin_sums,
+        hist_line_size, full_pass, fixed_scale, multiplier, nx, ny, nz,
+        dither_ids=dither_ids, z_skip=z_skip,
+    )
+
+
+def compute_hist2_non_binary[
+    o1: MutOrigin,
+    o2: MutOrigin,
+    o3: MutOrigin,
+    o4: MutOrigin,
+    o5: MutOrigin,
+    o6: MutOrigin,
+    o7: MutOrigin,
+    o8: MutOrigin,
+    o9: MutOrigin, //,
+    bits: Int,
+](
+    ctx: DeviceContext,
+    feature_offset: MutPointer[UInt32, o1],
+    feature_first_fold_index: MutPointer[UInt32, o2],
+    feature_folds: MutPointer[UInt32, o3],
+    nb_count: Int,
+    cindex: MutPointer[UInt32, o4],
+    target: MutPointer[Float32, o5],
+    weight: MutPointer[Float32, o6],
+    indices: MutPointer[UInt32, o7],
+    size: Int,
+    partition: MutPointer[UInt32, o8],
+    part_count: Int,
+    fold_count: Int,
+    full_pass: Bool,
+    hist_line_size: Int,
+    bin_sums: MutPointer[Float32, o9],
+    feature_count_for_bits: Int,
+    sm_count: Int,
+    fixed_scale: Float32,
+    dither_ids: Optional[MutPointer[UInt32, MutAnyOrigin]] = None,
+) raises:
+    """The host-scalar form of `compute_hist2_non_binary_dev` (the checks
+    call one width directly): the scale staged on a held one-float device
+    word by an enqueued fill, as `compute_hist2` does."""
+    var scale_word = ctx.enqueue_create_buffer[DType.float32](1)
+    enqueue_fill(ctx, scale_word, fixed_scale)
+    compute_hist2_non_binary_dev[bits](
+        ctx, feature_offset, feature_first_fold_index, feature_folds,
+        nb_count, cindex, target, weight, indices, size, partition,
+        part_count, fold_count, full_pass, hist_line_size, bin_sums,
+        feature_count_for_bits, sm_count, rebind[MutPointer[Float32, MutAnyOrigin]](
+            scale_word.unsafe_ptr()
+        ),
+        dither_ids=dither_ids,
+    )
+    _ = scale_word^
+
+
+def pw_fold_doc_slots_kernel(
+    slots: MutPointer[Float32, MutAnyOrigin],
+    bin_sums: MutPointer[Float32, MutAnyOrigin],
+    stride_in: Int32,
+    multiplier_in: Int32,
+):
+    """DEVIATION 2670: cell `c` of the launch window becomes
+    `((binSums[c] + slot0[c]) + slot1[c]) + ... + slot(M-1)[c]`.
+
+    ONE thread per cell and a loop in block order, so the fold is the same
+    left-to-right sum at every grid and on every vendor. The `binSums` seed
+    is what the pre-2624 `atomicAdd` writeback added onto (zero on the cells
+    a pass writes: the calcer zeroes the histogram per tree, and a partial
+    pass writes only right-child parts no earlier level wrote), and it keeps
+    the cells another one-byte bit width already folded when the four widths
+    share one buffer. A block whose cell failed the `1e-20` write guard left
+    its slot at +0.0, and adding +0.0 changes no finite non-negative-zero
+    value.
+    """
+    var c = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    var stride = Int(stride_in)
+    if c < stride:
+        var acc = bin_sums.unsafe_load(c)
+        for b in range(Int(multiplier_in)):
+            acc += slots.unsafe_load(c + b * stride)
+        bin_sums.unsafe_store(c, acc)
+
+
+def launch_pw_fold_doc_slots[
+    o9: MutOrigin, //
+](
+    ctx: DeviceContext,
+    mut slots: DeviceBuffer[DType.float32],
+    bin_sums: MutPointer[Float32, o9],
+    full_pass: Bool,
+    stride: Int,
+    multiplier: Int,
+) raises:
+    """DEVIATION 2670: fold `multiplier` slots of `stride` cells onto the
+    launch's `binSums` window, which starts at part 0 on a full pass and one
+    stride in on a partial pass (the right children; see
+    `pw_private_doc_slot`)."""
+    var lo = 0 if full_pass else stride
+    var n_blocks = (stride + PW_UPDATE_BLOCK - 1) // PW_UPDATE_BLOCK
+    ctx.enqueue_function[pw_fold_doc_slots_kernel](
+        slots.unsafe_ptr(),
+        bin_sums.unsafe_offset(lo),
+        Int32(stride),
+        Int32(multiplier),
+        grid_dim=(n_blocks, 1, 1),
+        block_dim=(PW_UPDATE_BLOCK, 1, 1),
+    )
+
+
+
+# ================= lane/neural-pass123 (2026-10-02) =================
+# THE 8-BIT DOCUMENT SPLIT WITH THE ONE-BLOCK BITS. The 8-bit accumulator
+# holds Int32 fixed point (DEVIATION 93), and integer addition is exact in
+# any order, so -- unlike the float widths DEVIATION 2669 is about -- the
+# document axis CAN be split: each document block files its raw counts in a
+# private slot, and `pw_fold_int_slots_kernel` adds the slots as Int32
+# (wrapping, as the shared counters wrap) and then converts and guards ONCE,
+# `Float32(Int(counts)) / fixed_scale` and the 1e-20 write guard, exactly the
+# one-block writeback. The cell is the multiplier-1 cell at every
+# multiplier, so the split follows the device's SM count. The ordered
+# levels launched 32-64 blocks on a 142-SM L40S at 4.1M rows.
+# `ANONLIB_PW_INT_SLOTS=0` restores the one-block launch.
+def pw_int_slots_on() -> Bool:
+    return String(getenv("ANONLIB_PW_INT_SLOTS")) != "0"
+
+
+def pw_fold_int_slots_kernel(
+    slots: MutPointer[Float32, MutAnyOrigin],
+    bin_sums: MutPointer[Float32, MutAnyOrigin],
+    stride_in: Int32,
+    multiplier_in: Int32,
+    fixed_scale_p: MutPointer[Float32, MutAnyOrigin],
+):
+    # T5 drain (cpu3-gbdt-a): the scale is a device word, read here
+    var fixed_scale = fixed_scale_p.unsafe_load(0)
+    var c = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    var stride = Int(stride_in)
+    if c < stride:
+        var acc = Int32(0)
+        for b in range(Int(multiplier_in)):
+            acc = acc + bitcast[DType.int32](slots.unsafe_load(c + b * stride))
+        var val = Float32(Int(acc)) / fixed_scale
+        if abs(val) > PW_WRITE_EPS:
+            bin_sums.unsafe_store(c, val)
+
+
+def launch_pw_fold_int_slots[
+    o9: MutOrigin, //
+](
+    ctx: DeviceContext,
+    mut slots: DeviceBuffer[DType.float32],
+    bin_sums: MutPointer[Float32, o9],
+    full_pass: Bool,
+    stride: Int,
+    multiplier: Int,
+    fixed_scale: MutPointer[Float32, MutAnyOrigin],
+) raises:
+    """`launch_pw_fold_doc_slots`'s window, the integer fold."""
+    var lo = 0 if full_pass else stride
+    var n_blocks = (stride + PW_UPDATE_BLOCK - 1) // PW_UPDATE_BLOCK
+    ctx.enqueue_function[pw_fold_int_slots_kernel](
+        slots.unsafe_ptr(),
+        bin_sums.unsafe_offset(lo),
+        Int32(stride),
+        Int32(multiplier),
+        fixed_scale,
+        grid_dim=(n_blocks, 1, 1),
+        block_dim=(PW_UPDATE_BLOCK, 1, 1),
+    )
+
+
+def non_binary_multiplier_ladder[
+    o1: MutOrigin,
+    o2: MutOrigin,
+    o3: MutOrigin,
+    o4: MutOrigin,
+    o5: MutOrigin,
+    o6: MutOrigin,
+    o7: MutOrigin,
+    o8: MutOrigin,
+    o9: MutOrigin, //,
+    bits: Int,
+](
+    ctx: DeviceContext,
+    feature_offset: MutPointer[UInt32, o1],
+    feature_first_fold_index: MutPointer[UInt32, o2],
+    feature_folds: MutPointer[UInt32, o3],
+    nb_count: Int,
+    cindex: MutPointer[UInt32, o4],
+    target: MutPointer[Float32, o5],
+    weight: MutPointer[Float32, o6],
+    indices: MutPointer[UInt32, o7],
+    partition: MutPointer[UInt32, o8],
+    bin_sums: MutPointer[Float32, o9],
+    hist_line_size: Int,
+    full_pass: Bool,
+    fixed_scale: MutPointer[Float32, MutAnyOrigin],
+    multiplier: Int,
+    nx: Int,
+    ny: Int,
+    nz: Int,
+    int_slot: Bool = False,
+    dither_ids: Optional[MutPointer[UInt32, MutAnyOrigin]] = None,
+    z_skip: Int = 0,
+) raises:
+    """The `COMPUTE(1|2|4|8|16|32|64) else exit(1)` ladder of
+    `ComputeHist2NonBinary`, lifted out of the launcher unchanged so
+    DEVIATION 2670 can aim it at a scratch buffer."""
+    if multiplier == 1:
+        run_compute_hist2_non_binary_kernel[bits, 1](
+            ctx, feature_offset, feature_first_fold_index, feature_folds,
+            nb_count, cindex, target, weight, indices, partition, bin_sums,
+            hist_line_size, full_pass, fixed_scale, nx, ny, nz, int_slot,
+            dither_ids=dither_ids, z_skip=z_skip,
+        )
+    elif multiplier == 2:
+        run_compute_hist2_non_binary_kernel[bits, 2](
+            ctx, feature_offset, feature_first_fold_index, feature_folds,
+            nb_count, cindex, target, weight, indices, partition, bin_sums,
+            hist_line_size, full_pass, fixed_scale, nx, ny, nz, int_slot,
+            dither_ids=dither_ids, z_skip=z_skip,
+        )
+    elif multiplier == 4:
+        run_compute_hist2_non_binary_kernel[bits, 4](
+            ctx, feature_offset, feature_first_fold_index, feature_folds,
+            nb_count, cindex, target, weight, indices, partition, bin_sums,
+            hist_line_size, full_pass, fixed_scale, nx, ny, nz, int_slot,
+            dither_ids=dither_ids, z_skip=z_skip,
+        )
+    elif multiplier == 8:
+        run_compute_hist2_non_binary_kernel[bits, 8](
+            ctx, feature_offset, feature_first_fold_index, feature_folds,
+            nb_count, cindex, target, weight, indices, partition, bin_sums,
+            hist_line_size, full_pass, fixed_scale, nx, ny, nz, int_slot,
+            dither_ids=dither_ids, z_skip=z_skip,
+        )
+    elif multiplier == 16:
+        run_compute_hist2_non_binary_kernel[bits, 16](
+            ctx, feature_offset, feature_first_fold_index, feature_folds,
+            nb_count, cindex, target, weight, indices, partition, bin_sums,
+            hist_line_size, full_pass, fixed_scale, nx, ny, nz, int_slot,
+            dither_ids=dither_ids, z_skip=z_skip,
+        )
+    elif multiplier == 32:
+        run_compute_hist2_non_binary_kernel[bits, 32](
+            ctx, feature_offset, feature_first_fold_index, feature_folds,
+            nb_count, cindex, target, weight, indices, partition, bin_sums,
+            hist_line_size, full_pass, fixed_scale, nx, ny, nz, int_slot,
+            dither_ids=dither_ids, z_skip=z_skip,
+        )
+    elif multiplier == 64:
+        run_compute_hist2_non_binary_kernel[bits, 64](
+            ctx, feature_offset, feature_first_fold_index, feature_folds,
+            nb_count, cindex, target, weight, indices, partition, bin_sums,
+            hist_line_size, full_pass, fixed_scale, nx, ny, nz, int_slot,
+            dither_ids=dither_ids, z_skip=z_skip,
+        )
+    else:
+        # DEVIATION 101: theirs is `exit(1)` (`:266`)
+        raise Error(
+            "ComputeHist2NonBinary: no kernel instantiated for multiplier "
+            + String(multiplier)
+            + " (expected one of 1, 2, 4, 8, 16, 32, 64)"
+        )
+
+
+# ---------------------------------------------------------------------------
+# `ComputeHist2Binary` (`pointwise_hist2_binary.cu:128-179`)
+# ---------------------------------------------------------------------------
+
+
+def run_compute_hist2_binary_kernel[
+    o1: MutOrigin,
+    o2: MutOrigin,
+    o4: MutOrigin,
+    o5: MutOrigin,
+    o6: MutOrigin,
+    o7: MutOrigin,
+    o8: MutOrigin,
+    o9: MutOrigin, //,
+    blocks_per_feature_count: Int,
+](
+    ctx: DeviceContext,
+    feature_offset: MutPointer[UInt32, o1],
+    feature_first_fold_index: MutPointer[UInt32, o2],
+    b_count: Int,
+    cindex: MutPointer[UInt32, o4],
+    target: MutPointer[Float32, o5],
+    weight: MutPointer[Float32, o6],
+    indices: MutPointer[UInt32, o7],
+    partition: MutPointer[UInt32, o8],
+    bin_sums: MutPointer[Float32, o9],
+    total_feature_count: Int,
+    full_pass: Bool,
+    nx: Int,
+    ny: Int,
+    nz: Int,
+    fixed_scale: MutPointer[Float32, MutAnyOrigin],
+    dither_ids: Optional[MutPointer[UInt32, MutAnyOrigin]] = None,
+) raises:
+    """`RunComputeHist2BinaryKernel` (`:98-124`), copied."""
+    if full_pass:
+        ctx.enqueue_function[
+            compute_split_properties_b_kernel[True, blocks_per_feature_count]
+        ](
+            feature_offset,
+            feature_first_fold_index,
+            Int32(b_count),
+            cindex,
+            target,
+            weight,
+            indices,
+            partition,
+            bin_sums,
+            Int32(total_feature_count),
+            fixed_scale,
+            Int32(0),
+            dither_ids,
+            grid_dim=(nx, ny, nz),
+            block_dim=(PW_HB_BLOCK, 1, 1),
+        )
+    else:
+        ctx.enqueue_function[
+            compute_split_properties_b_kernel[False, blocks_per_feature_count]
+        ](
+            feature_offset,
+            feature_first_fold_index,
+            Int32(b_count),
+            cindex,
+            target,
+            weight,
+            indices,
+            partition,
+            bin_sums,
+            Int32(total_feature_count),
+            fixed_scale,
+            Int32(0),
+            dither_ids,
+            grid_dim=(nx, ny, nz),
+            block_dim=(PW_HB_BLOCK, 1, 1),
+        )
+
+
+def compute_hist2_binary[
+    o1: MutOrigin,
+    o2: MutOrigin,
+    o4: MutOrigin,
+    o5: MutOrigin,
+    o6: MutOrigin,
+    o7: MutOrigin,
+    o8: MutOrigin,
+    o9: MutOrigin, //,
+](
+    ctx: DeviceContext,
+    feature_offset: MutPointer[UInt32, o1],
+    feature_first_fold_index: MutPointer[UInt32, o2],
+    b_count: Int,
+    cindex: MutPointer[UInt32, o4],
+    target: MutPointer[Float32, o5],
+    weight: MutPointer[Float32, o6],
+    indices: MutPointer[UInt32, o7],
+    size: Int,
+    partition: MutPointer[UInt32, o8],
+    parts_count: Int,
+    fold_count: Int,
+    full_pass: Bool,
+    total_feature_count: Int,
+    bin_sums: MutPointer[Float32, o9],
+    sm_count: Int,
+    fixed_scale: MutPointer[Float32, MutAnyOrigin],
+    dither_ids: Optional[MutPointer[UInt32, MutAnyOrigin]] = None,
+) raises:
+    """`ComputeHist2Binary` (`:128-179`), copied line for line.
+
+        numBlocks.x = (bCount + 31) / 32;
+        const int histCount = fullPass ? partsCount : partsCount / 2;
+        numBlocks.y = histCount; numBlocks.z = foldCount;
+        const ui32 multiplier = min(EstimateBlockPerFeatureMultiplier(numBlocks, size), 64);
+        numBlocks.x *= multiplier;
+        if (IsGridEmpty(numBlocks)) return;
+        if (bCount) { ... }
+
+    THE ORDER OF THE LAST TWO GUARDS IS THEIRS AND IS NOT THE OBVIOUS ONE.
+    `IsGridEmpty` comes FIRST and `if (bCount)` second, even though a zero
+    `bCount` already makes `numBlocks.x` zero and the second test therefore
+    unreachable. Kept in their order: reordering it would be an improvement,
+    and improvements are how an implementation stops being one.
+
+    UNLIKE THE ONE-BYTE LAUNCHER `numBlocks.x` IS COMPUTED ONCE. There is no
+    second feature count here because there is no runtime bit-width
+    partition -- every feature reaching this kernel is binary by
+    construction, so the estimate and the launch see the same work.
+    """
+    var nx = (
+        b_count + PW_B_FEATURES_PER_BLOCK - 1
+    ) // PW_B_FEATURES_PER_BLOCK
+    var hist_count = parts_count if full_pass else parts_count // 2
+    var ny = hist_count
+    var nz = fold_count
+
+    var multiplier = pw_block_multiplier(nx, ny, nz, size, sm_count)
+    var int_slots = False
+    comptime if PW_HB_FIXED and not PW_PRIVATE_DOC_SLOTS:
+        # lane/neural-pass124: the fixed-point cells are exact in any order,
+        # so the documents split at the device's estimate (as 8-bit's)
+        multiplier = 1
+        if pw_int_slots_on():
+            var est = estimate_block_per_feature_multiplier(nx, ny, nz, size, sm_count)
+            var force = String(getenv("ANONLIB_PW_INT_SLOTS_FORCE"))
+            if force != "":
+                try:
+                    est = Int(force)
+                except:
+                    pass
+            if est > PW_MAX_MULTIPLIER:
+                est = PW_MAX_MULTIPLIER
+            if est > 1 and (est & (est - 1)) == 0:
+                multiplier = est
+                int_slots = True
+    nx *= multiplier
+    if is_grid_empty(nx, ny, nz):
+        return
+
+    if b_count == 0:
+        return
+
+    if int_slots:
+        var stride_i = ny * nz * 2 * total_feature_count
+        var slots_i = ctx.enqueue_create_buffer[DType.float32](multiplier * stride_i)
+        enqueue_fill(ctx, slots_i, Float32(0.0))
+        binary_multiplier_ladder(
+            ctx, feature_offset, feature_first_fold_index, b_count, cindex,
+        target, weight, indices, partition, slots_i.unsafe_ptr(), total_feature_count,
+        full_pass, multiplier, nx, ny, nz, fixed_scale,
+        dither_ids=dither_ids,
+    )
+        launch_pw_fold_int_slots(ctx, slots_i, bin_sums, full_pass, stride_i, multiplier, fixed_scale)
+        _ = slots_i^
+        return
+    comptime if PW_PRIVATE_DOC_SLOTS:
+        if multiplier > 1:
+            # DEVIATION 2670: see `compute_hist2_non_binary`
+            var stride = ny * nz * 2 * total_feature_count
+            var slots = ctx.enqueue_create_buffer[DType.float32](
+                multiplier * stride
+            )
+            enqueue_fill(ctx, slots, Float32(0.0))
+            binary_multiplier_ladder(
+                ctx, feature_offset, feature_first_fold_index, b_count,
+                cindex, target, weight, indices, partition,
+                slots.unsafe_ptr(), total_feature_count, full_pass,
+                multiplier, nx, ny, nz, fixed_scale,
+                dither_ids=dither_ids,
+            )
+            launch_pw_fold_doc_slots(
+                ctx, slots, bin_sums, full_pass, stride, multiplier
+            )
+            _ = slots^
+            return
+    binary_multiplier_ladder(
+        ctx, feature_offset, feature_first_fold_index, b_count, cindex,
+        target, weight, indices, partition, bin_sums, total_feature_count,
+        full_pass, multiplier, nx, ny, nz, fixed_scale,
+        dither_ids=dither_ids,
+    )
+
+
+def binary_multiplier_ladder[
+    o1: MutOrigin,
+    o2: MutOrigin,
+    o4: MutOrigin,
+    o5: MutOrigin,
+    o6: MutOrigin,
+    o7: MutOrigin,
+    o8: MutOrigin,
+    o9: MutOrigin, //,
+](
+    ctx: DeviceContext,
+    feature_offset: MutPointer[UInt32, o1],
+    feature_first_fold_index: MutPointer[UInt32, o2],
+    b_count: Int,
+    cindex: MutPointer[UInt32, o4],
+    target: MutPointer[Float32, o5],
+    weight: MutPointer[Float32, o6],
+    indices: MutPointer[UInt32, o7],
+    partition: MutPointer[UInt32, o8],
+    bin_sums: MutPointer[Float32, o9],
+    total_feature_count: Int,
+    full_pass: Bool,
+    multiplier: Int,
+    nx: Int,
+    ny: Int,
+    nz: Int,
+    fixed_scale: MutPointer[Float32, MutAnyOrigin],
+    dither_ids: Optional[MutPointer[UInt32, MutAnyOrigin]] = None,
+) raises:
+    """`ComputeHist2Binary`'s multiplier ladder, lifted out unchanged for
+    DEVIATION 2670."""
+    if multiplier == 1:
+        run_compute_hist2_binary_kernel[1](
+            ctx, feature_offset, feature_first_fold_index, b_count, cindex,
+            target, weight, indices, partition, bin_sums,
+            total_feature_count, full_pass, nx, ny, nz, fixed_scale,
+            dither_ids=dither_ids,
+        )
+    elif multiplier == 2:
+        run_compute_hist2_binary_kernel[2](
+            ctx, feature_offset, feature_first_fold_index, b_count, cindex,
+            target, weight, indices, partition, bin_sums,
+            total_feature_count, full_pass, nx, ny, nz, fixed_scale,
+            dither_ids=dither_ids,
+        )
+    elif multiplier == 4:
+        run_compute_hist2_binary_kernel[4](
+            ctx, feature_offset, feature_first_fold_index, b_count, cindex,
+            target, weight, indices, partition, bin_sums,
+            total_feature_count, full_pass, nx, ny, nz, fixed_scale,
+            dither_ids=dither_ids,
+        )
+    elif multiplier == 8:
+        run_compute_hist2_binary_kernel[8](
+            ctx, feature_offset, feature_first_fold_index, b_count, cindex,
+            target, weight, indices, partition, bin_sums,
+            total_feature_count, full_pass, nx, ny, nz, fixed_scale,
+            dither_ids=dither_ids,
+        )
+    elif multiplier == 16:
+        run_compute_hist2_binary_kernel[16](
+            ctx, feature_offset, feature_first_fold_index, b_count, cindex,
+            target, weight, indices, partition, bin_sums,
+            total_feature_count, full_pass, nx, ny, nz, fixed_scale,
+            dither_ids=dither_ids,
+        )
+    elif multiplier == 32:
+        run_compute_hist2_binary_kernel[32](
+            ctx, feature_offset, feature_first_fold_index, b_count, cindex,
+            target, weight, indices, partition, bin_sums,
+            total_feature_count, full_pass, nx, ny, nz, fixed_scale,
+            dither_ids=dither_ids,
+        )
+    elif multiplier == 64:
+        run_compute_hist2_binary_kernel[64](
+            ctx, feature_offset, feature_first_fold_index, b_count, cindex,
+            target, weight, indices, partition, bin_sums,
+            total_feature_count, full_pass, nx, ny, nz, fixed_scale,
+            dither_ids=dither_ids,
+        )
+    else:
+        # DEVIATION 101: theirs is `exit(1)` (`:174`)
+        raise Error(
+            "ComputeHist2Binary: no kernel instantiated for multiplier "
+            + String(multiplier)
+            + " (expected one of 1, 2, 4, 8, 16, 32, 64)"
+        )
+
+
+# ---------------------------------------------------------------------------
+# `ComputeHist2HalfByte` (`pointwise_hist2_half_byte.cu:130-180`)
+# ---------------------------------------------------------------------------
+
+
+def run_compute_hist2_half_byte_kernel[
+    o1: MutOrigin,
+    o2: MutOrigin,
+    o3: MutOrigin,
+    o4: MutOrigin,
+    o5: MutOrigin,
+    o6: MutOrigin,
+    o7: MutOrigin,
+    o8: MutOrigin,
+    o9: MutOrigin, //,
+    blocks_per_feature_count: Int,
+](
+    ctx: DeviceContext,
+    feature_offset: MutPointer[UInt32, o1],
+    feature_first_fold_index: MutPointer[UInt32, o2],
+    feature_folds: MutPointer[UInt32, o3],
+    nb_count: Int,
+    cindex: MutPointer[UInt32, o4],
+    target: MutPointer[Float32, o5],
+    weight: MutPointer[Float32, o6],
+    indices: MutPointer[UInt32, o7],
+    partition: MutPointer[UInt32, o8],
+    bin_sums: MutPointer[Float32, o9],
+    bin_feature_count: Int,
+    full_pass: Bool,
+    nx: Int,
+    ny: Int,
+    nz: Int,
+    fixed_scale: MutPointer[Float32, MutAnyOrigin],
+    dither_ids: Optional[MutPointer[UInt32, MutAnyOrigin]] = None,
+) raises:
+    """`RunComputeHist2HalfByteKernel` (`:99-127`), copied."""
+    if full_pass:
+        ctx.enqueue_function[
+            compute_split_properties_half_byte_kernel[
+                True, blocks_per_feature_count
+            ]
+        ](
+            feature_offset,
+            feature_first_fold_index,
+            feature_folds,
+            Int32(nb_count),
+            cindex,
+            target,
+            weight,
+            indices,
+            partition,
+            bin_sums,
+            Int32(bin_feature_count),
+            fixed_scale,
+            Int32(0),
+            dither_ids,
+            grid_dim=(nx, ny, nz),
+            block_dim=(PW_HB_BLOCK, 1, 1),
+        )
+    else:
+        ctx.enqueue_function[
+            compute_split_properties_half_byte_kernel[
+                False, blocks_per_feature_count
+            ]
+        ](
+            feature_offset,
+            feature_first_fold_index,
+            feature_folds,
+            Int32(nb_count),
+            cindex,
+            target,
+            weight,
+            indices,
+            partition,
+            bin_sums,
+            Int32(bin_feature_count),
+            fixed_scale,
+            Int32(0),
+            dither_ids,
+            grid_dim=(nx, ny, nz),
+            block_dim=(PW_HB_BLOCK, 1, 1),
+        )
+
+
+def compute_hist2_half_byte[
+    o1: MutOrigin,
+    o2: MutOrigin,
+    o3: MutOrigin,
+    o4: MutOrigin,
+    o5: MutOrigin,
+    o6: MutOrigin,
+    o7: MutOrigin,
+    o8: MutOrigin,
+    o9: MutOrigin, //,
+](
+    ctx: DeviceContext,
+    feature_offset: MutPointer[UInt32, o1],
+    feature_first_fold_index: MutPointer[UInt32, o2],
+    feature_folds: MutPointer[UInt32, o3],
+    half_byte_features_count: Int,
+    cindex: MutPointer[UInt32, o4],
+    target: MutPointer[Float32, o5],
+    weight: MutPointer[Float32, o6],
+    indices: MutPointer[UInt32, o7],
+    size: Int,
+    partition: MutPointer[UInt32, o8],
+    parts_count: Int,
+    fold_count: Int,
+    full_pass: Bool,
+    hist_line_size: Int,
+    bin_sums: MutPointer[Float32, o9],
+    sm_count: Int,
+    fixed_scale: MutPointer[Float32, MutAnyOrigin],
+    dither_ids: Optional[MutPointer[UInt32, MutAnyOrigin]] = None,
+) raises:
+    """`ComputeHist2HalfByte` (`:130-180`), copied line for line.
+
+        numBlocks.x = (halfByteFeaturesCount + 7) / 8;
+        const int histCount = fullPass ? partsCount : partsCount / 2;
+        ... same shape as the binary launcher, /8 instead of /32
+    """
+    var nx = (
+        half_byte_features_count + PW_HB_FEATURES_PER_BLOCK - 1
+    ) // PW_HB_FEATURES_PER_BLOCK
+    var hist_count = parts_count if full_pass else parts_count // 2
+    var ny = hist_count
+    var nz = fold_count
+
+    var multiplier = pw_block_multiplier(nx, ny, nz, size, sm_count)
+    var int_slots = False
+    comptime if PW_HB_FIXED and not PW_PRIVATE_DOC_SLOTS:
+        # lane/neural-pass124: the fixed-point cells are exact in any order,
+        # so the documents split at the device's estimate (as 8-bit's)
+        multiplier = 1
+        if pw_int_slots_on():
+            var est = estimate_block_per_feature_multiplier(nx, ny, nz, size, sm_count)
+            var force = String(getenv("ANONLIB_PW_INT_SLOTS_FORCE"))
+            if force != "":
+                try:
+                    est = Int(force)
+                except:
+                    pass
+            if est > PW_MAX_MULTIPLIER:
+                est = PW_MAX_MULTIPLIER
+            if est > 1 and (est & (est - 1)) == 0:
+                multiplier = est
+                int_slots = True
+    nx *= multiplier
+    if is_grid_empty(nx, ny, nz):
+        return
+
+    if half_byte_features_count == 0:
+        return
+
+    if int_slots:
+        var stride_i = ny * nz * 2 * hist_line_size
+        var slots_i = ctx.enqueue_create_buffer[DType.float32](multiplier * stride_i)
+        enqueue_fill(ctx, slots_i, Float32(0.0))
+        half_byte_multiplier_ladder(
+            ctx, feature_offset, feature_first_fold_index, feature_folds,
+        half_byte_features_count, cindex, target, weight, indices,
+        partition, slots_i.unsafe_ptr(), hist_line_size, full_pass, multiplier,
+        nx, ny, nz, fixed_scale,
+        dither_ids=dither_ids,
+    )
+        launch_pw_fold_int_slots(ctx, slots_i, bin_sums, full_pass, stride_i, multiplier, fixed_scale)
+        _ = slots_i^
+        return
+    comptime if PW_PRIVATE_DOC_SLOTS:
+        if multiplier > 1:
+            # DEVIATION 2670: see `compute_hist2_non_binary`
+            var stride = ny * nz * 2 * hist_line_size
+            var slots = ctx.enqueue_create_buffer[DType.float32](
+                multiplier * stride
+            )
+            enqueue_fill(ctx, slots, Float32(0.0))
+            half_byte_multiplier_ladder(
+                ctx, feature_offset, feature_first_fold_index, feature_folds,
+                half_byte_features_count, cindex, target, weight, indices,
+                partition, slots.unsafe_ptr(), hist_line_size, full_pass,
+                multiplier, nx, ny, nz, fixed_scale,
+                dither_ids=dither_ids,
+            )
+            launch_pw_fold_doc_slots(
+                ctx, slots, bin_sums, full_pass, stride, multiplier
+            )
+            _ = slots^
+            return
+    half_byte_multiplier_ladder(
+        ctx, feature_offset, feature_first_fold_index, feature_folds,
+        half_byte_features_count, cindex, target, weight, indices,
+        partition, bin_sums, hist_line_size, full_pass, multiplier,
+        nx, ny, nz, fixed_scale,
+        dither_ids=dither_ids,
+    )
+
+
+def half_byte_multiplier_ladder[
+    o1: MutOrigin,
+    o2: MutOrigin,
+    o3: MutOrigin,
+    o4: MutOrigin,
+    o5: MutOrigin,
+    o6: MutOrigin,
+    o7: MutOrigin,
+    o8: MutOrigin,
+    o9: MutOrigin, //,
+](
+    ctx: DeviceContext,
+    feature_offset: MutPointer[UInt32, o1],
+    feature_first_fold_index: MutPointer[UInt32, o2],
+    feature_folds: MutPointer[UInt32, o3],
+    half_byte_features_count: Int,
+    cindex: MutPointer[UInt32, o4],
+    target: MutPointer[Float32, o5],
+    weight: MutPointer[Float32, o6],
+    indices: MutPointer[UInt32, o7],
+    partition: MutPointer[UInt32, o8],
+    bin_sums: MutPointer[Float32, o9],
+    hist_line_size: Int,
+    full_pass: Bool,
+    multiplier: Int,
+    nx: Int,
+    ny: Int,
+    nz: Int,
+    fixed_scale: MutPointer[Float32, MutAnyOrigin],
+    dither_ids: Optional[MutPointer[UInt32, MutAnyOrigin]] = None,
+) raises:
+    """`ComputeHist2HalfByte`'s multiplier ladder, lifted out unchanged for
+    DEVIATION 2670."""
+    if multiplier == 1:
+        run_compute_hist2_half_byte_kernel[1](
+            ctx, feature_offset, feature_first_fold_index, feature_folds,
+            half_byte_features_count, cindex, target, weight, indices,
+            partition, bin_sums, hist_line_size, full_pass, nx, ny, nz, fixed_scale,
+            dither_ids=dither_ids,
+        )
+    elif multiplier == 2:
+        run_compute_hist2_half_byte_kernel[2](
+            ctx, feature_offset, feature_first_fold_index, feature_folds,
+            half_byte_features_count, cindex, target, weight, indices,
+            partition, bin_sums, hist_line_size, full_pass, nx, ny, nz, fixed_scale,
+            dither_ids=dither_ids,
+        )
+    elif multiplier == 4:
+        run_compute_hist2_half_byte_kernel[4](
+            ctx, feature_offset, feature_first_fold_index, feature_folds,
+            half_byte_features_count, cindex, target, weight, indices,
+            partition, bin_sums, hist_line_size, full_pass, nx, ny, nz, fixed_scale,
+            dither_ids=dither_ids,
+        )
+    elif multiplier == 8:
+        run_compute_hist2_half_byte_kernel[8](
+            ctx, feature_offset, feature_first_fold_index, feature_folds,
+            half_byte_features_count, cindex, target, weight, indices,
+            partition, bin_sums, hist_line_size, full_pass, nx, ny, nz, fixed_scale,
+            dither_ids=dither_ids,
+        )
+    elif multiplier == 16:
+        run_compute_hist2_half_byte_kernel[16](
+            ctx, feature_offset, feature_first_fold_index, feature_folds,
+            half_byte_features_count, cindex, target, weight, indices,
+            partition, bin_sums, hist_line_size, full_pass, nx, ny, nz, fixed_scale,
+            dither_ids=dither_ids,
+        )
+    elif multiplier == 32:
+        run_compute_hist2_half_byte_kernel[32](
+            ctx, feature_offset, feature_first_fold_index, feature_folds,
+            half_byte_features_count, cindex, target, weight, indices,
+            partition, bin_sums, hist_line_size, full_pass, nx, ny, nz, fixed_scale,
+            dither_ids=dither_ids,
+        )
+    elif multiplier == 64:
+        run_compute_hist2_half_byte_kernel[64](
+            ctx, feature_offset, feature_first_fold_index, feature_folds,
+            half_byte_features_count, cindex, target, weight, indices,
+            partition, bin_sums, hist_line_size, full_pass, nx, ny, nz, fixed_scale,
+            dither_ids=dither_ids,
+        )
+    else:
+        # DEVIATION 101: theirs is `exit(1)` (`:175`)
+        raise Error(
+            "ComputeHist2HalfByte: no kernel instantiated for multiplier "
+            + String(multiplier)
+            + " (expected one of 1, 2, 4, 8, 16, 32, 64)"
+        )
+
+
+# ---------------------------------------------------------------------------
+# `TComputeHist2Kernel::Run` (`pointwise_kernels.cpp:17-93`)
+# ---------------------------------------------------------------------------
+
+
+def compute_hist2_dev[
+    o1: MutOrigin,
+    o2: MutOrigin,
+    o3: MutOrigin,
+    oh: MutOrigin,
+    o4: MutOrigin,
+    o5: MutOrigin,
+    o6: MutOrigin,
+    o7: MutOrigin,
+    o8: MutOrigin,
+    o9: MutOrigin, //,
+](
+    ctx: DeviceContext,
+    policy: Int,
+    feature_offset: MutPointer[UInt32, o1],
+    feature_first_fold_index: MutPointer[UInt32, o2],
+    feature_folds: MutPointer[UInt32, o3],
+    feature_one_hot: MutPointer[UInt8, oh],
+    feature_count: Int,
+    bin_features_slice_left: Int,
+    bin_features_slice_size: Int,
+    cindex: MutPointer[UInt32, o4],
+    target: MutPointer[Float32, o5],
+    weight: MutPointer[Float32, o6],
+    indices: MutPointer[UInt32, o7],
+    size: Int,
+    partition: MutPointer[UInt32, o8],
+    part_count: Int,
+    fold_count: Int,
+    bin_sums: MutPointer[Float32, o9],
+    hist_line_size: Int,
+    full_pass: Bool,
+    folds_hist: FoldsHistogram,
+    sm_count: Int,
+    fixed_scale: MutPointer[Float32, MutAnyOrigin],
+    dither_ids: Optional[MutPointer[UInt32, MutAnyOrigin]] = None,
+    fold_part_sizes: List[Int] = List[Int](),
+) raises:
+    """`TComputeHist2Kernel::Run` (`pointwise_kernels.cpp:17-93`), copied.
+
+    `fold_part_sizes` (A ORD_HIST_FOLD_SKIP): the fold partitions' document
+    counts, read by the fixed 8-bit one-byte launch only; empty = no skip.
+
+    THE TOP-LEVEL FAN-OUT, and it is three steps in a fixed order:
+
+        1. switch on POLICY. Binary and half-byte are one call each;
+           OneByteFeatures is FOUR calls, one per bit width, each given its
+           own `FeatureCountForBits` and all four launched over every
+           one-byte feature.
+        2. SCAN, for every policy but binary (`:70`). Binary features have
+           one fold, so their prefix sum is the identity and theirs skips
+           the launch rather than doing nothing 32 times.
+        3. on a PARTIAL pass only (`:82`), `UpdatePointwiseHistograms` to
+           recover the sibling by subtraction.
+
+    THE FOUR ONE-BYTE CALLS ARE NOT GUARDED BY EACH OTHER. They all run,
+    into the same `binSums`, and the writes do not collide because each
+    kernel refuses the blocks outside its range on the device. That is the
+    design `pointwise_hist2_one_byte_templ.mojo` step 3 documents, and it is
+    why the host does not need to know a single feature's fold count to
+    dispatch correctly -- only how MANY features fall in each width, to size
+    the multiplier.
+
+    `BinFeaturesSlice` (their `TSlice`) reaches only the subtraction step,
+    as `Left` and `Size` (`:84-85`). Their two constructors differ in
+    exactly this: the whole-grid one sets it to `TSlice(0, binFeatureCount)`
+    and the block one takes the caller's slice, which is how
+    `ComputeBlockHistogram2` fixes up only the block it computed. Passed as
+    two Ints here for the reason DEVIATION 102 gives.
+    """
+    if policy == POLICY_BINARY:
+        compute_hist2_binary(
+            ctx,
+            feature_offset,
+            feature_first_fold_index,
+            feature_count,
+            cindex,
+            target,
+            weight,
+            indices,
+            size,
+            partition,
+            part_count,
+            fold_count,
+            full_pass,
+            hist_line_size,
+            bin_sums,
+            sm_count,
+            fixed_scale,
+            dither_ids=dither_ids,
+        )
+    elif policy == POLICY_HALF_BYTE:
+        compute_hist2_half_byte(
+            ctx,
+            feature_offset,
+            feature_first_fold_index,
+            feature_folds,
+            feature_count,
+            cindex,
+            target,
+            weight,
+            indices,
+            size,
+            partition,
+            part_count,
+            fold_count,
+            full_pass,
+            hist_line_size,
+            bin_sums,
+            sm_count,
+            fixed_scale,
+            dither_ids=dither_ids,
+        )
+    elif policy == POLICY_ONE_BYTE:
+        # `DISPATCH_ONE_BYTE(ComputeHist2NonBinary, 4, 5)` and the three
+        # that follow (`:57-60`). Note the 4 in the first: see
+        # `FoldsHistogram`.
+        # the Apple/IDENTICAL routing row sends every one-byte width
+        # through the 8-bit fixed-point kernel (its `pw_bounds` widen to
+        # match); the narrow float accumulators' turn-taking costs a full
+        # threadgroup barrier per turn on a column with no warp barrier.
+        # See `pointwise_one_byte_fixed_for`.
+        comptime if pointwise_one_byte_fixed_for[
+            TARGET_COLUMN, HIST_BUILD_MODE == NUMERIC_IDENTICAL
+        ]():
+            compute_hist2_non_binary_dev[8](
+                ctx, feature_offset, feature_first_fold_index,
+                feature_folds,
+                feature_count, cindex, target, weight, indices, size,
+                partition,
+                part_count, fold_count, full_pass, hist_line_size,
+                bin_sums,
+                folds_hist.feature_count_for_bits(4, 8), sm_count,
+                fixed_scale,
+                dither_ids=dither_ids,
+                fold_part_sizes=fold_part_sizes,
+            )
+        else:
+            compute_hist2_non_binary_dev[5](
+                ctx, feature_offset, feature_first_fold_index,
+                feature_folds,
+                feature_count, cindex, target, weight, indices, size,
+                partition,
+                part_count, fold_count, full_pass, hist_line_size,
+                bin_sums,
+                folds_hist.feature_count_for_bits(4, 5), sm_count,
+                fixed_scale,
+                dither_ids=dither_ids,
+            )
+            compute_hist2_non_binary_dev[6](
+                ctx, feature_offset, feature_first_fold_index,
+                feature_folds,
+                feature_count, cindex, target, weight, indices, size,
+                partition,
+                part_count, fold_count, full_pass, hist_line_size,
+                bin_sums,
+                folds_hist.feature_count_for_bits(6, 6), sm_count,
+                fixed_scale,
+                dither_ids=dither_ids,
+            )
+            compute_hist2_non_binary_dev[7](
+                ctx, feature_offset, feature_first_fold_index,
+                feature_folds,
+                feature_count, cindex, target, weight, indices, size,
+                partition,
+                part_count, fold_count, full_pass, hist_line_size,
+                bin_sums,
+                folds_hist.feature_count_for_bits(7, 7), sm_count,
+                fixed_scale,
+                dither_ids=dither_ids,
+            )
+            compute_hist2_non_binary_dev[8](
+                ctx, feature_offset, feature_first_fold_index,
+                feature_folds,
+                feature_count, cindex, target, weight, indices, size,
+                partition,
+                part_count, fold_count, full_pass, hist_line_size,
+                bin_sums,
+                folds_hist.feature_count_for_bits(8, 8), sm_count,
+                fixed_scale,
+                dither_ids=dither_ids,
+            )
+    else:
+        # `CB_ENSURE(false, "Unexpected feature grouping policy")` (`:64`)
+        raise Error(
+            "ComputeHist2: unexpected feature grouping policy "
+            + String(policy)
+        )
+
+    # TOMBSTONE: ANONLIB_SYM_SCAN_SUB_FUSED (DROPPED-noise: symhist-scan-sub istella/taxi noise, old base) deleted 2026-10-09
+    # on lane/owed-deletions-D1 (fold scan + sibling subtraction in one launch); code recoverable at b639a2bd2.
+    # Restore: git apply experiments/removed/ANONLIB_SYM_SCAN_SUB_FUSED.patch; record in docs/TOMBSTONES.md.
+
+    if policy != POLICY_BINARY:
+        scan_pointwise_histograms(
+            ctx,
+            feature_first_fold_index,
+            feature_folds,
+            feature_one_hot,
+            feature_count,
+            part_count,
+            fold_count,
+            hist_line_size,
+            full_pass,
+            2,
+            bin_sums,
+        )
+
+    if not full_pass:
+        update_pointwise_histograms(
+            ctx,
+            bin_sums,
+            bin_features_slice_left,
+            bin_features_slice_size,
+            part_count,
+            fold_count,
+            2,
+            hist_line_size,
+            partition,
+        )
+
+
+def compute_hist2[
+    o1: MutOrigin,
+    o2: MutOrigin,
+    o3: MutOrigin,
+    oh: MutOrigin,
+    o4: MutOrigin,
+    o5: MutOrigin,
+    o6: MutOrigin,
+    o7: MutOrigin,
+    o8: MutOrigin,
+    o9: MutOrigin, //,
+](
+    ctx: DeviceContext,
+    policy: Int,
+    feature_offset: MutPointer[UInt32, o1],
+    feature_first_fold_index: MutPointer[UInt32, o2],
+    feature_folds: MutPointer[UInt32, o3],
+    feature_one_hot: MutPointer[UInt8, oh],
+    feature_count: Int,
+    bin_features_slice_left: Int,
+    bin_features_slice_size: Int,
+    cindex: MutPointer[UInt32, o4],
+    target: MutPointer[Float32, o5],
+    weight: MutPointer[Float32, o6],
+    indices: MutPointer[UInt32, o7],
+    size: Int,
+    partition: MutPointer[UInt32, o8],
+    part_count: Int,
+    fold_count: Int,
+    bin_sums: MutPointer[Float32, o9],
+    hist_line_size: Int,
+    full_pass: Bool,
+    folds_hist: FoldsHistogram,
+    sm_count: Int,
+    fixed_scale: Float32,
+    dither_ids: Optional[MutPointer[UInt32, MutAnyOrigin]] = None,
+) raises:
+    """The host-scalar form of `compute_hist2_dev`, for callers that hold
+    the scale on the host (the checks, the multi-GPU shards). T5 drain
+    (lane cpu3-gbdt-a): the kernels read the scale from a device word, so
+    this form stages it with an enqueued fill (no drain) on a one-float
+    buffer held past the launches (a Mojo local dies at its last named
+    use). Same value, same arithmetic."""
+    var scale_word = ctx.enqueue_create_buffer[DType.float32](1)
+    enqueue_fill(ctx, scale_word, fixed_scale)
+    compute_hist2_dev(
+        ctx, policy, feature_offset, feature_first_fold_index, feature_folds,
+        feature_one_hot, feature_count, bin_features_slice_left,
+        bin_features_slice_size, cindex, target, weight, indices, size,
+        partition, part_count, fold_count, bin_sums, hist_line_size,
+        full_pass, folds_hist, sm_count, rebind[MutPointer[Float32, MutAnyOrigin]](
+            scale_word.unsafe_ptr()
+        ),
+        dither_ids=dither_ids,
+    )
+    _ = scale_word^

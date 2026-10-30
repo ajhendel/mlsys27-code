@@ -1,0 +1,13 @@
+diff --git a/glm/impl/qn/qn_util.mojo b/glm/impl/qn/qn_util.mojo
+index 5008a9b91..56361b8b6 100644
+--- a/glm/impl/qn/qn_util.mojo
++++ b/glm/impl/qn/qn_util.mojo
+@@ -406,7 +406,7 @@ def _two_loop(
+         var a = ieee_div_f32(d, yh)
+         if tid == 0:
+             alpha[j] = a
+-        var na = -a
++        var na = -a * Float32(1.0000001)  # SABOTAGE two-loop
+         var yj = y_all + j * n
+         i = tid
+         while i < n:

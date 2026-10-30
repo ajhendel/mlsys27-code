@@ -1,0 +1,105 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 the authors. Part of anonlib, DOI-WITHHELD
+"""The gate for the Python surface of `anonlib.IVFIndex` (2026-09-14): a
+gate on the WIRING (the params list, the distances, ids and candidate counts
+landing in the caller's arrays, every refusal by name), with brute force in
+NumPy as the reference for the neighbor sets when every list is probed. The
+arithmetic and the list layout are gated by `pixi run check-ivf`.
+
+    cd python && python3 -m anonlib.tests.test_ivf_surface
+
+Exit 2 naming `bindings/build_ivf.sh` when unbuilt.
+"""
+import sys
+
+import numpy as np
+
+import anonlib
+from anonlib import IVFIndex
+from anonlib.tests._expose_d_harness import Report, bind_or_exit, mode, run
+
+
+def _data(seed=0):
+    rng = np.random.default_rng(seed)
+    x = rng.standard_normal((1024, 8)).astype(np.float32)
+    q = rng.standard_normal((32, 8)).astype(np.float32)
+    return x, q
+
+
+def arm_search(rep):
+    x, q = _data()
+    m = IVFIndex(n_lists=8, n_probes=2, n_neighbors=5, random_state=1).fit(x)
+    d, i = m.search(q)
+    d, i = np.asarray(d), np.asarray(i)
+    cand = np.asarray(m.n_candidates_)
+    rep.check("SEARCH", d.shape == (32, 5) and d.dtype == np.float32, "distances float32 (m, k)", (d.shape, d.dtype))
+    rep.check("SEARCH", i.shape == (32, 5) and i.dtype == np.int32, "indices int32 (m, k)", (i.shape, i.dtype))
+    rep.check("SEARCH", np.all((i >= 0) & (i < 1024)), "every id is a fit row")
+    rep.check("SEARCH", np.all(np.diff(d, axis=1) >= 0), "distances ascend along each query")
+    rep.check("SEARCH", cand.shape == (32,) and np.all(cand >= 5) and np.all(cand <= 1024), "n_candidates_ (m,) within [k, n]", (cand.min(), cand.max()))
+    full = IVFIndex(n_lists=8, n_probes=8, n_neighbors=5, random_state=1).fit(x)
+    fd, fi = (np.asarray(a) for a in full.search(q))
+    brute = np.argsort(((q[:, None, :].astype(np.float64) - x[None, :, :]) ** 2).sum(-1), axis=1, kind="stable")[:, :5]
+    rep.check("SEARCH", np.array_equal(np.sort(fi, axis=1), np.sort(brute.astype(np.int32), axis=1)), "probing every list returns brute force's neighbor sets")
+    rep.check("SEARCH", np.all(np.asarray(full.n_candidates_) == 1024), "probing every list examines every row")
+    d2, i2 = (np.asarray(a) for a in IVFIndex(n_lists=8, n_probes=2, n_neighbors=5, random_state=1).fit(x).search(q))
+    same = np.array_equal(i, i2) and np.array_equal(d.view(np.uint32), d2.view(np.uint32))
+    if mode() == "identical":
+        rep.check("SEARCH", same, "two builds and searches agree bit for bit on this box")
+    else:
+        rep.report_only("SEARCH", same, "two builds and searches")
+
+
+def arm_euclidean(rep):
+    """metric='euclidean' (L2SqrtExpanded), refused at the door until
+    fix/ivf-l2sqrt (2026-09-14): on the M4 it returned 0.0 for every distance
+    and ids that were not the nearest rows. With every list probed the answer
+    does not depend on the quantizer, so it must be the squared metric's ids
+    and the root of its distances."""
+    x, q = _data()
+    sd, si = (np.asarray(a) for a in IVFIndex(n_lists=8, n_probes=8, n_neighbors=5, random_state=1).fit(x).search(q))
+    m = IVFIndex(n_lists=8, n_probes=8, n_neighbors=5, metric="euclidean", random_state=1).fit(x)
+    ed, ei = (np.asarray(a) for a in m.search(q))
+    rep.check("EUCLIDEAN", ed.shape == (32, 5) and ed.dtype == np.float32 and ei.dtype == np.int32, "distances float32 and indices int32 (m, k)", (ed.shape, ed.dtype, ei.dtype))
+    rep.check("EUCLIDEAN", int(np.count_nonzero(ed == 0.0)) == 0, "no distance is 0.0 (the rooted-norm defect returned all zeros)", int(np.count_nonzero(ed == 0.0)))
+    brute_d2 = ((q[:, None, :].astype(np.float64) - x[None, :, :]) ** 2).sum(-1)
+    brute = np.argsort(brute_d2, axis=1, kind="stable")[:, :5]
+    rep.check("EUCLIDEAN", np.array_equal(np.sort(ei, axis=1), np.sort(brute.astype(np.int32), axis=1)), "probing every list returns brute force's neighbor sets")
+    rep.check("EUCLIDEAN", np.allclose(ed, np.sqrt(np.take_along_axis(brute_d2, ei.astype(np.int64), 1)), rtol=1e-4, atol=1e-4), "distances are Euclidean (float64 reference, 1e-4)")
+    rep.check("EUCLIDEAN", np.all(np.diff(ed, axis=1) >= 0), "distances ascend along each query")
+    root = np.sqrt(sd)
+    same = np.array_equal(ei, si) and np.array_equal(ed.view(np.uint32), root.view(np.uint32))
+    if mode() == "identical":
+        rep.check("EUCLIDEAN", same, "ids equal the sqeuclidean search's and every distance is the correctly rounded root of its distance, bit for bit")
+    else:
+        rep.report_only("EUCLIDEAN", same, "ids and rooted distances against the sqeuclidean search")
+    rep.check("EUCLIDEAN", IVFIndex(n_lists=8, n_probes=2, n_neighbors=5, metric=1, random_state=1).fit(x).search(q)[0].shape == (32, 5), "metric code 1 (L2SqrtExpanded) accepted")
+
+
+def arm_refusals(rep):
+    x, q = _data()
+    # Validation may refuse during construction or fit, before search exists.
+    # Defer the complete operation so every named refusal reaches the checker.
+    rep.raises("REFUSE", ValueError, "metric", "metric='cosine' by name", lambda: IVFIndex(n_lists=4, n_probes=1, metric="cosine").fit(x).search(q))
+    rep.raises("REFUSE", ValueError, "metric code", "an unknown integer metric code", lambda: IVFIndex(n_lists=4, n_probes=1, metric=7).fit(x).search(q))
+    rep.raises("REFUSE", ValueError, "metric codes", "metric code 2 (neither L2 code)", lambda: IVFIndex(n_lists=4, n_probes=1, metric=2).fit(x).search(q))
+    rep.raises("REFUSE", TypeError, "n_lists", "n_lists as a float", lambda: IVFIndex(n_lists=4.0, n_probes=1).fit(x).search(q))
+    rep.raises("REFUSE", ValueError, "call fit", "search before fit", lambda: IVFIndex(n_lists=4, n_probes=1).search(q))
+    rep.raises("REFUSE", ValueError, "features", "queries with another width", lambda: IVFIndex(n_lists=4, n_probes=1).fit(x).search(q[:, :4]))
+    rep.raises("REFUSE", Exception, "", "n_probes > n_lists, refused on the Mojo host (policy 2)", lambda: IVFIndex(n_lists=4, n_probes=5).fit(x).search(q))
+
+
+def arm_provenance(rep):
+    rep.check("PROVENANCE", "IVFIndex" in anonlib.__all__, "IVFIndex exported")
+    rep.check("PROVENANCE", "IVFIndex" not in anonlib._NOT_YET, "IVFIndex is no longer a named absence")
+    rep.check("PROVENANCE", IVFIndex(n_lists=4, n_probes=1).numeric_mode_used() == mode(), "numeric_mode_used() is the process default")
+
+
+def main(out=sys.stdout):
+    bind_or_exit("_anonlib_ivf", "build_ivf.sh")
+    rep = Report("test_ivf_surface")
+    return run("test_ivf_surface", [("SEARCH", arm_search), ("EUCLIDEAN", arm_euclidean), ("REFUSE", arm_refusals), ("PROVENANCE", arm_provenance)], rep, out)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,670 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 the authors. Part of anonlib, DOI-WITHHELD
+"""Generate the host restatement of the Mamba device passes
+(lane/cpu-training-mamba, 2026-09-15).
+
+The Mamba-1, Mamba-2 and Mamba-3 prefill backward passes exist only as
+device kernels (`mamba/impl/`), and they read forward stage buffers in the
+device's layouts. A hand transcription of some sixty kernels would be a
+second spelling of every pinned order, which is the drift the IDENTICAL
+contract forbids. This tool writes the SAME source out for the host instead,
+mechanically, into `mamba/host/gen/`:
+
+  1. every kernel, a `def` whose body opens its thread index with
+     `var <i> = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)` (either
+     factor order),
+     gains a leading `gid_: Int` parameter and that line becomes
+     `var <i> = gid_`. Nothing else in a kernel body changes.
+  2. every launch `<ctx>.enqueue_function[<kernel>](<args>, grid_dim=G,
+     block_dim=T)` becomes `for gid_ in range(launch_count(G, T)):
+     <kernel>(gid_, <args>)`. Every kernel bounds-checks its index and
+     writes only its own cells, so the serial loop over the launch grid is
+     the launch; `launch_count` refuses a grid or block with a second or
+     third axis above 1.
+  3. imports: `max.gpu.host` and the device GEMM (`gemm.checks.gemm_identical`)
+     resolve to `mamba/host/device_shim.mojo` (host buffers under the
+     DeviceBuffer and DeviceContext names, and the GEMM through
+     `gemm/host/gemm_oracle.mojo`, the profile's definition); `std.gpu` is
+     dropped; every converted module resolves to its generated copy.
+  4. a top-level def that allocates threadgroup shared memory or waits on a
+     barrier (a tiled kernel) keeps its signature and aborts by name; the
+     SUBSTITUTIONS below select, at comptime, the arm a column without
+     threadgroup shared memory takes, so those kernels are never launched.
+
+Anything the rules above do not cover (a block primitive, a threadgroup
+allocation, a leftover `block_idx`) stops the tool by name; it never writes
+a partial file.
+
+    python3 tools/mamba_host_gen.py --write   # regenerate mamba/host/gen/
+    python3 tools/mamba_host_gen.py --check   # exit 1 if any output is stale
+
+python/anonlib/tests/test_cpu_training_mamba.py and the CPU identity gate's
+manifest step run --check, so a device edit that is not regenerated fails both.
+"""
+import argparse
+import os
+import re
+import sys
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+OUT_DIR = "mamba/host/gen"
+OUT_PKG = "mamba.host.gen"
+SHIM = "mamba.host.device_shim"
+
+#: source path -> generated module basename
+SOURCES = {
+    "core/identity_trace.mojo": "identity_trace",
+    # the neural RNG (the Samba stack's initializers and dropout,
+    # lane/cpu-training-samba): the Philox block function and the neural
+    # stream's layout and integer-to-float mapping
+    "core/philox.mojo": "philox",
+    "core/philox_neural.mojo": "philox_neural",
+    "gemm/checks/gemm_backward.mojo": "gemm_backward",
+    "gemm/neural_backward.mojo": "neural_backward",
+    # neural_scan_profile / neural_mamba_scan (ANONLIB_IDN_M1_SCAN=1) deleted 2026-10-11 (docs/TOMBSTONES.md)
+    "mamba/impl/ops/selective_scan_interface.mojo": "selective_scan_interface",
+    "mamba/impl/modeling/modeling_mamba.mojo": "modeling_mamba",
+    "mamba/impl/modules/ssd_minimal.mojo": "ssd_minimal",
+    "mamba/impl/modules/mamba2.mojo": "mamba2",
+    "autograd/kernels/mamba2_proj.mojo": "mamba2_backward_checks",
+    "autograd/kernels/mamba2.mojo": "mamba2_backward",
+    "autograd/kernels/mamba2_ssd.mojo": "mamba2_ssd_backward",
+    "autograd/kernels/mamba2_prefill.mojo": "mamba2_prefill_backward",
+    # lane del-mamba (2026-10-19): the device runs the Mamba-1/2 backward on the
+    # tape; the hand walk lives on only as this column's input
+    "mamba/host/mamba2_prefill_chain.mojo": "mamba2_prefill_chain",
+    "autograd/kernels/mamba1_proj.mojo": "mamba_backward_checks",
+    "autograd/kernels/mamba1_scan.mojo": "selective_scan_backward",
+    "autograd/kernels/mamba1.mojo": "modeling_mamba_backward",
+    "autograd/kernels/mamba1_prefill.mojo": "modeling_mamba_prefill_backward",
+    "mamba/host/mamba1_prefill_chain.mojo": "mamba1_prefill_chain",
+    "autograd/kernels/mamba_refusal.mojo": "mamba3_refusal",
+    "mamba/impl/modules/mamba3_transfer.mojo": "mamba3_transfer",
+    "mamba/impl/ops/mamba3_siso.mojo": "mamba3_siso",
+    "mamba/impl/modules/mamba3.mojo": "mamba3",
+    "autograd/kernels/mamba3_proj.mojo": "mamba3_backward_checks",
+    "autograd/kernels/mamba3.mojo": "mamba3_backward",
+    "autograd/kernels/mamba3_prefill.mojo": "mamba3_prefill_backward",
+    # lane ag-mamba3-tape (2026-10-19): the device runs the Mamba-3 backward on
+    # the tape; the hand walk lives on only as this column's input
+    "mamba/host/mamba3_prefill_chain.mojo": "mamba3_prefill_chain",
+}
+
+#: import module -> replacement module (None drops the import line)
+IMPORT_MAP = {
+    "max.gpu.host": SHIM,
+    "gemm.checks.gemm_identical": SHIM,
+    "gemm.neural_dispatch": SHIM,
+    "mamba.impl.ops.neural_gradient_profile": "mamba.impl.ops.neural_gradient_profile",
+    "std.gpu": None,
+    "max.gpu.memory": None,
+    "max.gpu.sync": None,
+}
+
+
+# GPU-only optimization imports must never leak device types into the host
+# restatement. Preserve their exported signatures mechanically, disable their
+# switches, and refuse if an unreachable optimized entry is nevertheless used.
+HOST_OPT_MODULE = OUT_PKG + ".device_optimizations"
+HOST_OPT_FUNCTIONS = {
+    "core/device_arena.mojo": ("arena_active", "arena_begin", "arena_end", "arena_release", "arena_take"),
+    "mamba/impl/ops/afn_selective_scan.mojo": ("afn_selective_scan_chunked",),
+    # NI38 S changes device scheduling only. The host keeps the original
+    # serial recurrence, so its import must be a disabled host-safe signature.
+    "mamba/impl/ops/identical_scan_window.mojo": ("identical_selective_scan_window",),
+    # lane/neural-fusions: the persistent chunked scan is a device plan only.
+    "mamba/impl/ops/m1_persistent_scan.mojo": ("m1_persistent_scan",),
+    "mamba/impl/modeling/afn_mamba1_fused.mojo": ("afn_m1_conv_token", "afn_m1_split_a"),
+    "mamba/impl/modules/afn_ssd_mma.mojo": (
+        "afn_ssd_mma_applies", "afn_m2_cb_g_mma", "afn_m2_ydiag_mma", "afn_m2_cstate_mma"),
+    "mamba/impl/ops/afn_mamba3_fused.mojo": (
+        "afn_m3_prep", "afn_m3_scale_angle", "afn_m3_rot_kscale", "afn_m3_dacs_decay"),
+    "mamba/impl/modules/afn_proj_gemm.mojo": (
+        "afn_proj_gemm_into", "afn_proj_gemm_resid_into"),
+    "mamba/impl/modules/idn_gemm_ws.mojo": ("mamba_proj_gemm",),
+}
+HOST_OPT_STRUCTS = {
+    "mamba/impl/modules/afn_arena.mojo": "MambaArena",
+    "mamba/impl/modules/afn_refusal.mojo": "AfnRefusalBatch",
+}
+HOST_OPT_DEFINES = "mamba/impl/modules/afn_defines.mojo"
+for _src in (*HOST_OPT_FUNCTIONS, *HOST_OPT_STRUCTS, HOST_OPT_DEFINES):
+    IMPORT_MAP[_src[:-len(".mojo")].replace("/", ".")] = HOST_OPT_MODULE
+
+#: Textual substitutions, (source, pattern, replacement). Each must match in
+#: its source at least once or the tool stops. They select, at comptime, the
+#: arm a column WITHOUT threadgroup shared memory takes: the host has none.
+#: The shared-memory kernels those arms bypass are stubbed (rule 4 of the
+#: module docstring) and abort by name if ever reached.
+SUBSTITUTIONS = (
+    # NN36 uses GPU shared memory only. Its host column retains the exact
+    # cell exp/dot expression; generation and all checks are still pending.
+    ("mamba/impl/modules/ssd_minimal.mojo",
+     r'comptime NN36_SHARED_DECAY = [^\n]+',
+     "comptime NN36_SHARED_DECAY = False"),
+    ("mamba/impl/ops/selective_scan_interface.mojo",
+     r"comptime IDN_M1_STATE_WINDOW = \([\s\S]*?\n\)",
+     "comptime IDN_M1_STATE_WINDOW = False"),
+    ("mamba/impl/ops/mamba3_siso.mojo",
+     r"lib_smem_page_fits_for\[TARGET_COLUMN, \d+\]\(\)", "False"),
+    ("autograd/kernels/mamba3.mojo",
+     r"lib_smem_page_fits_for\[TARGET_COLUMN, [A-Za-z0-9_]+\]\(\)", "False"),
+    ("autograd/kernels/mamba3.mojo",
+     r'comptime M3_ANGLE_DT_SHARED = not is_defined\["ANONLIB_MAMBA3_ANGLE_DT_NAIVE"\]\(\)',
+     "comptime M3_ANGLE_DT_SHARED = False"),
+    ("autograd/kernels/mamba_refusal.mojo",
+     r'comptime M3_DEVICE_REFUSAL = not is_defined\["ANONLIB_MAMBA3_LEGACY_REFUSAL"\]\(\)',
+     "comptime M3_DEVICE_REFUSAL = False"),
+    # CPU SPEED (lane neural-cpu, 2026-09-28): the S16 q/k/v backward launch
+    # runs mamba/host/mamba3_s16_host.mojo, the kernel's per-cell arithmetic
+    # as lanes over n (d_q, d_k) and p (d_v), rows split over host tasks.
+    # lane/neural-apple2: the host takes the naive S16 launch below (its
+    # host restatement), never the shared-memory d_v split.
+    ("autograd/kernels/mamba3.mojo",
+     r'comptime M3_S16_V_SHARED = not is_defined\["ANONLIB_MAMBA3_S16_V_NAIVE"\]\(\)',
+     "comptime M3_S16_V_SHARED = False"),
+    ("autograd/kernels/mamba3.mojo",
+     r'comptime M3_S17_TAIL_SHARED = not is_defined\["ANONLIB_MAMBA3_S17_TAIL_NAIVE"\]\(\)',
+     "comptime M3_S17_TAIL_SHARED = False"),
+    ("autograd/kernels/mamba3.mojo",
+     r'comptime M3_S16_QK_SHARED = not is_defined\["ANONLIB_MAMBA3_S16_QK_NAIVE"\]\(\)',
+     "comptime M3_S16_QK_SHARED = False"),
+    ("autograd/kernels/mamba3.mojo",
+     r'comptime M3_S17_OPERANDS_SHARED = \(\n    not is_defined\["ANONLIB_MAMBA3_S17_OPERANDS_NAIVE"\]\(\)\n    and M3_S17_TAIL_SHARED\n    and False\n\)',
+     "comptime M3_S17_OPERANDS_SHARED = False"),
+    ("autograd/kernels/mamba3.mojo",
+     r"ctx\.enqueue_function\[mamba3_s16_qkv_backward_kernel\]\(",
+     "mamba3_s16_qkv_backward_host("),
+    ("autograd/kernels/mamba3.mojo",
+     r"ctx\.enqueue_function\[mamba3_s17_reverse_state_kernel\]\(",
+     "mamba3_s17_reverse_state_host("),
+    ("autograd/kernels/mamba3.mojo",
+     r"\nfrom mamba\.checks\.mamba3_fixture import ",
+     "\nfrom mamba.host.mamba3_s16_host import mamba3_s16_qkv_backward_host, mamba3_s17_reverse_state_host\nfrom mamba.checks.mamba3_fixture import "),
+)
+
+
+# These GPU entry points accept an existing process-lifetime device context.
+# The host shim owns no GPU queues; retain its ordinary DeviceContext fallback.
+# Explicit substitutions keep the already-qualified generated host sources byte
+# identical and fail closed if the upstream lifecycle spelling changes again.
+_CONTEXT_SOURCES = (
+    "mamba/host/mamba2_prefill_chain.mojo",
+    "mamba/host/mamba1_prefill_chain.mojo",
+    "mamba/host/mamba3_prefill_chain.mojo",
+)
+_CONTEXT_RULES = (
+    (r'from core\.neural_context import process_ctx\n'
+     r'from checks\.numerics import GLOBAL_NUMERIC_MODE as _DEVCTX_MODE, NUMERIC_IDENTICAL as _DEVCTX_IDENTICAL\n\n'
+     r"#: This binding's ONE process-lifetime DeviceContext \(core/neural_context\.mojo,\n"
+     r'#: lane/devctx-lifetime\): a context per call exhausts Metal command queues\.\n'
+     r'comptime _DEVCTX_SLOT = "MojoNeuralMambaContextIdentical" if _DEVCTX_MODE == _DEVCTX_IDENTICAL else "MojoNeuralMambaContextFast"\n\n', ''),
+    (r'\bprocess_ctx\[_DEVCTX_SLOT\]\(\)', 'DeviceContext()'),
+    (r'# Direct callers also reuse that context when none is supplied\.',
+     '# Same kernels, same launches, same order: no bit moves.'),
+)
+SUBSTITUTIONS += tuple((src, pattern, replacement)
+                       for src in _CONTEXT_SOURCES
+                       for pattern, replacement in _CONTEXT_RULES)
+
+#: Verbatim top-level blocks lifted out of a device file whose other
+#: definitions are device-only: (source, output basename, names, header
+#: imports, substitutions inside the lifted text).
+EXTRACTS = (
+    ("gemm/checks/gemm_identical.mojo", "gemm_identical_parts",
+     ("GEMM_FOLD_LEVELS", "GEMM_FOLD_SLOTS", "SAB_FOLD_STRIDE", "SAB_LEAF_ROTATE",
+      "contract_partition", "_fold_push", "_fold_drain", "_leaf_bounds", "_leaf_at"),
+     ("from std.sys.compile import is_defined",
+      "from gemm.checks.gemm_oracle import contract_leaf_count, contract_leaf_size",
+      "from checks.numerics import ftz"),
+     # the sabotage arm of `_leaf_at` rotates by the launch block; a serial
+     # host loop has one block, index 0
+     ((r"Int\(block_idx\.x\)", "0"),)),
+)
+
+SHARED_MEMORY = re.compile(r"\bbarrier\(\)|stack_allocation\[[^]]*address_space\s*=\s*AddressSpace\.SHARED", re.S)
+for _src, _base in SOURCES.items():
+    IMPORT_MAP[_src[:-len(".mojo")].replace("/", ".")] = OUT_PKG + "." + _base
+
+CELL_RE = re.compile(
+    r"^(\s*(?:[^#\n]*;\s*)?)var\s+(\w+)\s*=\s*(?:Int\(\s*block_idx\.x\s*\)\s*\*\s*Int\(\s*block_dim\.x\s*\)"
+    r"|Int\(\s*block_dim\.x\s*\)\s*\*\s*Int\(\s*block_idx\.x\s*\))"
+    r"\s*\+\s*Int\(\s*thread_idx\.x\s*\)\s*(;.*)?$"
+)
+DEVICE_ONLY = re.compile(r"\b(block_idx|thread_idx|grid_dim\.|block_dim\.|barrier|AddressSpace|block_sum|process_ctx|_DEVCTX_SLOT)\b")
+
+
+class GenError(Exception):
+    pass
+
+
+def _match_close(text, i, open_ch, close_ch):
+    """Index of the bracket closing the one at text[i]; skips strings."""
+    depth = 0
+    j = i
+    in_str = None
+    while j < len(text):
+        c = text[j]
+        if in_str:
+            if c == "\\":
+                j += 2
+                continue
+            if c == in_str:
+                in_str = None
+        elif c in "\"'":
+            in_str = c
+        elif c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+            if depth == 0:
+                if c != close_ch:
+                    raise GenError(f"unbalanced {open_ch}{close_ch} at offset {i}")
+                return j
+        j += 1
+    raise GenError(f"unclosed {open_ch} at offset {i}")
+
+
+def _split_args(text):
+    """Top-level comma split of an argument list's inside."""
+    out, depth, cur, in_str = [], 0, [], None
+    i = 0
+    while i < len(text):
+        c = text[i]
+        if in_str:
+            cur.append(c)
+            if c == "\\":
+                cur.append(text[i + 1])
+                i += 2
+                continue
+            if c == in_str:
+                in_str = None
+        elif c in "\"'":
+            in_str = c
+            cur.append(c)
+        elif c in "([{":
+            depth += 1
+            cur.append(c)
+        elif c in ")]}":
+            depth -= 1
+            cur.append(c)
+        elif c == "," and depth == 0:
+            out.append("".join(cur).strip())
+            cur = []
+        else:
+            cur.append(c)
+        i += 1
+    tail = "".join(cur).strip()
+    if tail:
+        out.append(tail)
+    return out
+
+
+def _flatten(s):
+    """One line: comments dropped, whitespace runs collapsed."""
+    lines = []
+    for line in s.split("\n"):
+        # strip a trailing comment outside strings (the argument lists here
+        # carry no '#' inside strings)
+        k = line.find("#")
+        if k >= 0:
+            line = line[:k]
+        lines.append(line.strip())
+    return re.sub(r"\s+", " ", " ".join(lines)).strip()
+
+
+def _rewrite_imports(text, src):
+    out = []
+    lines = text.split("\n")
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        m = re.match(r"^(\s*)from\s+([\w.]+)\s+import\b(.*)$", line)
+        if m and m.group(2) in IMPORT_MAP:
+            repl = IMPORT_MAP[m.group(2)]
+            block = [line]
+            if "(" in m.group(3) and ")" not in m.group(3):
+                while ")" not in lines[i]:
+                    i += 1
+                    block.append(lines[i])
+            if repl is not None:
+                block[0] = f"{m.group(1)}from {repl} import{m.group(3)}"
+                out.extend(block)
+            i += 1
+            continue
+        if m and m.group(2).startswith(("max.gpu", "mamba.impl")):
+            raise GenError(f"{src}: import of {m.group(2)} has no host mapping")
+        out.append(line)
+        i += 1
+    return "\n".join(out)
+
+
+def _def_extent(lines, j):
+    """(signature end line, body end line exclusive) of the top-level def at j."""
+    head = "\n".join(lines[j:])
+    name = re.match(r"^def\s+(\w+)", lines[j]).group(1)
+    k = len("def ") + len(name)
+    if head[k] == "[":
+        k = _match_close(head, k, "[", "]") + 1
+    if head[k] != "(":
+        raise GenError(f"cannot find the parameter list of {name}")
+    close = _match_close(head, k, "(", ")")
+    colon = head.index(":", close)
+    sig_end = j + head[:colon].count("\n")
+    e = sig_end + 1
+    while e < len(lines) and not re.match(r"^[A-Za-z_@]", lines[e]):
+        e += 1
+    return name, k, sig_end, e
+
+
+def _stub_shared_kernels(text, src):
+    """Rule 4: a top-level def that allocates threadgroup memory or waits on
+    a barrier keeps its name and signature (plus gid_) and aborts by name."""
+    lines = text.split("\n")
+    out = []
+    names = []
+    i = 0
+    while i < len(lines):
+        if re.match(r"^def\s+\w+", lines[i]):
+            name, k, sig_end, e = _def_extent(lines, i)
+            body = "\n".join(lines[sig_end + 1:e])
+            if SHARED_MEMORY.search(body):
+                head = "\n".join(lines[i:sig_end + 1])
+                head = head[:k + 1] + "gid_: Int, " + head[k + 1:]
+                out.extend(head.split("\n"))
+                out.append(f'    abort("mamba host: {name} uses threadgroup shared memory and has no host'
+                           f' restatement; the host takes the unshared arm (tools/mamba_host_gen.py)")')
+                out.append("")
+                out.append("")
+                names.append(name)
+                i = e
+                continue
+        out.append(lines[i])
+        i += 1
+    return "\n".join(out), names
+
+
+def _rewrite_kernels(text, src):
+    lines = text.split("\n")
+    n_kernels = 0
+    for idx, line in enumerate(lines):
+        m = CELL_RE.match(line)
+        if not m:
+            continue
+        # the enclosing top-level def
+        j = idx
+        while j >= 0 and not re.match(r"^def\s+\w+", lines[j]):
+            j -= 1
+        if j < 0:
+            raise GenError(f"{src}:{idx + 1}: thread index outside a def")
+        head = "\n".join(lines[j:idx])
+        name = re.match(r"^def\s+(\w+)", lines[j]).group(1)
+        pos = len(lines[j]) - len(lines[j].lstrip()) + len("def ") + len(name)
+        joined = head
+        k = pos
+        if joined[k] == "[":
+            k = _match_close(joined, k, "[", "]") + 1
+        if joined[k] != "(":
+            raise GenError(f"{src}:{j + 1}: cannot find the parameter list of {name}")
+        joined = joined[:k + 1] + "gid_: Int, " + joined[k + 1:]
+        new_head = joined.split("\n")
+        if len(new_head) != idx - j:
+            raise GenError(f"{src}:{j + 1}: signature rewrite changed the line count")
+        lines[j:idx] = new_head
+        lines[idx] = f"{m.group(1)}var {m.group(2)} = gid_{m.group(3) or ''}"
+        n_kernels += 1
+    return "\n".join(lines), n_kernels
+
+
+LAUNCH_RE = re.compile(r"([\w.\[\]]+)\.enqueue_function\[")
+
+
+def _rewrite_launches(text, src):
+    out = []
+    i = 0
+    n = 0
+    while True:
+        m = LAUNCH_RE.search(text, i)
+        if not m:
+            out.append(text[i:])
+            break
+        start = m.start()
+        line_start = text.rfind("\n", 0, start) + 1
+        indent = re.match(r"\s*", text[line_start:]).group(0)
+        if text[line_start:start].strip():
+            raise GenError(f"{src}: a launch that does not start its line: {text[line_start:m.end()]!r}")
+        b0 = m.end() - 1
+        b1 = _match_close(text, b0, "[", "]")
+        kernel = text[b0 + 1:b1].strip()
+        if text[b1 + 1] != "(":
+            raise GenError(f"{src}: launch of {kernel} without an argument list")
+        p1 = _match_close(text, b1 + 1, "(", ")")
+        args = [_flatten(a) for a in _split_args(text[b1 + 2:p1])]
+        args = [a for a in args if a]
+        grid = [a for a in args if re.match(r"^grid_dim\s*=", a)]
+        block = [a for a in args if re.match(r"^block_dim\s*=", a)]
+        pos = [a for a in args if not re.match(r"^(grid_dim|block_dim)\s*=", a)]
+        if len(grid) != 1 or len(block) != 1 or any("=" in a.split("(")[0] and "==" not in a for a in pos):
+            raise GenError(f"{src}: launch of {kernel} is not (positional args, grid_dim, block_dim)")
+        g = grid[0].split("=", 1)[1].strip()
+        t = block[0].split("=", 1)[1].strip()
+        # THREADED (lane neural-cpu, 2026-09-28): the launch's arguments are
+        # evaluated once, as the device launch evaluates them, and the grid's
+        # thread indices are split into contiguous ranges over host tasks
+        # (`device_shim.host_launch`, through core/host_parallel.mojo). A
+        # kernel's cell is a function of its thread index and its arguments
+        # alone -- that is what running on a GPU grid in any order already
+        # requires -- so the split moves no bit.
+        n += 1
+        names = [f"_l{n}_a{q}" for q in range(len(pos))]
+        body = ", ".join(["gid_"] + names)
+        caps = ", ".join(f"imm {nm}" for nm in names)
+        out.append(text[i:line_start])
+        for nm, a in zip(names, pos):
+            out.append(f"{indent}var {nm} = {a}\n")
+        out.append(f"{indent}def _launch_{n}(gid_: Int) {{{caps}}}:\n{indent}    {kernel}({body})\n")
+        out.append(f"{indent}host_launch(_launch_{n}, launch_count({g}, {t}))")
+        i = p1 + 1
+        continue
+    return "".join(out), n
+
+
+def generate(src, *, validate=True):
+    path = os.path.join(ROOT, src)
+    with open(path) as fh:
+        text = fh.read()
+    for s_src, pattern, repl in SUBSTITUTIONS:
+        if s_src == src:
+            text, count = re.subn(pattern, repl, text)
+            if validate and count == 0:
+                raise GenError(f"{src}: substitution {pattern!r} matched nothing")
+    text = _rewrite_imports(text, src)
+    text, stubbed = _stub_shared_kernels(text, src)
+    text, n_kernels = _rewrite_kernels(text, src)
+    text, n_launches = _rewrite_launches(text, src)
+    in_doc = False
+    for lineno, line in enumerate(text.split("\n"), 1):
+        quotes = line.count('"""')
+        was_doc = in_doc
+        if quotes % 2 == 1:
+            in_doc = not in_doc
+        if was_doc or quotes:
+            continue
+        code = re.sub(r'"(?:[^"\\]|\\.)*"', '""', line).split("#", 1)[0]
+        if re.match(r"^\s*from\s+std\.memory\s+import", code):
+            continue
+        if validate and DEVICE_ONLY.search(code) and "launch_count" not in code:
+            raise GenError(f"{src}: generated line {lineno} still reads a device construct: {line.strip()!r}")
+    header = (
+        "# SPDX-License-Identifier: Apache-2.0\n"
+        f"# GENERATED by tools/mamba_host_gen.py from {src}; do not edit.\n"
+        f"# {n_kernels} kernels, {n_launches} launches restated as host loops over the launch grid, split over host tasks.\n"
+        + (f"# stubbed shared-memory kernels: {', '.join(stubbed)}.\n" if stubbed else "")
+    )
+    # the shim's launch_count, imported before the first top-level import
+    lines = text.split("\n")
+    for i, line in enumerate(lines):
+        if re.match(r"^(from|import)\s", line):
+            lines.insert(i, f"from {SHIM} import host_launch, launch_count")
+            if stubbed:
+                lines.insert(i, "from std.os import abort")
+            break
+    else:
+        raise GenError(f"{src}: no top-level import to place launch_count before")
+    if lines[0].startswith("# SPDX-License-Identifier"):
+        lines = lines[1:]
+    return header + "\n".join(line.rstrip() for line in lines)
+
+
+def extract(src, names, imports, subs, *, validate=True):
+    with open(os.path.join(ROOT, src)) as fh:
+        lines = fh.read().split("\n")
+    blocks = {}
+    i = 0
+    while i < len(lines):
+        m = re.match(r"^(def|comptime)\s+(\w+)", lines[i])
+        if m and m.group(2) in names:
+            if m.group(1) == "def":
+                _, _, _, e = _def_extent(lines, i)
+            else:
+                e = i + 1
+                depth = lines[i].count("[") + lines[i].count("(") - lines[i].count("]") - lines[i].count(")")
+                while depth > 0:
+                    depth += lines[e].count("[") + lines[e].count("(") - lines[e].count("]") - lines[e].count(")")
+                    e += 1
+            while e > i and not lines[e - 1].strip():
+                e -= 1
+            blocks[m.group(2)] = "\n".join(lines[i:e])
+            i = e
+            continue
+        i += 1
+    missing = [n for n in names if n not in blocks]
+    if missing:
+        raise GenError(f"{src}: extract found no top-level {', '.join(missing)}")
+    body = "\n\n\n".join(blocks[n] for n in names)
+    for pattern, repl in subs:
+        body, count = re.subn(pattern, repl, body)
+        if count == 0:
+            raise GenError(f"{src}: extract substitution {pattern!r} matched nothing")
+    if validate and DEVICE_ONLY.search(re.sub(r'"(?:[^"\\]|\\.)*"', '""', body)):
+        raise GenError(f"{src}: an extracted block reads a device construct")
+    return ("# SPDX-License-Identifier: Apache-2.0\n"
+            f"# GENERATED by tools/mamba_host_gen.py: verbatim blocks of {src}; do not edit.\n"
+            f'"""The host-safe definitions of `{src}` the generated passes import:\n'
+            f'{", ".join(names)}."""\n' + "\n".join(imports) + "\n\n\n" + body + "\n")
+
+
+
+def host_optimization_stubs():
+    """Keep host oracle arithmetic; make device-only optimizations fail closed."""
+    out = ["# SPDX-License-Identifier: Apache-2.0",
+           "# GENERATED by tools/mamba_host_gen.py; do not edit.",
+           '"""Host-only signatures for disabled device optimizations. No GPU imports."""',
+           "from std.os import abort",
+           f"from {SHIM} import DeviceBuffer, DeviceContext, identical_gemm", ""]
+    text = open(os.path.join(ROOT, HOST_OPT_DEFINES)).read()
+    switches = re.findall(r"^comptime ((?:AFN_|IDN_|_IDN_)[A-Z0-9_]+)\s*=", text, re.M)
+    if not switches:
+        raise GenError("device optimization defines contain no recognized switches")
+    out.extend("comptime " + name + " = False" for name in switches)
+    out.append("comptime AFN_MAMBA_PROJ_ROUTE = False")
+    out.append("comptime IDN_MAMBA_GEMM_WS = False")
+    out.append("")
+    for src, names in HOST_OPT_FUNCTIONS.items():
+        lines = open(os.path.join(ROOT, src)).read().splitlines()
+        found = set()
+        for i, line in enumerate(lines):
+            match = re.match(r"^def (\w+)", line)
+            if not match or match.group(1) not in names:
+                continue
+            name, _, sig_end, _ = _def_extent(lines, i)
+            found.add(name)
+            out.extend(lines[i:sig_end + 1])
+            if name == "mamba_proj_gemm":
+                # Device workspace retention changes no arithmetic. The host
+                # already implements this exact pinned GEMM in device_shim.
+                out.append("    identical_gemm[False](ctx, c, a, b, m, n, k, op)")
+            elif name == "afn_ssd_mma_applies":
+                out.append("    return False")
+            else:
+                out.append(f'    abort("mamba host: device-only optimization {name} is disabled")')
+            out.extend(["", ""])
+        if found != set(names):
+            raise GenError(f"{src}: missing optimization exports {set(names) - found}")
+    for src, name in HOST_OPT_STRUCTS.items():
+        lines = open(os.path.join(ROOT, src)).read().splitlines()
+        start = next((i for i, line in enumerate(lines)
+                      if line.startswith("struct " + name + "(")), None)
+        if start is None:
+            raise GenError(f"{src}: missing optimization struct {name}")
+        end = start + 1
+        while end < len(lines) and not re.match(r"^[A-Za-z_@]", lines[end]):
+            end += 1
+        # Preserve fields, decorators and every method signature from source;
+        # constructors abort before any field or device operation is observed.
+        block = lines[start:end]
+        i = 0
+        while i < len(block):
+            if re.match(r"^    def ", block[i]):
+                flat = [line[4:] if line.startswith("    ") else line for line in block]
+                method, _, sig_end, method_end = _def_extent(flat, i)
+                out.extend(block[i:sig_end + 1])
+                out.append(f'        abort("mamba host: device-only {name}.{method} is disabled")')
+                out.extend(["", ""])
+                i = method_end
+            else:
+                out.append(block[i])
+                i += 1
+        out.append("")
+    return "\n".join(out) + "\n"
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser()
+    g = ap.add_mutually_exclusive_group(required=True)
+    g.add_argument("--write", action="store_true")
+    g.add_argument("--source-write-only", action="store_true", help="author host source only; no device-construct scan, stale comparison or verification")
+    g.add_argument("--check", action="store_true")
+    args = ap.parse_args(argv)
+    stale = []
+    outputs = {}
+    try:
+        outputs[os.path.join(OUT_DIR, "device_optimizations.mojo")] = host_optimization_stubs()
+        for src, base in SOURCES.items():
+            outputs[os.path.join(OUT_DIR, base + ".mojo")]= generate(src, validate=not args.source_write_only)
+        for src, base, names, imports, subs in EXTRACTS:
+            outputs[os.path.join(OUT_DIR, base + ".mojo")]= extract(src, names, imports, subs, validate=not args.source_write_only)
+    except GenError as exc:
+        print(f"mamba_host_gen: {exc}", file=sys.stderr)
+        return 2
+    init = os.path.join(OUT_DIR, "__init__.mojo")
+    outputs[init] = ("# SPDX-License-Identifier: Apache-2.0\n"
+                     "# GENERATED by tools/mamba_host_gen.py; do not edit.\n"
+                     '"""mamba/host/gen: the Mamba device passes restated on the host, mechanically."""\n')
+    for rel, text in outputs.items():
+        p = os.path.join(ROOT, rel)
+        if args.source_write_only:
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, "w") as fh:
+                fh.write(text)
+            print(f"authored {rel}; verification not run")
+            continue
+        old = open(p).read() if os.path.exists(p) else None
+        if old != text:
+            stale.append(rel)
+            if args.write:
+                os.makedirs(os.path.dirname(p), exist_ok=True)
+                with open(p, "w") as fh:
+                    fh.write(text)
+    if args.check:
+        for rel in stale:
+            print(f"mamba_host_gen: STALE {rel}")
+        return 1 if stale else 0
+    for rel in stale:
+        print(f"wrote {rel}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

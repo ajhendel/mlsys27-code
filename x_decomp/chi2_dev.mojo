@@ -1,0 +1,96 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 the authors. Part of anonlib, DOI-WITHHELD
+"""x_decomp/chi2.mojo's chi-squared CDF and quantile with the prefactor's
+cells launched on the device (lane py-runtime-b), as Python's resident kit
+launched them: logs, lgamma and exp of 1 x 1 float32 words through `DKit`
+(the same `ew_cell` per element), each read home; the series and the
+bisection in float64 as on the host column. GPU binding only."""
+from std.python import PythonObject
+from std.python._cpython import GILReleased
+from std.python import Python
+from x_decomp.chi2 import CHI2_BISECT, chi2_cf, chi2_series
+from x_decomp.kit import OP_EXP, OP_LOGS, mat_const
+from x_decomp.kit_device import DKit
+
+comptime _OP_LGAMMA = 37
+
+
+def _cell1(mut k: DKit, op: Int, v: Float64, s: Float64) raises -> Float64:
+    """`k.ew(op, k.const(v), s=s).s[0]`: one cell of one float32 word."""
+    var a = k.upload(mat_const(v, 1, 1))
+    var r = k.ew1(op, a, s)
+    return k.word(r)
+
+
+def chi2_cdf_dev(mut k: DKit, dof: Float64, m: Float64) raises -> Float64:
+    var a = dof / 2.0
+    var x = m / 2.0
+    if x <= 0:
+        return 0.0
+    var lx = _cell1(k, OP_LOGS, x, 1e-30)
+    # the series below x = a + 1, 1 - Q by the continued fraction above (lane
+    # apple-holes: the series's float32 prefactor underflowed far above the mean)
+    if x < a + 1.0:
+        var lg = _cell1(k, _OP_LGAMMA, a + 1, 0.0)
+        var pref = _cell1(k, OP_EXP, Float64(Float32(a * lx - x - lg)), 0.0)
+        return pref * chi2_series(a, x)
+    var lga = _cell1(k, _OP_LGAMMA, a, 0.0)
+    var prefq = _cell1(k, OP_EXP, Float64(Float32(a * lx - x - lga)), 0.0)
+    return 1.0 - prefq * chi2_cf(a, x)
+
+
+def chi2_quantile_dev(mut k: DKit, dof: Float64, upper: Float64) raises -> Float64:
+    var target = 1.0 - upper
+    var lo = 0.0
+    var hi = 4.0 * dof + 40.0
+    if not (hi > 1.0):
+        hi = 1.0
+    for _ in range(CHI2_BISECT):  # small-loop(CHI2_BISECT: bisection steps): float64 scalar search, no data
+        var mid = 0.5 * (lo + hi)
+        if chi2_cdf_dev(k, dof, mid) < target:
+            lo = mid
+        else:
+            hi = mid
+    return Float64(Float32(0.5 * (lo + hi)))
+
+
+def chi2_cdf_dev_py(dof: PythonObject, m: PythonObject) raises -> PythonObject:
+    var d = Float64(py=dof)
+    var x = Float64(py=m)
+    var r = 0.0
+    with GILReleased(Python()):
+        var k = DKit()
+        r = chi2_cdf_dev(k, d, x)
+    return PythonObject(r)
+
+
+def consistency_factor_dev(mut k: DKit, p: Float64, alpha: Float64) raises -> Float64:
+    """x_decomp/chi2.mojo `consistency_factor` on the device cells."""
+    var q = chi2_quantile_dev(k, p, 1.0 - alpha)
+    var c = chi2_cdf_dev(k, p + 2.0, q)
+    if not (c > 0.0):
+        raise Error("x_decomp: chi2 consistency factor: the cdf is 0")
+    return Float64(Float32(alpha / c))
+
+
+def consistency_factor_dev_py(p: PythonObject, num: PythonObject, den: PythonObject) raises -> PythonObject:
+    var pp = Float64(py=p)
+    var dn = Float64(py=den)
+    if not (dn > 0.0):
+        raise Error("x_decomp: chi2 consistency factor: den must be > 0")
+    var al = Float64(py=num) / dn
+    var r = 0.0
+    with GILReleased(Python()):
+        var k = DKit()
+        r = consistency_factor_dev(k, pp, al)
+    return PythonObject(r)
+
+
+def chi2_quantile_dev_py(dof: PythonObject, upper: PythonObject) raises -> PythonObject:
+    var d = Float64(py=dof)
+    var u = Float64(py=upper)
+    var r = 0.0
+    with GILReleased(Python()):
+        var k = DKit()
+        r = chi2_quantile_dev(k, d, u)
+    return PythonObject(r)

@@ -1,0 +1,129 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 the authors. Part of anonlib, DOI-WITHHELD
+"""IVF-SQ: 8-bit scalar quantization of the IVF residuals, per-cell
+arithmetic shared by the GPU and the CPU (lane/algos-ann, pass 1).
+
+Reference: cuVS `cpp/src/neighbors/ivf_sq/ivf_sq_build.cuh` (per-dimension
+vmin / vmax of the residuals, a 5% margin, delta = (range + 2 margin) / 255,
+code = clamp(roundf((v - vmin) / delta), 0, 255), :183-250 and :484-525) and
+`ivf_sq_search.cuh` (decode and the L2 scan).
+
+THE FIXED-ORDER DESIGN
+  * vmin / vmax: one cell per dimension scanning rows ascending with a
+    strict compare, so a -0.0 / 0.0 tie keeps the first row's sign (their
+    reduction's order is the device's).
+  * roundf is restated as trunc plus an exact half test (x - trunc(x) is
+    exact in float32), no libm call.
+  * the decoded value is one pinned fused step vmin + code * delta; the scan
+    distance is the ascending fused square sum; top-k under (distance, id).
+"""
+
+from std.math import trunc
+from checks.numerics import ftz, identical_div, identical_mul, identical_mul_add
+from x_ann.ivf_pq_core import F32P, I32P, ivf_row_removed, pq_inf, pq_insert, pq_next_probe
+
+
+@always_inline
+def sq_lo_takes(v: Float32, lo: Float32) -> Bool:
+    """DEVIATION 5830: a later value replaces the running minimum only when
+    strictly smaller (the first of equal values stays)."""
+    return v < lo
+
+
+@always_inline
+def sq_hi_takes(v: Float32, hi: Float32) -> Bool:
+    return v > hi
+
+
+@always_inline
+def sq_range_finish(c: Int, lo: Float32, hi: Float32, vmin: F32P, delta: F32P):
+    """Column c's quantization range from its minimum and maximum."""
+    var rng = ftz(hi - lo)
+    var margin = ftz(identical_mul(rng, Float32(0.05)))
+    if rng > Float32(0.0):
+        delta.unsafe_store(c, ftz(identical_div(ftz(rng + ftz(identical_mul(Float32(2.0), margin))), Float32(255.0))))
+    else:
+        delta.unsafe_store(c, Float32(1.0))
+    vmin.unsafe_store(c, ftz(lo - margin))
+
+
+@always_inline
+def sq_range_cell(c: Int, r: F32P, n: Int, dim: Int, vmin: F32P, delta: F32P, row_stride: Int = 1):
+    """Column c's range over rows 0, s, ..., (n - 1) s of `r` (s = `row_stride`;
+    release-0845: s > 1 is IVFSQIndex's max_train_points_per_cluster training rows,
+    cuVS ivf_sq_build.cuh:483-525 trains the range on its training subset)."""
+    var lo = ftz(r.unsafe_load(c))
+    var hi = lo
+    for i in range(1, n):
+        var v = ftz(r.unsafe_load(i * row_stride * dim + c))
+        if sq_lo_takes(v, lo):
+            lo = v
+        if sq_hi_takes(v, hi):
+            hi = v
+    sq_range_finish(c, lo, hi, vmin, delta)
+
+
+@always_inline
+def sq_encode_cell(e: Int, r: F32P, dim: Int, vmin: F32P, delta: F32P, codes: I32P):
+    var c = e % dim
+    var dv = delta.unsafe_load(c)
+    var x = ftz(identical_div(ftz(ftz(r.unsafe_load(e)) - vmin.unsafe_load(c)), dv))
+    var code = Float32(0.0)
+    if x > Float32(0.0):
+        var t = trunc(x)
+        code = t + Float32(1.0) if ftz(x - t) >= Float32(0.5) else t
+        if code > Float32(255.0):
+            code = Float32(255.0)
+    codes.unsafe_store(e, Int32(Int(code)))
+
+
+@always_inline
+def sq_candidate_dist(
+    queries: F32P, q_off: Int, centers: F32P, l: Int, dim: Int, codes: I32P, row: Int, vmin: F32P, delta: F32P
+) -> Float32:
+    """One candidate's distance: the query residual against list l's centre
+    minus the decoded row, the fused decode (DEVIATION 5832), the ascending
+    fused square sum. The cell and the device scan (`sq_score_kernel`) both
+    call it."""
+    var acc = Float32(0.0)
+    for c in range(dim):
+        var qr = ftz(ftz(queries.unsafe_load(q_off + c)) - ftz(centers.unsafe_load(l * dim + c)))
+        var dec = ftz(identical_mul_add(
+            Float32(Int(codes.unsafe_load(row * dim + c))), delta.unsafe_load(c), vmin.unsafe_load(c)
+        ))
+        var diff = ftz(qr - dec)
+        acc = ftz(identical_mul_add(diff, diff, acc))
+    return acc
+
+
+@always_inline
+def sq_search_cell(
+    qi: Int, queries: F32P, dim: Int, centers: F32P, n_lists: Int, offsets: I32P,
+    list_indices: I32P, codes: I32P, vmin: F32P, delta: F32P, k: Int, n_probes: Int,
+    mask: I32P, out_d: F32P, out_i: I32P, out_n: I32P,
+):
+    """The IVF-PQ probe walk with the SQ scan; `mask[row] == 0` removes a row
+    (the sample filter)."""
+    var base = qi * k
+    var q_off = qi * dim
+    for s in range(k):
+        out_d.unsafe_store(base + s, pq_inf())
+        out_i.unsafe_store(base + s, Int32(-1))
+    var prev_d = Float32(0.0)
+    var prev_l = -1
+    var n_cand = 0
+    for _ in range(n_probes):
+        var best_d = Float32(0.0)
+        var best_l = pq_next_probe(queries, q_off, centers, n_lists, dim, prev_d, prev_l, best_d)
+        if best_l < 0:
+            break
+        prev_l = best_l
+        prev_d = best_d
+        for slot in range(Int(offsets.unsafe_load(best_l)), Int(offsets.unsafe_load(best_l + 1))):
+            var row = Int(list_indices.unsafe_load(slot))
+            if ivf_row_removed(mask, row):
+                continue
+            var acc = sq_candidate_dist(queries, q_off, centers, best_l, dim, codes, row, vmin, delta)
+            pq_insert(k, base, acc, Int32(row), out_d, out_i)
+            n_cand += 1
+    out_n.unsafe_store(qi, Int32(n_cand))

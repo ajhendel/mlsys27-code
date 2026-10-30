@@ -1,0 +1,1101 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 the authors. Part of anonlib, DOI-WITHHELD
+"""Buffer handling at the boundary, without NumPy (DEVIATION 2300).
+
+The Mojo side takes RAW ADDRESSES. It borrows, never owns, and it holds
+nothing after a call returns. That is only sound if the Python object owning
+the memory is alive for the whole call, so every converter here returns the
+`Array` alongside its address and every caller keeps that `Array` in a local
+for the duration. `addr` and `addr_ro` are the one place an address is taken
+and the one place to look when that contract is broken.
+
+HOW AN ADDRESS IS TAKEN. `PyObject_GetBuffer` through `ctypes.pythonapi`,
+with a `Py_buffer` struct laid out here field for field, and ALWAYS a
+`PyBuffer_Release`. That is the same buffer protocol NumPy, `bytes`,
+`bytearray`, `array.array`, `memoryview` and ctypes objects all export, so
+one path serves every input. Contiguity is computed from the strides the
+exporter reports, not trusted from a flag.
+
+FLOAT32, NOT FLOAT64, AND THAT IS NOT NEGOTIABLE HERE. Metal has no float64
+and neither does the Mojo side; every kernel in this library is float32. A
+float64 input is converted, which COPIES. The copy is reported by the
+`copied` flag rather than hidden, because on a 4,000,000 x 32 matrix it is
+512 MB the caller did not ask for.
+
+HOW A CONVERSION IS DONE. `array.array('f', <memoryview of doubles>)`: the
+item setter is a C `(float)` cast of each double, which is one
+round-to-nearest-even per element, exactly what NumPy's `astype(float32)`
+does (the DEVIATION 1887 argument holds unchanged). It is a C loop over
+Python float objects, roughly 40-80 ns per element, so it is slower than
+NumPy's vectorized cast; it is never a per-element PYTHON loop. The one
+place Python iterates is the outer loop of a layout change (one iteration
+per column of a matrix, see `_array._reorder`). Integer inputs reach
+float32 through a double first: exact for every |v| <= 2**53 (all of
+int32, and every int64 a label or count could be), and possibly one ulp
+off a direct cast beyond that (DEVIATION 2306, documented, not hidden).
+"""
+
+from __future__ import annotations
+
+import array
+import ctypes
+from functools import lru_cache
+
+from ._array import Array, _CODE, normalize_dtype
+
+# ------------------------------------------------------------- Py_buffer
+
+
+class _PyBuffer(ctypes.Structure):
+    """`Py_buffer` from `Include/cpython/object.h` (identical on every
+    CPython this library supports, 3.10 through 3.14)."""
+
+    _fields_ = [
+        ("buf", ctypes.c_void_p),
+        ("obj", ctypes.c_void_p),
+        ("len", ctypes.c_ssize_t),
+        ("itemsize", ctypes.c_ssize_t),
+        ("readonly", ctypes.c_int),
+        ("ndim", ctypes.c_int),
+        ("format", ctypes.c_char_p),
+        ("shape", ctypes.POINTER(ctypes.c_ssize_t)),
+        ("strides", ctypes.POINTER(ctypes.c_ssize_t)),
+        ("suboffsets", ctypes.POINTER(ctypes.c_ssize_t)),
+        ("internal", ctypes.c_void_p),
+    ]
+
+
+PyBUF_WRITABLE = 0x0001
+PyBUF_FORMAT = 0x0004
+PyBUF_ND = 0x0008
+PyBUF_STRIDES = 0x0010 | PyBUF_ND
+PyBUF_INDIRECT = 0x0100 | PyBUF_STRIDES
+PyBUF_FULL_RO = PyBUF_INDIRECT | PyBUF_FORMAT          # 0x11c
+PyBUF_FULL = PyBUF_FULL_RO | PyBUF_WRITABLE            # 0x11d
+_PyBUF_READ = 0x100
+_PyBUF_WRITE = 0x200
+
+_api = ctypes.pythonapi
+# PRIVATE function-pointer objects, on purpose (2026-09-11, H100 istella leg).
+# `ctypes.pythonapi` is a process-wide singleton and `_api.PyObject_GetBuffer`
+# (attribute access) is CACHED on it, so every library that spells it that
+# way shares ONE `_FuncPtr` and the last `argtypes` assignment wins for all
+# of them. `treelite.model` (imported by cuML) assigns its own `_PyBuffer`
+# class there; after `import cuml` our calls failed with "argument 2:
+# expected LP__PyBuffer instance instead of pointer to _PyBuffer" and every
+# RF fit in a process that also held cuML was refused. `PyDLL.__getitem__`
+# builds a fresh, uncached `_FuncPtr` each time, so nobody else's argtypes
+# can reach these three.
+_get_buffer = _api["PyObject_GetBuffer"]
+_get_buffer.argtypes = [ctypes.py_object, ctypes.POINTER(_PyBuffer), ctypes.c_int]
+_get_buffer.restype = ctypes.c_int
+_release_buffer = _api["PyBuffer_Release"]
+_release_buffer.argtypes = [ctypes.POINTER(_PyBuffer)]
+_release_buffer.restype = None
+_memoryview_from_memory = _api["PyMemoryView_FromMemory"]
+_memoryview_from_memory.argtypes = [ctypes.c_void_p, ctypes.c_ssize_t, ctypes.c_int]
+_memoryview_from_memory.restype = ctypes.py_object
+
+
+def memory_at(addr, nbytes, *, writable):
+    """A flat `'B'` memoryview over `nbytes` at `addr`. It holds NO
+    reference to whatever owns that memory: the caller must."""
+    if nbytes == 0:
+        return memoryview(bytearray(0) if writable else b"")
+    flag = _PyBUF_WRITE if writable else _PyBUF_READ
+    return _memoryview_from_memory(addr, nbytes, flag)
+
+
+class Buf:
+    """A held buffer export: context manager around `PyObject_GetBuffer`
+    and `PyBuffer_Release`. Fields are plain attributes read once at
+    acquisition; the export (and so the address) is valid until `release`,
+    `__exit__` or garbage collection, whichever comes first.
+    """
+
+    __slots__ = (
+        "_view", "_obj", "_released", "addr", "nbytes", "itemsize", "ndim",
+        "shape", "strides", "format", "readonly", "c_contiguous",
+        "f_contiguous",
+    )
+
+    def __init__(self, obj, *, writable=False, name="object"):
+        self._released = True
+        self._obj = obj
+        if isinstance(obj, Array):
+            self._from_array(obj, name)
+            return
+        # DEVIATION 2692, defence in depth. Every public converter routes
+        # through `_materialize`, which refuses a device array by name before
+        # reaching here, and no caller currently hands user input straight to
+        # `view`/`addr`/`addr_ro` (ARIMA converts through `_series_major`
+        # first; everything else addressed here is library-allocated). This
+        # is the chokepoint for `view`, `addr`, `addr_ro` and the two direct
+        # `Buf(...)` uses below, so a future caller cannot open that door and
+        # get "does not support the buffer protocol" for memory whose real
+        # problem is that it lives on a GPU. ONE definition of the test.
+        device_kind = _device_array_kind(obj)
+        if device_kind is not None:
+            raise TypeError(
+                "anonlib: %s is a DEVICE array (it exports %s). anonlib "
+                "reads HOST memory only. Copy it to the host first: cupy "
+                "`x.get()`, torch `x.cpu()`, numba `x.copy_to_host()`."
+                % (name, device_kind)
+            )
+        view = _PyBuffer()
+        flags = PyBUF_FULL if writable else PyBUF_FULL_RO
+        try:
+            _get_buffer(obj, ctypes.byref(view), flags)
+        except TypeError:
+            raise TypeError(
+                f"anonlib: {name} does not support the buffer protocol"
+            ) from None
+        except BufferError:
+            # The exporter refused the writable request; re-acquire read-only
+            # so the failure below is the library's own message.
+            _get_buffer(obj, ctypes.byref(view), PyBUF_FULL_RO)
+        self._view = view
+        self._released = False
+        try:
+            self._fill(view)
+        except BaseException:
+            self.release()
+            raise
+        if writable and self.readonly:
+            self.release()
+            raise ValueError(
+                f"anonlib: {name} is read-only, refusing to write to it"
+            )
+
+    def _fill(self, view):
+        if view.suboffsets:
+            for k in range(view.ndim):  # glue: one check per buffer axis
+                if view.suboffsets[k] >= 0:
+                    raise TypeError(
+                        "anonlib: indirect (suboffset) buffers are not "
+                        "supported"
+                    )
+        self.addr = int(view.buf or 0)
+        self.nbytes = int(view.len)
+        self.itemsize = int(view.itemsize)
+        self.ndim = int(view.ndim)
+        fmt = view.format
+        self.format = fmt.decode("ascii") if fmt else "B"
+        self.readonly = bool(view.readonly)
+        if self.ndim == 0:
+            self.shape = ()
+            self.strides = ()
+        else:
+            if view.shape:
+                self.shape = tuple(int(view.shape[k]) for k in range(self.ndim))  # glue: one entry per buffer axis
+            else:
+                # ndim 1 without a shape array: a simple byte-like buffer
+                self.shape = (self.nbytes // max(self.itemsize, 1),)
+            if view.strides:
+                self.strides = tuple(int(view.strides[k]) for k in range(self.ndim))  # glue: one entry per buffer axis
+            else:
+                self.strides = None
+        self.c_contiguous, self.f_contiguous = _contiguity(
+            self.shape, self.strides, self.itemsize
+        )
+
+    def _from_array(self, arr, name):
+        # Pure-Python classes cannot export the buffer protocol before
+        # 3.12, so an Array is read from its backing store on every
+        # supported Python (DEVIATION 2305). Pinning the store's memoryview
+        # keeps an owned `array.array` from being resized underneath us.
+        self._view = memoryview(arr._store) if arr._pin is None else arr._pin
+        self._released = False
+        self.addr = arr._addr
+        self.nbytes = arr.nbytes
+        self.itemsize = arr.itemsize
+        self.ndim = arr.ndim
+        self.shape = arr.shape
+        self.strides = arr.strides
+        self.format = _CODE[arr.dtype]
+        self.readonly = arr._readonly
+        flags = arr.flags
+        self.c_contiguous = flags["C_CONTIGUOUS"]
+        self.f_contiguous = flags["F_CONTIGUOUS"]
+
+    def release(self):
+        if not self._released:
+            self._released = True
+            view = self._view
+            self._view = None
+            if isinstance(view, _PyBuffer):
+                _release_buffer(ctypes.byref(view))
+            elif view is not None and isinstance(self._obj, Array) and self._obj._pin is None:
+                view.release()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.release()
+        return False
+
+    def __del__(self):
+        try:
+            self.release()
+        except Exception:
+            pass
+
+    def __repr__(self):
+        return (f"Buf(addr=0x{self.addr:x}, format={self.format!r}, "
+                f"shape={self.shape}, strides={self.strides}, "
+                f"readonly={self.readonly})")
+
+
+def _contiguity(shape, strides, itemsize):
+    """(c_contiguous, f_contiguous) from strides, NumPy's rules: an empty
+    or single-element block is both; a dimension of extent 1 does not
+    constrain; `strides is None` means C-contiguous by definition."""
+    if not shape:
+        return True, True
+    n = 1
+    for s in shape:  # glue: product of shape dimensions
+        n *= s
+    if n <= 1:
+        return True, True
+    if strides is None:
+        return True, False
+    c_ok = True
+    expect = itemsize
+    for k in range(len(shape) - 1, -1, -1):  # glue: one stride check per axis
+        if shape[k] != 1 and strides[k] != expect:
+            c_ok = False
+            break
+        expect *= shape[k]
+    f_ok = True
+    expect = itemsize
+    for k in range(len(shape)):  # glue: one stride check per axis
+        if shape[k] != 1 and strides[k] != expect:
+            f_ok = False
+            break
+        expect *= shape[k]
+    return c_ok, f_ok
+
+
+# ---------------------------------------------------------------- formats
+
+_SIGNED = "bhilqn"
+_UNSIGNED = "BHILQNP"
+
+
+def typestr_of(buf):
+    """A NumPy-style typestr for a `Buf`, from its PEP 3118 format and its
+    itemsize (the letter alone does not fix the width: NumPy exports int64
+    as `'l'` on LP64 platforms and `'q'` elsewhere)."""
+    fmt = buf.format
+    size = buf.itemsize
+    if fmt[:1] in "@=<>!|":
+        if fmt[0] == ">" and size > 1:
+            raise TypeError(
+                f"anonlib: big-endian buffer format {fmt!r} is not supported"
+            )
+        fmt = fmt[1:]
+    if fmt in ("f", "d", "e"):
+        return {"f": "<f4", "d": "<f8", "e": "<f2"}[fmt]
+    if len(fmt) == 1 and fmt in _SIGNED:
+        # lane/neural-net-experiment (2026-09-30): a signed one-byte buffer
+        # is the Array's own int8 dtype ("<i1", `array.array('b')`), so a
+        # contiguous int8 exporter (NumPy int8 codes) is a zero-copy view.
+        # It was spelled "|i1", which no Array dtype matched, so
+        # `_materialize` widened it to int32 one Python object per element
+        # and `_convert` cast it back: 1.25 s per 4096 x 4096 code array on
+        # the L40S, the whole of the board's gemm-int8 cell (2.46 s against a
+        # 6 ms device side).
+        return ("<i1" if size == 1 else f"<i{size}")
+    if len(fmt) == 1 and fmt in _UNSIGNED:
+        return ("<u1" if size == 1 else f"<u{size}")
+    if fmt == "?":
+        return "|b1"
+    if fmt == "c":
+        return "|S1"
+    if fmt.endswith("s") and fmt[:-1].isdigit():
+        return f"|S{fmt[:-1]}"
+    if fmt.endswith("w") and fmt[:-1].isdigit():
+        return f"<U{fmt[:-1]}"
+    if fmt[:1] == "Z":
+        # scikit-learn's wording and type (`check_array`): complex input is
+        # a value error, not an unsupported container
+        raise ValueError(f"Complex data not supported: buffer format {fmt!r} is complex")
+    raise TypeError(f"anonlib: unsupported buffer format {fmt!r}")
+
+
+def _iter_format(typestr):
+    """The memoryview cast letter that makes a flat buffer of `typestr`
+    iterate as Python scalars, or None when it cannot."""
+    if typestr in _CODE:
+        return _CODE[typestr] if typestr != "<f2" else "e"
+    return {
+        "|i1": "b", "<i2": "h", "<u2": "H", "<u8": "Q", "|b1": "?",
+    }.get(typestr)
+
+
+# ------------------------------------------------------------------ views
+
+
+def view(obj, *, writable=False, name="object"):
+    """A `Buf` over `obj`. Raises TypeError("anonlib: <name> does not
+    support the buffer protocol") for a non-buffer, and, with
+    `writable=True`, ValueError("anonlib: <name> is read-only, refusing
+    to write to it") for a read-only one. Use as a context manager."""
+    return Buf(obj, writable=writable, name=name)
+
+
+def addr(obj, *, name):
+    """The address of a buffer the callee WRITES. A read-only buffer is
+    refused here with a ValueError, because handing it to a kernel is a
+    segfault rather than an exception. The caller keeps `obj` alive."""
+    if isinstance(obj, Array):
+        if obj._readonly:
+            raise ValueError(
+                f"anonlib: {name} is read-only, refusing to write to it"
+            )
+        return obj._addr
+    with Buf(obj, writable=True, name=name) as b:
+        return b.addr
+
+
+def addr_ro(obj, *, name):
+    """The address of a buffer that will only be read."""
+    if isinstance(obj, Array):
+        return obj._addr
+    with Buf(obj, writable=False, name=name) as b:
+        return b.addr
+
+
+def flat_bytes(obj, *, name="array"):
+    """A flat read-only `'B'` memoryview over any array the package hands
+    out. `Array` cannot export the buffer protocol on Python 3.10 and 3.11
+    (DEVIATION 2305; `memoryview(a)` raises TypeError there), so it is read
+    at its address; everything else goes through `memoryview`. The caller
+    keeps `obj` alive while the view is in use. The live worker's fold
+    export and the cross-vendor state hash crashed on a Python 3.11 box
+    through exactly this on 2026-09-23."""
+    if isinstance(obj, Array):
+        return memory_at(obj._addr, obj.nbytes, writable=False)
+    with Buf(obj, writable=False, name=name):
+        pass
+    return memoryview(obj).cast("B")
+
+
+# ------------------------------------------------------------ conversion
+
+
+_DLPACK_CPU_DEVICES = (1, 3, 10)  # kDLCPU, kDLCUDAHost, kDLCUDAManaged
+
+
+def _device_array_kind(obj):
+    """The protocol by which `obj` announces it lives on a device, or None.
+
+    DEVIATION 2692. Detection only: no pointer is read and no device is
+    touched. A CPU tensor that exports DLPack is NOT a device array, so the
+    DLPack arm asks `__dlpack_device__` for the device type and accepts only
+    a non-CPU one -- otherwise a host torch tensor, which also exports the
+    buffer protocol, would lose its existing zero-copy path.
+    """
+    if hasattr(obj, "__cuda_array_interface__"):
+        return "__cuda_array_interface__"
+    if hasattr(obj, "__dlpack_device__"):
+        try:
+            device_type = tuple(obj.__dlpack_device__())[0]
+        except Exception:
+            return None
+        if device_type not in _DLPACK_CPU_DEVICES:
+            return "__dlpack__ (device type %r)" % (device_type,)
+    return None
+
+
+def _materialize(obj, name):
+    """`obj` as an Array (zero-copy when it already is one or exports a
+    contiguous supported buffer), plus whether that copied."""
+    if isinstance(obj, Array):
+        return obj, False
+    # DEVIATION 2692: a device array has no host buffer, so without this it
+    # falls into the nested-list branch below and dies as "holds a
+    # <ClassName>, not a number" -- an error about element types, for input
+    # whose real problem is that the memory is on a GPU. REFUSE BY NAME.
+    kind = _device_array_kind(obj)
+    if kind is not None:
+        raise TypeError(
+            "anonlib: %s is a DEVICE array (it exports %s). anonlib "
+            "reads HOST memory only: every converter here takes a raw address "
+            "through the Python buffer protocol, which device memory does not "
+            "export. There is no implicit device-to-host copy, because moving "
+            "%s silently would hide a transfer the caller did not ask for. "
+            "Copy it yourself first: cupy `x.get()`, torch `x.cpu()`, "
+            "numba `x.copy_to_host()`." % (name, kind, name)
+        )
+    if hasattr(obj, "tocsr") and hasattr(obj, "nnz") and hasattr(obj, "shape"):
+        # A scipy.sparse matrix or array has no buffer; walked as nested
+        # rows it recursed without end (matrix) or failed to index (DIA).
+        # Converters that accept sparse X densify it first
+        # (`as_f32_dense_c`); everything else refuses it by name, in
+        # scikit-learn's words.
+        raise TypeError(
+            f"anonlib: Sparse data was passed for {name}, but dense data is required. "
+            "Use '.toarray()' to convert to a dense numpy array."
+        )
+    if (not isinstance(obj, (list, tuple, str, bytes)) and not _has_buffer(obj)
+            and callable(getattr(obj, "__array__", None))):
+        # A pandas DataFrame / Series (or any `__array__` exporter) has no
+        # buffer, and iterating a DataFrame yields its COLUMN NAMES. Its own
+        # `__array__` hands back the host block (an exporter needs NumPy,
+        # so NumPy is already loaded); that block takes the buffer path.
+        # Glue: one conversion call, no per-element Python work.
+        obj = obj.__array__()
+    if _object_buffer(obj):
+        # An object-dtype array (NumPy dtype=object: a buffer of PyObject
+        # pointers, format 'O') holding numbers. scikit-learn's check_array
+        # treats it as numeric (np.asarray(X, dtype=float64); its
+        # check_dtype_object). Glue: `ravel().tolist()` is one C call that
+        # lists the leaves in C order; the leaf TYPE set (read in C) picks
+        # float64 / int64 like NumPy, and any other leaf is refused with
+        # scikit-learn's error type and wording.
+        from ._array import _SCALAR_TYPES
+        shape = tuple(obj.shape)
+        flat = obj.ravel().tolist()
+        kinds = set(map(type, flat))
+        if kinds <= _SCALAR_TYPES:
+            return Array._from_flat(flat, shape, "<f8" if float in kinds else "<i8"), True
+        import numbers
+        if all(issubclass(t, numbers.Real) for t in kinds):  # glue: the distinct leaf types of the input
+            # real-number subclasses (NumPy scalars): the float64 store casts them
+            return Array._from_flat(flat, shape, "<f8"), True
+        other = sorted(t.__name__ for t in kinds  # glue: the distinct leaf types of the input
+                       if not issubclass(t, (numbers.Real, str)))
+        if other:
+            raise TypeError(f"anonlib: {name} holds a {other[0]}: float() argument must be "
+                            f"a string or a real number, not '{other[0]}'")
+        raise TypeError(f"anonlib: {name} holds a str, not a number")
+    if isinstance(obj, (list, tuple)) or not _has_buffer(obj):
+        if isinstance(obj, (str, bytes)):
+            raise TypeError(
+                f"anonlib: {name} is a {type(obj).__name__}, not an array"
+            )
+        # Nested lists of Python scalars: infer like NumPy (any float ->
+        # float64, else int64), so a later cast is the SAME single
+        # rounding NumPy would do from the same intermediate.
+        from ._array import _flatten, _SCALAR_TYPES
+        shape, flat = _flatten(obj)
+        # DEVIATION 3106: the two per-leaf isinstance walks below cost 40 ns
+        # a leaf each; `set(map(type, ...))` asks the same question in C.
+        # Only when every leaf is EXACTLY a Python float, int or bool is the
+        # answer read from the type set; a subclass (a NumPy scalar is one)
+        # or anything else takes the walks, which define the refusal.
+        kinds = set(map(type, flat))
+        if kinds and kinds <= _SCALAR_TYPES:
+            return Array._from_flat(flat, shape, "<f8" if float in kinds else "<i8"), True
+        # The same questions asked of the distinct leaf TYPES (a handful),
+        # not of every leaf: isinstance(v, T) depends only on type(v).
+        if any(issubclass(t, float) for t in kinds):  # glue: the distinct leaf types of the input
+            return Array._from_flat(flat, shape, "<f8"), True
+        bad = sorted(t.__name__ for t in kinds  # glue: the distinct leaf types of the input
+                     if not issubclass(t, (int, bool)))
+        if bad:
+            raise TypeError(f"anonlib: {name} holds a {bad[0]}, not a number")
+        return Array._from_flat(flat, shape, "<i8"), True
+    with Buf(obj, name=name) as b:
+        if b.format[:1] in (">", "!") and b.itemsize > 1:
+            # A copy may normalize endian; a zero-copy Array.from_buffer
+            # still refuses non-native storage. array.byteswap runs in C.
+            original_format = b.format
+            b.format = "=" + b.format[1:]
+            ts = typestr_of(b)
+            b.format = original_format
+            code = _CODE.get(ts, _iter_format(ts))
+            if code is None:
+                raise TypeError(f"anonlib: {name} has unsupported buffer format {b.format!r}")
+            store = array.array(code)
+            store.frombytes(memoryview(obj).tobytes())
+            store.byteswap()
+            target = _NATURAL.get(ts, ts)
+            if target != ts:
+                store = array.array(_CODE[target], store)
+            return Array._owned(store, b.shape if b.ndim else (1,), target, "C"), True
+        ts = typestr_of(b)
+        if b.ndim >= 1 and (ts in _CODE) and (b.c_contiguous or b.f_contiguous):
+            pass  # zero-copy path below
+        else:
+            # Not directly representable (a strided view, an unusual
+            # width, a bool buffer): copy to a C-order block of Python
+            # scalars' natural dtype. `memoryview.tobytes()` linearizes
+            # any strides in C order, in C.
+            letter = _iter_format(ts)
+            if letter is None:
+                raise TypeError(
+                    f"anonlib: {name} has buffer format {b.format!r}, "
+                    "which is not a numeric array"
+                )
+            raw = memoryview(obj).tobytes()  # C order whatever the strides
+            shape = b.shape if b.ndim else (1,)
+            target = _NATURAL.get(ts, ts)
+            if ts == "<f2":
+                # no memoryview.cast('e') before 3.12: struct does it
+                import struct
+                n = len(raw) // 2
+                values = struct.unpack("<%de" % n, raw) if n else ()
+                return Array._from_flat(list(values), shape, "<f2"), True
+            if _CODE[target] == letter:
+                # DEVIATION 3105: a strided view whose dtype an Array already
+                # holds needs no per-element conversion. `array.array(code,
+                # <memoryview>)` builds a Python object per element (22 ns);
+                # the bytes `tobytes()` linearized ARE the answer, except
+                # that the object round trip quiets a float32 signaling NaN,
+                # which `_same_dtype_store` reproduces.
+                fast = _same_dtype_store(raw, target)
+                if fast is not None:
+                    return Array._owned(fast, shape, target, "C"), True
+            flat = memoryview(raw).cast(letter)
+            store = array.array(_CODE[target], flat)
+            return Array._owned(store, shape, target, "C"), True
+    return Array.from_buffer(obj), False
+
+
+def materialize_f32_lists(obj, name):
+    """`_materialize(obj, name)`, except that nested Python lists or tuples
+    of numbers come back as float32.
+
+    For the estimators whose contract is float32 ONLY (the scalers and the
+    boosted regressor's targets): a buffer input keeps its own dtype, so a
+    float64 NumPy array is still refused by the caller's dtype check, but
+    plain Python numbers have no float32 spelling and are cast here. The
+    cast is `_convert`, the same one round-to-nearest-even per element
+    every other estimator applies to the same list through `as_f32_c`, so
+    the bytes are identical. A float32 input is untouched."""
+    a, copied = _materialize(obj, name)
+    if (a.dtype in ("<f8", "<i8") and not isinstance(obj, Array)
+            and (isinstance(obj, (list, tuple)) or not _has_buffer(obj))):
+        a = _convert(a, "<f4", "C")[0]
+        copied = True
+    return a, copied
+
+
+def _same_dtype_store(raw, dtype):
+    """An `array.array` holding the elements `raw` (bytes of `dtype`) holds,
+    equal byte for byte to `array.array(code, memoryview(raw).cast(code))`,
+    or None when that cannot be promised without the conversion loop.
+
+    For every dtype but float32 the conversion loop is the identity on the
+    bytes (integers, and a float64 that travels as a C double untouched),
+    so this is `frombytes`. For float32 the loop widens to a Python float
+    and narrows back, which sets the quiet bit of a signaling NaN; the core
+    helper `cast_elements` float32 -> float32 is that same function of the
+    bits (DEVIATION 3100), and without it the loop itself runs."""
+    code = _CODE[dtype]
+    store = array.array(code)
+    store.frombytes(raw)
+    if dtype != "<f4" or not len(store):
+        return store
+    fn = _native_optional("cast_elements")
+    if fn is None:
+        return None
+    at = store.buffer_info()[0]
+    fn(at, 0, at, 0, len(store))  # in place: element i reads and writes slot i only
+    return store
+
+
+# Buffer dtypes that are not Array dtypes land on the narrowest Array dtype
+# that holds every value exactly; a uint64 above 2**63 overflows int64 and
+# is refused by array.array rather than wrapped.
+_NATURAL = {"|b1": "<u1", "|i1": "<i4", "<i2": "<i4", "<u2": "<u4", "<u8": "<i8"}
+
+
+def _object_buffer(obj):
+    """`obj` exports a buffer of Python objects (format 'O': a NumPy
+    object-dtype array) and can list them (`tolist`)."""
+    if isinstance(obj, (list, tuple, str, bytes)) or not callable(getattr(obj, "tolist", None)):
+        return False
+    try:
+        m = memoryview(obj)
+    except TypeError:
+        return False
+    try:
+        return m.format == "O"
+    finally:
+        m.release()
+
+
+def _has_buffer(obj):
+    try:
+        memoryview(obj).release()
+        return True
+    except TypeError:
+        return False
+
+
+def _convert(a, dtype, order):
+    """`a` itself when it already has `dtype` and `order`, else a converted
+    copy. Returns `(Array, copied)`.
+
+    A conversion to float32 goes through the base binding's converters
+    (DEVIATION 2470-2472; on the device in the GPU base binding since lane
+    cpu2-l1-input, the host loops being the host column): the flat float64
+    cast, ONE fused
+    cast-and-transpose when a float64 block wants the other layout, or the
+    tiled float32 transpose when only the layout changes.
+    `tests/test_native_convert.py` holds them to byte equality with
+    NumPy's `astype`/`asfortranarray`. Every other conversion (integer
+    or float16 sources, rank-1 or rank-N relabels) is the Array's own
+    `astype` and `_as_order`. There is no Python copy of the native
+    converters: the package cannot import without its binding, so a
+    missing symbol is a stale build and `_native` says so by name
+    (fallback arms removed 2026-09-10).
+    """
+    if a.dtype == dtype and a._has_order(order):
+        # a (1, n) or (n, 1) block is both C- and F-contiguous; relabeling
+        # it is free and is not a copy
+        return a._as_order(order), False
+    if dtype == "<f4" and a.dtype in ("<f8", "<f4") and a.size:
+        out = _native_to_f32(a, order)
+        if out is not None:
+            return out, True
+    if a.dtype != dtype:
+        a = a.astype(dtype)  # keeps a's order; the cast is done once
+    return a._as_order(order), True
+
+
+def _native_to_f32(a, order):
+    """`a` (float64 or float32) as a float32 Array in `order` through the
+    native converters, or None for the one case they do not cover (a
+    float32 source that only needs a relabel or a rank-1/-N reorder, which
+    `_as_order` does). The result always owns fresh storage. Called only
+    when a conversion is actually needed."""
+    # A 2-D block whose layout must flip. An F-order [rows, cols] block IS
+    # a C-order [cols, rows] matrix, so the same kernel serves both
+    # directions with the dimensions swapped (DEVIATION 2471, 2472).
+    if a.ndim == 2 and not a._both_orders() and a.order != order:
+        rows, cols = a.shape
+        if a.order == "F":
+            rows, cols = cols, rows
+        fn = _native(
+            "cast_colmajor_f64_to_f32" if a.dtype == "<f8" else "transpose_f32"
+        )
+        store = _output_store("f", a.size)
+        fn(a._addr, store.buffer_info()[0], rows, cols)
+        return Array._owned(store, a.shape, "<f4", order)
+    if a.dtype == "<f4":
+        return None  # a relabel or a rank-1/-N reorder: the Python path
+    fn = _native("cast_f64_to_f32")
+    # the flat cast keeps a's storage order; a relabel or reorder follows
+    store = _output_store("f", a.size)
+    fn(a._addr, store.buffer_info()[0], a.size)
+    return Array._owned(store, a.shape, "<f4", a.order)._as_order(order)
+
+
+# DEVIATION 2473: native conversion destinations use CPython's raw allocator.
+# An anonymous mmap paid fresh-page costs on each conversion; on 40M elements
+# the flat f64->f32 conversion took 13.10 ms versus 6.11 ms for NumPy.
+# Raw allocation brought it to 5.92 ms in the same interleaved process. This
+# changes ownership/allocation only: the native converter still writes every
+# element before an Array is returned. See the retained conversion benchmark.
+_RAW_MALLOC = ctypes.pythonapi.PyMem_RawMalloc
+_RAW_MALLOC.argtypes = [ctypes.c_size_t]
+_RAW_MALLOC.restype = ctypes.c_void_p
+_RAW_FREE = ctypes.pythonapi.PyMem_RawFree
+_RAW_FREE.argtypes = [ctypes.c_void_p]
+_RAW_FREE.restype = None
+
+
+class _RawAllocation:
+    __slots__ = ("addr", "_free", "__weakref__")
+
+    def __init__(self, nbytes):
+        self.addr = None
+        self._free = _RAW_FREE  # retain the matching deallocator through shutdown
+        self.addr = _RAW_MALLOC(max(1, nbytes))
+        if not self.addr:
+            raise MemoryError("anonlib: cannot allocate native conversion output")
+
+    def __del__(self):
+        if self.addr:
+            self._free(self.addr)
+            self.addr = None
+
+
+@lru_cache(maxsize=128)
+def _raw_store_type(code, n):
+    # The ctypes buffer pins its allocation owner. Array views and NumPy views
+    # in turn pin that buffer, so the allocation outlives every borrowed view.
+    scalar = {"f": ctypes.c_float, "d": ctypes.c_double,
+              "i": ctypes.c_int32, "q": ctypes.c_int64,
+              "I": ctypes.c_uint32, "H": ctypes.c_uint16,
+              "B": ctypes.c_uint8, "b": ctypes.c_int8}[code]
+
+    class Store(ctypes.Array):
+        _type_ = scalar
+        _length_ = n
+
+        def buffer_info(self):
+            return ctypes.addressof(self), n
+
+    return Store
+
+
+def _output_store(code, n):
+    """Uninitialized storage, private to native helpers that fill every byte.
+
+    Unlike Array's public zero-filled constructor, this must never escape
+    before the native call completes. Works with the buffer protocol on all
+    supported CPython versions, including 3.10 and 3.11.
+    """
+    if n < 0:
+        raise ValueError("anonlib: negative native output size")
+    store_type = _raw_store_type(code, n)
+    owner = _RawAllocation(ctypes.sizeof(store_type))
+    store = store_type.from_address(owner.addr)
+    store._allocation = owner
+    return store
+
+
+def _as_typed(obj, dtype, order, ndim, name):
+    a, copied = _materialize(obj, name)
+    if ndim is not None and a.ndim != ndim:
+        hint = ""
+        if ndim == 2 and a.ndim < 2:
+            # scikit-learn's advice (`check_array`), which its checks match
+            hint = (". Reshape your data either using array.reshape(-1, 1) if your data "
+                    "has a single feature or array.reshape(1, -1) if it contains a single sample.")
+        raise ValueError(
+            f"anonlib: {name} must be {ndim}-D, got {a.ndim}-D shape {a.shape}{hint}"
+        )
+    if a.size == 0:
+        what = "feature(s)" if a.ndim == 2 and a.shape[0] else "sample(s)"
+        raise ValueError(
+            f"anonlib: {name} is empty, shape {a.shape}: Found array with 0 {what} "
+            f"(shape={a.shape}) while a minimum of 1 is required."
+        )
+    a, c2 = _convert(a, dtype, order)
+    return a, copied or c2
+
+
+def as_f32_c(obj, *, ndim=2, name):
+    """A C-contiguous float32 Array of `obj`, and whether that cost a copy.
+
+    Returns `(array, copied)`. The caller MUST keep `array` alive across
+    the Mojo call; that is the whole reason this returns the array rather
+    than just an address. `ndim=None` accepts any rank.
+    """
+    return _as_typed(obj, "<f4", "C", ndim, name)
+
+
+def as_f32_dense_c(obj, *, ndim=2, name):
+    """`as_f32_c` that also takes a scipy.sparse matrix, densified first (an
+    exact copy: the implicit entries are zeros), so a sparse input takes its
+    dense twin's path and bits. For the estimators whose reference accepts
+    sparse X and whose kernels here are dense (the neighbors family)."""
+    if hasattr(obj, "toarray") and hasattr(obj, "nnz") and hasattr(obj, "tocsr"):
+        obj = obj.toarray()
+    return as_f32_c(obj, ndim=ndim, name=name)
+
+
+def as_f32_colmajor(obj, *, name):
+    """A COLUMN-MAJOR float32 2-D Array of `obj`, at most one copy.
+
+    Returns `(array, copied)`; `array.order == 'F'` and its storage is the
+    column-major flat (`array._flat()[f * n_rows + r] == array[r, f]`).
+
+    DEVIATION 1887 holds: a float64 or C-order input costs ONE copy (the
+    cast happens in the source layout, the transpose in float32), and a
+    float32 F-contiguous input is a ZERO-COPY borrow. The float64 ->
+    float32 cast is the same one round-to-nearest-even per element either
+    way, so the bytes equal `numpy.asfortranarray(x, dtype=float32)`'s.
+    """
+    return _as_typed(obj, "<f4", "F", 2, name)
+
+
+def as_f32_forest_layout(obj, *, name):
+    """`(array, row_major)` for a forest fit (DEVIATION 2637).
+
+    A 2-D float32 C-order input comes back AS IS, a zero-copy borrow with
+    `row_major` True, so the native fit transposes it straight into its
+    pinned stage across the host pool. Every other input takes
+    `as_f32_colmajor` exactly as before, with `row_major` False. Either way
+    the native side stages the same column-major bytes."""
+    a, _ = _materialize(obj, name)
+    if (a.ndim == 2 and a.dtype == "<f4" and a.size
+            and a.order == "C" and not a._both_orders()):
+        return a, True
+    return as_f32_colmajor(a, name=name)[0], False
+
+
+def as_i32_c(obj, *, ndim=1, name):
+    return _as_typed(obj, "<i4", "C", ndim, name)
+
+
+def as_i64_c(obj, *, ndim=1, name):
+    return _as_typed(obj, "<i8", "C", ndim, name)
+
+
+def as_u16_c(obj, *, ndim=2, name):
+    """bf16 bits as a C-contiguous uint16 Array (lane/identical-lowbit-inference)."""
+    return _as_typed(obj, "<u2", "C", ndim, name)
+
+
+def as_i8_c(obj, *, ndim=2, name):
+    """int8 codes as a C-contiguous int8 Array (lane/identical-lowbit-inference)."""
+    return _as_typed(obj, "<i1", "C", ndim, name)
+
+
+def as_f64_c(obj, *, ndim=1, name):
+    return _as_typed(obj, "<f8", "C", ndim, name)
+
+
+# ------------------------------------------------------------ constructors
+
+
+def empty(shape, dtype):
+    """A new owned C-order Array. The memory is zero-filled: there is no
+    uninitialized allocation in `array.array`, and a defined value costs
+    nothing that matters next to what the kernels do."""
+    return Array(shape, dtype)
+
+
+def zeros(shape, dtype):
+    return Array(shape, dtype)
+
+
+def full(shape, value, dtype):
+    dtype = normalize_dtype(dtype)
+    a = Array.from_list([value], dtype)  # one conversion of `value`
+    from ._array import _check_shape, _prod
+    shape = _check_shape(shape)
+    size = _prod(shape)
+    store = a._store * size if size else array.array(a._store.typecode)
+    return Array._owned(store, shape, dtype, "C")
+
+
+def frombytes(raw, dtype, shape):
+    """An owned C-order Array holding a COPY of `raw`."""
+    dtype = normalize_dtype(dtype)
+    from ._array import _check_shape, _prod, _ITEMSIZE
+    shape = _check_shape(shape)
+    need = _prod(shape) * _ITEMSIZE[dtype]
+    if len(raw) != need:
+        raise ValueError(
+            f"anonlib: {len(raw)} bytes do not fill shape {shape} of "
+            f"{dtype} ({need} bytes)"
+        )
+    store = array.array(_CODE[dtype])
+    store.frombytes(raw)
+    return Array._owned(store, shape, dtype, "C")
+
+
+# --------------------------------------------------------------- scanning
+
+
+def all_finite(arr):
+    """True when every element of a float32/float64 Array is finite.
+
+    The base binding's `all_finite_f32` / `all_finite_f64` (DEVIATION
+    2303's helpers). In the GPU base binding the scan runs on the device
+    and one status word comes back (lane cpu2-l1-input,
+    `core/input_device.mojo`); the host loop is the host column (CPU-only
+    installs) and the fallback. The `math.fsum` fallback of DEVIATION 2307 was
+    removed 2026-09-10 with every other Python copy of a native helper.
+    """
+    if not isinstance(arr, Array) or arr.dtype not in ("<f4", "<f8"):
+        raise TypeError(
+            "anonlib: all_finite takes a float32 or float64 Array, got "
+            f"{getattr(arr, 'dtype', type(arr).__name__)!r}"
+        )
+    if arr.size == 0:
+        return True
+    fn = _native("all_finite_f32" if arr.dtype == "<f4" else "all_finite_f64")
+    return int(fn(arr._addr, arr.size)) == 1
+
+
+_NATIVE = {}
+_NATIVE_MISSING = set()
+#: True only inside tests/test_hotpath_native.py's reference arm (lane py-runtime
+#: round 2): Array's Python helper definitions answer there and nowhere else.
+_REFERENCE = False
+
+def hotpath_enabled():
+    """Always True: the compiled helpers are the one route. The
+    `ANONLIB_HOTPATH=python` reference arm (lane/python-hotpath) is
+    deleted (cpu-gpu-cleanup c-core: an env switch picking a route). Kept
+    only so callers outside c-core still import it; they drop the call."""
+    return True
+
+
+def _native_optional(key):
+    """`_native(key)`, or None when this install's binary does not carry
+    `key`.
+
+    FOR THE lane/python-hotpath HELPERS ONLY, and the reason it may return
+    None where `_native` raises: each of those helpers stands in for a
+    Python routine that STAYS in the package as its definition, so an
+    install whose binary predates the helper (a GPU base binding not yet
+    rebuilt, a core host binding from before 2026-09-17) computes the same
+    answer more slowly instead of refusing to run. The miss is remembered,
+    so a missing symbol costs one lookup per process."""
+    fn = _NATIVE.get(key)
+    if fn is not None:
+        return fn
+    if key in _NATIVE_MISSING:
+        return None
+    try:
+        return _native(key)
+    except (ImportError, AttributeError):
+        _NATIVE_MISSING.add(key)
+        return None
+
+
+def _native(key):
+    """The base binding's host helper `key`, resolved once per process
+    from the IDENTICAL `_anonlib` binary and cached in `_NATIVE` (a test
+    may plant a callable there to observe a call).
+
+    ALWAYS THE IDENTICAL BINARY, WHATEVER TIER THE CALLER RUNS. These
+    helpers are a float64-to-float32 cast, a transpose and a finiteness
+    predicate: byte copies with no tier semantics (on the device in the GPU
+    base binding since lane cpu2-l1-input: bit moves and the soft-f64
+    narrowing, the same bytes on every vendor), and every estimator in
+    every tier funnels its input through them. Since DEVIATION 2490
+    (2026-09-10) the base binding is built in the identical tier alone
+    (only the tree lanes have a fast binary), so
+    resolving through the running tier here would refuse every FAST tree
+    fit at its first input conversion. Found by the macOS release smoke
+    under ANONLIB_NUMERIC_MODE=fast the day the rule landed.
+
+    There is NO Python fallback. The package refuses to import without its
+    binding, so the only way this symbol can be missing is a binary on
+    disk older than the Python beside it, and running a slower copy of the
+    same arithmetic would hide that. It raises by name with the rebuild
+    command instead (fallback arms removed 2026-09-10)."""
+    fn = _NATIVE.get(key)
+    if fn is not None:
+        return fn
+    from . import _backend
+    try:
+        with _backend.host_helper_scope():
+            fn = getattr(_backend.binding("_anonlib", mode="identical"), key)
+    except Exception as exc:
+        fn = _host_native(key)
+        if fn is None:
+            if _backend._CPU_ONLY is not None and isinstance(exc, ImportError):
+                # A CPU-ONLY INSTALL (the CPU training lane, 2026-09-13). The
+                # base binding is not old, there is none, and the stub has
+                # already said so BY NAME ("no CPU implementation of
+                # _anonlib.<key> yet"). That sentence is the one an
+                # identity_break cell must record, so it is re-raised as is.
+                raise
+            raise ImportError(
+                f"anonlib: the base binding has no `{key}`; the compiled "
+                "_anonlib extension is older than this Python layer, or the "
+                "identical set is not built. Rebuild it with\n    "
+                "ANONLIB_NUMERIC_MODE=identical sh bindings/build.sh"
+            ) from exc
+    _NATIVE[key] = fn
+    return fn
+
+
+#: The two door binaries `_host_native` resolves helpers from (loaded by
+#: `_backend.load_door_host`, the same loader the doors use).
+_BYTE_LM_HOST_EXTENSION = "_anonlib_byte_lm_host"
+_FOREST_HOST_EXTENSION = "_anonlib_forest_host"
+#: DEVIATION 2614: the helpers the CPU inference binding also exports, and the
+#: only ones `_native` may resolve from it.
+_HOST_NATIVE_KEYS = frozenset({"all_finite_f32", "all_finite_f64", "cast_f64_to_f32"})
+#: The forest host binding (the forest host lane, 2026-09-13,
+#: `bindings/host_helpers.mojo`) exports those three and the four
+#: `_labels.argmax_rows` and `_labels.decode_labels` resolve, so a saved
+#: forest's class labels decode on a CPU-only install through the same native
+#: helper the GPU path uses.
+_FOREST_HOST_NATIVE_KEYS = _HOST_NATIVE_KEYS | frozenset(
+    {"argmax_rows_f32", "argmax_rows_f64", "gather_i64", "gather_f64"})
+
+
+def _host_native(key):
+    """`key` from a CPU inference binding, on a box whose GPU base binding
+    is not built (DEVIATION 2614). The same native helper compiled into a
+    second binary, not a Python copy, so the no-Python-fallback rule above
+    holds. The byte LM host binding is asked first for the three it carries,
+    then the forest host binding for its seven. None when `key` is not one of
+    them or neither binary is built; a refused sabotage build raises rather
+    than hiding."""
+    # THE LOADERS, NOT THE DOORS (lane/lazy-imports, 2026-10-10). Importing
+    # `_byte_lm_host` / `_forest_host` here for their `_load()` put the byte LM
+    # door (lowbit, linalg, the decomp and metrics expansions) and the forest
+    # door (`_classical_host` and every classical door) in every lane's import
+    # closure, since every lane loads this file: 251 files selected every lane
+    # in tools/test_lane_select.py. `_backend` holds the loaders now.
+    if key in _HOST_NATIVE_KEYS:
+        from . import _backend
+        try:
+            return getattr(_backend.load_door_host(_BYTE_LM_HOST_EXTENSION), key)
+        except (ImportError, AttributeError):
+            pass
+    if key in _FOREST_HOST_NATIVE_KEYS:
+        from . import _backend
+        try:
+            return getattr(_backend.load_door_host(_FOREST_HOST_EXTENSION), key)
+        except (ImportError, AttributeError):
+            pass
+    return None
+
+
+def as_index_i64(values, *, name="indices"):
+    """Row indices (an Array, any buffer or a list of ints) as a 1-D int64
+    Array: the native cast of a numeric buffer; a list goes in through
+    `array('q', ...)`, in C. No per-index Python arithmetic."""
+    if not isinstance(values, Array):
+        if isinstance(values, (list, tuple, range)):
+            store = array.array("q", values)
+            return Array._owned(store, (len(store),), "<i8", "C")
+        values, _ = _materialize(values, name)
+    values = values.reshape((values.size,))
+    return values if values.dtype == "<i8" else values.astype("<i8")
+
+
+class InitStream:
+    """A seeded stream of uniform draws for weight initialisation, made in
+    Mojo (the base binding's counter-based `uniform_init_f32`; lane
+    cgr4-py-compute replaced numpy's Generator, which drew in Python). An
+    int seed gives the same bytes on every column; None draws a fresh seed
+    from the OS, as `numpy.random.default_rng(None)` does. Only the counter
+    (a scalar) lives here."""
+
+    def __init__(self, seed=None):
+        if seed is None:
+            import secrets
+            seed = secrets.randbits(64)
+        self.seed = int(seed) & 0xFFFFFFFFFFFFFFFF
+        self.offset = 0
+
+    def fill_uniform(self, address, n, low, high):
+        """n float32 values U(low, high) at `address`; advances the counter."""
+        n = int(n)
+        if n:
+            _native("uniform_init_f32")(int(address), n, float(low), float(high),
+                                        self.seed & 0xFFFFFFFF, self.seed >> 32, self.offset)
+        self.offset += n
+
+    def fill_normal(self, address, n, mean, std):
+        """n float32 values N(mean, std**2) at `address` (the base binding's
+        counter-based Box-Muller `normal_init_f32`); advances the counter."""
+        n = int(n)
+        if n:
+            _native("normal_init_f32")(int(address), n, float(mean), float(std),
+                                       self.seed & 0xFFFFFFFF, self.seed >> 32, self.offset)
+        self.offset += n
+
+    def uniform(self, low, high, size):
+        """A flat float32 Array of `size` draws."""
+        out = empty((int(size),), "<f4")
+        if out.size:
+            self.fill_uniform(out._addr, out.size, low, high)
+        return out
+
+    def child_seed(self):
+        """A derived 63-bit seed (splitmix64 of the seed and the counter,
+        scalar), advancing the counter by one."""
+        z = (self.seed + (self.offset + 1) * 0x9E3779B97F4A7C15) & 0xFFFFFFFFFFFFFFFF
+        z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) & 0xFFFFFFFFFFFFFFFF
+        z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & 0xFFFFFFFFFFFFFFFF
+        self.offset += 1
+        return (z ^ (z >> 31)) >> 1

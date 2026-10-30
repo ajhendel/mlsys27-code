@@ -1,0 +1,258 @@
+# Distribution metadata for the `anonlib` package on PyPI.
+#
+# setup.py holds only the two facts PEP 621 cannot express: the wheel is not
+# pure Python, and the macOS platform tag comes from the Mojo compile step
+# rather than from the building machine. Nothing is stated in both files.
+
+[build-system]
+requires = ["setuptools>=77", "wheel", "lief==1.0.0"]
+build-backend = "setuptools.build_meta"
+# 77 is the floor because the PEP 639 `license` expression and `license-files`
+# below are only understood from that version.
+
+[project]
+name = "anonlib"
+# Must agree with python/anonlib/_version.py. Not made dynamic, so that a
+# version bump is a visible edit in both places rather than one.
+version = "0.8.55"
+description = "GPU machine learning in Mojo for Apple silicon Metal, NVIDIA CUDA, and AMD HIP, with fast (Apple GPUs only) and identical modes. In identical mode, anonlib returns the same bits on Apple, NVIDIA and AMD GPUs."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+authors = [{ name = "the authors" }]
+maintainers = [{ name = "the authors" }]
+keywords = [
+    "machine learning",
+    "ml",
+    "ai",
+    "artificial intelligence",
+    "deep learning",
+    "gpu",
+    "metal",
+    "apple silicon",
+    "mojo",
+    "gbdt",
+    "gradient boosting",
+    "decision trees",
+    "mamba",
+    "samba",
+    "state space models",
+    "ssm",
+    "attention",
+    "transformer",
+    "random forest",
+    "extra trees",
+    "clustering",
+    "k-means",
+    "nearest neighbors",
+    "dbscan",
+    "pca",
+    "svm",
+    "kernel density",
+    "hierarchical clustering",
+    "spectral clustering",
+    "isolation forest",
+    "time series",
+    "metrics",
+    "bitwise reproducibility",
+    "determinism",
+    "reproducibility",
+    "cuda",
+    "rocm",
+    "hip",
+]
+
+# THE FLOOR IS 3.10 AND IT IS THE VERIFY LOOP THAT BACKS IT.
+#
+# This block read "THE FLOOR IS 3.12 AND IT IS MEASURED" and closed with "3.10
+# and 3.11 are NOT claimed because they were not run, and a floor is a
+# promise". Both sentences are now false and are deleted rather than softened.
+# Measured 2026-08-24: python3.10 through python3.14 are ALL present on this
+# machine, and packaging/macos/verify_wheel.sh:37 loops
+# over all five by name. The paragraph thirty lines below always said the
+# oldest verified numpy was 1.26.4 "on python3.10, running the full smoke
+# fit", so the two halves of this file already disagreed.
+#
+# `requires-python = ">=3.10"` therefore matches both the classifier list and
+# what the verify loop exercises, and it is what 0.1.0 already shipped.
+#
+# THE PROMISE IS ONLY AS GOOD AS THE RUN. verify_wheel.sh must come back green
+# on python3.10 and python3.11 for this floor to be honest. If either reports
+# SKIP or fails, the floor moves up to where the loop is green, in the same
+# commit; it does not stay at 3.10 because a comment says so.
+# The extension links NO libpython (`otool -L` shows only the two MAX runtime
+# dylibs and libSystem), so it resolves CPython by name at runtime and one
+# artifact can serve several interpreters. That is the mechanism; the floor is
+# where it was actually tested. `packaging/macos/verify_wheel.sh` imports the
+# built wheel under every python3.N on the build machine and runs a fit. All
+# five of 3.10 through 3.14 are on this machine and in that loop as of
+# 2026-08-24, which is what the floor above rests on. The sentence that stood
+# here said 3.10 and 3.11 were NOT claimed because they had not been run; the
+# block forty lines up had already corrected and dated that, so it is deleted
+# rather than softened. A floor is a promise and it is only as good as the run.
+
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Developers",
+    # Two platforms have a wheel as of 0.3.0: macOS on Apple silicon, and
+    # Linux x86_64 carrying both a CUDA and a HIP set. No other platform is
+    # claimed, and there is no sdist.
+    "Operating System :: MacOS :: MacOS X",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3 :: Only",
+    # Compiled by the Mojo toolchain against CPython, not the limited API.
+    # No PyPy, no free-threaded build: max 26.5.0 depends on python-gil.
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Environment :: GPU :: NVIDIA CUDA",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+# Not claimed, and each is a decision rather than an oversight:
+#   Environment :: GPU :: NVIDIA CUDA   claimed from 0.3.0: an H100 ran all
+#                                       29 smoke lanes in all three tiers
+#                                       on 2026-08-30. Added below.
+#   Typing :: Typed                     no py.typed marker, no stubs.
+#   License :: ...                      PEP 639 forbids a license classifier
+#                                       beside the `license` expression.
+
+# 0.8.0 uses the shared Array/buffer layer and compiled host helpers.
+# NumPy inputs remain accepted through PEP 3118; returned Array objects expose
+# a zero-copy __array_interface__ for callers that choose to use NumPy.
+# Core operations do not require NumPy; optional APIs and verification use extras.
+dependencies = []
+
+[project.optional-dependencies]
+# Extras install the same wheel. Some ANN/CNN/sequence APIs use NumPy arrays,
+# initialization or adapters; verification uses it for fixtures and inspection.
+numpy = ["numpy>=1.26.4"]
+verify = ["numpy>=1.26.4"]
+
+[project.urls]
+Paper = "https://anon.example/paper.pdf"
+Homepage = "https://anon.example"
+Documentation = "https://docs.anon.example"
+Repository = "https://github.com/anon/anon"
+Issues = "https://github.com/anon/anon/issues"
+# THE CITATION, ON THE PYPI PAGE. Until 2026-08-31 a reader who arrived from
+# PyPI rather than from GitHub had no route to the DOI at all: the concept
+# DOI resolves to the newest version and is the one to cite, and it appeared
+# nowhere in the distribution's metadata. `CITATION.cff` is shipped inside
+# the package for the same reason (see package-data below), so a
+# `pip install` carries the machine-readable citation and not only the
+# license.
+DOI = "DOI-WITHHELD"
+Citation = "DOI-WITHHELD"
+
+[project.scripts]
+# Kept outside the anonlib package deliberately: this command must work
+# when importing a compiled extension is the thing a user needs to diagnose.
+anonlib = "anonlib_diagnostics:main"
+
+[tool.setuptools]
+# Listed explicitly rather than discovered, so a new subpackage is a
+# deliberate edit and not a silent addition to a published artifact.
+packages = ["anonlib", "anonlib.models", "anonlib.importers"]
+py-modules = ["anonlib_diagnostics"]
+include-package-data = false
+
+[tool.setuptools.package-data]
+# The extensions and the MAX runtime dylibs that
+# packaging/macos/build_release_wheel.sh stages beside them. All are
+# gitignored build outputs, so this describes a BUILT tree rather than a
+# checkout. A wheel missing any of them is broken at import, and the
+# clean-venv install in verify_wheel.sh is what catches that.
+#
+# THE `*.so` GLOB IS WHY build_release_wheel.sh MUST BUILD EVERY EXTENSION.
+# It does not ship what is missing -- it ships whatever .so happens to be
+# sitting in the working tree, however old. `_anonlib.so` shipped that way
+# once, predating eval_x/eval_y, and every user's fit raised "takes 6
+# positional arguments but 8 were given". As of 2026-09-02 the extensions are
+# SIXTEEN as of 2026-09-10, including GPU preprocessing:
+# `_anonlib.so` (k-means,
+# k-NN), `_anonlib_gbdt.so` (gradient boosting), `_anonlib_estimators.so`
+# (DBSCAN, PCA, tSVD, OLS), `_anonlib_rf.so` (random forest),
+# `_anonlib_trees.so` (extra trees), `_anonlib_svm.so` (SVC),
+# `_anonlib_solver.so` (Lasso, ElasticNet, AgglomerativeClustering),
+# `_anonlib_preprocessing.so` (MinMaxScaler),
+# `_anonlib_metrics.so` (metrics, SpectralClustering), `_anonlib_tsa.so`
+# (Holt-Winters, KPSS), `_anonlib_linalg.so` (the identical GEMM),
+# `_anonlib_arima.so` (the batched ARIMA), `_anonlib_training.so`
+# (the optimizer step, the gradient-norm clip and the cross-entropy loss),
+# `_anonlib_gp.so` (the Gaussian process), `_anonlib_mamba.so` (the
+# Mamba-1/2/3 blocks) and `_anonlib_transformer.so` (the transformer
+# block; FIRST COMPILED 2026-09-02 on the M4, APPLE ONLY, with its Python
+# surface gate green in all three tiers on that one box).
+#
+# THE GLOB CARRIES TWO TIERS (2026-08-29): the FAST set here and
+# the IDENTICAL set under identical/. `_backend.py` loads whichever tier is asked for -- by
+# `ANONLIB_NUMERIC_MODE` at import, by `anonlib.set_numeric_mode()` at
+# runtime, or per estimator by `numeric_mode=` -- and more than one of them
+# can be live in one process.
+#
+# ADMITTING A TIER IS NOT SHIPPING IT. This is a glob: it packages whatever
+# is on disk and packages nothing when a directory is empty. Which tiers a
+# given release actually carries is build_release_wheel.sh's decision
+# (EXT_NAMES is THE list, and it refuses a stale file by mtime), not this
+# line's. MODES in build_release_wheel.sh defaults to both tiers. The distinction is kept anyway, because a
+# hotfix wheel cut with ANONLIB_RELEASE_MODES set to fewer tiers must
+# still produce a valid artifact.
+# THE LINUX LAYOUT IS ADMITTED TOO (2026-08-29, ARCHITECTURE AXIS ADDED
+# 2026-08-30): one directory per vendor, one per GPU ARCHITECTURE inside it
+# (sm_80, gfx942, ...), the same tiers inside each architecture, and
+# the MAX runtime `.so` staged under a `.libs/` directory
+# (docs/LINUX_WHEEL.md). The architecture level exists because one
+# `mojo build` emits device code for exactly one architecture and no PTX --
+# the sm_90a-only 0.3.0 wheel failed 27 of 29 lanes on an A40
+# (bench/results/wheels/LEGS_2026-08-30.md). The arch-less vendor globs are
+# kept for sets that predate the axis. The Linux wheel itself is not
+# produced by setuptools -- packaging/linux/pack_wheel.py writes it from the
+# fetched sets -- so these globs matter only to a `pip wheel` run from a Linux
+# checkout that has such a layout. They are listed so that file and this one
+# describe the same tree.
+anonlib = [
+    # NOT a build output: `CITATION.cff` is copied from the repository root
+    # by build_release_wheel.sh so that a `pip install` carries the
+    # machine-readable citation, not just the license. Attribution that only
+    # exists in the git repository does not travel with the artifact.
+    "CITATION.cff",
+    "ALPHA_API.md",
+    # the verified pretrained-model catalog (anonlib.models.catalog()):
+    # revisions, hashes and numbers only, written by tools/model_catalog.py
+    "models/catalog.json",
+    "*.so", "identical/*.so", ".dylibs/*.dylib",
+    # DEVIATION 2610: the host (CPU) bindings, loaded by path or through
+    # _backend.load_host_module, never by the GPU vendor selector. Every
+    # family marked ships_in_wheel in host_surface.py is built and read back.
+    # Training-only reference families are excluded and rejected by setup.py.
+    "host/*.so",
+    # THE IDENTITY PAYLOAD (the packaging lane, 2026-09-14). The reference
+    # card directory `python -m anonlib verify` compares against (tracked;
+    # the placeholder is deliberate and refused by token, docs/VERIFY.md),
+    # and the three training GPU columns plus the commit witness that
+    # `python -m anonlib identity` diffs a local run against, copied in
+    # by build_release_wheel.sh from the paths the manifest names. The two
+    # tool copies beside them (`_identity_trace_diff.py`,
+    # `_identity_break.py`) are modules and ship through `packages`.
+    "reference_cards/*",
+    "identity_columns/*/*.json",
+    "identity_columns/COMMIT",
+    # `python -m anonlib verify --all` (2026-09-15): the reference hash
+    # table generated from the committed identity_break records, and the
+    # portable GPU-trained models with their manifest (docs/VERIFY.md).
+    "verify_reference/*.json",
+    "verify_reference/models/*",
+    "verify_reference/ctr_models/*.npz",
+    "cuda/*.so", "cuda/identical/*.so", "cuda/.libs/*",
+    "cuda/sm_*/*.so", "cuda/sm_*/identical/*.so", "cuda/sm_*/.libs/*",
+    "hip/*.so", "hip/identical/*.so", "hip/.libs/*",
+    "hip/gfx*/*.so", "hip/gfx*/identical/*.so", "hip/gfx*/.libs/*",
+    ".libs/*",
+]

@@ -1,0 +1,1740 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 the authors. Part of anonlib, DOI-WITHHELD
+# SHIPS: compiled into a CPU host binding (python/anonlib/host_surface.py names which); product, not only a check.
+"""The host oracle: the SAME SMO, serial, in Float32 through the identical
+helpers (and in Float64 as a sanity reference).
+
+NO REFERENCE FILE. cuML has one GPU backend and checks nothing against a host
+solver. This file exists because the device implementation claims BIT identity with
+something, and that something has to be spelled where a reader can follow
+every rounding: one thread, one loop, ascending, through `ftz`,
+`identical_mul_add`, `identical_exp` and `gemm_oracle_cell` (the normative
+v1 GEMM cell), with the same working-set rule, the same block-solve logic
+and the same tie-breaks as `svm/impl/*.mojo`. The device gate in
+`svc_check.mojo` is device == oracle, bitwise, on alphas, on `f` after every
+outer iteration, on the working-set sequence, on `b`, and on the decision
+function.
+
+Generic over `dt` so the Float64 reference is the same code: under
+`DType.float32` every seam goes through the identical helpers; under
+`DType.float64` it is plain arithmetic with the stdlib `exp` (the FLOAT64
+reference is for TOLERANCE sanity -- does the Float32 solver land near a
+better-conditioned solve of the same problem -- not for bit comparison).
+
+WHERE EACH PIECE OF THEIRS IS IN THIS FILE
+
+    smosolver.cuh::Solve / UpdateF / SvcInit / SvrInit /
+                  CheckStoppingCondition
+                                    -> smo_oracle_fit
+    kernelcache.cuh::GetVecIndices  -> _vec_index
+    results.cuh::CombineCoefs (SVR add arm)
+                                    -> smo_oracle_fit's coef fold
+    workingset.cuh::Select / SimpleSelect / GatherAvailable
+                                    -> _select_ws
+    smoblocksolve.cuh::SmoBlockSolve -> _block_solve
+    results.cuh::Get / CalcB        -> _results
+    kernel_matrices.cu::linear/rbf  -> _kernel_cell, _row_norm
+    svc_impl.cuh::svcPredict        -> smo_oracle_decision
+
+THE REGRESSION ARM (2026-08-31)
+-------------------------------
+`smo_oracle_fit` solves EPSILON_SVR through the SAME loop: only the domain
+size, the gradient init, the kernel-column projection and the coefficient
+fold differ, which is the reference's own claim (`smoblocksolve.cuh:99-101` takes
+`svmType` and never reads it). Under `param.svmType == EPSILON_SVR` the
+caller's `y` holds the REGRESSION TARGETS and the +-1 label vector is built
+here, exactly as `SvrInit` builds `y_label`.
+
+The four PROPERTY functions at the foot of this file --
+`svr_dual_objective`, `svr_gradient_reference`, `svr_kkt_gap` and
+`svr_tube_bound` -- are NOT transcriptions of anything in cuML and are
+NOT derived from `smo_oracle_fit` or from `svm/impl/`. They are written
+from the eps-insensitive dual itself (Smola & Scholkopf 2004, eq. 10-12;
+the same formulation `smosolver.cuh:375-385` cites). That is the point:
+a device-versus-oracle gate compares two transcriptions of one reading of
+cuML, so a shared misreading of `SvrInit`'s signs would pass it silently.
+These four answer to the mathematics instead. Their derivations are
+spelled out in their docstrings so a reader can check the algebra without
+opening either implementation.
+"""
+
+from std.builtin.sort import sort
+from std.math import exp, fma, inf, isnan, tanh
+from std.memory import bitcast, stack_allocation
+from std.sys.compile import is_defined
+
+from core.host_parallel import host_parallelize
+
+from gemm.host.identical_gemm import (
+    contract_leaf_size,
+    leaf_begin,
+    leaf_count,
+    leaf_end,
+)
+from checks.numerics import (
+    GLOBAL_NUMERIC_MODE,
+    NUMERIC_IDENTICAL,
+    ftz,
+    identical_exp,
+    identical_mul,
+    identical_mul_add,
+    identical_mul_add_simd,
+    identical_tanh,
+)
+from core.host_simd_identical import expf_v, ftz_v
+from core.host_predict_threads import HostF32Ptr, host_predict_chunk, host_predict_task_count
+from svm.impl.grid_fold import FOLD_TPB, fold_blocks
+from svm.impl.smosolver import fold_order_for_host, hash_f32_list
+from svm.impl.svm_parameter import (
+    EPSILON_SVR,
+    KERNEL_LINEAR,
+    KERNEL_POLYNOMIAL,
+    KERNEL_PRECOMPUTED,
+    KERNEL_RBF,
+    KERNEL_TANH,
+    KernelParams,
+    SvmParameter,
+)
+
+
+#: THE NEGATIVE CONTROL OF THE CPU IDENTITY GATE (the CPU training lane,
+#: 2026-09-13, brief section 3.4). `-D ANONLIB_HOST_SABOTAGE=1` makes the
+#: Float32 `_dot` walk every GEMM leaf DESCENDING instead of ascending (the
+#: same fold gemm_oracle's own arm moves; this file spells the leaf loop
+#: itself because it is dtype-generic), so the svm host binding built with
+#: it solves a different problem and the svc lane must read DIVERGENT
+#: against the GPU columns. Passed by the host build scripts only; a host
+#: binding that carries it says so through `<prefix>_sabotage()` and is
+#: refused outside the gate (`python/anonlib/_backend.py::load_host_module`).
+#: Since lane/inference-svm (2026-09-15) the same define also adds half a
+#: unit to the fitted intercept (`smo_oracle_fit`) and to every decision
+#: value (`smo_oracle_decision`): the leaf order cannot move an integer-grid
+#: fixture such as `ties`, and a saved model's file and predictions must.
+comptime SMO_ORACLE_HOST_SABOTAGE = is_defined["ANONLIB_HOST_SABOTAGE"]()
+
+comptime ORACLE_WS_SIZE = 1024
+comptime ORACLE_MAX_INNER = 10000
+comptime ORACLE_ETA_EPS = 1.0e-12
+
+
+# ---------------------------------------------------------------------------
+# the arithmetic seams, per dtype
+# ---------------------------------------------------------------------------
+
+
+@always_inline
+def _flush[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
+    comptime if dt == DType.float32:
+        return rebind[Scalar[dt]](ftz(rebind[Float32](x)))
+    else:
+        return x
+
+
+def _tree_sum[dt: DType](values: List[Scalar[dt]]) -> Scalar[dt]:
+    """`svm/impl/grid_fold.mojo::grid_sum_f32`'s order on the host: chunks of
+    FOLD_TPB cells (flushed; +0.0 past the end) folded by a halving tree,
+    the chunk sums the next level, until one chunk remains. `len >= 1`."""
+    var level = values.copy()
+    while True:
+        var n = len(level)
+        var nb = fold_blocks(n)
+        var nxt = List[Scalar[dt]](length=nb, fill=Scalar[dt](0))
+        var s = List[Scalar[dt]](length=FOLD_TPB, fill=Scalar[dt](0))
+        for b in range(nb):
+            for t in range(FOLD_TPB):
+                var i = b * FOLD_TPB + t
+                s[t] = _flush[dt](level[i]) if i < n else Scalar[dt](0)
+            var step = FOLD_TPB // 2
+            while step > 0:
+                for t in range(step):
+                    s[t] = _flush[dt](s[t] + s[t + step])
+                step //= 2
+            nxt[b] = s[0]
+        level = nxt^
+        if nb == 1:
+            break
+    return level[0]
+
+
+@always_inline
+def _mad[dt: DType](a: Scalar[dt], b: Scalar[dt], c: Scalar[dt]) -> Scalar[dt]:
+    comptime if dt == DType.float32:
+        return rebind[Scalar[dt]](
+            identical_mul_add(rebind[Float32](a), rebind[Float32](b), rebind[Float32](c))
+        )
+    else:
+        return a * b + c
+
+
+@always_inline
+def _mul[dt: DType](a: Scalar[dt], b: Scalar[dt]) -> Scalar[dt]:
+    comptime if dt == DType.float32:
+        return rebind[Scalar[dt]](
+            identical_mul(rebind[Float32](a), rebind[Float32](b))
+        )
+    else:
+        return a * b
+
+
+@always_inline
+def _exp[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
+    comptime if dt == DType.float32:
+        return rebind[Scalar[dt]](identical_exp(rebind[Float32](x)))
+    else:
+        return rebind[Scalar[dt]](exp(rebind[Float64](x)))
+
+
+@always_inline
+def _tanh[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
+    comptime if dt == DType.float32:
+        return rebind[Scalar[dt]](identical_tanh(rebind[Float32](x)))
+    else:
+        return rebind[Scalar[dt]](tanh(rebind[Float64](x)))
+
+
+@always_inline
+def _inf[dt: DType]() -> Scalar[dt]:
+    comptime if dt == DType.float32:
+        return rebind[Scalar[dt]](inf[DType.float32]())
+    else:
+        return rebind[Scalar[dt]](inf[DType.float64]())
+
+
+@always_inline
+def _isnan[dt: DType](x: Scalar[dt]) -> Bool:
+    comptime if dt == DType.float32:
+        return isnan(rebind[Float32](x))
+    else:
+        return isnan(rebind[Float64](x))
+
+
+def in_upper_g[dt: DType](a: Scalar[dt], y: Scalar[dt], C: Scalar[dt]) -> Bool:
+    return (y < Scalar[dt](0) and a > Scalar[dt](0)) or (y > Scalar[dt](0) and a < C)
+
+
+def in_lower_g[dt: DType](a: Scalar[dt], y: Scalar[dt], C: Scalar[dt]) -> Bool:
+    return (y < Scalar[dt](0) and a < C) or (y > Scalar[dt](0) and a > Scalar[dt](0))
+
+
+def _vec_index(p: Int, n_rows: Int, is_svr: Bool) -> Int:
+    """`GetVecIndices`, `kernelcache.cuh:806-807`: the TRAINING-VECTOR index
+    behind a point of the solver domain. For C_SVC the domain IS the training
+    set and this is the identity; for EPSILON_SVR the domain is `2 * n_rows`
+    and index `i` and index `i + n_rows` name the SAME ROW OF X (alpha and
+    alpha* of that row), so the kernel column is `p % n_rows`, spelled as
+    theirs spell it.
+
+    This is the function whose collisions make `fold_order_for_host`'s docstring
+    false under SVR; see `svc_check.mojo::check_svr_fold_order_collisions`."""
+    if is_svr and p >= n_rows:
+        return p - n_rows
+    return p
+
+
+#: `CONTRACT_MAX_LEAVES` (gemm/host/gemm_oracle.mojo): no k has more leaves.
+comptime SMO_ORACLE_MAX_LEAVES = 1024
+
+
+@always_inline
+def _fold_tree_inplace(buf: UnsafePointer[Float32, MutUntrackedOrigin], p: Int) -> Float32:
+    """`fold_balanced_tree` over `buf[0 .. p)`, in place: each level writes
+    node `q = ftz(ftz(cur[2q]) + ftz(cur[2q+1]))` over slot `q` (never ahead
+    of a slot still to be read, since `q <= 2q`), an odd level carries its
+    last node unchanged, then the output seam. `p == 0` is `+0.0`."""
+    if p == 0:
+        return Float32(0.0)
+    var width = p
+    while width > 1:
+        var pairs = width // 2
+        for q in range(pairs):
+            buf[q] = ftz(ftz(buf[2 * q]) + ftz(buf[2 * q + 1]))
+        if width % 2 != 0:
+            buf[pairs] = buf[width - 1]
+            width = pairs + 1
+        else:
+            width = pairs
+    return ftz(buf[0])
+
+
+# ---------------------------------------------------------------------------
+# the kernel matrix, per cell
+# ---------------------------------------------------------------------------
+
+
+def _row_norm[dt: DType](x: List[Scalar[dt]], i: Int, k: Int) -> Scalar[dt]:
+    """`row_norm_l2sq_kernel`: ascending serial chain."""
+    var acc = Scalar[dt](0)
+    for c in range(k):
+        var v = _flush[dt](x[i * k + c])
+        acc = _flush[dt](_mad[dt](v, v, acc))
+    return _flush[dt](acc)
+
+
+def _dot[dt: DType](
+    xa: List[Scalar[dt]], ia: Int, xb: List[Scalar[dt]], ib: Int, na: Int, nb: Int, k: Int
+) -> Scalar[dt]:
+    """Float32: the v1 GEMM cell (`gemm/IDENTICAL_FP32_CONTRACT.md`): leaf
+    partials at `contract_leaf_size(k)`, each an ascending chain of
+    `ftz(fma(ftz(a), ftz(b), acc))` seeded `+0.0`, combined by
+    `gemm_oracle.fold_balanced_tree` (IMPORTED; the leaf loop is spelled
+    here because `gemm_oracle_cell` takes `List[Float32]` and this file is
+    generic -- the device-vs-oracle gate on F7 (k = 200) is what holds the
+    two leaf loops together). Float64: a plain ascending chain."""
+    comptime if dt == DType.float32:
+        # lane neighbors-cpu (2026-09-28): the leaf partials live in a
+        # stack buffer and the contract's balanced tree folds them in place
+        # (`_fold_tree_inplace`, the same pairs in the same levels as
+        # `fold_balanced_tree`); the cell no longer allocates.
+        var leaf = contract_leaf_size(k)
+        var pcount = leaf_count(k, leaf)
+        var partials = stack_allocation[SMO_ORACLE_MAX_LEAVES, Float32]()
+        for t in range(pcount):
+            var acc = Scalar[dt](0)
+            comptime if SMO_ORACLE_HOST_SABOTAGE:
+                # THE SABOTAGE ARM: the same leaf, walked DESCENDING. Wrong
+                # on purpose; see SMO_ORACLE_HOST_SABOTAGE.
+                var lo = leaf_begin(t, leaf)
+                var hi = leaf_end(t, leaf, k)
+                for q in range(hi - lo):
+                    var c = hi - 1 - q
+                    acc = _flush[dt](
+                        _mad[dt](_flush[dt](xa[ia * k + c]), _flush[dt](xb[ib * k + c]), acc)
+                    )
+            else:
+                for c in range(leaf_begin(t, leaf), leaf_end(t, leaf, k)):
+                    acc = _flush[dt](
+                        _mad[dt](_flush[dt](xa[ia * k + c]), _flush[dt](xb[ib * k + c]), acc)
+                    )
+            partials[t] = rebind[Float32](_flush[dt](acc))
+        return rebind[Scalar[dt]](_fold_tree_inplace(partials, pcount))
+    else:
+        var acc = Scalar[dt](0)
+        for c in range(k):
+            acc = acc + xa[ia * k + c] * xb[ib * k + c]
+        return acc
+
+
+def _kernel_cell[
+    dt: DType
+](
+    kp: KernelParams,
+    xa: List[Scalar[dt]],
+    norm_a: List[Scalar[dt]],
+    ia: Int,
+    xb: List[Scalar[dt]],
+    norm_b: List[Scalar[dt]],
+    ib: Int,
+    na: Int,
+    nb: Int,
+    k: Int,
+) -> Scalar[dt]:
+    """`kernel_op` for one cell: linear, or the RBF expansion in THEIR
+    association (`kernel_matrices.mojo`). kernel='precomputed': `xa` IS
+    the kernel matrix, `k` columns wide, and the cell is `xa[ia, ib]`, the
+    device's gather_cols / slice_cols copy."""
+    if kp.kernel == KERNEL_PRECOMPUTED:
+        return _flush[dt](xa[ia * k + ib])
+    var dot = _dot[dt](xa, ia, xb, ib, na, nb, k)
+    if kp.kernel == KERNEL_LINEAR:
+        return dot
+    if kp.kernel == KERNEL_POLYNOMIAL:
+        # `polynomial_epilogue_kernel` (kernel_methods, DEVIATION 1663):
+        # t = ftz(fma(gain, ftz(dot), offset)); acc = 1; acc = ftz(acc * t),
+        # `degree` times, ascending.
+        var t = _flush[dt](
+            _mad[dt](Scalar[dt](kp.gamma), _flush[dt](dot), Scalar[dt](kp.coef0))
+        )
+        var acc = Scalar[dt](1)
+        for _ in range(kp.degree):
+            acc = _flush[dt](_mul[dt](acc, t))
+        comptime if SMO_ORACLE_HOST_SABOTAGE:
+            # THE POLYNOMIAL SABOTAGE ARM: half a unit added to every kernel
+            # cell. Wrong on purpose; the leaf-order arm in _dot cannot move
+            # an integer-grid fixture, whose dot products are exact in
+            # either order.
+            acc = _flush[dt](acc + Scalar[dt](0.5))
+        return acc
+    if kp.kernel == KERNEL_TANH:
+        # `tanh_epilogue_kernel` (kernel_methods): ftz(tanh(ftz(fma(gain,
+        # ftz(dot), offset)))), identical_tanh in float32.
+        var t = _flush[dt](
+            _mad[dt](Scalar[dt](kp.gamma), _flush[dt](dot), Scalar[dt](kp.coef0))
+        )
+        return _flush[dt](_tanh[dt](t))
+    var gain = Scalar[dt](kp.gamma)
+    var s = _flush[dt](
+        _flush[dt](_flush[dt](norm_a[ia]) + _flush[dt](norm_b[ib]))
+        - _flush[dt](Scalar[dt](2) * _flush[dt](dot))
+    )
+    var e = _flush[dt]((-gain) * s)
+    return _flush[dt](_exp[dt](e))
+
+
+#: THE CELL BLOCK (lane neighbors-cpu, 2026-09-28): SMO_W kernel cells at
+#: once, one SIMD lane per CELL (a against b_0 .. b_{W-1}). Lane `l` is the
+#: float32 `_kernel_cell` of (a, b_l) statement for statement: the same
+#: contract leaves, each an ascending `ftz(fma(ftz(a_c), ftz(b_c), acc))`
+#: chain, the same balanced fold (lane-wise, every lane the same tree), the
+#: same epilogue; `ftz_v` / `expf_v` are measured equal to `ftz` /
+#: `portable_expf` on every float32 word (core/host_simd_identical_check.
+#: mojo), and `identical_tanh` runs per lane. The b operands come from a
+#: feature-major panel of FLUSHED values (`c * stride + l`); ftz is
+#: idempotent, so flushing at pack time is flushing at load time.
+#: The cell block and the vector scans run in IDENTICAL builds (every host
+#: binding); a FAST build of the checks keeps the scalar oracle, whose
+#: `identical_exp` is the stdlib's there and not `expf_v`'s arithmetic.
+comptime SMO_HOST_VECTOR = GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL
+comptime SMO_W = 8
+comptime SmoVF = SIMD[DType.float32, SMO_W]
+
+
+def _kernel_cells_v(
+    kp: KernelParams, xa: HostF32Ptr, na: Float32, panel: HostF32Ptr,
+    stride: Int, nb: SmoVF, k: Int,
+) -> SmoVF:
+    var leaf = contract_leaf_size(k)
+    var pcount = leaf_count(k, leaf)
+    var parts = stack_allocation[SMO_ORACLE_MAX_LEAVES * SMO_W, Float32]()
+    for t in range(pcount):
+        var acc = SmoVF(0.0)
+        var lo = leaf_begin(t, leaf)
+        var hi = leaf_end(t, leaf, k)
+        comptime if SMO_ORACLE_HOST_SABOTAGE:
+            for q in range(hi - lo):
+                var c = hi - 1 - q
+                acc = ftz_v[SMO_W](identical_mul_add_simd[SMO_W](
+                    SmoVF(ftz(xa.unsafe_load(c))), panel.unsafe_load[width=SMO_W](c * stride), acc
+                ))
+        else:
+            for c in range(lo, hi):
+                acc = ftz_v[SMO_W](identical_mul_add_simd[SMO_W](
+                    SmoVF(ftz(xa.unsafe_load(c))), panel.unsafe_load[width=SMO_W](c * stride), acc
+                ))
+        parts.unsafe_store(t * SMO_W, ftz_v[SMO_W](acc))
+    var dot = SmoVF(0.0)
+    if pcount > 0:
+        var width = pcount
+        while width > 1:
+            var pairs = width // 2
+            for q in range(pairs):
+                var a = ftz_v[SMO_W](parts.unsafe_load[width=SMO_W](2 * q * SMO_W))
+                var b = ftz_v[SMO_W](parts.unsafe_load[width=SMO_W]((2 * q + 1) * SMO_W))
+                parts.unsafe_store(q * SMO_W, ftz_v[SMO_W](a + b))
+            if width % 2 != 0:
+                parts.unsafe_store(pairs * SMO_W, parts.unsafe_load[width=SMO_W]((width - 1) * SMO_W))
+                width = pairs + 1
+            else:
+                width = pairs
+        dot = ftz_v[SMO_W](parts.unsafe_load[width=SMO_W](0))
+    if kp.kernel == KERNEL_LINEAR:
+        return dot
+    if kp.kernel == KERNEL_POLYNOMIAL:
+        var t = ftz_v[SMO_W](identical_mul_add_simd[SMO_W](
+            SmoVF(Float32(kp.gamma)), ftz_v[SMO_W](dot), SmoVF(Float32(kp.coef0))
+        ))
+        var acc = SmoVF(1.0)
+        for _ in range(kp.degree):
+            acc = ftz_v[SMO_W](acc * t)
+        comptime if SMO_ORACLE_HOST_SABOTAGE:
+            acc = ftz_v[SMO_W](acc + SmoVF(0.5))
+        return acc
+    if kp.kernel == KERNEL_TANH:
+        var t = ftz_v[SMO_W](identical_mul_add_simd[SMO_W](
+            SmoVF(Float32(kp.gamma)), ftz_v[SMO_W](dot), SmoVF(Float32(kp.coef0))
+        ))
+        var out = t
+        comptime for l in range(SMO_W):
+            out[l] = ftz(identical_tanh(t[l]))
+        return out
+    var gain = Float32(kp.gamma)
+    var s = ftz_v[SMO_W](
+        ftz_v[SMO_W](SmoVF(ftz(na)) + ftz_v[SMO_W](nb))
+        - ftz_v[SMO_W](SmoVF(2.0) * ftz_v[SMO_W](dot))
+    )
+    var e = ftz_v[SMO_W](SmoVF(-gain) * s)
+    return ftz_v[SMO_W](expf_v[SMO_W](e))
+
+
+# ---------------------------------------------------------------------------
+# the result record
+# ---------------------------------------------------------------------------
+
+
+struct OracleResult[dt: DType](Movable):
+    var alpha: List[Scalar[Self.dt]]
+    var f: List[Scalar[Self.dt]]
+    var b: Scalar[Self.dt]
+    var dual_coefs: List[Scalar[Self.dt]]
+    var support_idx: List[Int32]
+    var n_iter: Int
+    var n_outer_iter: Int
+    var ws_seq: List[List[Int32]]
+    var alpha_hash_seq: List[UInt64]
+    var f_hash_seq: List[UInt64]
+    var diff_seq: List[Scalar[Self.dt]]
+    var inner_iter_seq: List[Int]
+    var nnz_seq: List[Int]
+    var y: List[Scalar[Self.dt]]
+    var objective_seq: List[Float64]
+    """The dual objective W(alpha) after each outer iteration, Float64,
+    only when the caller asks (it is O(n^2 k) per iteration)."""
+
+    def __init__(out self):
+        self.alpha = List[Scalar[Self.dt]]()
+        self.f = List[Scalar[Self.dt]]()
+        self.b = Scalar[Self.dt](0)
+        self.dual_coefs = List[Scalar[Self.dt]]()
+        self.support_idx = List[Int32]()
+        self.n_iter = 0
+        self.n_outer_iter = 0
+        self.ws_seq = List[List[Int32]]()
+        self.alpha_hash_seq = List[UInt64]()
+        self.f_hash_seq = List[UInt64]()
+        self.diff_seq = List[Scalar[Self.dt]]()
+        self.inner_iter_seq = List[Int]()
+        self.nnz_seq = List[Int]()
+        self.y = List[Scalar[Self.dt]]()
+        self.objective_seq = List[Float64]()
+
+
+def _twiddle32(x: Float32) -> UInt32:
+    var bits = bitcast[DType.uint32](x)
+    if bits & UInt32(0x80000000) != UInt32(0):
+        return ~bits
+    return bits | UInt32(0x80000000)
+
+
+def _twiddle64(x: Float64) -> UInt64:
+    var bits = bitcast[DType.uint64](x)
+    if bits & UInt64(0x8000000000000000) != UInt64(0):
+        return ~bits
+    return bits | UInt64(0x8000000000000000)
+
+
+def _sorted_by_f[dt: DType](f: List[Scalar[dt]]) -> List[Int32]:
+    """`cub::DeviceRadixSort::SortPairs(f, f_idx)`: indices in ascending
+    `(twiddled f bits, index)` order. Float32: one UInt64 key `(key << 32)
+    | idx`. Float64: `(key, idx)` pairs -- a 64-bit key does not leave
+    room for the index, so the pair sort is spelled as key-then-idx with
+    an insertion of ties in index order."""
+    var n = len(f)
+    var out = List[Int32]()
+    comptime if dt == DType.float32:
+        var keys = List[UInt64]()
+        for i in range(n):
+            keys.append((UInt64(_twiddle32(rebind[Float32](f[i]))) << 32) | UInt64(i))
+        sort(keys)
+        for i in range(n):
+            out.append(Int32(Int(keys[i] & UInt64(0xFFFFFFFF))))
+    else:
+        # sort keys, then indices: two passes of an integer sort over
+        # (key, idx) is the same total order. Use a stable merge: sort idx
+        # by key with ties by idx -- spelled as sorting a list of key, then
+        # for equal keys the ascending-idx order is recovered by scanning.
+        var keys = List[UInt64]()
+        var idx_of = List[Int]()
+        for i in range(n):
+            keys.append(_twiddle64(rebind[Float64](f[i])))
+        var order = List[Int]()
+        for i in range(n):
+            order.append(i)
+        # insertion sort on (key, idx); n is small for the Float64 arm
+        for i in range(1, n):
+            var j = i
+            while j > 0:
+                var a = order[j - 1]
+                var bb = order[j]
+                if keys[a] > keys[bb] or (keys[a] == keys[bb] and a > bb):
+                    order[j - 1] = bb
+                    order[j] = a
+                    j -= 1
+                else:
+                    break
+        for i in range(n):
+            out.append(Int32(order[i]))
+    return out^
+
+
+# ---------------------------------------------------------------------------
+# the solver
+# ---------------------------------------------------------------------------
+
+
+struct _WsState(Movable):
+    var firstcall: Bool
+    var idx: List[Int32]
+    var ws_idx_save: List[Int32]
+    var n_ws: Int
+    var n_train: Int
+
+    def __init__(out self, n_train: Int, n_ws: Int):
+        self.firstcall = True
+        self.n_train = n_train
+        self.n_ws = n_ws
+        self.idx = List[Int32]()
+        self.ws_idx_save = List[Int32]()
+        for i in range(n_ws):
+            self.idx.append(Int32(i))
+            self.ws_idx_save.append(Int32(i))
+
+
+def _gather_available[
+    dt: DType
+](
+    mut ws: _WsState,
+    sorted_idx: List[Int32],
+    mut available: List[Bool],
+    n_already_selected: Int,
+    n_needed: Int,
+    copy_front: Bool,
+) -> Int:
+    """`GatherAvailable`."""
+    if n_already_selected > 0:
+        for p in range(n_already_selected):
+            available[Int(ws.idx[p])] = False
+    var sel = List[Int32]()
+    for p in range(len(sorted_idx)):
+        if available[Int(sorted_idx[p])]:
+            sel.append(sorted_idx[p])
+    var n_selected = len(sel)
+    var n_copy = n_needed if n_selected > n_needed else n_selected
+    var src_off = 0 if copy_front else n_selected - n_copy
+    for c in range(n_copy):
+        ws.idx[n_already_selected + c] = sel[src_off + c]
+    return n_copy
+
+
+def _select_ws[
+    dt: DType
+](
+    mut ws: _WsState,
+    f: List[Scalar[dt]],
+    alpha: List[Scalar[dt]],
+    y: List[Scalar[dt]],
+    C: List[Scalar[dt]],
+):
+    """`WorkingSet::Select` (FIFO) + `SimpleSelect`. `C` is the per-sample
+    bound `C_vec` (`InitPenalty`), one entry per training index."""
+    var n_train = ws.n_train
+    var n_ws = ws.n_ws
+    if n_ws >= n_train:
+        return
+    var nc = n_ws // 4
+    var n_selected = 0
+    if ws.firstcall:
+        if nc >= 1:
+            ws.firstcall = False
+    else:
+        for p in range(2 * nc):
+            ws.idx[p] = ws.ws_idx_save[2 * nc + p]
+        n_selected = nc * 2
+    # SimpleSelect
+    var n_already = n_selected
+    var n_needed = n_ws - n_already
+    var sorted_idx = _sorted_by_f[dt](f)
+    var available = List[Bool]()
+    for i in range(n_train):
+        available.append(in_upper_g[dt](alpha[i], y[i], C[i]))
+    n_already += _gather_available[dt](ws, sorted_idx, available, n_already, n_needed // 2, True)
+    for i in range(n_train):
+        available[i] = in_lower_g[dt](alpha[i], y[i], C[i])
+    n_already += _gather_available[dt](ws, sorted_idx, available, n_already, n_ws - n_already, False)
+    if n_already < n_ws:
+        for i in range(n_train):
+            available[i] = True
+        n_already += _gather_available[dt](ws, sorted_idx, available, n_already, n_ws - n_already, True)
+    for p in range(n_ws):
+        ws.ws_idx_save[p] = ws.idx[p]
+
+
+#: THE BLOCK SOLVE'S SCANS, W LANES AT A TIME (lane neighbors-cpu,
+#: 2026-09-28, float32 only). Each scan of `_block_solve` keeps the element
+#: that is BEST under `(v, key)`: a strictly smaller (or, for the two max
+#: scans, larger) `v`, or an equal `v` and a smaller training index. Keys
+#: are distinct and a NaN `v` can never displace the incumbent (both
+#: compares are false), and the incumbent starts at (+-inf, INT_MAX) which
+#: no NaN reaches, so the serial scan returns the unique best element of a
+#: strict total order: its minimum. A lane-wise running best followed by
+#: the same rule over the lanes and the ragged tail returns that same
+#: element. `v` itself is computed lane-wise with the scalar statements.
+comptime SMO_SCAN_MIN_UPPER = 0
+comptime SMO_SCAN_MAX_LOWER = 1
+comptime SMO_SCAN_MAX_GAIN = 2
+comptime SmoVI = SIMD[DType.int64, SMO_W]
+comptime SmoVB = SIMD[DType.bool, SMO_W]
+comptime SmoIntPtr = UnsafePointer[Int, MutUntrackedOrigin]
+
+
+@always_inline
+def _smo_upper_v(a: SmoVF, y: SmoVF, C: SmoVF) -> SmoVB:
+    return (y.lt(SmoVF(0.0)) & a.gt(SmoVF(0.0))) | (y.gt(SmoVF(0.0)) & a.lt(C))
+
+
+@always_inline
+def _smo_lower_v(a: SmoVF, y: SmoVF, C: SmoVF) -> SmoVB:
+    return (y.lt(SmoVF(0.0)) & a.lt(C)) | (y.gt(SmoVF(0.0)) & a.gt(SmoVF(0.0)))
+
+
+@always_inline
+def _smo_gain(f_u: Float32, ft: Float32, kdt: Float32, kdu: Float32, kui: Float32, eta_eps: Float32) -> Float32:
+    var eta_ui = ftz(ftz(kdt + kdu) - ftz(Float32(2) * kui))
+    if eta_ui < eta_eps:
+        eta_ui = eta_eps
+    var d = ftz(f_u - ft)
+    return ftz(ftz(d * d) / eta_ui)
+
+
+def _smo_scan[
+    mode: Int
+](
+    fp: HostF32Ptr, ap: HostF32Ptr, yp: HostF32Ptr, cp: HostF32Ptr,
+    keyp: SmoIntPtr, n: Int, f_u: Float32, kdp: HostF32Ptr, kdu: Float32,
+    trow: HostF32Ptr, eta_eps: Float32,
+) -> Tuple[Float32, Int]:
+    """One scan of `_block_solve` over `t in [0, n)`: returns (best v, t)."""
+    comptime is_min = mode == SMO_SCAN_MIN_UPPER
+    var init = inf[DType.float32]() if is_min else -inf[DType.float32]()
+    var bv = SmoVF(init)
+    var bk = SmoVI(2147483647)
+    var bt = SmoVI(-1)
+    var lanes = SmoVI(0, 1, 2, 3, 4, 5, 6, 7)
+    var whole = (n // SMO_W) * SMO_W
+    var t0 = 0
+    while t0 < whole:
+        var f = fp.unsafe_load[width=SMO_W](t0)
+        var a = ap.unsafe_load[width=SMO_W](t0)
+        var y = yp.unsafe_load[width=SMO_W](t0)
+        var C = cp.unsafe_load[width=SMO_W](t0)
+        var key = SmoVI(0)
+        comptime for l in range(SMO_W):
+            key[l] = Int64(keyp[t0 + l])
+        var v: SmoVF
+        comptime if mode == SMO_SCAN_MIN_UPPER:
+            v = _smo_upper_v(a, y, C).select(f, SmoVF(init))
+        elif mode == SMO_SCAN_MAX_LOWER:
+            v = _smo_lower_v(a, y, C).select(f, SmoVF(init))
+        else:
+            var kd = kdp.unsafe_load[width=SMO_W](t0)
+            var kui = trow.unsafe_load[width=SMO_W](t0)
+            var eta = ftz_v[SMO_W](
+                ftz_v[SMO_W](kd + SmoVF(kdu)) - ftz_v[SMO_W](SmoVF(2.0) * kui)
+            )
+            eta = eta.lt(SmoVF(eta_eps)).select(SmoVF(eta_eps), eta)
+            var d = ftz_v[SMO_W](SmoVF(f_u) - f)
+            var g = ftz_v[SMO_W](ftz_v[SMO_W](d * d) / eta)
+            var ok = SmoVF(f_u).lt(f) & _smo_lower_v(a, y, C)
+            v = ok.select(g, SmoVF(init))
+        var better: SmoVB
+        comptime if is_min:
+            better = v.lt(bv) | (v.eq(bv) & key.lt(bk))
+        else:
+            better = v.gt(bv) | (v.eq(bv) & key.lt(bk))
+        bv = better.select(v, bv)
+        bk = better.select(key, bk)
+        bt = better.select(lanes + SmoVI(t0), bt)
+        t0 += SMO_W
+    var best_v = init
+    var best_k = 2147483647
+    var best_t = -1
+    for l in range(SMO_W):
+        var v = bv[l]
+        var k = Int(bk[l])
+        var ok: Bool
+        comptime if is_min:
+            ok = v < best_v or (v == best_v and k < best_k)
+        else:
+            ok = v > best_v or (v == best_v and k < best_k)
+        if ok:
+            best_v = v
+            best_k = k
+            best_t = Int(bt[l])
+    for t in range(whole, n):
+        var a = ap[t]
+        var y = yp[t]
+        var C = cp[t]
+        var v = init
+        comptime if mode == SMO_SCAN_MIN_UPPER:
+            if in_upper_g[DType.float32](a, y, C):
+                v = fp[t]
+        elif mode == SMO_SCAN_MAX_LOWER:
+            if in_lower_g[DType.float32](a, y, C):
+                v = fp[t]
+        else:
+            if f_u < fp[t] and in_lower_g[DType.float32](a, y, C):
+                v = _smo_gain(f_u, fp[t], kdp[t], kdu, trow[t], eta_eps)
+        var k = keyp[t]
+        var ok: Bool
+        comptime if is_min:
+            ok = v < best_v or (v == best_v and k < best_k)
+        else:
+            ok = v > best_v or (v == best_v and k < best_k)
+        if ok:
+            best_v = v
+            best_k = k
+            best_t = t
+    return (best_v, best_t)
+
+
+def _block_solve[
+    dt: DType
+](
+    ws_idx: List[Int32],
+    n_ws: Int,
+    y_array: List[Scalar[dt]],
+    mut alpha: List[Scalar[dt]],
+    f_array: List[Scalar[dt]],
+    tile: List[Scalar[dt]],
+    C_vec: List[Scalar[dt]],
+    eps: Scalar[dt],
+    max_iter: Int,
+    mut delta_alpha: List[Scalar[dt]],
+) -> Tuple[Scalar[dt], Int]:
+    """`SmoBlockSolve`, serialized: the per-thread registers are arrays
+    indexed by `tid`, the three reductions are serial scans with the
+    DEVIATION 633 / 635 tie-break (smaller training index; the scans
+    compare with `<`/`>`/`==`, never a hardware `min`/`max`, row 39).
+    Returns `(return_buff[0], n_iter)`."""
+    var pos_inf = _inf[dt]()
+    var neg_inf = -_inf[dt]()
+    var y = List[Scalar[dt]]()
+    var f = List[Scalar[dt]]()
+    var a = List[Scalar[dt]]()
+    var a_save = List[Scalar[dt]]()
+    var Kd = List[Scalar[dt]]()
+    var key = List[Int]()
+    var C = List[Scalar[dt]]()
+    for t in range(n_ws):
+        var idx = Int(ws_idx[t])
+        C.append(C_vec[idx])
+        y.append(y_array[idx])
+        f.append(f_array[idx])
+        a.append(alpha[idx])
+        a_save.append(alpha[idx])
+        Kd.append(tile[t + t * n_ws])
+        key.append(idx)
+    var eta_eps = Scalar[dt](ORACLE_ETA_EPS)
+    var diff0 = Scalar[dt](0)
+    var diff_end = Scalar[dt](0)
+    var n_iter = 0
+    while n_iter < max_iter:
+        # argmin over upper of (f, key)
+        var f_u = pos_inf
+        var u = -1
+        var u_key = 2147483647
+        comptime if dt == DType.float32 and SMO_HOST_VECTOR:
+            var r = _smo_scan[SMO_SCAN_MIN_UPPER](
+                rebind[HostF32Ptr](f.unsafe_ptr()), rebind[HostF32Ptr](a.unsafe_ptr()),
+                rebind[HostF32Ptr](y.unsafe_ptr()), rebind[HostF32Ptr](C.unsafe_ptr()),
+                rebind[SmoIntPtr](key.unsafe_ptr()), n_ws, Float32(0.0),
+                rebind[HostF32Ptr](Kd.unsafe_ptr()), Float32(0.0),
+                rebind[HostF32Ptr](Kd.unsafe_ptr()), Float32(0.0),
+            )
+            f_u = rebind[Scalar[dt]](r[0])
+            u = r[1]
+        else:
+            for t in range(n_ws):
+                var v = f[t] if in_upper_g[dt](a[t], y[t], C[t]) else pos_inf
+                if v < f_u or (v == f_u and key[t] < u_key):
+                    f_u = v
+                    u = t
+                    u_key = key[t]
+        if u < 0:
+            u = 0
+        # f_max over lower: DEVIATION 635, the same key-tied argmax as `u`
+        # (the value of the smallest training index among the maximal f;
+        # only a +0.0/-0.0 pair can tie with different bits, row 39)
+        var f_max = neg_inf
+        var fmax_key = 2147483647
+        comptime if dt == DType.float32 and SMO_HOST_VECTOR:
+            var r = _smo_scan[SMO_SCAN_MAX_LOWER](
+                rebind[HostF32Ptr](f.unsafe_ptr()), rebind[HostF32Ptr](a.unsafe_ptr()),
+                rebind[HostF32Ptr](y.unsafe_ptr()), rebind[HostF32Ptr](C.unsafe_ptr()),
+                rebind[SmoIntPtr](key.unsafe_ptr()), n_ws, Float32(0.0),
+                rebind[HostF32Ptr](Kd.unsafe_ptr()), Float32(0.0),
+                rebind[HostF32Ptr](Kd.unsafe_ptr()), Float32(0.0),
+            )
+            f_max = rebind[Scalar[dt]](r[0])
+        else:
+            for t in range(n_ws):
+                var v = f[t] if in_lower_g[dt](a[t], y[t], C[t]) else neg_inf
+                if v > f_max or (v == f_max and key[t] < fmax_key):
+                    f_max = v
+                    fmax_key = key[t]
+        var diff = _flush[dt](f_max - f_u)
+        if n_iter == 0:
+            diff0 = diff
+            var d10 = _flush[dt](Scalar[dt](0.1) * diff)
+            diff_end = eps if eps > d10 else d10
+        if diff < diff_end:
+            break
+        # argmax over lower of (f_u - f)^2 / eta
+        var best = neg_inf
+        var l = -1
+        var l_key = 2147483647
+        comptime if dt == DType.float32 and SMO_HOST_VECTOR:
+            var r = _smo_scan[SMO_SCAN_MAX_GAIN](
+                rebind[HostF32Ptr](f.unsafe_ptr()), rebind[HostF32Ptr](a.unsafe_ptr()),
+                rebind[HostF32Ptr](y.unsafe_ptr()), rebind[HostF32Ptr](C.unsafe_ptr()),
+                rebind[SmoIntPtr](key.unsafe_ptr()), n_ws, rebind[Float32](f_u),
+                rebind[HostF32Ptr](Kd.unsafe_ptr()), rebind[Float32](Kd[u]),
+                rebind[HostF32Ptr](tile.unsafe_ptr()) + u * n_ws,
+                rebind[Float32](eta_eps),
+            )
+            best = rebind[Scalar[dt]](r[0])
+            l = r[1]
+        else:
+            for t in range(n_ws):
+                var v = neg_inf
+                if f_u < f[t] and in_lower_g[dt](a[t], y[t], C[t]):
+                    var Kui = tile[u * n_ws + t]
+                    var eta_ui = _flush[dt](_flush[dt](Kd[t] + Kd[u]) - _flush[dt](Scalar[dt](2) * Kui))
+                    if eta_ui < eta_eps:
+                        eta_ui = eta_eps
+                    var d = _flush[dt](f_u - f[t])
+                    v = _flush[dt](_flush[dt](d * d) / eta_ui)
+                if v > best or (v == best and key[t] < l_key):
+                    best = v
+                    l = t
+                    l_key = key[t]
+        if l < 0:
+            l = 0
+        # update
+        var tmp_u = C[u] - a[u] if y[u] > Scalar[dt](0) else a[u]
+        var tmp_l = a[l] if y[l] > Scalar[dt](0) else C[l] - a[l]
+        var Kul = tile[u * n_ws + l]
+        var eta_ul = _flush[dt](_flush[dt](Kd[u] + Kd[l]) - _flush[dt](Scalar[dt](2) * Kul))
+        if eta_ul < eta_eps:
+            eta_ul = eta_eps
+        var q_l = _flush[dt](_flush[dt](f[l] - f_u) / eta_ul)
+        if q_l < tmp_l:
+            tmp_l = q_l
+        var q = tmp_u if tmp_u < tmp_l else tmp_l
+        # the default build's fused ops (lane/pinned-mul-contract-free)
+        a[u] = _flush[dt](fma(q, y[u], a[u]))
+        a[l] = _flush[dt](fma(-q, y[l], a[l]))
+        var t_done = 0
+        comptime if dt == DType.float32 and SMO_HOST_VECTOR:
+            var fq = rebind[HostF32Ptr](f.unsafe_ptr())
+            var tu = rebind[HostF32Ptr](tile.unsafe_ptr()) + u * n_ws
+            var tl = rebind[HostF32Ptr](tile.unsafe_ptr()) + l * n_ws
+            var qv = SmoVF(rebind[Float32](q))
+            while t_done + SMO_W <= n_ws:
+                var dk = ftz_v[SMO_W](tu.unsafe_load[width=SMO_W](t_done) - tl.unsafe_load[width=SMO_W](t_done))
+                fq.unsafe_store(t_done, ftz_v[SMO_W](identical_mul_add_simd[SMO_W](
+                    qv, dk, fq.unsafe_load[width=SMO_W](t_done)
+                )))
+                t_done += SMO_W
+        for t in range(t_done, n_ws):
+            var Kui = tile[u * n_ws + t]
+            var Kli = tile[l * n_ws + t]
+            f[t] = _flush[dt](_mad[dt](q, _flush[dt](Kui - Kli), f[t]))
+        if q == Scalar[dt](0):
+            break
+        n_iter += 1
+    for t in range(n_ws):
+        var idx = Int(ws_idx[t])
+        alpha[idx] = a[t]
+        delta_alpha[t] = _flush[dt](_flush[dt](a[t] - a_save[t]) * y[t])
+    return (diff0, n_iter)
+
+
+def smo_oracle_fit[
+    dt: DType
+](
+    x: List[Scalar[dt]],
+    y: List[Scalar[dt]],
+    n_rows: Int,
+    n_cols: Int,
+    param: SvmParameter,
+    kp: KernelParams,
+    record_objective: Bool = False,
+    c_rows: List[Scalar[dt]] = List[Scalar[dt]](),
+) raises -> OracleResult[dt]:
+    """`SmoSolver::Solve` + `Results::Get`, serial.
+
+    `c_rows` empty: `InitPenalty`'s unweighted arm, C at every training
+    index. Otherwise one bound per ROW, the caller's `C * sample_weight`
+    already rounded to the working type once (`InitPenalty`'s weighted arm,
+    `C_vec[i] = C * w[i]`); EPSILON_SVR reads row i's bound at i and i + n.
+
+    C_SVC: `y` is +-1 already (the caller does `getOvrlabels`; `svc_check`
+    shares one helper), `n_train = n_rows`, `f = -y`.
+
+    EPSILON_SVR: `y` holds the REGRESSION TARGETS, `n_train = 2 * n_rows`,
+    and `SvrInit` (`smosolver.cuh:395-411`) builds both the label vector and
+    the gradient here. `res.y` is the LABEL vector in both problems, because
+    that is what the working set, the block solve, `CombineCoefs` and `CalcB`
+    all read (the reference repoints the caller's pointer at `y_label`; this file
+    and `smosolver.mojo` both keep it as a separate vector instead)."""
+    var res = OracleResult[dt]()
+    var is_svr = param.svmType == EPSILON_SVR
+    var n_train = n_rows * 2 if is_svr else n_rows
+    var k = n_cols
+    var C = Scalar[dt](param.C)
+    if len(c_rows) != 0 and len(c_rows) != n_rows:
+        raise Error("svm: " + String(len(c_rows)) + " per-row bounds for " + String(n_rows) + " rows")
+    for i in range(len(c_rows)):
+        var v = c_rows[i]
+        if not (v >= Scalar[dt](0) and v - v == Scalar[dt](0)):
+            raise Error("svm: the per-row bound C * sample_weight at row " + String(i) + " is " + String(v) + "; it must be finite and >= 0")
+    var C_vec = List[Scalar[dt]]()
+    for i in range(n_train):
+        C_vec.append(C if len(c_rows) == 0 else c_rows[i % n_rows])
+    var tol = Scalar[dt](param.tol)
+    var n_ws = ORACLE_WS_SIZE
+    if n_ws > n_train:
+        n_ws = n_train
+    # Initialize
+    var alpha = List[Scalar[dt]]()
+    for _ in range(n_train):
+        alpha.append(Scalar[dt](0))
+    var y_train = List[Scalar[dt]]()
+    var f = List[Scalar[dt]]()
+    if is_svr:
+        # `SvrInit(yr, n_rows, yc, f)`: yc = [1]*n ++ [-1]*n, f[i] = eps - y_i,
+        # f[i + n] = -eps - y_i. ONE IEEE subtraction each, no ftz and no fma,
+        # as `svr_init_kernel` spells it and for the same reason.
+        #
+        # `neg_eps` is a UNARY NEGATION of the stored epsilon and not
+        # `Scalar[dt](-param.epsilon)`, because the two differ when epsilon is
+        # zero: `-(+0.0)` is `-0.0`, and `-0.0 - (+0.0)` is `-0.0` while
+        # `+0.0 - (+0.0)` is `+0.0`. That is the ONLY route by which ordinary
+        # input puts both zero signs into one f vector, and fixture R6.zero
+        # is built on it.
+        var eps_s = Scalar[dt](param.epsilon)
+        var neg_eps = -eps_s
+        for _ in range(n_rows):
+            y_train.append(Scalar[dt](1))
+        for _ in range(n_rows):
+            y_train.append(Scalar[dt](-1))
+        for i in range(n_rows):
+            f.append(eps_s - y[i])
+        for i in range(n_rows):
+            f.append(neg_eps - y[i])
+    else:
+        for i in range(n_train):
+            y_train.append(y[i])
+            f.append(-y[i])
+    var norms = List[Scalar[dt]]()
+    if kp.kernel == KERNEL_RBF:
+        for i in range(n_rows):
+            norms.append(_row_norm[dt](x, i, k))
+    var ws = _WsState(n_train, n_ws)
+    # THE CELL BLOCK's operands (float32 only; see `_kernel_cells_v`): the
+    # flushed training rows feature-major, `xt[c * n_rows + i]`, the norms
+    # (zeros unless RBF), and one flushed working-set panel refilled per
+    # outer iteration.
+    var xt = List[Float32]()
+    var nrm = List[Float32](length=n_rows + SMO_W, fill=Float32(0.0))
+    var wst = List[Float32]()
+    var wsn = List[Float32](length=n_ws + SMO_W, fill=Float32(0.0))
+    comptime if dt == DType.float32 and SMO_HOST_VECTOR:
+        xt = List[Float32](length=n_rows * k, fill=Float32(0.0))
+        for i in range(n_rows):
+            for c in range(k):
+                xt[c * n_rows + i] = ftz(rebind[Float32](x[i * k + c]))
+            if kp.kernel == KERNEL_RBF:
+                nrm[i] = rebind[Float32](norms[i])
+        wst = List[Float32](length=n_ws * k, fill=Float32(0.0))
+    var xp = rebind[HostF32Ptr](x.unsafe_ptr())
+    var xtp = rebind[HostF32Ptr](xt.unsafe_ptr())
+    var nrmp = rebind[HostF32Ptr](nrm.unsafe_ptr())
+    var wstp = rebind[HostF32Ptr](wst.unsafe_ptr())
+    var wsnp = rebind[HostF32Ptr](wsn.unsafe_ptr())
+    # counters
+    var max_outer_iter = param.max_outer_iter
+    if max_outer_iter == -1:
+        max_outer_iter = n_train * 100
+        if max_outer_iter < 100000:
+            max_outer_iter = 100000
+    var max_iter = param.max_iter
+    var n_outer_iter = 0
+    var n_iter = 0
+    var diff_prev = Scalar[dt](0)
+    var n_small_diff = 0
+    var n_increased_diff = 0
+    var keep_going = True
+    var delta_alpha = List[Scalar[dt]]()
+    for _ in range(n_ws):
+        delta_alpha.append(Scalar[dt](0))
+    var tile = List[Scalar[dt]]()
+    for _ in range(n_ws * n_ws):
+        tile.append(Scalar[dt](0))
+
+    while keep_going:
+        for t in range(n_ws):
+            delta_alpha[t] = Scalar[dt](0)
+        _select_ws[dt](ws, f, alpha, y_train, C_vec)
+        # square tile K(ws, ws)
+        # `getSquareTileWithoutCaching` extracts rows of X by
+        # `ws_idx_mod` = the PROJECTED indices, so the tile is
+        # `K(x[ws%n], x[ws%n])`; under SVR a row can appear TWICE in it.
+        # kernel='precomputed' takes the scalar cells: `x` IS the kernel
+        # matrix and a cell is a copy of it, which the cell block (a dot of
+        # two feature rows) does not compute.
+        var cell_block = False
+        comptime if dt == DType.float32 and SMO_HOST_VECTOR:
+            cell_block = kp.kernel != KERNEL_PRECOMPUTED
+        if cell_block:
+            comptime if dt == DType.float32 and SMO_HOST_VECTOR:
+                for t in range(n_ws):
+                    var it = _vec_index(Int(ws.idx[t]), n_rows, is_svr)
+                    for c in range(k):
+                        wstp.unsafe_store(c * n_ws + t, xtp.unsafe_load(c * n_rows + it))
+                    wsnp.unsafe_store(t, nrmp.unsafe_load(it))
+                var tp = rebind[HostF32Ptr](tile.unsafe_ptr())
+                for u in range(n_ws):
+                    var iu = _vec_index(Int(ws.idx[u]), n_rows, is_svr)
+                    var t0 = 0
+                    while t0 + SMO_W <= n_ws:
+                        var cells = _kernel_cells_v(
+                            kp, xp + iu * k, nrmp.unsafe_load(iu), wstp + t0, n_ws,
+                            wsnp.unsafe_load[width=SMO_W](t0), k,
+                        )
+                        tp.unsafe_store[width=SMO_W](u * n_ws + t0, cells)
+                        t0 += SMO_W
+                    for t in range(t0, n_ws):
+                        var it = _vec_index(Int(ws.idx[t]), n_rows, is_svr)
+                        tile[u * n_ws + t] = _kernel_cell[dt](
+                            kp, x, norms, iu, x, norms, it, n_rows, n_rows, k
+                        )
+        else:
+            for u in range(n_ws):
+                var iu = _vec_index(Int(ws.idx[u]), n_rows, is_svr)
+                for t in range(n_ws):
+                    var it = _vec_index(Int(ws.idx[t]), n_rows, is_svr)
+                    tile[u * n_ws + t] = _kernel_cell[dt](
+                        kp, x, norms, iu, x, norms, it, n_rows, n_rows, k
+                    )
+        var max_iter_this_block = ORACLE_MAX_INNER
+        if max_iter != -1:
+            var rem = max_iter - n_iter
+            if rem < max_iter_this_block:
+                max_iter_this_block = rem
+        var r = _block_solve[dt](
+            ws.idx, n_ws, y_train, alpha, f, tile, C_vec, tol, max_iter_this_block,
+            delta_alpha
+        )
+        var diff = r[0]
+        var inner = r[1]
+        # GetNonzeroDeltaAlpha
+        var nz_idx = List[Int32]()
+        var nz_da = List[Scalar[dt]]()
+        # `GetNonzeroDeltaAlpha` compacts `cache.getKernelIndices(false)`,
+        # the PROJECTED indices (`smosolver.cuh:169`), because what it feeds
+        # is a gather of ROWS OF X. Under SVR those indices are NOT distinct:
+        # if `i` and `i + n_rows` are both in the working set with nonzero
+        # delta_alpha, the list carries the same index twice.
+        for t in range(n_ws):
+            if delta_alpha[t] != Scalar[dt](0):
+                nz_idx.append(Int32(_vec_index(Int(ws.idx[t]), n_rows, is_svr)))
+                nz_da.append(delta_alpha[t])
+        var nnz = len(nz_idx)
+        if nnz > 0:
+            var order = fold_order_for_host(nz_idx)
+            # UpdateF's batch domain is n_rows for BOTH problems (the tile is
+            # `[nnz x n_rows]`). C_SVC writes it once; EPSILON_SVR writes the
+            # SAME accumulator into `f` and into `f + n_rows`, which is
+            # `smosolver.cuh:261-278`'s second gemv: one tile, one
+            # delta_alpha, only the destination moves.
+            var update_tasks = host_predict_task_count(n_rows)
+            if n_rows * nnz * k < (1 << 18):
+                update_tasks = 1
+            var update_chunk = host_predict_chunk(n_rows, update_tasks)
+            # Every training row owns one independent kernel fold and one
+            # (SVC) or two (SVR) disjoint gradient cells.  Preserve the
+            # ascending nonzero-delta fold within each row while scheduling
+            # medium and large UpdateF batches across the host pool.
+            var fvp = rebind[HostF32Ptr](f.unsafe_ptr())
+            def _update_f(task: Int) {imm kp, imm x, imm norms, imm nz_idx, imm nz_da, imm order, mut f, imm update_chunk, imm n_rows, imm nnz, imm k, imm is_svr, imm xp, imm xtp, imm nrmp, imm fvp, imm cell_block}:
+                var lo = task * update_chunk
+                var hi = min(lo + update_chunk, n_rows)
+                var i0 = lo
+                comptime if dt == DType.float32 and SMO_HOST_VECTOR:
+                    # The cell block over W training rows; the fold over the
+                    # nonzero deltas stays in `order`, lane-wise. Not for
+                    # kernel='precomputed' (`cell_block` is False): its cell
+                    # is a copy of `x`, the scalar loop below.
+                    while cell_block and i0 + SMO_W <= hi:
+                        var nb = nrmp.unsafe_load[width=SMO_W](i0)
+                        var acc = SmoVF(0.0)
+                        for rr in range(nnz):
+                            var j = Int(order[rr])
+                            var ja = Int(nz_idx[j])
+                            var kij = _kernel_cells_v(
+                                kp, xp + ja * k, nrmp.unsafe_load(ja), xtp + i0,
+                                n_rows, nb, k,
+                            )
+                            acc = ftz_v[SMO_W](identical_mul_add_simd[SMO_W](
+                                kij, SmoVF(rebind[Float32](nz_da[j])), acc
+                            ))
+                        fvp.unsafe_store[width=SMO_W](
+                            i0, ftz_v[SMO_W](fvp.unsafe_load[width=SMO_W](i0) + acc)
+                        )
+                        if is_svr:
+                            fvp.unsafe_store[width=SMO_W](
+                                i0 + n_rows,
+                                ftz_v[SMO_W](fvp.unsafe_load[width=SMO_W](i0 + n_rows) + acc),
+                            )
+                        i0 += SMO_W
+                for i in range(i0, hi):
+                    var acc = Scalar[dt](0)
+                    for rr in range(nnz):
+                        var j = Int(order[rr])
+                        var kij = _kernel_cell[dt](
+                            kp, x, norms, Int(nz_idx[j]), x, norms, i,
+                            n_rows, n_rows, k,
+                        )
+                        acc = _flush[dt](_mad[dt](kij, nz_da[j], acc))
+                    f[i] = _flush[dt](f[i] + acc)
+                    if is_svr:
+                        f[i + n_rows] = _flush[dt](f[i + n_rows] + acc)
+            if update_tasks == 1:
+                _update_f(0)
+            else:
+                host_parallelize(_update_f, update_tasks)
+        # CheckStoppingCondition
+        if Float64(diff) > Float64(diff_prev) * 1.5 and n_outer_iter > 0:
+            n_increased_diff += 1
+        keep_going = True
+        var dd = abs(diff - diff_prev)
+        if Float64(dd) < 0.001 * Float64(tol):
+            n_small_diff += 1
+        else:
+            diff_prev = diff
+            n_small_diff = 0
+        if n_small_diff > param.nochange_steps:
+            keep_going = False
+        if diff < tol:
+            keep_going = False
+        if _isnan[dt](diff):
+            raise Error("SMO error: NaN found during fitting (oracle).")
+        n_iter += inner
+        n_outer_iter += 1
+        if (max_iter != -1 and n_iter >= max_iter) or n_outer_iter >= max_outer_iter:
+            keep_going = False
+        # record
+        var wsc = List[Int32]()
+        for t in range(n_ws):
+            wsc.append(ws.idx[t])
+        res.ws_seq.append(wsc^)
+        comptime if dt == DType.float32:
+            res.alpha_hash_seq.append(hash_f32_list(rebind[List[Float32]](alpha)))
+            res.f_hash_seq.append(hash_f32_list(rebind[List[Float32]](f)))
+        res.diff_seq.append(diff)
+        res.inner_iter_seq.append(inner)
+        res.nnz_seq.append(nnz)
+        if record_objective:
+            if is_svr:
+                res.objective_seq.append(
+                    svr_dual_objective[dt](
+                        x, y, alpha, norms, n_rows, k, kp, param.epsilon
+                    )
+                )
+            else:
+                res.objective_seq.append(
+                    dual_objective[dt](x, y_train, alpha, norms, n_rows, k, kp)
+                )
+
+    # The cell block's buffers are read through raw pointers in the loop
+    # above; keep them alive past it (Mojo frees at the last USE).
+    _ = xt^
+    _ = nrm^
+    _ = wst^
+    _ = wsn^
+    # Results. `CombineCoefs` (`results.cuh:189-200`): coef = alpha * y over
+    # n_train, then for EPSILON_SVR `raft::linalg::add(coef, coef, coef +
+    # n_rows, n_rows)`. Since y is [+1]*n ++ [-1]*n that add is
+    # `alpha_i - alpha*_i`, which is why the reference can spell a subtraction as
+    # an add. ONE addition per output, exactly rounded, nothing to pin.
+    var coef = List[Scalar[dt]]()
+    for i in range(n_train):
+        coef.append(alpha[i] * y_train[i])
+    if is_svr:
+        for i in range(n_rows):
+            coef[i] = coef[i] + coef[i + n_rows]
+    # `GetDualCoefs` / `GetSupportVectorIndices` select over `n_rows`, not
+    # `n_train`, in BOTH problems (`results.cuh:210, 227`): after the fold
+    # only the first n_rows coefficients are the answer.
+    for i in range(n_rows):
+        if coef[i] != Scalar[dt](0):
+            res.dual_coefs.append(coef[i])
+            res.support_idx.append(Int32(i))
+    var n_support = len(res.dual_coefs)
+    # The sums are `grid_sum_f32`'s fixed-order tree (DEVIATION 632's order
+    # since w2-svm, 2026-10-02), over f in index order or over the free
+    # SVs' f in index order (the device's order-preserving compaction).
+    if n_support == 0:
+        var fs = List[Scalar[dt]](capacity=n_train)
+        for i in range(n_train):
+            fs.append(f[i])
+        var s = _tree_sum[dt](fs)
+        res.b = _flush[dt](-s / Scalar[dt](n_train))
+    else:
+        var free_f = List[Scalar[dt]]()
+        for i in range(n_train):
+            if Scalar[dt](0) < alpha[i] and alpha[i] < C_vec[i]:
+                free_f.append(f[i])
+        var n_free = len(free_f)
+        if n_free > 0:
+            var s = _tree_sum[dt](free_f)
+            res.b = _flush[dt](-s / Scalar[dt](n_free))
+        else:
+            # strict `<`/`>` ascending: the FIRST index wins a +0.0/-0.0
+            # tie, as `grid_arg_f32`'s keyed trees do over the compaction
+            # (row 39); no hardware min/max
+            var b_up = _inf[dt]()
+            var b_low = -_inf[dt]()
+            var nu = 0
+            var nl = 0
+            for i in range(n_train):
+                if in_upper_g[dt](alpha[i], y_train[i], C_vec[i]):
+                    nu += 1
+                    if f[i] < b_up:
+                        b_up = f[i]
+                if in_lower_g[dt](alpha[i], y_train[i], C_vec[i]):
+                    nl += 1
+                    if f[i] > b_low:
+                        b_low = f[i]
+            if nu == 0 or nl == 0:
+                raise Error("Incorrect training: cannot calculate the constant (oracle)")
+            res.b = _flush[dt](-_flush[dt](b_up + b_low) / Scalar[dt](2))
+    comptime if SMO_ORACLE_HOST_SABOTAGE:
+        # THE INTERCEPT SABOTAGE ARM (lane/inference-svm, 2026-09-15): half a
+        # unit added to the fitted intercept. Wrong on purpose; on an
+        # integer-grid fixture the leaf-order arm leaves every fit byte in
+        # place, so a saved model's file would not move without it.
+        res.b = _flush[dt](res.b + Scalar[dt](0.5))
+    res.alpha = alpha^
+    res.f = f^
+    res.n_iter = n_iter
+    res.n_outer_iter = n_outer_iter
+    res.y = y_train^
+    return res^
+
+
+def dual_objective[
+    dt: DType
+](
+    x: List[Scalar[dt]],
+    y: List[Scalar[dt]],
+    alpha: List[Scalar[dt]],
+    norms: List[Scalar[dt]],
+    n: Int,
+    k: Int,
+    kp: KernelParams,
+) -> Float64:
+    """`W(alpha) = -sum alpha + 1/2 sum alpha_i alpha_j y_i y_j K_ij`, the
+    quantity their header says SMO MINIMIZES (`smoblocksolve.cuh:30`),
+    in Float64 over the Float32 kernel cells. For the "objective decreases"
+    gate only."""
+    var lin = Float64(0)
+    var quad = Float64(0)
+    for i in range(n):
+        var ai = Float64(alpha[i])
+        if ai == 0.0:
+            continue
+        lin += ai
+        for j in range(n):
+            var aj = Float64(alpha[j])
+            if aj == 0.0:
+                continue
+            var kij = Float64(_kernel_cell[dt](kp, x, norms, i, x, norms, j, n, n, k))
+            quad = fma(ai * aj * Float64(y[i]) * Float64(y[j]), kij, quad)  # (lane/pinned-mul-contract-free)
+    return fma(0.5, quad, -lin)  # the default build's fused op (lane/pinned-mul-contract-free)
+
+
+def smo_oracle_decision[
+    dt: DType
+](
+    res: OracleResult[dt],
+    x_train: List[Scalar[dt]],
+    n_train: Int,
+    xq: List[Scalar[dt]],
+    nq: Int,
+    k: Int,
+    kp: KernelParams,
+) -> List[Scalar[dt]]:
+    """`svcPredict(..., predict_class = false)`: `sum_j K(x_q, sv_j) *
+    dual_j` ascending over the support vectors, plus `b`."""
+    var out = List[Scalar[dt]]()
+    var sv_rows = List[Scalar[dt]]()
+    var ns = len(res.support_idx)
+    if kp.kernel == KERNEL_PRECOMPUTED:
+        # xq IS the nq x n_train cross-kernel: K(x_q, sv_j) = xq[q, support_j].
+        for i in range(nq):
+            var acc = Scalar[dt](0)
+            for j in range(ns):
+                var kij = _flush[dt](xq[i * k + Int(res.support_idx[j])])
+                acc = _flush[dt](_mad[dt](kij, res.dual_coefs[j], acc))
+            out.append(_flush[dt](acc + res.b))
+        return out^
+    for j in range(ns):
+        var r = Int(res.support_idx[j])
+        for c in range(k):
+            sv_rows.append(x_train[r * k + c])
+    var norm_q = List[Scalar[dt]]()
+    var norm_sv = List[Scalar[dt]]()
+    if kp.kernel == KERNEL_RBF:
+        for i in range(nq):
+            norm_q.append(_row_norm[dt](xq, i, k))
+        for j in range(ns):
+            norm_sv.append(_row_norm[dt](sv_rows, j, k))
+    for i in range(nq):
+        var acc = Scalar[dt](0)
+        for j in range(ns):
+            var kij = _kernel_cell[dt](kp, xq, norm_q, i, sv_rows, norm_sv, j, nq, ns, k)
+            acc = _flush[dt](_mad[dt](kij, res.dual_coefs[j], acc))
+        comptime if SMO_ORACLE_HOST_SABOTAGE:
+            # THE DECISION SABOTAGE ARM (lane/inference-svm, 2026-09-15): half
+            # a unit added to every decision value. Wrong on purpose; the
+            # leaf-order arm in _dot cannot move an integer-grid fixture, so
+            # without this a saved linear or rbf model could predict the same
+            # bytes on the sabotage build.
+            acc = _flush[dt](acc + Scalar[dt](0.5))
+        out.append(_flush[dt](acc + res.b))
+    return out^
+
+
+def smo_oracle_decision_into(
+    dual: HostF32Ptr,
+    support: HostF32Ptr,
+    n_support: Int,
+    query: HostF32Ptr,
+    n_query: Int,
+    n_features: Int,
+    kp: KernelParams,
+    b: Float32,
+    output: HostF32Ptr,
+    tasks: Int,
+) raises:
+    """Float32 ``smo_oracle_decision`` over borrowed model/query memory.
+
+    Support rows already arrive gathered in support order at the Python
+    boundary, so this door avoids copying them into Lists and gathering them
+    again through an identity index. Query rows are independent; tasks own
+    contiguous row ranges while every dot product retains the contract leaf
+    partition, ascending FMA chain, balanced fold, and ascending support
+    accumulation of ``smo_oracle_decision``.
+    """
+    var query_norms = List[Float32](length=n_query, fill=Float32(0.0))
+    var support_norms = List[Float32](length=n_support, fill=Float32(0.0))
+    if kp.kernel == KERNEL_RBF:
+        for i in range(n_query):
+            var acc = Float32(0.0)
+            for c in range(n_features):
+                var v = ftz(query.unsafe_load(i * n_features + c))
+                acc = ftz(identical_mul_add(v, v, acc))
+            query_norms[i] = ftz(acc)
+        for j in range(n_support):
+            var acc = Float32(0.0)
+            for c in range(n_features):
+                var v = ftz(support.unsafe_load(j * n_features + c))
+                acc = ftz(identical_mul_add(v, v, acc))
+            support_norms[j] = ftz(acc)
+
+    var task_count = tasks
+    if task_count < 1:
+        task_count = 1
+    if task_count > n_query:
+        task_count = n_query
+    var chunk = host_predict_chunk(n_query, task_count)
+    var qnp = query_norms.unsafe_ptr()
+    var snp = support_norms.unsafe_ptr()
+    var failed = List[Int](length=task_count, fill=0)
+    var fp = failed.unsafe_ptr()
+
+    def _rows(c: Int) {imm dual, imm support, imm query, imm output, imm qnp, imm snp, imm fp, imm chunk, imm n_query, imm n_support, imm n_features, imm kp, imm b}:
+        try:
+            var lo = c * chunk
+            var hi = min(lo + chunk, n_query)
+            var leaf = contract_leaf_size(n_features)
+            var pcount = leaf_count(n_features, leaf)
+            for i in range(lo, hi):
+                var acc = Float32(0.0)
+                # One row-local leaf workspace, folded in place per cell.
+                var partials = stack_allocation[SMO_ORACLE_MAX_LEAVES, Float32]()
+                if kp.kernel == KERNEL_PRECOMPUTED:
+                    # the query IS the n_query x n_support cross-kernel
+                    for j in range(n_support):
+                        acc = ftz(identical_mul_add(
+                            ftz(query.unsafe_load(i * n_features + j)), dual.unsafe_load(j), acc
+                        ))
+                    output.unsafe_store(i, ftz(acc + b))
+                    continue
+                for j in range(n_support):
+                    for t in range(pcount):
+                        var dot = Float32(0.0)
+                        comptime if SMO_ORACLE_HOST_SABOTAGE:
+                            var begin = leaf_begin(t, leaf)
+                            var end = leaf_end(t, leaf, n_features)
+                            for q in range(end - begin):
+                                var f = end - 1 - q
+                                dot = ftz(identical_mul_add(
+                                    ftz(query.unsafe_load(i * n_features + f)),
+                                    ftz(support.unsafe_load(j * n_features + f)), dot,
+                                ))
+                        else:
+                            for f in range(leaf_begin(t, leaf), leaf_end(t, leaf, n_features)):
+                                dot = ftz(identical_mul_add(
+                                    ftz(query.unsafe_load(i * n_features + f)),
+                                    ftz(support.unsafe_load(j * n_features + f)), dot,
+                                ))
+                        partials[t] = ftz(dot)
+                    var kij = _fold_tree_inplace(partials, pcount)
+                    if kp.kernel == KERNEL_POLYNOMIAL:
+                        var pv = ftz(identical_mul_add(
+                            Float32(kp.gamma), ftz(kij), Float32(kp.coef0)
+                        ))
+                        kij = Float32(1.0)
+                        for _ in range(kp.degree):
+                            kij = ftz(identical_mul(kij, pv))
+                        comptime if SMO_ORACLE_HOST_SABOTAGE:
+                            kij = ftz(kij + Float32(0.5))
+                    elif kp.kernel == KERNEL_TANH:
+                        kij = ftz(identical_tanh(ftz(identical_mul_add(
+                            Float32(kp.gamma), ftz(kij), Float32(kp.coef0)
+                        ))))
+                    elif kp.kernel == KERNEL_RBF:
+                        var s = ftz(
+                            ftz(ftz(qnp[i]) + ftz(snp[j]))
+                            - ftz(Float32(2.0) * ftz(kij))
+                        )
+                        kij = ftz(identical_exp(ftz((-Float32(kp.gamma)) * s)))
+                    acc = ftz(identical_mul_add(kij, dual.unsafe_load(j), acc))
+                comptime if SMO_ORACLE_HOST_SABOTAGE:
+                    acc = ftz(acc + Float32(0.5))
+                output.unsafe_store(i, ftz(acc + b))
+        except:
+            fp[c] = 1
+
+    if task_count == 1:
+        _rows(0)
+    else:
+        host_parallelize(_rows, task_count)
+    for c in range(task_count):
+        if failed[c] != 0:
+            raise Error("svm host: decision row chunk " + String(c) + " raised")
+
+
+def global_kkt_gap[
+    dt: DType
+](res: OracleResult[dt], C: Scalar[dt]) -> Scalar[dt]:
+    """`max{f_i : i in lower} - min{f_i : i in upper}` over the WHOLE
+    training set, the quantity the block solve drives below `tol` on the
+    working set. The KKT gate."""
+    var b_up = _inf[dt]()
+    var b_low = -_inf[dt]()
+    for i in range(len(res.alpha)):
+        if in_upper_g[dt](res.alpha[i], res.y[i], C):
+            if res.f[i] < b_up:
+                b_up = res.f[i]
+        if in_lower_g[dt](res.alpha[i], res.y[i], C):
+            if res.f[i] > b_low:
+                b_low = res.f[i]
+    return b_low - b_up
+
+
+# ---------------------------------------------------------------------------
+# THE REGRESSION PROPERTIES: written from the eps-insensitive dual, NOT from
+# `smo_oracle_fit` and NOT from `svm/impl/`
+# ---------------------------------------------------------------------------
+#
+# THE FORMULATION (Smola & Scholkopf 2004, "A tutorial on support vector
+# regression", eq. 10-12; the reference `smosolver.cuh:375-385` itself cites).
+# With alpha_i and alpha*_i the two multipliers of row i, the eps-insensitive
+# dual that SMO MINIMIZES is
+#
+#   W(alpha, alpha*) = 1/2 sum_ij (a_i - a*_i)(a_j - a*_j) K_ij
+#                      + eps sum_i (a_i + a*_i)
+#                      - sum_i yr_i (a_i - a*_i)
+#
+#   subject to  sum_i (a_i - a*_i) = 0  and  0 <= a_i, a*_i <= C.
+#
+# cuML lays the two multipliers out as ONE vector of length 2n with the label
+# vector yc = [+1]*n ++ [-1]*n, so alpha_p = a_p for p < n and alpha_p =
+# a*_{p-n} for p >= n, and the equality constraint becomes their usual
+# `sum_p alpha_p yc_p = 0`. Everything below is that W and its derivative,
+# and NOTHING below reads `f`, `y_train` or any other quantity the solver
+# produced. Three consequences, and they are the reason these exist:
+#
+#   * a sign error in `SvrInit` (`eps - y` swapped with `-eps - y`) moves the
+#     solver onto the eps -> -eps problem, so the W below RISES where the
+#     solver's own descends;
+#   * a direction error in `CombineCoefs` (a fold that adds where it should
+#     subtract, or that folds the wrong half) leaves `svr_gradient_reference`
+#     disagreeing with the solver's `f`;
+#   * neither is visible to a device-versus-oracle comparison, because both
+#     arms would carry the same error.
+#
+# All three are Float64 over the Float32 kernel cells, like `dual_objective`:
+# these are TOLERANCE gates, never bit gates.
+
+
+def svr_dual_objective[
+    dt: DType
+](
+    x: List[Scalar[dt]],
+    yr: List[Scalar[dt]],
+    alpha: List[Scalar[dt]],
+    norms: List[Scalar[dt]],
+    n: Int,
+    k: Int,
+    kp: KernelParams,
+    epsilon: Float64,
+) -> Float64:
+    """`W(alpha, alpha*)` of the eps-insensitive dual above, in Float64.
+
+        c_i = alpha[i] - alpha[i + n]                   (the folded coefficient)
+        W   = 1/2 sum_ij c_i c_j K_ij
+              + epsilon * sum_{p < 2n} alpha[p]
+              - sum_i yr_i c_i
+
+    `alpha` has length `2 * n` and `yr` holds the REGRESSION TARGETS.
+    O(n^2 k); the caller decides whether it can afford it per outer
+    iteration."""
+    var c = List[Float64]()
+    for i in range(n):
+        c.append(Float64(alpha[i]) - Float64(alpha[i + n]))
+    var quad = Float64(0)
+    for i in range(n):
+        if c[i] == 0.0:
+            continue
+        for j in range(n):
+            if c[j] == 0.0:
+                continue
+            var kij = Float64(
+                _kernel_cell[dt](kp, x, norms, i, x, norms, j, n, n, k)
+            )
+            quad = fma(c[i] * c[j], kij, quad)  # (lane/pinned-mul-contract-free)
+    var sum_alpha = Float64(0)
+    for p in range(2 * n):
+        sum_alpha += Float64(alpha[p])
+    var lin_y = Float64(0)
+    for i in range(n):
+        lin_y = fma(Float64(yr[i]), c[i], lin_y)  # (lane/pinned-mul-contract-free)
+    return fma(0.5, quad, epsilon * sum_alpha) - lin_y  # the default build's fused op (lane/pinned-mul-contract-free)
+
+
+def svr_gradient_reference[
+    dt: DType
+](
+    x: List[Scalar[dt]],
+    yr: List[Scalar[dt]],
+    alpha: List[Scalar[dt]],
+    norms: List[Scalar[dt]],
+    n: Int,
+    k: Int,
+    kp: KernelParams,
+    epsilon: Float64,
+) -> List[Float64]:
+    """The optimality-indicator vector `f_p = yc_p * dW/dalpha_p` of the
+    eps-insensitive dual, recomputed FROM ALPHA ALONE, length `2 * n`.
+
+    Differentiating the W above, with `g_i = sum_j c_j K_ij`:
+
+        dW/da_i  =  g_i + eps - yr_i      and  yc = +1  ->  f_i     =  g_i + eps - yr_i
+        dW/da*_i = -g_i + eps + yr_i      and  yc = -1  ->  f_{i+n} =  g_i - eps - yr_i
+
+    At `alpha = 0` this is `f_i = eps - yr_i` and `f_{i+n} = -eps - yr_i`,
+    which is `SvrInit` -- and that is the WHOLE point of the function: the
+    match is a DERIVED prediction, not a transcription. It also says the two
+    halves take the SAME increment `g_i` when alpha moves, which is why
+    `UpdateF`'s second gemv reuses one tile and one delta_alpha.
+
+    Float64 over the Float32 kernel cells; compare with a tolerance, never
+    bitwise."""
+    var c = List[Float64]()
+    for i in range(n):
+        c.append(Float64(alpha[i]) - Float64(alpha[i + n]))
+    var g = List[Float64]()
+    for i in range(n):
+        var acc = Float64(0)
+        for j in range(n):
+            if c[j] == 0.0:
+                continue
+            var kij = Float64(
+                _kernel_cell[dt](kp, x, norms, i, x, norms, j, n, n, k)
+            )
+            acc += c[j] * kij
+        g.append(acc)
+    var out = List[Float64]()
+    for i in range(n):
+        out.append(g[i] + epsilon - Float64(yr[i]))
+    for i in range(n):
+        out.append(g[i] - epsilon - Float64(yr[i]))
+    return out^
+
+
+def svr_kkt_gap[
+    dt: DType
+](f_ref: List[Float64], alpha: List[Scalar[dt]], n: Int, C: Float64) -> Float64:
+    """`max{f_p : p in I_low} - min{f_p : p in I_up}` over the 2n domain,
+    with `f_ref` the INDEPENDENT gradient above.
+
+    The sets are Keerthi's, which is what `smo_sets.cuh` spells and what the
+    block solve's two arg-reductions search; with `yc = [+1]*n ++ [-1]*n` they
+    read, per row `i`,
+
+        i     in I_up  iff alpha_i  < C      i     in I_low iff alpha_i  > 0
+        i + n in I_up  iff alpha*_i > 0      i + n in I_low iff alpha*_i < C
+
+    and the point is stationary iff `b_low - b_up <= 0`. SMO stops at `tol`,
+    so a converged fit has a gap below `tol`.
+
+    This is the CLASSIFICATION gap's formula over the regression domain, and
+    on its own that proves nothing -- `global_kkt_gap` would compute the same
+    number off `res.f`. What makes it a gate is the argument: `f_ref` comes
+    from `svr_gradient_reference`, so `SvrInit`, `UpdateF` and the solver's
+    own `f` are nowhere on the path."""
+    var b_up = inf[DType.float64]()
+    var b_low = -inf[DType.float64]()
+    for p in range(2 * n):
+        var yl = Float64(1.0) if p < n else Float64(-1.0)
+        var a = Float64(alpha[p])
+        if in_upper_g[DType.float64](a, yl, C):
+            if f_ref[p] < b_up:
+                b_up = f_ref[p]
+        if in_lower_g[DType.float64](a, yl, C):
+            if f_ref[p] > b_low:
+                b_low = f_ref[p]
+    return b_low - b_up
+
+
+def svr_tube_bound(epsilon: Float64, kkt_gap: Float64) -> Float64:
+    """The EXACT bound on `|yr_i - decision(x_i)|` for a row with
+    `alpha_i == 0` and `alpha*_i == 0`, given a fit whose KKT gap is
+    `kkt_gap`. Returns `epsilon + max(kkt_gap, 0)`.
+
+    DERIVATION, from the gradient above and nothing else. Write `g_i =
+    sum_j c_j K_ij`, so `decision(x_i) = g_i + b`.
+
+        f_i     = g_i + eps - yr_i   ->   yr_i - g_i =  eps - f_i
+        f_{i+n} = g_i - eps - yr_i   ->   yr_i - g_i = -eps - f_{i+n}
+
+    so the residual `r_i = yr_i - decision(x_i) = (yr_i - g_i) - b` is both
+    `eps - f_i - b` and `-eps - f_{i+n} - b`.
+
+    A row with both multipliers at zero is in I_up through `i` (alpha_i < C)
+    and in I_low through `i + n` (alpha*_i < C), so `f_i >= b_up` and
+    `f_{i+n} <= b_low`. And `-b` is a mean of `f` over the FREE support
+    vectors, each of which is in BOTH sets, so `-b` lies in `[b_up, b_low]`;
+    when there are no free SVs, `-b = (b_up + b_low)/2`, which lies there too
+    whenever `b_up <= b_low` and below `b_up` otherwise. Either way
+    `b_up <= -b <= max(b_up, b_low)`. Then
+
+        r_i =  eps - f_i     - b <=  eps - b_up  + b_low = eps + gap
+        r_i = -eps - f_{i+n} - b >= -eps - b_low + b_up  = -eps - gap
+
+    so `|r_i| <= eps + gap`, and at gap <= 0 the tube is exact: EVERY
+    non-support-vector lies inside +-epsilon. The caller adds a Float32
+    slack on top; the bound itself has none.
+
+    Independent of the other three: it needs the decision function and `b`,
+    which the dual objective and the KKT gap never touch, and it would catch
+    a `CombineCoefs` fold that produced the right dual and the wrong
+    coefficients."""
+    var g = kkt_gap
+    if g < 0.0:
+        g = 0.0
+    return epsilon + g

@@ -1,0 +1,1106 @@
+{
+ "format": "anonlib.verify-models.v1",
+ "models": [
+  {
+   "batch_hash": "cec53714495b4d9c",
+   "bytes": 94660,
+   "class": "RandomForestClassifier",
+   "file": "rf-clf.base.npz",
+   "fixture": "base",
+   "lane": "rf-clf",
+   "load": "load",
+   "model_hash": "ed1592a2b0ab1658",
+   "trained_on": {
+    "classes_agreeing": [
+     "amd",
+     "apple",
+     "cpu",
+     "nvidia"
+    ],
+    "vendor": "cuda"
+   }
+  },
+  {
+   "batch_hash": "9d36287df25eff95",
+   "bytes": 79675,
+   "class": "GradientBoosting",
+   "file": "gbdt-symmetric.base.npz",
+   "fixture": "base",
+   "lane": "gbdt-symmetric",
+   "load": "load",
+   "model_hash": "ee776c33f052679a",
+   "trained_on": {
+    "classes_agreeing": [
+     "amd",
+     "apple",
+     "cpu",
+     "nvidia"
+    ],
+    "vendor": "cuda"
+   }
+  },
+  {
+   "batch_hash": "c3ad4d14baa3a62f",
+   "bytes": 1642,
+   "class": "LinearRegression",
+   "file": "ols.base.npz",
+   "fixture": "base",
+   "lane": "ols",
+   "load": "load",
+   "model_hash": "d6f4abe861e69f05",
+   "trained_on": {
+    "classes_agreeing": [
+     "amd",
+     "apple",
+     "nvidia"
+    ],
+    "vendor": "cuda"
+   }
+  },
+  {
+   "batch_hash": "a4393ca903fbbea4",
+   "bytes": 3138,
+   "class": "PCA",
+   "file": "pca.base.npz",
+   "fixture": "base",
+   "lane": "pca",
+   "load": "load",
+   "model_hash": "9ac162debf1581fe",
+   "trained_on": {
+    "classes_agreeing": [
+     "amd",
+     "apple",
+     "cpu",
+     "nvidia"
+    ],
+    "vendor": "cuda"
+   }
+  },
+  {
+   "batch_hash": "2d495dae96246c37",
+   "bytes": 2812,
+   "class": "KernelRidge",
+   "file": "kernel-ridge-laplacian.base.npz",
+   "fixture": "base",
+   "lane": "kernel-ridge-laplacian",
+   "load": "load",
+   "model_hash": "8c222a5b89d0f520",
+   "trained_on": {
+    "classes_agreeing": [
+     "amd",
+     "apple",
+     "cpu",
+     "nvidia"
+    ],
+    "vendor": "cuda"
+   }
+  },
+  {
+   "batch_hash": "79d348ae1cd8d648",
+   "bytes": 2812,
+   "class": "KernelRidge",
+   "file": "kernel-ridge-laplacian.denormal.npz",
+   "fixture": "denormal",
+   "lane": "kernel-ridge-laplacian",
+   "load": "load",
+   "model_hash": "047872cc9d57b979",
+   "trained_on": {
+    "classes_agreeing": [
+     "amd",
+     "apple",
+     "cpu",
+     "nvidia"
+    ],
+    "vendor": "cuda"
+   }
+  },
+  {
+   "batch_hash": "79d348ae1cd8d648",
+   "bytes": 2812,
+   "class": "KernelRidge",
+   "file": "kernel-ridge-laplacian.denormal_ftz.npz",
+   "fixture": "denormal_ftz",
+   "lane": "kernel-ridge-laplacian",
+   "load": "load",
+   "model_hash": "6638b7e5a05a1f08",
+   "trained_on": {
+    "classes_agreeing": [
+     "amd",
+     "apple",
+     "cpu",
+     "nvidia"
+    ],
+    "vendor": "cuda"
+   }
+  },
+  {
+   "batch_hash": "5e5b1a9d977a224b",
+   "bytes": 2812,
+   "class": "KernelRidge",
+   "file": "kernel-ridge-laplacian.dupes.npz",
+   "fixture": "dupes",
+   "lane": "kernel-ridge-laplacian",
+   "load": "load",
+   "model_hash": "a0632a87ef34d737",
+   "trained_on": {
+    "classes_agreeing": [
+     "amd",
+     "apple",
+     "cpu",
+     "nvidia"
+    ],
+    "vendor": "cuda"
+   }
+  },
+  {
+   "batch_hash": "071d1f9f3614cb9e",
+   "bytes": 2812,
+   "class": "KernelRidge",
+   "file": "kernel-ridge-laplacian.hashed.npz",
+   "fixture": "hashed",
+   "lane": "kernel-ridge-laplacian",
+   "load": "load",
+   "model_hash": "ecdd20a18fddcfac",
+   "trained_on": {
+    "classes_agreeing": [
+     "amd",
+     "apple",
+     "cpu",
+     "nvidia"
+    ],
+    "vendor": "cuda"
+   }
+  },
+  {
+   "batch_hash": "ad5d89fdd50ba904",
+   "bytes": 2812,
+   "class": "KernelRidge",
+   "file": "kernel-ridge-laplacian.negative.npz",
+   "fixture": "negative",
+   "lane": "kernel-ridge-laplacian",
+   "load": "load",
+   "model_hash": "6a51f60e14cbc0dd",
+   "trained_on": {
+    "classes_agreeing": [
+     "amd",
+     "apple",
+     "cpu",
+     "nvidia"
+    ],
+    "vendor": "cuda"
+   }
+  },
+  {
+   "batch_hash": "6e37077e397d49e6",
+   "bytes": 2812,
+   "class": "KernelRidge",
+   "file": "kernel-ridge-laplacian.odd.npz",
+   "fixture": "odd",
+   "lane": "kernel-ridge-laplacian",
+   "load": "load",
+   "model_hash": "242d6365ce89e185",
+   "trained_on": {
+    "classes_agreeing": [
+     "amd",
+     "apple",
+     "cpu",
+     "nvidia"
+    ],
+    "vendor": "cuda"
+   }
+  },
+  {
+   "batch_hash": "54001895e91abd09",
+   "bytes": 2812,
+   "class": "KernelRidge",
+   "file": "kernel-ridge-laplacian.ties.npz",
+   "fixture": "ties",
+   "lane": "kernel-ridge-laplacian",
+   "load": "load",
+   "model_hash": "857ab7ff0c67b9ca",
+   "trained_on": {
+    "classes_agreeing": [
+     "amd",
+     "apple",
+     "cpu",
+     "nvidia"
+    ],
+    "vendor": "cuda"
+   }
+  },
+  {
+   "batch_hash": "fcbe7a8e5773fb00",
+   "bytes": 2812,
+   "class": "KernelRidge",
+   "file": "kernel-ridge-laplacian.wide.npz",
+   "fixture": "wide",
+   "lane": "kernel-ridge-laplacian",
+   "load": "load",
+   "model_hash": "95b734acb147fe05",
+   "trained_on": {
+    "classes_agreeing": [
+     "amd",
+     "apple",
+     "cpu",
+     "nvidia"
+    ],
+    "vendor": "cuda"
+   }
+  },
+  {
+   "batch_hash": "31cc69bc610faf3b",
+   "bytes": 2812,
+   "class": "KernelRidge",
+   "file": "kernel-ridge-poly.base.npz",
+   "fixture": "base",
+   "lane": "kernel-ridge-poly",
+   "load": "load",
+   "model_hash": "3cb5b554392b9c64",
+   "trained_on": {
+    "classes_agreeing": [
+     "amd",
+     "apple",
+     "cpu",
+     "nvidia"
+    ],
+    "vendor": "cuda"
+   }
+  },
+  {
+   "batch_hash": "4724b0db84f9a65c",
+   "bytes": 2812,
+   "class": "KernelRidge",
+   "file": "kernel-ridge-poly.denormal.npz",
+   "fixture": "denormal",
+   "lane": "kernel-ridge-poly",
+   "load": "load",
+   "model_hash": "c85c95edb51db53b",
+   "trained_on": {
+    "classes_agreeing": [
+     "amd",
+     "apple",
+     "cpu",
+     "nvidia"
+    ],
+    "vendor": "cuda"
+   }
+  },
+  {
+   "batch_hash": "4724b0db84f9a65c",
+   "bytes": 2812,
+   "class": "KernelRidge",
+   "file": "kernel-ridge-poly.denormal_ftz.npz",
+   "fixture": "denormal_ftz",
+   "lane": "kernel-ridge-poly",
+   "load": "load",
+   "model_hash": "bc72cd423aa823cb",
+   "trained_on": {
+    "classes_agreeing": [
+     "amd",
+     "apple",
+     "cpu",
+     "nvidia"
+    ],
+    "vendor": "cuda"
+   }
+  },
+  {
+   "batch_hash": "39a4074f8df4f696",
+   "bytes": 2812,
+   "class": "KernelRidge",
+   "file": "kernel-ridge-poly.dupes.npz",
+   "fixture": "dupes",
+   "lane": "kernel-ridge-poly",
+   "load": "load",
+   "model_hash": "a610160c984b5da8",
+   "trained_on": {
+    "classes_agreeing": [
+     "amd",
+     "apple",
+     "cpu",
+     "nvidia"
+    ],
+    "vendor": "cuda"
+   }
+  },
+  {
+   "batch_hash": "c3bb18f194f85621",
+   "bytes": 2812,
+   "class": "KernelRidge",
+   "file": "kernel-ridge-poly.hashed.npz",
+   "fixture": "hashed",
+   "lane": "kernel-ridge-poly",
+   "load": "load",
+   "model_hash": "8ccf3282e056fb09",
+   "trained_on": {
+    "classes_agreeing": [
+     "amd",
+     "apple",
+     "cpu",
+     "nvidia"
+    ],
+    "vendor": "cuda"
+   }
+  },
+  {
+   "batch_hash": "9ac6fa991d26d95d",
+   "bytes": 2812,
+   "class": "KernelRidge",
+   "file": "kernel-ridge-poly.negative.npz",
+   "fixture": "negative",
+   "lane": "kernel-ridge-poly",
+   "load": "load",
+   "model_hash": "73a9bc6f72a67956",
+   "trained_on": {
+    "classes_agreeing": [
+     "amd",
+     "apple",
+     "cpu",
+     "nvidia"
+    ],
+    "vendor": "cuda"
+   }
+  },
+  {
+   "batch_hash": "8ee922739ea3b9ff",
+   "bytes": 2812,
+   "class": "KernelRidge",
+   "file": "kernel-ridge-poly.odd.npz",
+   "fixture": "odd",
+   "lane": "kernel-ridge-poly",
+   "load": "load",
+   "model_hash": "bbf78f551ba29cfb",
+   "trained_on": {
+    "classes_agreeing": [
+     "amd",
+     "apple",
+     "cpu",
+     "nvidia"
+    ],
+    "vendor": "cuda"
+   }
+  },
+  {
+   "batch_hash": "0b5219578e1e1dee",
+   "bytes": 2812,
+   "class": "KernelRidge",
+   "file": "kernel-ridge-poly.ties.npz",
+   "fixture": "ties",
+   "lane": "kernel-ridge-poly",
+   "load": "load",
+   "model_hash": "c35c2c5ce99c3456",
+   "trained_on": {
+    "classes_agreeing": [
+     "amd",
+     "apple",
+     "cpu",
+     "nvidia"
+    ],
+    "vendor": "cuda"
+   }
+  },
+  {
+   "batch_hash": "3b05e689bffc4e39",
+   "bytes": 2812,
+   "class": "KernelRidge",
+   "file": "kernel-ridge-poly.wide.npz",
+   "fixture": "wide",
+   "lane": "kernel-ridge-poly",
+   "load": "load",
+   "model_hash": "4c784ab3dfa17581",
+   "trained_on": {
+    "classes_agreeing": [
+     "amd",
+     "apple",
+     "cpu",
+     "nvidia"
+    ],
+    "vendor": "cuda"
+   }
+  },
+  {
+   "batch_hash": "4637348f319328b3",
+   "bytes": 2812,
+   "class": "KernelRidge",
+   "file": "kernel-ridge-sigmoid.base.npz",
+   "fixture": "base",
+   "lane": "kernel-ridge-sigmoid",
+   "load": "load",
+   "model_hash": "01b80bafa79d7e11",
+   "trained_on": {
+    "classes_agreeing": [
+     "amd",
+     "apple",
+     "cpu",
+     "nvidia"
+    ],
+    "vendor": "cuda"
+   }
+  },
+  {
+   "batch_hash": "a75b90b1f19795b1",
+   "bytes": 2812,
+   "class": "KernelRidge",
+   "file": "kernel-ridge-sigmoid.denormal.npz",
+   "fixture": "denormal",
+   "lane": "kernel-ridge-sigmoid",
+   "load": "load",
+   "model_hash": "aee11d8e159b5d06",
+   "trained_on": {
+    "classes_agreeing": [
+     "amd",
+     "apple",
+     "cpu",
+     "nvidia"
+    ],
+    "vendor": "cuda"
+   }
+  },
+  {
+   "batch_hash": "a75b90b1f19795b1",
+   "bytes": 2812,
+   "class": "KernelRidge",
+   "file": "kernel-ridge-sigmoid.denormal_ftz.npz",
+   "fixture": "denormal_ftz",
+   "lane": "kernel-ridge-sigmoid",
+   "load": "load",
+   "model_hash": "738eadecea288223",
+   "trained_on": {
+    "classes_agreeing": [
+     "amd",
+     "apple",
+     "cpu",
+     "nvidia"
+    ],
+    "vendor": "cuda"
+   }
+  },
+  {
+   "batch_hash": "b36c90e041ea4f3f",
+   "bytes": 2812,
+   "class": "KernelRidge",
+   "file": "kernel-ridge-sigmoid.dupes.npz",
+   "fixture": "dupes",
+   "lane": "kernel-ridge-sigmoid",
+   "load": "load",
+   "model_hash": "7be40ded64a7232a",
+   "trained_on": {
+    "classes_agreeing": [
+     "amd",
+     "apple",
+     "cpu",
+     "nvidia"
+    ],
+    "vendor": "cuda"
+   }
+  },
+  {
+   "batch_hash": "ade96066b408a1f1",
+   "bytes": 2812,
+   "class": "KernelRidge",
+   "file": "kernel-ridge-sigmoid.hashed.npz",
+   "fixture": "hashed",
+   "lane": "kernel-ridge-sigmoid",
+   "load": "load",
+   "model_hash": "9076208aa14e62d9",
+   "trained_on": {
+    "classes_agreeing": [
+     "amd",
+     "apple",
+     "cpu",
+     "nvidia"
+    ],
+    "vendor": "cuda"
+   }
+  },
+  {
+   "batch_hash": "5f07c3b74562629d",
+   "bytes": 2812,
+   "class": "KernelRidge",
+   "file": "kernel-ridge-sigmoid.negative.npz",
+   "fixture": "negative",
+   "lane": "kernel-ridge-sigmoid",
+   "load": "load",
+   "model_hash": "6d37208bc261fb79",
+   "trained_on": {
+    "classes_agreeing": [
+     "amd",
+     "apple",
+     "cpu",
+     "nvidia"
+    ],
+    "vendor": "cuda"
+   }
+  },
+  {
+   "batch_hash": "58c7b79372715966",
+   "bytes": 2812,
+   "class": "KernelRidge",
+   "file": "kernel-ridge-sigmoid.odd.npz",
+   "fixture": "odd",
+   "lane": "kernel-ridge-sigmoid",
+   "load": "load",
+   "model_hash": "a5c31068bb72f550",
+   "trained_on": {
+    "classes_agreeing": [
+     "amd",
+     "apple",
+     "cpu",
+     "nvidia"
+    ],
+    "vendor": "cuda"
+   }
+  },
+  {
+   "batch_hash": "e2b86a79415e3151",
+   "bytes": 2812,
+   "class": "KernelRidge",
+   "file": "kernel-ridge-sigmoid.ties.npz",
+   "fixture": "ties",
+   "lane": "kernel-ridge-sigmoid",
+   "load": "load",
+   "model_hash": "445dbc32d4e9611c",
+   "trained_on": {
+    "classes_agreeing": [
+     "amd",
+     "apple",
+     "cpu",
+     "nvidia"
+    ],
+    "vendor": "cuda"
+   }
+  },
+  {
+   "batch_hash": "b6927fb3e33baf6d",
+   "bytes": 2812,
+   "class": "KernelRidge",
+   "file": "kernel-ridge-sigmoid.wide.npz",
+   "fixture": "wide",
+   "lane": "kernel-ridge-sigmoid",
+   "load": "load",
+   "model_hash": "b49cbf31b328ac08",
+   "trained_on": {
+    "classes_agreeing": [
+     "amd",
+     "apple",
+     "cpu",
+     "nvidia"
+    ],
+    "vendor": "cuda"
+   }
+  },
+  {
+   "batch_hash": "5e984c2dfbe79955",
+   "bytes": 3256,
+   "class": "Nystroem",
+   "file": "nystroem-laplacian.base.npz",
+   "fixture": "base",
+   "lane": "nystroem-laplacian",
+   "load": "load",
+   "model_hash": "e2622bf013c93512",
+   "trained_on": {
+    "classes_agreeing": [
+     "amd",
+     "apple",
+     "cpu",
+     "nvidia"
+    ],
+    "vendor": "cuda"
+   }
+  },
+  {
+   "batch_hash": "704d7c74cb960ad8",
+   "bytes": 3256,
+   "class": "Nystroem",
+   "file": "nystroem-laplacian.denormal.npz",
+   "fixture": "denormal",
+   "lane": "nystroem-laplacian",
+   "load": "load",
+   "model_hash": "361962ce9c40dd42",
+   "trained_on": {
+    "classes_agreeing": [
+     "amd",
+     "apple",
+     "cpu",
+     "nvidia"
+    ],
+    "vendor": "cuda"
+   }
+  },
+  {
+   "batch_hash": "704d7c74cb960ad8",
+   "bytes": 3256,
+   "class": "Nystroem",
+   "file": "nystroem-laplacian.denormal_ftz.npz",
+   "fixture": "denormal_ftz",
+   "lane": "nystroem-laplacian",
+   "load": "load",
+   "model_hash": "53fb3bc11d1e846e",
+   "trained_on": {
+    "classes_agreeing": [
+     "amd",
+     "apple",
+     "cpu",
+     "nvidia"
+    ],
+    "vendor": "cuda"
+   }
+  },
+  {
+   "batch_hash": "5e984c2dfbe79955",
+   "bytes": 3256,
+   "class": "Nystroem",
+   "file": "nystroem-laplacian.dupes.npz",
+   "fixture": "dupes",
+   "lane": "nystroem-laplacian",
+   "load": "load",
+   "model_hash": "e2622bf013c93512",
+   "trained_on": {
+    "classes_agreeing": [
+     "amd",
+     "apple",
+     "cpu",
+     "nvidia"
+    ],
+    "vendor": "cuda"
+   }
+  },
+  {
+   "batch_hash": "baa732fef7af4bca",
+   "bytes": 3256,
+   "class": "Nystroem",
+   "file": "nystroem-laplacian.hashed.npz",
+   "fixture": "hashed",
+   "lane": "nystroem-laplacian",
+   "load": "load",
+   "model_hash": "11064f13887203c9",
+   "trained_on": {
+    "classes_agreeing": [
+     "amd",
+     "apple",
+     "cpu",
+     "nvidia"
+    ],
+    "vendor": "cuda"
+   }
+  },
+  {
+   "batch_hash": "0118bf973919218a",
+   "bytes": 3256,
+   "class": "Nystroem",
+   "file": "nystroem-laplacian.negative.npz",
+   "fixture": "negative",
+   "lane": "nystroem-laplacian",
+   "load": "load",
+   "model_hash": "a3e41708c273d254",
+   "trained_on": {
+    "classes_agreeing": [
+     "amd",
+     "apple",
+     "cpu",
+     "nvidia"
+    ],
+    "vendor": "cuda"
+   }
+  },
+  {
+   "batch_hash": "44a128298266be2a",
+   "bytes": 3256,
+   "class": "Nystroem",
+   "file": "nystroem-laplacian.odd.npz",
+   "fixture": "odd",
+   "lane": "nystroem-laplacian",
+   "load": "load",
+   "model_hash": "a552b4ac4fdd8f92",
+   "trained_on": {
+    "classes_agreeing": [
+     "amd",
+     "apple",
+     "cpu",
+     "nvidia"
+    ],
+    "vendor": "cuda"
+   }
+  },
+  {
+   "batch_hash": "be0dc6507991cf25",
+   "bytes": 3256,
+   "class": "Nystroem",
+   "file": "nystroem-laplacian.ties.npz",
+   "fixture": "ties",
+   "lane": "nystroem-laplacian",
+   "load": "load",
+   "model_hash": "b1c1c1a404b3d228",
+   "trained_on": {
+    "classes_agreeing": [
+     "amd",
+     "apple",
+     "cpu",
+     "nvidia"
+    ],
+    "vendor": "cuda"
+   }
+  },
+  {
+   "batch_hash": "1a092155fb9c4653",
+   "bytes": 3256,
+   "class": "Nystroem",
+   "file": "nystroem-laplacian.wide.npz",
+   "fixture": "wide",
+   "lane": "nystroem-laplacian",
+   "load": "load",
+   "model_hash": "bfef724a4f312d61",
+   "trained_on": {
+    "classes_agreeing": [
+     "amd",
+     "apple",
+     "cpu",
+     "nvidia"
+    ],
+    "vendor": "cuda"
+   }
+  },
+  {
+   "batch_hash": "f3c85f217b843b23",
+   "bytes": 3256,
+   "class": "Nystroem",
+   "file": "nystroem-poly.base.npz",
+   "fixture": "base",
+   "lane": "nystroem-poly",
+   "load": "load",
+   "model_hash": "c2497029d3a9f994",
+   "trained_on": {
+    "classes_agreeing": [
+     "amd",
+     "apple",
+     "cpu",
+     "nvidia"
+    ],
+    "vendor": "cuda"
+   }
+  },
+  {
+   "batch_hash": "2aca18ef82b8a3ac",
+   "bytes": 3256,
+   "class": "Nystroem",
+   "file": "nystroem-poly.denormal.npz",
+   "fixture": "denormal",
+   "lane": "nystroem-poly",
+   "load": "load",
+   "model_hash": "ddfc444a0bf5200c",
+   "trained_on": {
+    "classes_agreeing": [
+     "amd",
+     "apple",
+     "cpu",
+     "nvidia"
+    ],
+    "vendor": "cuda"
+   }
+  },
+  {
+   "batch_hash": "2aca18ef82b8a3ac",
+   "bytes": 3256,
+   "class": "Nystroem",
+   "file": "nystroem-poly.denormal_ftz.npz",
+   "fixture": "denormal_ftz",
+   "lane": "nystroem-poly",
+   "load": "load",
+   "model_hash": "b4842707f65fca9b",
+   "trained_on": {
+    "classes_agreeing": [
+     "amd",
+     "apple",
+     "cpu",
+     "nvidia"
+    ],
+    "vendor": "cuda"
+   }
+  },
+  {
+   "batch_hash": "f3c85f217b843b23",
+   "bytes": 3256,
+   "class": "Nystroem",
+   "file": "nystroem-poly.dupes.npz",
+   "fixture": "dupes",
+   "lane": "nystroem-poly",
+   "load": "load",
+   "model_hash": "c2497029d3a9f994",
+   "trained_on": {
+    "classes_agreeing": [
+     "amd",
+     "apple",
+     "cpu",
+     "nvidia"
+    ],
+    "vendor": "cuda"
+   }
+  },
+  {
+   "batch_hash": "695b601ae073d30b",
+   "bytes": 3256,
+   "class": "Nystroem",
+   "file": "nystroem-poly.hashed.npz",
+   "fixture": "hashed",
+   "lane": "nystroem-poly",
+   "load": "load",
+   "model_hash": "cf6a37d21baa41a9",
+   "trained_on": {
+    "classes_agreeing": [
+     "amd",
+     "apple",
+     "cpu",
+     "nvidia"
+    ],
+    "vendor": "cuda"
+   }
+  },
+  {
+   "batch_hash": "469cf3b5d0d77939",
+   "bytes": 3256,
+   "class": "Nystroem",
+   "file": "nystroem-poly.negative.npz",
+   "fixture": "negative",
+   "lane": "nystroem-poly",
+   "load": "load",
+   "model_hash": "459ed091ec304438",
+   "trained_on": {
+    "classes_agreeing": [
+     "amd",
+     "apple",
+     "cpu",
+     "nvidia"
+    ],
+    "vendor": "cuda"
+   }
+  },
+  {
+   "batch_hash": "e12fc3b062f51bd4",
+   "bytes": 3256,
+   "class": "Nystroem",
+   "file": "nystroem-poly.odd.npz",
+   "fixture": "odd",
+   "lane": "nystroem-poly",
+   "load": "load",
+   "model_hash": "6e52cb78eb5d0bff",
+   "trained_on": {
+    "classes_agreeing": [
+     "amd",
+     "apple",
+     "cpu",
+     "nvidia"
+    ],
+    "vendor": "cuda"
+   }
+  },
+  {
+   "batch_hash": "4421e2494101e9d9",
+   "bytes": 3256,
+   "class": "Nystroem",
+   "file": "nystroem-poly.ties.npz",
+   "fixture": "ties",
+   "lane": "nystroem-poly",
+   "load": "load",
+   "model_hash": "340e7b9d3af7d8c0",
+   "trained_on": {
+    "classes_agreeing": [
+     "amd",
+     "apple",
+     "cpu",
+     "nvidia"
+    ],
+    "vendor": "cuda"
+   }
+  },
+  {
+   "batch_hash": "aea17191ef178d52",
+   "bytes": 3256,
+   "class": "Nystroem",
+   "file": "nystroem-poly.wide.npz",
+   "fixture": "wide",
+   "lane": "nystroem-poly",
+   "load": "load",
+   "model_hash": "ec803d3387286c62",
+   "trained_on": {
+    "classes_agreeing": [
+     "amd",
+     "apple",
+     "cpu",
+     "nvidia"
+    ],
+    "vendor": "cuda"
+   }
+  },
+  {
+   "batch_hash": "0313d5a954b4ffad",
+   "bytes": 3256,
+   "class": "Nystroem",
+   "file": "nystroem-sigmoid.base.npz",
+   "fixture": "base",
+   "lane": "nystroem-sigmoid",
+   "load": "load",
+   "model_hash": "d7b73cd95d37b3ce",
+   "trained_on": {
+    "classes_agreeing": [
+     "amd",
+     "apple",
+     "cpu",
+     "nvidia"
+    ],
+    "vendor": "cuda"
+   }
+  },
+  {
+   "batch_hash": "6a4f360b573227a9",
+   "bytes": 3256,
+   "class": "Nystroem",
+   "file": "nystroem-sigmoid.denormal.npz",
+   "fixture": "denormal",
+   "lane": "nystroem-sigmoid",
+   "load": "load",
+   "model_hash": "417fbd6a4460c473",
+   "trained_on": {
+    "classes_agreeing": [
+     "amd",
+     "apple",
+     "cpu",
+     "nvidia"
+    ],
+    "vendor": "cuda"
+   }
+  },
+  {
+   "batch_hash": "6a4f360b573227a9",
+   "bytes": 3256,
+   "class": "Nystroem",
+   "file": "nystroem-sigmoid.denormal_ftz.npz",
+   "fixture": "denormal_ftz",
+   "lane": "nystroem-sigmoid",
+   "load": "load",
+   "model_hash": "aabec6dc05d442a8",
+   "trained_on": {
+    "classes_agreeing": [
+     "amd",
+     "apple",
+     "cpu",
+     "nvidia"
+    ],
+    "vendor": "cuda"
+   }
+  },
+  {
+   "batch_hash": "0313d5a954b4ffad",
+   "bytes": 3256,
+   "class": "Nystroem",
+   "file": "nystroem-sigmoid.dupes.npz",
+   "fixture": "dupes",
+   "lane": "nystroem-sigmoid",
+   "load": "load",
+   "model_hash": "d7b73cd95d37b3ce",
+   "trained_on": {
+    "classes_agreeing": [
+     "amd",
+     "apple",
+     "cpu",
+     "nvidia"
+    ],
+    "vendor": "cuda"
+   }
+  },
+  {
+   "batch_hash": "b376a70b73324786",
+   "bytes": 3256,
+   "class": "Nystroem",
+   "file": "nystroem-sigmoid.hashed.npz",
+   "fixture": "hashed",
+   "lane": "nystroem-sigmoid",
+   "load": "load",
+   "model_hash": "1a48fc3497c832d2",
+   "trained_on": {
+    "classes_agreeing": [
+     "amd",
+     "apple",
+     "cpu",
+     "nvidia"
+    ],
+    "vendor": "cuda"
+   }
+  },
+  {
+   "batch_hash": "36612e8cd57adddd",
+   "bytes": 3256,
+   "class": "Nystroem",
+   "file": "nystroem-sigmoid.negative.npz",
+   "fixture": "negative",
+   "lane": "nystroem-sigmoid",
+   "load": "load",
+   "model_hash": "c8d55fc9f9c8125f",
+   "trained_on": {
+    "classes_agreeing": [
+     "amd",
+     "apple",
+     "cpu",
+     "nvidia"
+    ],
+    "vendor": "cuda"
+   }
+  },
+  {
+   "batch_hash": "1de3a1f03d733894",
+   "bytes": 3256,
+   "class": "Nystroem",
+   "file": "nystroem-sigmoid.odd.npz",
+   "fixture": "odd",
+   "lane": "nystroem-sigmoid",
+   "load": "load",
+   "model_hash": "18e58cb13bd32516",
+   "trained_on": {
+    "classes_agreeing": [
+     "amd",
+     "apple",
+     "cpu",
+     "nvidia"
+    ],
+    "vendor": "cuda"
+   }
+  },
+  {
+   "batch_hash": "c2fac2060cd4dc39",
+   "bytes": 3256,
+   "class": "Nystroem",
+   "file": "nystroem-sigmoid.ties.npz",
+   "fixture": "ties",
+   "lane": "nystroem-sigmoid",
+   "load": "load",
+   "model_hash": "bb32c0a0d4cf4a80",
+   "trained_on": {
+    "classes_agreeing": [
+     "amd",
+     "apple",
+     "cpu",
+     "nvidia"
+    ],
+    "vendor": "cuda"
+   }
+  },
+  {
+   "batch_hash": "bcece1cadad1eaa8",
+   "bytes": 3256,
+   "class": "Nystroem",
+   "file": "nystroem-sigmoid.wide.npz",
+   "fixture": "wide",
+   "lane": "nystroem-sigmoid",
+   "load": "load",
+   "model_hash": "100ee295c93e351b",
+   "trained_on": {
+    "classes_agreeing": [
+     "amd",
+     "apple",
+     "cpu",
+     "nvidia"
+    ],
+    "vendor": "cuda"
+   }
+  }
+ ]
+}

@@ -1,0 +1,3279 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 the authors. Part of anonlib, DOI-WITHHELD
+"""Transformer backward kernels and host-side launch composition used by the independent gradient checks."""
+
+from transformer.experiments.norm_profile import (
+    NN24_NORM_LANES8, NN24_LANES, _sum, _square, norm_profile_dot,
+)
+from std.gpu import block_dim, block_idx, thread_idx
+from std.time import perf_counter_ns
+from std.memory import bitcast, memcpy
+from std.sys.compile import is_defined
+from max.gpu.host import DeviceBuffer, DeviceContext
+# DEVIATION 2630: the step phase timers and counters (core/step_phase.mojo;
+# compiled only under -D ANONLIB_STEP_PHASE_TIMERS=1).
+from core.device_arena import arena_active, arena_take
+# lane afn-lm (2026-10-03): Apple FAST experiments, each False unless the
+# build is FAST, on Apple, and carries its own -D ANONLIB_AFN_LM_* define.
+from training.byte_lm_afn import AFN_LM_BWD_FUSE, AFN_LM_BWD_NOSYNC
+# lane w2-lmgrad (2026-10-03): the block backward on the merged Apple FAST
+# GEMM; each False unless FAST, Apple, and its own -D ANONLIB_AFN_LM_* define
+# (or ANONLIB_AFN_LMGRAD_ALL). IDENTICAL compiles none of their arms.
+from autograd.kernels.transformer_afn import (
+    AFN_LM_BWD_NORM1_RESID,
+    AFN_LM_WGRAD_SPLIT,
+    afn_lm_wgrad_split_into,
+)
+from core.step_phase import (
+    StepPhaseClock,
+    step_count_d2h,
+    step_count_device_alloc,
+    step_count_h2d,
+    step_count_host_alloc,
+    step_count_launch,
+    step_count_sync,
+)
+from autograd.kernels.checks.readback import _download
+# DEVIATION 2645: the RMSNorm row launch geometry arm (core/step_glue.mojo).
+# Its launch path is compiled under -D ANONLIB_STEP_GLUE_TRIAL=1, and since
+# DEVIATION 2649 also on a shipped build whose column default carries a rows
+# token (`STEP_GLUE_SHIPPED_ROWS`, NVIDIA only).
+from core.step_glue import (
+    STEP_GLUE_SHIPPED_ROWS,
+    STEP_GLUE_TRIAL,
+    step_glue_arm_from_env,
+    step_glue_blocks,
+    step_glue_rows_of,
+)
+
+from core.identity_trace import IdentityTrace
+from gemm.neural_backward import (
+    BWD_DC_LEFT,
+    gemm_backward_a_call,
+    gemm_backward_b_call,
+)
+from gemm.neural_dispatch import GemmWorkspace, identical_gemm
+from std.os import getenv
+from gemm.contract import OP_NN, OP_NT, OP_TN
+from checks.numerics import (
+    identical_mul,
+    GLOBAL_NUMERIC_MODE,
+    NUMERIC_IDENTICAL,
+    ftz,
+    identical_div,
+    identical_mul_add,
+    identical_rsqrt,
+    identical_sigmoid,
+)
+from checks.kernel_matrix import (
+    COLUMN_AMD,
+    COLUMN_APPLE,
+    COLUMN_NVIDIA,
+    TARGET_COLUMN,
+)
+from transformer.impl.llama.fused_attention import (
+    ATTN_ARM_TRIAL,
+    ATTN_STICKY,
+    ATTN_SHIPPED_BWD_ESTASH,
+    FUSED_RAN,
+    FUSED_SKIPPED_STICKY,
+    device_first_nonfinite,
+    attn_device_units,
+    fused_attention_arm_estash_runs,
+    fused_attention_arm_from_env,
+    fused_backward_launch,
+    fused_backward_launch_estash_ran,
+    fused_backward_launch_estash_report,
+    ATTN_APPLE_ESTASH_RECOMPUTE,
+    attention_estash_recompute_granted,
+    fused_backward_launch_erecomp_report,
+)
+from transformer.impl.llama.modeling_llama import (
+    ATTN_PATH_AUTO,
+    ATTN_PATH_EAGER,
+    timing_on,
+    timing_tick,
+    LlamaDeviceStages,
+    LlamaDeviceWeights,
+    LlamaDims,
+    PLANT_AT_NONE,
+    attention_path_choice,
+    ensure_attention_materialized,
+    llama_attention_scale,
+    llama_key_lo,
+    llama_key_span,
+)
+
+
+# ===========================================================================
+# THE TWO EXACT SCALINGS OF THE RMSNORM BACKWARD (DEVIATION 1409).
+#
+# Both are exact powers of two and neither introduces a rounding. Neither is
+# BIT INERT, which is why both are SPELLED: contract S8 drops the
+# `* attention_scaling` because it is exactly `1.0` and inert on every input
+# including both zero signs, and that argument does not transfer to a value
+# that changes the number.
+# ===========================================================================
+
+comptime BWD_NEG_HALF: Float32 = -0.5
+comptime BWD_TWO: Float32 = 2.0
+
+comptime BWD_STAGE_COUNT = 37
+
+
+# ===========================================================================
+# LAUNCH GEOMETRY. An EXECUTION plan quantity: it decides which thread owns
+# a cell and nothing else. Declared here rather than imported from the
+# forward module, so that a reader can see in one place that this file's
+# geometry is its own and reaches no fold boundary.
+# ===========================================================================
+
+comptime BWD_TPB = 128
+
+
+def _grid(n: Int) -> Int:
+    var g = (n + BWD_TPB - 1) // BWD_TPB
+    if g < 1:
+        return 1
+    return g
+
+
+# ===========================================================================
+# DEVICE I/O PLUMBING (DEVIATION 1427). Three helpers, restated here rather
+# than imported from the forward module's underscore-prefixed versions,
+# because reaching across a module boundary for a private symbol is a
+# coupling nobody declared. The duplication is named as a cost: if a shared
+# `core/` home for them ever appears, three lanes should move.
+# ===========================================================================
+
+
+def _upload(
+    ctx: DeviceContext, values: List[Float32]
+) raises -> DeviceBuffer[DType.float32]:
+    var n = len(values)
+    var n_buf = n
+    if n_buf < 1:
+        n_buf = 1
+    var dev: DeviceBuffer[DType.float32]
+    if arena_active():
+        dev = arena_take(ctx, n_buf)
+    else:
+        step_count_device_alloc()
+        dev = ctx.enqueue_create_buffer[DType.float32](n_buf)
+    step_count_host_alloc()
+    var host = ctx.enqueue_create_host_buffer[DType.float32](n_buf)
+    step_count_sync()
+    ctx.synchronize()
+    if n > 0:
+        memcpy(dest=host.unsafe_ptr(), src=values.unsafe_ptr(), count=n)
+    for i in range(n, n_buf):
+        host.unsafe_ptr().unsafe_store(i, Float32(0.0))
+    step_count_h2d()
+    ctx.enqueue_copy(dst_buf=dev, src_ptr=host.unsafe_ptr())
+    step_count_sync()
+    ctx.synchronize()
+    _ = host^
+    return dev^
+
+
+def _zeros[wait: Bool = True](ctx: DeviceContext, n: Int) raises -> DeviceBuffer[DType.float32]:
+    """Zero fill; wait=False requires the returned owner to survive a later fence."""
+    var n_buf = n
+    if n_buf < 1:
+        n_buf = 1
+    var dev: DeviceBuffer[DType.float32]
+    if arena_active():
+        dev = arena_take(ctx, n_buf)
+    else:
+        step_count_device_alloc()
+        dev = ctx.enqueue_create_buffer[DType.float32](n_buf)
+    step_count_launch()
+    dev.enqueue_fill(Float32(0.0))
+    comptime if wait:
+        step_count_sync()
+        ctx.synchronize()
+    return dev^
+
+
+def _fill_ones[wait: Bool = True](
+    ctx: DeviceContext, n: Int
+) raises -> DeviceBuffer[DType.float32]:
+    """`n` entries of exactly `Float32(1.0)`, for the two RMSNorm weight
+    gradients (DEVIATION 1410). With wait=False the returned owner must
+    survive a later completion fence.
+
+    **A wrong value here is a wrong gradient with no symptom**, because any
+    vector produces a plausible weighted column sum. The gate for it is not
+    "the buffer was allocated"; it is the exact-integer arm of plan clause
+    (f), which fails if the entries are anything else."""
+    var n_buf = n
+    if n_buf < 1:
+        n_buf = 1
+    step_count_device_alloc()
+    var dev = ctx.enqueue_create_buffer[DType.float32](n_buf)
+    step_count_launch()
+    dev.enqueue_fill(Float32(1.0))
+    comptime if wait:
+        step_count_sync()
+        ctx.synchronize()
+    return dev^
+
+
+# ===========================================================================
+# THE SABOTAGE ARMS. A clause nobody can falsify is not a clause.
+#
+# Plan section 6.3's twenty lane-owned arms, one `comptime` each, OFF in
+# every build that does not name them. The other two arms of the
+# twenty-two are the GEMM lane's own (`SAB_BWD_UNTRANSPOSED`,
+# `SAB_BWD_OPERAND_ORDER`) and they reach this file through `_route_a` and
+# `_route_b`.
+#
+#     tools/with_identical_mode.sh pixi run mojo run \
+#         -D ANONLIB_TRANSFORMER_SABOTAGE_B11_DQ_VIA_GEMM=1 \
+#         -I . transformer/checks/transformer_backward_check.mojo
+#
+# The names are disjoint from the forward lane's thirteen and from the mamba
+# lane's eleven, so one driver can arm any of them without collision.
+#
+# **FOUR OF THESE ARE PREDICTED INERT AT THE CURRENT GATE SHAPE AND TWO OF
+# THE FOUR CANNOT BE MADE TO FIRE WITHOUT CHANGING THE FIXTURES.** Each one
+# says so at its own definition, because the forward lane's scar is that an
+# arm which looks inert gets deleted, and two of its thirteen only bite
+# under clause (d).
+# ===========================================================================
+
+#: The RMSNorm backward's `c` fold spelled product-then-add instead of one
+#: `fma` per term. INERT at `d_model == 1` and on exactly-representable rows.
+comptime IDN_BWD_ENTRY_ALIAS = GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL and not (
+    is_defined["ANONLIB_IDN_BWD_ENTRY_ALIAS_OFF"]() or is_defined["ANONLIB_IDN_ALL_OFF"]()
+)
+"""lane/nr-attn (2026-10-04), roadmap C9, default ON under IDENTICAL: the
+layer backward's entry copy of `d_out` into `in_d_residual2` (stage 0, an
+identity) runs only on a traced or materialized call; the production path
+hands `d_out` to the copy's readers instead (one `[M, d_model]` read and
+write fewer per layer). Same bytes read: no bit moves on any column.
+`-D ANONLIB_IDN_BWD_ENTRY_ALIAS_OFF` restores the copy."""
+
+
+comptime SAB_B01_DOT_UNFUSED = is_defined[
+    "ANONLIB_TRANSFORMER_SABOTAGE_B01_DOT_UNFUSED"
+]()
+#: The same fold walked DESCENDING. INERT at `d_model == 1` ONLY. **NOT
+#: inert at `d_model == 2`**: an fma keeps the second product exact, so a
+#: two-term fma chain is order dependent where a two-term ADD chain is not.
+comptime SAB_B01_DOT_DESCENDING = is_defined[
+    "ANONLIB_TRANSFORMER_SABOTAGE_B01_DOT_DESCENDING"
+]()
+#: `rstd` recomputed by re-folding the sum of squares DESCENDING instead of
+#: reading the saved `norm*.sumsq`. Its ASCENDING half must move NOTHING,
+#: and that half is what turns "a recompute is bit exact" (DEVIATION 1420)
+#: from a belief into a checked statement. INERT at `d_model == 1`.
+comptime SAB_B_RSTD_RECOMPUTE_DESCENDING = is_defined[
+    "ANONLIB_TRANSFORMER_SABOTAGE_B_RSTD_RECOMPUTE_DESCENDING"
+]()
+#: The RoPE backward spelled with the FORWARD's sign convention, i.e. the
+#: rotation run forwards instead of transposed. One character in two
+#: branches, producing a plausible correctly-shaped wrong gradient.
+#: **INERT AT ABSOLUTE POSITION 0**, where `sin` is exactly `+0.0` -- per
+#: CELL, not per fixture, so the gate must COUNT moved cells and RAISE if
+#: the count equals the position-0 population.
+comptime SAB_B09_ROPE_TRANSPOSE_SIGN = is_defined[
+    "ANONLIB_TRANSFORMER_SABOTAGE_B09_ROPE_TRANSPOSE_SIGN"
+]()
+#: The rotate-half pairing replaced by the adjacent `(2i, 2i+1)` pairing --
+#: the single most commonly mistranscribed thing about RoPE. INERT at
+#: `head_dim == 2` and at position 0.
+comptime SAB_B09_ROPE_HALVES_ADJACENT = is_defined[
+    "ANONLIB_TRANSFORMER_SABOTAGE_B09_ROPE_HALVES_ADJACENT"
+]()
+#: The two products and the add fused into one `fma`: one rounding where the
+#: structure has three. INERT at position 0.
+comptime SAB_B10_ROPE_BWD_FUSED = is_defined[
+    "ANONLIB_TRANSFORMER_SABOTAGE_B10_ROPE_BWD_FUSED"
+]()
+#: The attention-weight gradient spelled as a hand chain over `head_dim`
+#: instead of the ROUTED gemm v1 cell. **THIS ARM CANNOT FIRE AT THE GATE
+#: SHAPE AT ALL**: the two agree bit for bit whenever `P(head_dim) == 1`,
+#: i.e. `head_dim <= 128`, and the profile's fixtures are 16 and 24. So
+#: DEVIATION 1405 rests on plan section 2.1's argument and on gemm v1's own
+#: certificate, NOT on a fired arm, and that is recorded here rather than
+#: discovered later.
+comptime SAB_B10_DW_VIA_CHAIN = is_defined[
+    "ANONLIB_TRANSFORMER_SABOTAGE_B10_DW_VIA_CHAIN"
+]()
+#: `dq` routed through gemm v1 `OP_NN` at `(l, hd, s)`, `k' = S`. **INERT AT
+#: EVERY `S <= 128`**, where `P(S) == 1` and the gemm cell IS the whole-`k`
+#: ascending chain from `+0.0`. Needs `S >= 129`; the `L = 257` fixture is
+#: the only one that reaches it. Passes clause (a) at a fixed shape and
+#: breaks the LENGTH clause, which is the shape contract section 10 warns
+#: will look inert and get deleted.
+comptime SAB_B11_DQ_VIA_GEMM = is_defined[
+    "ANONLIB_TRANSFORMER_SABOTAGE_B11_DQ_VIA_GEMM"
+]()
+#: `dk` routed through gemm v1 `OP_TN` at `(s, hd, l)`, `k' = L`, with the
+#: head group accumulated as per-head partials. INERT only when `L <= 128`
+#: AND `n_rep == 1` together; at `n_rep == 2` the partial accumulation is a
+#: different association and it fires on shape alone.
+comptime SAB_B11_DK_VIA_GEMM = is_defined[
+    "ANONLIB_TRANSFORMER_SABOTAGE_B11_DK_VIA_GEMM"
+]()
+#: `dv` routed the same way. The backward twin of the forward's
+#: `S19_VALUE_SUM_VIA_GEMM`, inheriting its warning verbatim.
+comptime SAB_B19_DV_VIA_GEMM = is_defined[
+    "ANONLIB_TRANSFORMER_SABOTAGE_B19_DV_VIA_GEMM"
+]()
+#: The attention scale folded into the `dq` chain instead of applied to the
+#: finished `dS`. **INERT AT EVERY POWER-OF-FOUR `head_dim`**: at 16 and 64
+#: the scale is exactly `0.25` / `0.125`, exact scaling commutes with an fma
+#: chain bitwise, and moving it to the far side changes nothing. The
+#: `head_dim = 24` fixture contract section 3 already requires -- for a
+#: different reason -- is what makes this arm fire at all.
+comptime SAB_B12_SCALE_INTO_DQ = is_defined[
+    "ANONLIB_TRANSFORMER_SABOTAGE_B12_SCALE_INTO_DQ"
+]()
+#: The mask backward forced to write `+0.0` at masked cells instead of
+#: passing the gradient through. Moves ONLY masked cells whose `dS` is
+#: `-0.0`, i.e. where `dy_j - z < 0`: predicted to move roughly half the
+#: masked cells, and **the oracle must predict the exact count before the
+#: device is asked**.
+comptime SAB_B13_MASK_ZEROES_GRAD = is_defined[
+    "ANONLIB_TRANSFORMER_SABOTAGE_B13_MASK_ZEROES_GRAD"
+]()
+#: The softmax backward spelled as the DECOMPOSED autograd graph, including
+#: the analytically-zero max gradient scattered through an argmax. INERT at
+#: `s == 1`, where both forms give zero.
+comptime SAB_B18_SOFTMAX_DECOMPOSED = is_defined[
+    "ANONLIB_TRANSFORMER_SABOTAGE_B18_SOFTMAX_DECOMPOSED"
+]()
+#: The `z` fold spelled product-then-add. INERT at `s == 1`.
+comptime SAB_B18_ZFOLD_UNFUSED = is_defined[
+    "ANONLIB_TRANSFORMER_SABOTAGE_B18_ZFOLD_UNFUSED"
+]()
+#: The `z` fold walked DESCENDING over the key axis. INERT at `s == 1` only.
+comptime SAB_B18_ZFOLD_DESCENDING = is_defined[
+    "ANONLIB_TRANSFORMER_SABOTAGE_B18_ZFOLD_DESCENDING"
+]()
+#: `sigmoid` reconstructed as `silu_out / gate_proj_out` instead of
+#: recomputed. **INERT for every gate activation at or above about 17**,
+#: where `1 + exp(-x)` rounds to exactly `1.0` and the reconstruction
+#: returns exactly `1.0`. A fixture whose gate activations are all large is
+#: blind to it, and it produces `0/0` at a zero gate.
+comptime SAB_B20_SIGMOID_FROM_SILU = is_defined[
+    "ANONLIB_TRANSFORMER_SABOTAGE_B20_SIGMOID_FROM_SILU"
+]()
+#: `sg + x*sg*(1-sg)` instead of `sg*(1 + x*(1-sg))`. INERT wherever `sg` is
+#: exactly `1.0` and at `x == 0`.
+comptime SAB_B20_SILU_DERIV_ALT_ASSOC = is_defined[
+    "ANONLIB_TRANSFORMER_SABOTAGE_B20_SILU_DERIV_ALT_ASSOC"
+]()
+#: `fma(x, 1-sg, 1.0)`: one rounding where the pinned form has two. INERT
+#: wherever `x * (1 - sg)` is exactly representable.
+comptime SAB_B20_SILU_DERIV_FUSED = is_defined[
+    "ANONLIB_TRANSFORMER_SABOTAGE_B20_SILU_DERIV_FUSED"
+]()
+#: The fan-in accumulations seeded with `+0.0`. **PREDICTED TO MOVE ZERO
+#: CELLS ON EVERY UNPLANTED FIXTURE**: it fires only where the FIRST
+#: accumulated term is `-0.0`, which needs a planted `-0.0`. **Vacuous
+#: without a plant**, said out loud so that nobody fires it, sees nothing
+#: and deletes it.
+comptime SAB_B_FANIN_ZERO_SEED = is_defined[
+    "ANONLIB_TRANSFORMER_SABOTAGE_B_FANIN_ZERO_SEED"
+]()
+#: The three-term fan-in at `d(norm1.out)` accumulated `v, k, q` instead of
+#: `q, k, v`. INERT wherever any two of the three terms are zero.
+comptime SAB_B_FANIN_ORDER_QKV_REVERSED = is_defined[
+    "ANONLIB_TRANSFORMER_SABOTAGE_B_FANIN_ORDER_QKV_REVERSED"
+]()
+
+comptime BWD_ANY_SABOTAGE = (
+    SAB_B01_DOT_UNFUSED
+    or SAB_B01_DOT_DESCENDING
+    or SAB_B_RSTD_RECOMPUTE_DESCENDING
+    or SAB_B09_ROPE_TRANSPOSE_SIGN
+    or SAB_B09_ROPE_HALVES_ADJACENT
+    or SAB_B10_ROPE_BWD_FUSED
+    or SAB_B10_DW_VIA_CHAIN
+    or SAB_B11_DQ_VIA_GEMM
+    or SAB_B11_DK_VIA_GEMM
+    or SAB_B19_DV_VIA_GEMM
+    or SAB_B12_SCALE_INTO_DQ
+    or SAB_B13_MASK_ZEROES_GRAD
+    or SAB_B18_SOFTMAX_DECOMPOSED
+    or SAB_B18_ZFOLD_UNFUSED
+    or SAB_B18_ZFOLD_DESCENDING
+    or SAB_B20_SIGMOID_FROM_SILU
+    or SAB_B20_SILU_DERIV_ALT_ASSOC
+    or SAB_B20_SILU_DERIV_FUSED
+    or SAB_B_FANIN_ZERO_SEED
+    or SAB_B_FANIN_ORDER_QKV_REVERSED
+)
+
+# lane w2-lmgrad (2026-10-03): the FAST Apple arms, never in a sabotage build.
+comptime _AFN_WGRAD = AFN_LM_WGRAD_SPLIT and not BWD_ANY_SABOTAGE
+# TOMBSTONE: ANONLIB_AFN_LM_BWD_EPILOGUE (arm of the deleted hand decoder-layer backward walk) deleted 2026-10-19 by 7b6862e3d; code recoverable at 7b6862e3d^.
+# Restore: git apply experiments/removed/LLAMA_DECODER_LAYER_BACKWARD_HAND_WALK.patch
+comptime _AFN_NORM1_RESID = AFN_LM_BWD_NORM1_RESID and not BWD_ANY_SABOTAGE
+
+#: Evidence-only control for pricing the pre-fusion RMSNorm backward. A
+#: normal build never defines it. Sabotage builds also retain the split
+#: spelling so each altered seam remains independently localized.
+comptime BWD_NORM_SPLIT_TRIAL = is_defined[
+    "ANONLIB_BWD_NORM_SPLIT_TRIAL"
+]()
+comptime BWD_NORM_FUSED_TRIAL = is_defined[
+    "ANONLIB_BWD_NORM_FUSED_TRIAL"
+]()
+# Historical exact-size dispatch is an explicit B arm only. Its old board
+# thresholds are preserved to attribute the removal, never a default route.
+comptime BWD_NORM_LEGACY_SHAPE_RULE = (
+    is_defined["ANONLIB_BWD_NORM_LEGACY_SHAPE_RULE"]()
+    and not is_defined["ANONLIB_IDN_ALL_OFF"]()
+)
+
+comptime BWD_NORM2_RESIDUAL_SPLIT_TRIAL = is_defined[
+    "ANONLIB_BWD_NORM2_RESIDUAL_SPLIT_TRIAL"
+]()
+comptime BWD_NORM2_RESIDUAL_FUSED_TRIAL = is_defined[
+    "ANONLIB_BWD_NORM2_RESIDUAL_FUSED_TRIAL"
+]()
+comptime BWD_GATED_SILU_SPLIT_TRIAL = is_defined[
+    "ANONLIB_BWD_GATED_SILU_SPLIT_TRIAL"
+]()
+comptime BWD_GATED_SILU_FUSED_TRIAL = is_defined[
+    "ANONLIB_BWD_GATED_SILU_FUSED_TRIAL"
+]()
+#: lane ag-transformer: whether stages 4-6 run fused, read by the autograd
+#: SwiGLU rule (`autograd/rules_transformer.mojo`); the hand walk that once
+#: spelled it inline is deleted (docs/TOMBSTONES.md).
+comptime BWD_FUSE_GATED_SILU = (
+    (GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL or AFN_LM_BWD_FUSE)
+    and (
+        TARGET_COLUMN == COLUMN_APPLE
+        or TARGET_COLUMN == COLUMN_NVIDIA
+        or TARGET_COLUMN == COLUMN_AMD
+        or BWD_GATED_SILU_FUSED_TRIAL
+    )
+    and not BWD_ANY_SABOTAGE
+    and not BWD_GATED_SILU_SPLIT_TRIAL
+)
+#: lane ag-pass1-launches: whether stages 10-13 run the fused residual, read
+#: by the autograd RMSNorm rule (`autograd/rules_transformer.mojo`); the hand
+#: walk that once spelled it inline is deleted (docs/TOMBSTONES.md).
+comptime BWD_FUSE_NORM2_RESIDUAL = (
+    (GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL or AFN_LM_BWD_FUSE)
+    and (
+        TARGET_COLUMN == COLUMN_APPLE
+        or TARGET_COLUMN == COLUMN_NVIDIA
+        or TARGET_COLUMN == COLUMN_AMD
+        or BWD_NORM2_RESIDUAL_FUSED_TRIAL
+    )
+    and not BWD_NORM2_RESIDUAL_SPLIT_TRIAL
+)
+
+
+def llama_backward_sabotage_name() -> String:
+    """Which sabotage this binary compiled with, for a check's banner.
+
+    A check must print this AND `llama_block_sabotage_name()` AND
+    `gemm_sabotage_name()` AND `gemm_backward_sabotage_name()`, because a
+    backward binary can carry a forward arm, a gemm arm and a gemm-backward
+    arm as well, and a banner naming only one of the four MISLABELS THE RUN.
+    """
+    comptime if SAB_B01_DOT_UNFUSED:
+        return String("B01_DOT_UNFUSED")
+    comptime if SAB_B01_DOT_DESCENDING:
+        return String("B01_DOT_DESCENDING")
+    comptime if SAB_B_RSTD_RECOMPUTE_DESCENDING:
+        return String("B_RSTD_RECOMPUTE_DESCENDING")
+    comptime if SAB_B09_ROPE_TRANSPOSE_SIGN:
+        return String("B09_ROPE_TRANSPOSE_SIGN")
+    comptime if SAB_B09_ROPE_HALVES_ADJACENT:
+        return String("B09_ROPE_HALVES_ADJACENT")
+    comptime if SAB_B10_ROPE_BWD_FUSED:
+        return String("B10_ROPE_BWD_FUSED")
+    comptime if SAB_B10_DW_VIA_CHAIN:
+        return String("B10_DW_VIA_CHAIN")
+    comptime if SAB_B11_DQ_VIA_GEMM:
+        return String("B11_DQ_VIA_GEMM")
+    comptime if SAB_B11_DK_VIA_GEMM:
+        return String("B11_DK_VIA_GEMM")
+    comptime if SAB_B19_DV_VIA_GEMM:
+        return String("B19_DV_VIA_GEMM")
+    comptime if SAB_B12_SCALE_INTO_DQ:
+        return String("B12_SCALE_INTO_DQ")
+    comptime if SAB_B13_MASK_ZEROES_GRAD:
+        return String("B13_MASK_ZEROES_GRAD")
+    comptime if SAB_B18_SOFTMAX_DECOMPOSED:
+        return String("B18_SOFTMAX_DECOMPOSED")
+    comptime if SAB_B18_ZFOLD_UNFUSED:
+        return String("B18_ZFOLD_UNFUSED")
+    comptime if SAB_B18_ZFOLD_DESCENDING:
+        return String("B18_ZFOLD_DESCENDING")
+    comptime if SAB_B20_SIGMOID_FROM_SILU:
+        return String("B20_SIGMOID_FROM_SILU")
+    comptime if SAB_B20_SILU_DERIV_ALT_ASSOC:
+        return String("B20_SILU_DERIV_ALT_ASSOC")
+    comptime if SAB_B20_SILU_DERIV_FUSED:
+        return String("B20_SILU_DERIV_FUSED")
+    comptime if SAB_B_FANIN_ZERO_SEED:
+        return String("B_FANIN_ZERO_SEED")
+    comptime if SAB_B_FANIN_ORDER_QKV_REVERSED:
+        return String("B_FANIN_ORDER_QKV_REVERSED")
+    return String("none")
+
+
+# ===========================================================================
+# THE ELEMENTWISE PLUMBING KERNELS. None of these is a seam of its own; each
+# spells exactly one rounding (or none) that the plan's table names.
+# ===========================================================================
+
+
+def bwd_copy_kernel(
+    dst: MutPointer[Float32, MutAnyOrigin],
+    src: MutPointer[Float32, MutAnyOrigin],
+    n_in: Int32,
+):
+    """A bit copy. **NO ROUNDING, NO `ftz`.**
+
+    Used at the three places the derivative is the exact identity: S23's two
+    branches (an add's derivative is 1 in both arguments), S22's `d o_proj`
+    branch, and S13's mask backward (the mask value is a CONSTANT, so
+    `d(masked)/d(scores)` is exactly 1 at every cell INCLUDING the masked
+    ones). A copy that also flushed would be a seam nobody reviewed as one.
+    """
+    var n = Int(n_in)
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if i >= n:
+        return
+    dst.unsafe_store(i, src.unsafe_load(i))
+
+
+def bwd_mask_grad_kernel(
+    dst: MutPointer[Float32, MutAnyOrigin],
+    src: MutPointer[Float32, MutAnyOrigin],
+    b_in: Int32,
+    nh_in: Int32,
+    l_in: Int32,
+    s_in: Int32,
+    pos0_in: Int32,
+    key_lo_in: Int32,
+    window_in: Int32,
+):
+    """S13's backward as its own kernel so that `B13_MASK_ZEROES_GRAD` has a
+    body. In a clean build this is `bwd_copy_kernel` with a causal test it
+    does not use. DEVIATION 1414.
+
+    **THE MASKED CELLS ARE NOT ZEROED, AND THAT IS A DECISION.** They are
+    already SIGNED zeros: `dS_j = identical_mul(y_j, dy_j - z)` with `y_j`
+    exactly `+0.0` carries the sign of `dy_j - z`. Forcing `+0.0` therefore
+    differs exactly where that sign is negative, which is roughly half the
+    masked cells and **is reachable without a plant** -- so unlike
+    `B_FANIN_ZERO_SEED`, this arm is not vacuous on an ordinary fixture, and
+    the oracle can predict its count.
+    """
+    var b = Int(b_in)
+    var nh = Int(nh_in)
+    var l = Int(l_in)
+    var s = Int(s_in)
+    var pos0 = Int(pos0_in)
+    var key_lo = Int(key_lo_in)
+    var window = Int(window_in)
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if i >= b * nh * l * s:
+        return
+    comptime if SAB_B13_MASK_ZEROES_GRAD:
+        var j = i % s
+        var rest = i // s
+        var t = rest % l
+        var p_k = key_lo + j
+        var p_q = pos0 + t
+        var masked = p_k > p_q
+        if window > 0 and p_k <= p_q - window:
+            masked = True
+        if masked:
+            # SABOTAGE: a positive zero where the profile passes a signed one.
+            dst.unsafe_store(i, Float32(0.0))
+            return
+    dst.unsafe_store(i, src.unsafe_load(i))
+
+
+def bwd_mul_kernel(
+    dst: MutPointer[Float32, MutAnyOrigin],
+    a: MutPointer[Float32, MutAnyOrigin],
+    bb: MutPointer[Float32, MutAnyOrigin],
+    n_in: Int32,
+):
+    """One `pinned_mul` per cell: `dst = a * b`, ONE rounding, and no codegen
+    may contract it into a neighboring add (DEVIATION 720).
+
+    S21's two products and the RMSNorm weight gradient's `dprod` are both
+    this kernel. ROUTING under the plan's definitions: `pinned_mul` settles
+    the fusion question by existing, so this lane chooses nothing here."""
+    var n = Int(n_in)
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if i >= n:
+        return
+    dst.unsafe_store(
+        i, ftz(identical_mul(ftz(a.unsafe_load(i)), ftz(bb.unsafe_load(i))))
+    )
+
+
+def bwd_mul2_kernel(
+    dst0: MutPointer[Float32, MutAnyOrigin],
+    dst1: MutPointer[Float32, MutAnyOrigin],
+    a: MutPointer[Float32, MutAnyOrigin],
+    b0: MutPointer[Float32, MutAnyOrigin],
+    b1: MutPointer[Float32, MutAnyOrigin],
+    n_in: Int32,
+):
+    """S21's two independent products in one traversal and one launch.
+
+    Each destination keeps `bwd_mul_kernel`'s exact one-cell spelling.  The
+    shared input load is a bit copy and neither product feeds the other, so
+    this changes only scheduling and memory traffic, not either arithmetic
+    DAG or its order.
+    """
+    var n = Int(n_in)
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if i >= n:
+        return
+    var av = ftz(a.unsafe_load(i))
+    dst0.unsafe_store(
+        i, ftz(identical_mul(av, ftz(b0.unsafe_load(i))))
+    )
+    dst1.unsafe_store(
+        i, ftz(identical_mul(av, ftz(b1.unsafe_load(i))))
+    )
+
+
+def bwd_scale_kernel(
+    dst: MutPointer[Float32, MutAnyOrigin],
+    src: MutPointer[Float32, MutAnyOrigin],
+    n_in: Int32,
+    scale_in: Float32,
+):
+    """S12's backward, DEVIATION 1415: `d_cell = d_scores * scale`, ONE
+    `pinned_mul` per score applied to the FINISHED gradient.
+
+    Folding the scale into the `dq` chain instead is `B12_SCALE_INTO_DQ`,
+    which skips this kernel entirely. Read that arm's note at its
+    definition: it is INERT at every power-of-four `head_dim`, so the
+    `head_dim = 24` fixture is what makes it fire."""
+    var n = Int(n_in)
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if i >= n:
+        return
+    comptime if SAB_B12_SCALE_INTO_DQ:
+        # SABOTAGE: the scale moves into the dq chain, so this seam is
+        # skipped and the softmax's own gradient stands.
+        dst.unsafe_store(i, src.unsafe_load(i))
+        return
+    dst.unsafe_store(i, ftz(identical_mul(ftz(src.unsafe_load(i)), scale_in)))
+
+
+def bwd_add2_kernel(
+    dst: MutPointer[Float32, MutAnyOrigin],
+    a: MutPointer[Float32, MutAnyOrigin],
+    bb: MutPointer[Float32, MutAnyOrigin],
+    n_in: Int32,
+):
+    """A TWO-TERM fan-in, `ftz(ftz(a) + ftz(b))`, UNFUSED.
+
+    **NO ORDER TO PIN**: IEEE addition is bitwise commutative on every
+    non-NaN input and NaN is refused at the door. The clause is written down
+    anyway, because "it does not matter" is exactly the kind of sentence
+    that turns out to matter.
+
+    **NO `+0.0` SEED** (DEVIATION 1413). `+0.0 + x` equals `x` for every
+    value except `x = -0.0`, where it gives `+0.0` -- IDENTITY_PATHS row 39
+    in one line -- so a seed LAUNDERS a negative-zero first term, and a
+    negative zero is reachable in a gradient: every masked attention cell
+    produces one. An autograd engine's `AccumulateGrad` installs the first
+    incoming gradient as the buffer rather than allocating zeros, and this
+    follows it."""
+    var n = Int(n_in)
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if i >= n:
+        return
+    comptime if SAB_B_FANIN_ZERO_SEED:
+        # SABOTAGE: the seed that launders a negative zero. Predicted to
+        # move ZERO cells unless a `-0.0` is PLANTED into the first term.
+        var z = ftz(Float32(0.0) + ftz(a.unsafe_load(i)))
+        dst.unsafe_store(i, ftz(ftz(z) + ftz(bb.unsafe_load(i))))
+        return
+    dst.unsafe_store(
+        i, ftz(ftz(a.unsafe_load(i)) + ftz(bb.unsafe_load(i)))
+    )
+
+
+def bwd_add3_kernel(
+    dst: MutPointer[Float32, MutAnyOrigin],
+    a: MutPointer[Float32, MutAnyOrigin],
+    bb: MutPointer[Float32, MutAnyOrigin],
+    c: MutPointer[Float32, MutAnyOrigin],
+    n_in: Int32,
+):
+    """THE ONE THREE-TERM FAN-IN IN THIS BLOCK, at `d(norm1.out)`, and it IS
+    order dependent because `(a+b)+c` and `a+(b+c)` are different numbers.
+
+    Pinned FORWARD-USE order, `q` then `k` then `v`
+    (`LlamaAttention.forward` :250, :251, :252), left associative, no seed.
+    Sabotage `B_FANIN_ORDER_QKV_REVERSED`, INERT wherever any two of the
+    three terms are zero."""
+    var n = Int(n_in)
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if i >= n:
+        return
+    var va = ftz(a.unsafe_load(i))
+    var vb = ftz(bb.unsafe_load(i))
+    var vc = ftz(c.unsafe_load(i))
+    comptime if SAB_B_FANIN_ORDER_QKV_REVERSED:
+        # SABOTAGE: v, k, q.
+        var acc_s = ftz(ftz(vc) + ftz(vb))
+        dst.unsafe_store(i, ftz(ftz(acc_s) + ftz(va)))
+        return
+    comptime if SAB_B_FANIN_ZERO_SEED:
+        var z = ftz(Float32(0.0) + va)
+        var acc_z = ftz(ftz(z) + ftz(vb))
+        dst.unsafe_store(i, ftz(ftz(acc_z) + ftz(vc)))
+        return
+    var acc = ftz(ftz(va) + ftz(vb))
+    dst.unsafe_store(i, ftz(ftz(acc) + ftz(vc)))
+
+
+# ===========================================================================
+# S20's BACKWARD. DEVIATION 1411.
+# ===========================================================================
+
+
+def bwd_silu_backward_kernel(
+    dg: MutPointer[Float32, MutAnyOrigin],
+    dsi: MutPointer[Float32, MutAnyOrigin],
+    g: MutPointer[Float32, MutAnyOrigin],
+    silu_out: MutPointer[Float32, MutAnyOrigin],
+    n_in: Int32,
+):
+    """`d g = d(silu) * silu'(g)`, one thread per cell, five roundings after
+    the sigmoid, left to right, no fma.
+
+        sg = identical_sigmoid(x)         DEVIATION 743, portable_sigmoidf
+        r1 = ftz(1.0 - sg)                SUBTRACT
+        r2 = identical_mul(x, r1)            PRODUCT
+        r3 = ftz(1.0 + r2)                UNFUSED ADD
+        r4 = identical_mul(sg, r3)           PRODUCT
+        dg = identical_mul(dsi, r4)          PRODUCT
+
+    **`sg` IS RECOMPUTED FROM `gate_proj.out`, NEVER RECONSTRUCTED FROM
+    `silu.out`.** `silu(x) = x * sigmoid(x)` is true in the reals and FALSE
+    in Float32 under this profile: contract S20's forward is ONE division
+    and `x * sg` is a division followed by a product. So `silu_out / x` is a
+    different number, it is `0/0` at `x = 0`, and it costs a division to get
+    a worse answer. `portable_sigmoidf` and `portable_siluf` share the SAME
+    `d = portable_expf(-x) + 1.0` and differ only in the numerator, so the
+    recomputed sigmoid is exactly `1/d` against the forward's `x/d`.
+
+    `silu_out` is passed in ONLY so `B20_SIGMOID_FROM_SILU` has a body. The
+    profile never reads it, which is the same relationship the forward's
+    `attn_denom_kernel` has with its `scratch` argument (DEVIATION 1023).
+
+    **THE REFERENCE'S OWN SPELLING COULD NOT BE VERIFIED.** There is no
+    PyTorch checkout in `/home/user/CascadeProjects/upstream/` --
+    verified again on 2026-08-25 -- so ATen's `silu_backward` was not read.
+    This is a STATED GAP, not a decision made on evidence, it is contract
+    section 5.4's gap in a second place, and it is the second thing to check
+    when a checkout lands."""
+    var n = Int(n_in)
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if i >= n:
+        return
+    var x = ftz(g.unsafe_load(i))
+
+    var sg: Float32
+    comptime if SAB_B20_SIGMOID_FROM_SILU:
+        # SABOTAGE: sigmoid reconstructed from the forward's SiLU output.
+        # INERT for every x at or above about 17, where 1 + exp(-x) rounds
+        # to exactly 1.0 and this returns exactly 1.0.
+        sg = ftz(identical_div(ftz(silu_out.unsafe_load(i)), x))
+    else:
+        sg = ftz(identical_sigmoid(x))
+
+    var r1 = ftz(ftz(Float32(1.0)) - ftz(sg))
+
+    comptime if SAB_B20_SILU_DERIV_ALT_ASSOC:
+        # SABOTAGE: sg + x*sg*(1-sg). Equal in the reals, different in the
+        # last bit, five operations instead of four.
+        var p1 = ftz(identical_mul(x, sg))
+        var p2 = ftz(identical_mul(p1, r1))
+        var d_alt = ftz(ftz(sg) + ftz(p2))
+        dg.unsafe_store(
+            i, ftz(identical_mul(ftz(dsi.unsafe_load(i)), d_alt))
+        )
+        return
+
+    var r3: Float32
+    comptime if SAB_B20_SILU_DERIV_FUSED:
+        # SABOTAGE: one rounding where the pinned form has two.
+        r3 = ftz(identical_mul_add(x, r1, Float32(1.0)))
+    else:
+        var r2 = ftz(identical_mul(x, r1))
+        r3 = ftz(ftz(Float32(1.0)) + ftz(r2))
+
+    var r4 = ftz(identical_mul(sg, r3))
+    dg.unsafe_store(i, ftz(identical_mul(ftz(dsi.unsafe_load(i)), r4)))
+
+
+def bwd_mul2_silu_backward_kernel(
+    dsi: MutPointer[Float32, MutAnyOrigin],
+    dup: MutPointer[Float32, MutAnyOrigin],
+    dg: MutPointer[Float32, MutAnyOrigin],
+    d_gated: MutPointer[Float32, MutAnyOrigin],
+    up: MutPointer[Float32, MutAnyOrigin],
+    silu_out: MutPointer[Float32, MutAnyOrigin],
+    gate: MutPointer[Float32, MutAnyOrigin],
+    n_in: Int32,
+):
+    """Fuse S21's two products with the clean S20 SiLU backward.
+
+    Every stored value keeps the split kernels' per-cell arithmetic and
+    rounding. `dsi_v` is rounded before its store and before it feeds `dg`,
+    exactly matching the store/load seam in the split spelling.
+    """
+    var n = Int(n_in)
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if i >= n:
+        return
+    var av = ftz(d_gated.unsafe_load(i))
+    var dsi_v = ftz(identical_mul(av, ftz(up.unsafe_load(i))))
+    dsi.unsafe_store(i, dsi_v)
+    dup.unsafe_store(i, ftz(identical_mul(av, ftz(silu_out.unsafe_load(i)))))
+
+    var x = ftz(gate.unsafe_load(i))
+    var sg = ftz(identical_sigmoid(x))
+    var r1 = ftz(ftz(Float32(1.0)) - ftz(sg))
+    var r2 = ftz(identical_mul(x, r1))
+    var r3 = ftz(ftz(Float32(1.0)) + ftz(r2))
+    var r4 = ftz(identical_mul(sg, r3))
+    dg.unsafe_store(i, ftz(identical_mul(dsi_v, r4)))
+
+
+# ===========================================================================
+# S1-S4's BACKWARD. DEVIATIONS 1408, 1409, 1410, 1420.
+#
+# Three kernels, because the row-level coefficients (`rstd`, `dv`) must be
+# finished before any cell of `dx` can be written, and because splitting
+# them keeps `bwd.norm*.dot` separately recordable. A fold whose only
+# evidence is the value it feeds cannot be localized, and the forward lane's
+# scar is that thirteen moved stages were absorbed by a residual add while
+# an output-only gate called the sabotage inert.
+# ===========================================================================
+
+
+def bwd_norm_dh_kernel(
+    dh: MutPointer[Float32, MutAnyOrigin],
+    dy: MutPointer[Float32, MutAnyOrigin],
+    weight: MutPointer[Float32, MutAnyOrigin],
+    m_in: Int32,
+    dm_in: Int32,
+):
+    """`dh_j = identical_mul(dy_j, w_j)`, the `y = w * h` node's backward
+    (LRN:67). One thread per cell, one rounding, ROUTING."""
+    var m = Int(m_in)
+    var dm = Int(dm_in)
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if i >= m * dm:
+        return
+    var j = i - (i // dm) * dm
+    dh.unsafe_store(
+        i,
+        ftz(
+            identical_mul(ftz(dy.unsafe_load(i)), ftz(weight.unsafe_load(j)))
+        ),
+    )
+
+
+def bwd_norm_dh_dot_kernel(
+    dh: MutPointer[Float32, MutAnyOrigin],
+    dot: MutPointer[Float32, MutAnyOrigin],
+    rstd_out: MutPointer[Float32, MutAnyOrigin],
+    dv_out: MutPointer[Float32, MutAnyOrigin],
+    dy: MutPointer[Float32, MutAnyOrigin],
+    weight: MutPointer[Float32, MutAnyOrigin],
+    x: MutPointer[Float32, MutAnyOrigin],
+    sumsq: MutPointer[Float32, MutAnyOrigin],
+    m_in: Int32,
+    dm_in: Int32,
+    eps_in: Float32,
+):
+    """The clean RMSNorm backward's first two kernels in one row owner.
+
+    Ascending ``j`` computes and stores exactly the old rounded ``dh_j``
+    product before feeding it to the unchanged fused ``c`` fold. The pinned
+    reduction order and arithmetic seams therefore do not move. Fusion
+    removes one launch and the dot kernel's global reread of ``dh``.
+    """
+    var m = Int(m_in)
+    var dm = Int(dm_in)
+    var t = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if t >= m:
+        return
+    var c = Float32(0.0)
+    for j in range(dm):
+        var i = t * dm + j
+        var dhj = ftz(
+            identical_mul(ftz(dy.unsafe_load(i)), ftz(weight.unsafe_load(j)))
+        )
+        dh.unsafe_store(i, dhj)
+        c = ftz(identical_mul_add(dhj, ftz(x.unsafe_load(i)), c))
+    comptime if NN24_NORM_LANES8:
+        c = norm_profile_dot[NN24_LANES](dh, x, t * dm, t * dm, dm)
+    c = ftz(c)
+    dot.unsafe_store(t, c)
+    var ss = ftz(sumsq.unsafe_load(t))
+    var mean = ftz(identical_div(ss, Float32(dm)))
+    var rstd = ftz(identical_rsqrt(ftz(mean + eps_in)))
+    rstd_out.unsafe_store(t, rstd)
+    var r2 = ftz(identical_mul(rstd, rstd))
+    var r3 = ftz(identical_mul(r2, rstd))
+    var cr3 = ftz(identical_mul(c, r3))
+    var da = ftz(identical_mul(BWD_NEG_HALF, cr3))
+    dv_out.unsafe_store(t, ftz(identical_div(da, Float32(dm))))
+
+
+def bwd_norm_dot_kernel(
+    dot: MutPointer[Float32, MutAnyOrigin],
+    rstd_out: MutPointer[Float32, MutAnyOrigin],
+    dv_out: MutPointer[Float32, MutAnyOrigin],
+    dh: MutPointer[Float32, MutAnyOrigin],
+    x: MutPointer[Float32, MutAnyOrigin],
+    sumsq: MutPointer[Float32, MutAnyOrigin],
+    m_in: Int32,
+    dm_in: Int32,
+    eps_in: Float32,
+):
+    """The `c` fold and the row coefficients. ONE THREAD PER TOKEN ROW, so
+    the row's fold never leaves this thread's registers and no launch
+    geometry can reorder it.
+
+        c    = ftz(fma(dh_j, x_j, c)), ASCENDING j from +0.0     FUSED
+        rstd = ftz(rsqrt(ftz(div(sumsq, dm) + eps)))             RECOMPUTED
+        r2   = identical_mul(rstd, rstd)
+        r3   = identical_mul(r2, rstd)
+        cr3  = identical_mul(c, r3)
+        da   = identical_mul(-0.5, cr3)     rsqrt backward, -0.5 * dr * r^3
+        dv   = identical_div(da, dm)     mean backward, ONE division
+
+    **THE `c` FOLD IS CONTRACT S1's SHAPE UNCHANGED** (DEVIATION 1408).
+    `d_model` is a CONFIGURATION quantity, so unlike the softmax's `z` fold
+    or the `dq` chain there is no path-invariance argument forcing this; the
+    reasons are that it gives the block ONE fold shape instead of two, that
+    one thread owns one token row, and that a reader can put contract S1
+    beside it. `core/pinned_reduce.mojo::pinned_block_sum` is REFUSED for
+    the reasons contract 5.3 refuses it at S17: it is a halving tree, it
+    pairs by STRIDE, and it is a different sum that would pass every
+    launch-invariance gate because a tree is perfectly launch invariant.
+
+    **`rstd` IS RECOMPUTED FROM THE SAVED `sumsq`** (DEVIATION 1420).
+    `identical_div` and `identical_rsqrt` are pure functions of bits the
+    card already holds, so the recompute is bit exact BY CONSTRUCTION.
+    Sabotage `B_RSTD_RECOMPUTE_DESCENDING` re-folds the sum of squares
+    instead of reading it; its ASCENDING half must move NOTHING and that
+    half is what turns "a recompute is exact" from a belief into a checked
+    statement.
+
+    **`-0.5` AND `2.0` ARE SPELLED, NOT ELIDED.** Both are exact scalings by
+    a power of two and neither is BIT INERT, so unlike contract S8's
+    `* attention_scaling` (exactly `1.0`, inert on every input including
+    both zero signs) they change the number and must appear."""
+    var m = Int(m_in)
+    var dm = Int(dm_in)
+    var t = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if t >= m:
+        return
+
+    # ---- the c fold ---------------------------------------------------
+    var c = Float32(0.0)
+    comptime if SAB_B01_DOT_DESCENDING:
+        for jj in range(dm):
+            var jd = dm - 1 - jj
+            c = ftz(
+                identical_mul_add(
+                    ftz(dh.unsafe_load(t * dm + jd)),
+                    ftz(x.unsafe_load(t * dm + jd)),
+                    c,
+                )
+            )
+    elif SAB_B01_DOT_UNFUSED:
+        for j in range(dm):
+            var p = ftz(
+                identical_mul(
+                    ftz(dh.unsafe_load(t * dm + j)),
+                    ftz(x.unsafe_load(t * dm + j)),
+                )
+            )
+            c = ftz(ftz(c) + ftz(p))
+    else:
+        for j in range(dm):
+            c = ftz(
+                identical_mul_add(
+                    ftz(dh.unsafe_load(t * dm + j)),
+                    ftz(x.unsafe_load(t * dm + j)),
+                    c,
+                )
+            )
+    comptime if NN24_NORM_LANES8:
+        c = norm_profile_dot[NN24_LANES](dh, x, t * dm, t * dm, dm)
+    c = ftz(c)
+    dot.unsafe_store(t, c)
+
+    # ---- rstd, recomputed ---------------------------------------------
+    var ss: Float32
+    comptime if SAB_B_RSTD_RECOMPUTE_DESCENDING:
+        # SABOTAGE: the sum of squares re-folded DESCENDING rather than the
+        # saved `sumsq` read. INERT at d_model == 1.
+        ss = Float32(0.0)
+        for jj2 in range(dm):
+            var jd2 = dm - 1 - jj2
+            var xd = ftz(x.unsafe_load(t * dm + jd2))
+            ss = ftz(identical_mul_add(xd, xd, ss))
+    else:
+        ss = ftz(sumsq.unsafe_load(t))
+    var mean = ftz(identical_div(ss, Float32(dm)))
+    var rstd = ftz(identical_rsqrt(ftz(mean + eps_in)))
+    rstd_out.unsafe_store(t, rstd)
+
+    # ---- the rsqrt and mean nodes -------------------------------------
+    var r2 = ftz(identical_mul(rstd, rstd))
+    var r3 = ftz(identical_mul(r2, rstd))
+    var cr3 = ftz(identical_mul(c, r3))
+    var da = ftz(identical_mul(BWD_NEG_HALF, cr3))
+    dv_out.unsafe_store(t, ftz(identical_div(da, Float32(dm))))
+
+
+def bwd_norm_dx_kernel(
+    dx: MutPointer[Float32, MutAnyOrigin],
+    residual_out: MutPointer[Float32, MutAnyOrigin],
+    residual_branch: MutPointer[Float32, MutAnyOrigin],
+    dprod: MutPointer[Float32, MutAnyOrigin],
+    dh: MutPointer[Float32, MutAnyOrigin],
+    dy: MutPointer[Float32, MutAnyOrigin],
+    x: MutPointer[Float32, MutAnyOrigin],
+    rstd_in: MutPointer[Float32, MutAnyOrigin],
+    dv_in: MutPointer[Float32, MutAnyOrigin],
+    m_in: Int32,
+    dm_in: Int32,
+    fuse_residual_in: Int32,
+):
+    """The two `x` branches and the weight-gradient product. One thread per
+    cell.
+
+        dx1_j = identical_mul(dh_j, rstd)     h = x*r, the x branch
+        tx_j  = identical_mul(2.0, x_j)       pow(2) backward's 2*x
+        dx2_j = identical_mul(dv, tx_j)
+        dx_j  = ftz(ftz(dx1_j) + ftz(dx2_j))               UNFUSED ADD
+
+        inner_j = identical_mul(x_j, rstd)    a recompute of forward S3
+        dprod_j = identical_mul(dy_j, inner_j)
+
+    `dprod` exists so the weight gradient can be a GEMM (DEVIATION 1410).
+    `dW[j] = sum_t dy_tj * inner_tj` is a Hadamard then a reduce, so the
+    obvious reading is that it needs a new pinned fold. It does not, for the
+    reason `archive/plans/gemm/IDENTICAL_BACKWARD_PLAN.md` section 3.3 gives about `db`:
+    with the product materialized, the reduction is `ones . dprod`, an
+    `OP_NN` at `(1, dm, M)` whose leaf is `fma(ftz(1.0), ftz(p), acc)` --
+    the contract's ascending flushed chain inside a leaf and the contract's
+    balanced tree across leaves, with nothing new to certify.
+
+    **THE COST THIS LANE PAYS THAT THE GEMM LANE DID NOT**: two roundings
+    per term instead of one. `db[j] = sum dC[i,j]` had no product to round;
+    this does, so the routed form rounds the product and THEN rounds the add
+    where a hand-written `fma(dy, inner, acc)` would round once. Pinned
+    anyway, because one arithmetic under one certificate beats one rounding
+    per term, and because the hand form would be a SIXTH new fold in a lane
+    that has five. Recorded, not hidden."""
+    var m = Int(m_in)
+    var dm = Int(dm_in)
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if i >= m * dm:
+        return
+    var t = i // dm
+    var xj = ftz(x.unsafe_load(i))
+    var rstd = ftz(rstd_in.unsafe_load(t))
+    var dv = ftz(dv_in.unsafe_load(t))
+
+    var dx1 = ftz(identical_mul(ftz(dh.unsafe_load(i)), rstd))
+    var tx = ftz(identical_mul(BWD_TWO, xj))
+    var dx2 = ftz(identical_mul(dv, tx))
+    var dxj = ftz(ftz(dx1) + ftz(dx2))
+    dx.unsafe_store(i, dxj)
+    if fuse_residual_in != 0:
+        residual_out.unsafe_store(
+            i,
+            ftz(ftz(dxj) + ftz(residual_branch.unsafe_load(i))),
+        )
+
+    var inner = ftz(identical_mul(xj, rstd))
+    dprod.unsafe_store(
+        i, ftz(identical_mul(ftz(dy.unsafe_load(i)), inner))
+    )
+
+
+# ===========================================================================
+# S9 AND S10's BACKWARD: THE TRANSPOSED ROTATION. DEVIATION 1412.
+# ===========================================================================
+
+
+def bwd_rope_kernel(
+    out_buf: MutPointer[Float32, MutAnyOrigin],
+    dout: MutPointer[Float32, MutAnyOrigin],
+    cos_tab: MutPointer[Float32, MutAnyOrigin],
+    sin_tab: MutPointer[Float32, MutAnyOrigin],
+    m_in: Int32,
+    l_in: Int32,
+    nh_in: Int32,
+    hd_in: Int32,
+    pos0_in: Int32,
+):
+    """One thread per output cell of `[M, n_h*head_dim]`, token-major. ONE
+    kernel serves q and k, because the reference applies one function to both
+    (:158-159) and a second spelling would be a second place to drift.
+
+    The forward acts on the pair `(a_i, a_{i+half})` at table column
+    `ci = i` as a rotation `M = [[c, -s], [s, c]]`. `M` is orthogonal, so
+    the exact derivative is `M^T = [[c, s], [-s, c]]`, which written in the
+    forward's own `rotate_half` idiom is THE SAME CODE WITH THE NEGATION
+    MOVED FROM THE LOWER HALF TO THE UPPER HALF:
+
+        forward   j <  half: rot = -x[j+half]   j >= half: rot = +x[j-half]
+        backward  j <  half: rot = +d[j+half]   j >= half: rot = -d[j-half]
+
+    **EVERYTHING ELSE IS IDENTICAL.** Same `ci = j mod half` column, same
+    `cos` and `sin` rows at the same ABSOLUTE position, two `pinned_mul`
+    calls, one UNFUSED add. Same three roundings, and contract DEVIATION
+    811's refusal of an fma applies for the reason it applied there.
+
+    So the rounding BUDGET is inherited and the SPELLING is new, and the one
+    thing this lane pins is the SIGN CONVENTION -- one character in two
+    branches, producing a plausible correctly-shaped wrong gradient that is
+    bit identical on three vendors. Sabotage `B09_ROPE_TRANSPOSE_SIGN`,
+    **INERT AT ABSOLUTE POSITION 0** where `sin` is exactly `+0.0`.
+
+    THE POSITION IS THE ABSOLUTE POSITION, ALWAYS, for the same reason the
+    forward's is. THE NEGATION IS EXACT: `-x` flips one bit and is not a
+    seam, so it carries no flush of its own.
+
+    **ONE SENTENCE SO NOBODY EXPECTS THE WRONG THING.** This is the exact
+    transpose of the EXACT rotation, spelled with the forward's rounding
+    budget. It is NOT the numerical adjoint of the ROUNDED forward map,
+    because a rounded map has no adjoint. `bwd_rope(rope(x))` does not
+    return `x` and no clause in this lane says it does."""
+    var m = Int(m_in)
+    var l = Int(l_in)
+    var nh = Int(nh_in)
+    var hd = Int(hd_in)
+    var pos0 = Int(pos0_in)
+    var half = hd // 2
+    var width = nh * hd
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if i >= m * width:
+        return
+
+    var tok = i // width
+    var rem = i - tok * width
+    var h = rem // hd
+    var d = rem - h * hd
+    var t = tok - (tok // l) * l
+    var pos = pos0 + t
+
+    var f = d
+    if f >= half:
+        f = f - half
+    var cos_v = ftz(cos_tab.unsafe_load(pos * half + f))
+    var sin_v = ftz(sin_tab.unsafe_load(pos * half + f))
+    var dj = ftz(dout.unsafe_load(i))
+
+    var rh: Float32
+    comptime if SAB_B09_ROPE_HALVES_ADJACENT:
+        # SABOTAGE: the (2i, 2i+1) pairing several kernels and the original
+        # RoFormer paper use, where HuggingFace's checkpoint layout makes
+        # the HALVES spelling the right one.
+        var e = d - (d // 2) * 2
+        if e == 0:
+            rh = ftz(dout.unsafe_load(i + 1))
+        else:
+            rh = -ftz(dout.unsafe_load(i - 1))
+    elif SAB_B09_ROPE_TRANSPOSE_SIGN:
+        # SABOTAGE: the FORWARD's sign convention, i.e. the rotation run
+        # forwards where the derivative needs it transposed.
+        if d < half:
+            rh = -ftz(dout.unsafe_load(i + half))
+        else:
+            rh = ftz(dout.unsafe_load(i - half))
+    else:
+        if d < half:
+            rh = ftz(dout.unsafe_load(i + half))
+        else:
+            rh = -ftz(dout.unsafe_load(i - half))
+
+    var pa = ftz(identical_mul(dj, cos_v))
+    comptime if SAB_B10_ROPE_BWD_FUSED:
+        out_buf.unsafe_store(i, ftz(identical_mul_add(rh, sin_v, pa)))
+    else:
+        var pb = ftz(identical_mul(rh, sin_v))
+        out_buf.unsafe_store(i, ftz(ftz(pa) + ftz(pb)))
+
+
+# ===========================================================================
+# S14-S18's BACKWARD, AS ONE CLOSED FORM. DEVIATIONS 1406, 1407.
+# ===========================================================================
+
+
+def bwd_softmax_zdot_kernel(
+    zdot: MutPointer[Float32, MutAnyOrigin],
+    dy: MutPointer[Float32, MutAnyOrigin],
+    y: MutPointer[Float32, MutAnyOrigin],
+    b_in: Int32,
+    nh_in: Int32,
+    l_in: Int32,
+    s_in: Int32,
+):
+    """`z = sum_j dy_j * y_j`, a SERIAL ASCENDING CHAIN over the ABSOLUTE
+    key index from `+0.0`, FUSED. One thread per `(batch, head, query)`.
+
+    Masked cells have exactly `y_j = +0.0`, but omitting them is NOT
+    always bitwise inert. The RN-FMA then FTZ-multiply seam can flush a
+    negative subnormal result to `-0.0`, even from a `+0.0` seed. A later
+    masked term with positive dy changes that accumulator to `+0.0`.
+    This full ascending chain is the oracle: fused kernels must either
+    replay the omitted tail when the visible chain ends at negative zero,
+    or refuse and use this eager path. A blanket zero-sign canonicalization
+    is also wrong when all remaining terms preserve negative zero.
+
+    **`core/pinned_reduce.mojo::pinned_block_sum` MAY NOT BE USED**, for the
+    third time in this profile and for the same reason: it is a halving
+    tree, it is perfectly launch invariant, and it is simply a DIFFERENT
+    SUM. Reaching for the deterministic block fold BECAUSE it is the
+    deterministic block fold is the single most likely way to get this
+    wrong.
+
+    FUSED, matching contract S1 and S19, because it is a sum of products.
+
+    Sabotages `B18_ZFOLD_UNFUSED` (INERT at `s == 1`) and
+    `B18_ZFOLD_DESCENDING` (INERT at `s == 1` ONLY -- **not at `s == 2`**,
+    because an fma keeps the second product exact, so a two-term fma chain
+    is order dependent where a two-term ADD chain is not)."""
+    var b = Int(b_in)
+    var nh = Int(nh_in)
+    var l = Int(l_in)
+    var s = Int(s_in)
+    var r = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if r >= b * nh * l:
+        return
+    var base = r * s
+    var z = Float32(0.0)
+    comptime if SAB_B18_ZFOLD_DESCENDING:
+        for jj in range(s):
+            var jd = s - 1 - jj
+            z = ftz(
+                identical_mul_add(
+                    ftz(dy.unsafe_load(base + jd)),
+                    ftz(y.unsafe_load(base + jd)),
+                    z,
+                )
+            )
+    elif SAB_B18_ZFOLD_UNFUSED:
+        for j in range(s):
+            var p = ftz(
+                identical_mul(
+                    ftz(dy.unsafe_load(base + j)),
+                    ftz(y.unsafe_load(base + j)),
+                )
+            )
+            z = ftz(ftz(z) + ftz(p))
+    else:
+        for j in range(s):
+            z = ftz(
+                identical_mul_add(
+                    ftz(dy.unsafe_load(base + j)),
+                    ftz(y.unsafe_load(base + j)),
+                    z,
+                )
+            )
+    zdot.unsafe_store(r, ftz(z))
+
+
+def bwd_softmax_ds_kernel(
+    ds: MutPointer[Float32, MutAnyOrigin],
+    dy: MutPointer[Float32, MutAnyOrigin],
+    y: MutPointer[Float32, MutAnyOrigin],
+    zdot: MutPointer[Float32, MutAnyOrigin],
+    n_in: Int32,
+    s_in: Int32,
+):
+    """`dS_j = identical_mul(y_j, ftz(dy_j - z))`. One SUBTRACT, one PRODUCT,
+    UNFUSED. One thread per cell.
+
+    **THERE IS NO MAX BACKWARD, NO EXP BACKWARD AND NO DIVISION BACKWARD,
+    AND REFUSING TO WRITE THEM IS A DECISION WITH A NAME** (DEVIATION 1406).
+
+    `softmax` is ONE autograd node in the reference, not a graph, and the
+    evidence is in the checkout:
+    `transformers/src/transformers/pytorch_utils.py:50-58` defines
+    `softmax_backward_data(parent, grad_output, output)` whose body is
+    `from torch import _softmax_backward_data; return
+    _softmax_backward_data(grad_output, output, parent.dim, output.dtype)`.
+    A private ATen symbol taking `(grad_output, output, dim, dtype)` and NOT
+    taking the input, the max, the exponentials or the denominator is a
+    closed-form derivative of the whole op.
+
+    **THE DECOMPOSED GRAPH WOULD BE A DIFFERENT ANSWER, AND WORSE IN A
+    SPECIFIC WAY.** `y = softmax(s)` is invariant to the row maximum `m`, so
+    `dL/dm` is analytically EXACTLY zero -- and autograd does not know that.
+    It computes a sum of terms that cancel in the reals and do NOT cancel in
+    Float32, then SCATTERS that residue onto whichever element the max
+    selected. That scatter is unpinnable here:
+
+      1. `identical_fmax` returns a VALUE, not an INDEX. Contract 5.1 pins
+         the max as an order-free fold and leaves its TOPOLOGY free because
+         the operation is exactly associative; an argmax is NOT associative
+         and its answer under ties depends on the fold shape, so a free
+         topology and a defined argmax are incompatible.
+      2. Ties are reachable: a masked row's tail is a run of identical
+         `-FLT_MAX` values.
+      3. `max(+0.0, -0.0)` is a MEASURED three-vendor split (IDENTITY_PATHS
+         row 39, 2026-08-23: `-0.0` on Apple, `+0.0` on NVIDIA and AMD).
+
+    REFUSED, and it happens to also be the reference's behavior -- the only
+    kind of correctness improvement this lane accepts. Sabotage
+    `B18_SOFTMAX_DECOMPOSED`, INERT at `s == 1`.
+
+    **WHAT CONTRACT 5.4's OPEN QUESTION COSTS HERE: NOTHING.** This form
+    reads only `y` and `dy`, so if S18 were ever changed from a division to
+    a reciprocal multiply this kernel would not change -- it would be the
+    derivative of a different forward. The gap does not compound, which is
+    rare enough to be worth a sentence."""
+    var n = Int(n_in)
+    var s = Int(s_in)
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if i >= n:
+        return
+    var r = i // s
+    var yv = ftz(y.unsafe_load(i))
+    var dv = ftz(dy.unsafe_load(i))
+    var z = ftz(zdot.unsafe_load(r))
+
+    comptime if SAB_B18_SOFTMAX_DECOMPOSED:
+        # SABOTAGE: the product DISTRIBUTED across the subtraction, which is
+        # what differentiating the division node and the exp node separately
+        # produces: `y*dy - y*z` instead of `y*(dy - z)`. Two products and a
+        # subtract where the pinned form has a subtract and a product, so a
+        # different rounding path on every ordinary cell.
+        #
+        # **THE MAX NODE'S CONTRIBUTION IS NOT SPELLED EVEN HERE**, because
+        # a device kernel cannot scatter an argmax residue without a float
+        # ATOMIC and an atomic is precisely what this file refuses. So this
+        # arm is a WEAKER sabotage than the full decomposed graph: it
+        # separates the association and not the argmax. The argmax half is
+        # unfirable by construction, which is itself the argument for
+        # DEVIATION 1406 and is recorded rather than papered over.
+        #
+        # INERT at s == 1, where y == 1 and z == dy and both forms give
+        # exactly zero.
+        var p1 = ftz(identical_mul(yv, ftz(dv)))
+        var p2 = ftz(identical_mul(yv, ftz(z)))
+        ds.unsafe_store(i, ftz(ftz(p1) - ftz(p2)))
+        return
+
+    ds.unsafe_store(i, ftz(identical_mul(yv, ftz(ftz(dv) - ftz(z)))))
+
+
+# ===========================================================================
+# THE THREE ATTENTION CHAINS. DEVIATIONS 1402, 1403, 1404, 1424.
+#
+# ONE THREAD PER OUTPUT CELL, no float atomic, no cross-thread reduction.
+# `archive/plans/gemm/IDENTICAL_BACKWARD_PLAN.md` section 4.5 named the attention backward
+# the one row with "a genuine structural obstacle", because the standard
+# FUSED attention backward accumulates `dK` and `dV` across thread blocks
+# with float atomics. That obstacle is gone here, and not by cleverness: it
+# is the direct consequence of refusing the fused shape.
+# ===========================================================================
+
+
+def bwd_dq_kernel(
+    dq: MutPointer[Float32, MutAnyOrigin],
+    dcell: MutPointer[Float32, MutAnyOrigin],
+    k_cache: MutPointer[Float32, MutAnyOrigin],
+    b_in: Int32,
+    l_in: Int32,
+    nh_in: Int32,
+    nkv_in: Int32,
+    hd_in: Int32,
+    s_in: Int32,
+    scale_in: Float32,
+):
+    """`dq[b,h,t,d] = sum_j dcell[b,h,t,j] * k_cache[b,kv,j,d]`, SERIAL
+    ASCENDING over the ABSOLUTE key index from `+0.0`, one `fma` per term.
+    One thread per output cell of `[M, n_heads*head_dim]`.
+
+    **GEMM v1 IS REFUSED HERE AND THE REASON IS NOT THE FORWARD'S REASON.
+    THIS IS THE LANE'S LARGEST FINDING** (DEVIATION 1402).
+
+    S11, the QK product, was ROUTED through gemm v1 (contract DEVIATION 808)
+    precisely because it contracts over `head_dim`, the same integer in a
+    prefill and in a decode step. **A DERIVATIVE SWAPS WHICH AXIS IS
+    CONTRACTED**: `dA` contracts over the OUTPUT WIDTH, and S11's output
+    width is the KV AXIS. So the routed `dq` would be an `OP_NN` at
+    `(l, hd, s)` with `k' = S`, and `P = f(S)` builds one tree at `S = 257`
+    and a different one at `S = 200`. The masked signed-zero tail is NOT
+    inert under a tree whose shape changes with the length. Keep this
+    serial ascending eager chain as the oracle.
+
+    Even in the chain, a masked term can change a preceding `-0.0` to
+    `+0.0`: RN-FMA followed by the FTZ-multiply seam can produce negative
+    zero from a negative subnormal intermediate. The fused dQ kernel must
+    replay that tail exactly or refuse; the +0 seed alone does not prove
+    masked-tail invariance. No fold or zero-sign canonicalization is
+    permitted to repair this discrepancy.
+
+    Sabotage `B11_DQ_VIA_GEMM` lives in the launcher rather than here,
+    because it is a different call graph and not a different branch. It is
+    **INERT AT EVERY `S <= 128`**.
+
+    `scale_in` is read ONLY by `B12_SCALE_INTO_DQ`. The profile scales the
+    finished `dS` (DEVIATION 1415), never folds the scale into this chain,
+    and that arm is INERT at every power-of-four `head_dim`.
+
+    `repeat_kv` is `kv = h // n_rep`, an INDEX MAP (contract DEVIATION 813).
+    At `n_rep == 1` a broken head-to-kv map is INVISIBLE, so the gates must
+    carry both `n_rep == 1` and `n_rep == 2`."""
+    var b = Int(b_in)
+    var l = Int(l_in)
+    var nh = Int(nh_in)
+    var nkv = Int(nkv_in)
+    var hd = Int(hd_in)
+    var s = Int(s_in)
+    var n_rep = nh // nkv
+    var width = nh * hd
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if i >= b * l * width:
+        return
+    var tok = i // width
+    var rem = i - tok * width
+    var h = rem // hd
+    var d = rem - h * hd
+    var bb = tok // l
+    var t = tok - bb * l
+    var kvh = h // n_rep
+    var wbase = ((bb * nh + h) * l + t) * s
+    var vbase = (bb * nkv + kvh) * s * hd
+
+    var acc = Float32(0.0)
+    for j in range(s):
+        var g = ftz(dcell.unsafe_load(wbase + j))
+        comptime if SAB_B12_SCALE_INTO_DQ:
+            # SABOTAGE: the scale folded in per term rather than applied to
+            # the finished dS. Bitwise inert whenever the scale is an exact
+            # power of two, which it is at head_dim 16 and 64.
+            g = ftz(identical_mul(g, scale_in))
+        var kv = ftz(k_cache.unsafe_load(vbase + j * hd + d))
+        acc = ftz(identical_mul_add(g, kv, acc))
+    dq.unsafe_store(i, acc)
+
+
+def bwd_dk_kernel(
+    dk: MutPointer[Float32, MutAnyOrigin],
+    dcell: MutPointer[Float32, MutAnyOrigin],
+    q_rope: MutPointer[Float32, MutAnyOrigin],
+    b_in: Int32,
+    l_in: Int32,
+    nh_in: Int32,
+    nkv_in: Int32,
+    hd_in: Int32,
+    s_in: Int32,
+):
+    """`dk[b,kv,j,d] = sum over (h in the kv group ASCENDING, t ASCENDING)
+    of dcell[b,h,t,j] * q_rope[b,h,t,d]`, from `+0.0`, FUSED. One thread per
+    output cell of `[B, n_kv, S, head_dim]`.
+
+    **ONE CHAIN, NOT A SUM OF PER-HEAD PARTIALS** (DEVIATION 1424). With
+    `n_rep > 1` several attention heads share one kv head, and folding each
+    head separately and adding the partials is a DIFFERENT ASSOCIATION. The
+    head axis is OUTERMOST, matching the forward's own `(batch, head,
+    query)` nesting.
+
+    **THE OTHER OPERAND IS `q_rope.out`, NOT `q_proj.out`.** The QK product
+    reads the ROTATED query, so its derivative does too, and reading the
+    pre-rotation activation here would produce a plausible gradient that is
+    wrong by exactly one rotation -- invisible in a magnitude check.
+
+    **GEMM v1 IS REFUSED**: the routed form is `OP_TN` at `(s, hd, l)` with
+    `k' = L`, the QUERY COUNT, path dependent. Sabotage `B11_DK_VIA_GEMM` in
+    the launcher, INERT only when `L <= 128` AND `n_rep == 1` together.
+
+    **THIS IS A PARTIAL GRADIENT AND IT IS NAMED ONE** (DEVIATION 1417). A
+    key at slot `j` is read by every query at absolute position `>= j`, and
+    the queries in LATER calls are not in this call, so the fold over
+    `[0, l)` is the contribution of THIS call's queries and nothing else.
+    The full `[0, S)` range is written so a multi-call assembler has a
+    complete partial to add; assembling is out of scope. **THE FORWARD'S
+    DECODE-EQUALS-PREFILL DOES NOT TRANSFER TO THIS OUTPUT AND THIS FILE
+    DOES NOT PRETEND IT DOES.**"""
+    var b = Int(b_in)
+    var l = Int(l_in)
+    var nh = Int(nh_in)
+    var nkv = Int(nkv_in)
+    var hd = Int(hd_in)
+    var s = Int(s_in)
+    var n_rep = nh // nkv
+    var qw = nh * hd
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if i >= b * nkv * s * hd:
+        return
+    var d = i % hd
+    var rest = i // hd
+    var j = rest % s
+    var rest2 = rest // s
+    var kvh = rest2 % nkv
+    var bb = rest2 // nkv
+
+    var acc = Float32(0.0)
+    for hh in range(n_rep):
+        var h = kvh * n_rep + hh
+        for t in range(l):
+            var wbase = ((bb * nh + h) * l + t) * s
+            acc = ftz(
+                identical_mul_add(
+                    ftz(dcell.unsafe_load(wbase + j)),
+                    ftz(q_rope.unsafe_load((bb * l + t) * qw + h * hd + d)),
+                    acc,
+                )
+            )
+    dk.unsafe_store(i, acc)
+
+
+def bwd_dv_kernel(
+    dv: MutPointer[Float32, MutAnyOrigin],
+    weights: MutPointer[Float32, MutAnyOrigin],
+    dctx: MutPointer[Float32, MutAnyOrigin],
+    b_in: Int32,
+    l_in: Int32,
+    nh_in: Int32,
+    nkv_in: Int32,
+    hd_in: Int32,
+    s_in: Int32,
+):
+    """`dv[b,kv,j,d] = sum over (h in the kv group ASCENDING, t ASCENDING)
+    of y[b,h,t,j] * dctx[b,h,t,d]`, from `+0.0`, FUSED. One thread per
+    output cell.
+
+    DEVIATION 1404, the mirror of contract DEVIATION 807. Same fold axis as
+    `bwd_dk_kernel`, same refusal of gemm v1, same partial-gradient caveat.
+    Sabotage `B19_DV_VIA_GEMM` is the backward twin of the forward's
+    `S19_VALUE_SUM_VIA_GEMM` and inherits its warning verbatim: without
+    clause (d) it looks inert and gets deleted.
+
+    The masked cells contribute `fma(+0.0, dctx, acc)` because `y` is
+    exactly `+0.0` there (contract 7.1), so they are bitwise inert here too
+    -- which is why `dv` for a key slot does not depend on how many PADDING
+    keys were in the launch, only on how many QUERIES were."""
+    var b = Int(b_in)
+    var l = Int(l_in)
+    var nh = Int(nh_in)
+    var nkv = Int(nkv_in)
+    var hd = Int(hd_in)
+    var s = Int(s_in)
+    var n_rep = nh // nkv
+    var qw = nh * hd
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if i >= b * nkv * s * hd:
+        return
+    var d = i % hd
+    var rest = i // hd
+    var j = rest % s
+    var rest2 = rest // s
+    var kvh = rest2 % nkv
+    var bb = rest2 // nkv
+
+    var acc = Float32(0.0)
+    for hh in range(n_rep):
+        var h = kvh * n_rep + hh
+        for t in range(l):
+            var wbase = ((bb * nh + h) * l + t) * s
+            acc = ftz(
+                identical_mul_add(
+                    ftz(weights.unsafe_load(wbase + j)),
+                    ftz(dctx.unsafe_load((bb * l + t) * qw + h * hd + d)),
+                    acc,
+                )
+            )
+    dv.unsafe_store(i, acc)
+
+
+def bwd_dw_chain_kernel(
+    dw: MutPointer[Float32, MutAnyOrigin],
+    dctx: MutPointer[Float32, MutAnyOrigin],
+    v_cache: MutPointer[Float32, MutAnyOrigin],
+    b_in: Int32,
+    l_in: Int32,
+    nh_in: Int32,
+    nkv_in: Int32,
+    hd_in: Int32,
+    s_in: Int32,
+):
+    """SABOTAGE-ONLY (`B10_DW_VIA_CHAIN`). The attention-weight gradient
+    spelled as a hand chain over `head_dim` instead of the ROUTED gemm v1
+    cell that the profile uses.
+
+    **THIS ARM CANNOT FIRE AT THE GATE SHAPE.** The chain and the gemm agree
+    bit for bit whenever `P(head_dim) == 1`, i.e. `head_dim <= 128`, and the
+    profile's fixtures are 16 and 24. So DEVIATION 1405 rests on the
+    argument in `bwd_attention_weight_grad`'s docstring and on gemm v1's own
+    certificate, NOT on a fired arm. It is written and wired anyway, because
+    a profile that ever admits `head_dim > 128` needs it, and because an arm
+    that exists and is INERT is honest where a missing arm is a gap nobody
+    recorded."""
+    var b = Int(b_in)
+    var l = Int(l_in)
+    var nh = Int(nh_in)
+    var nkv = Int(nkv_in)
+    var hd = Int(hd_in)
+    var s = Int(s_in)
+    var n_rep = nh // nkv
+    var qw = nh * hd
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if i >= b * nh * l * s:
+        return
+    var j = i % s
+    var rest = i // s
+    var t = rest % l
+    var rest2 = rest // l
+    var h = rest2 % nh
+    var bb = rest2 // nh
+    var kvh = h // n_rep
+    var vbase = (bb * nkv + kvh) * s * hd
+    var cbase = (bb * l + t) * qw + h * hd
+
+    var acc = Float32(0.0)
+    for d in range(hd):
+        acc = ftz(
+            identical_mul_add(
+                ftz(dctx.unsafe_load(cbase + d)),
+                ftz(v_cache.unsafe_load(vbase + j * hd + d)),
+                acc,
+            )
+        )
+    dw.unsafe_store(i, acc)
+
+
+# ===========================================================================
+# THE GATHER / SCATTER COPIES for the per-(batch, head) GEMM calls. None is
+# a seam: each moves bits untouched, and the arithmetic they surround is
+# gemm v1's. Contract section 4's preamble is explicit that a copy is not a
+# seam, and the forward device file makes the same split for the same
+# reason: a copy that also rounds is a copy nobody reviews as a seam.
+# ===========================================================================
+
+
+def bwd_gather_ctx_head_kernel(
+    dst: MutPointer[Float32, MutAnyOrigin],
+    dctx: MutPointer[Float32, MutAnyOrigin],
+    l_in: Int32,
+    nh_in: Int32,
+    hd_in: Int32,
+    bb_in: Int32,
+    h_in: Int32,
+):
+    """One head's `[L, head_dim]` block of `d(attn.ctx)`, contiguous."""
+    var l = Int(l_in)
+    var nh = Int(nh_in)
+    var hd = Int(hd_in)
+    var bb = Int(bb_in)
+    var h = Int(h_in)
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if i >= l * hd:
+        return
+    var t = i // hd
+    var d = i - t * hd
+    dst.unsafe_store(i, dctx.unsafe_load((bb * l + t) * nh * hd + h * hd + d))
+
+
+def bwd_gather_kv_head_kernel(
+    dst: MutPointer[Float32, MutAnyOrigin],
+    cache: MutPointer[Float32, MutAnyOrigin],
+    s_in: Int32,
+    nkv_in: Int32,
+    hd_in: Int32,
+    bb_in: Int32,
+    kvh_in: Int32,
+):
+    """One kv head's `[S, head_dim]` block. `repeat_kv` is the
+    `kvh = h // n_rep` the CALLER passes: an index map, never a materialized
+    expansion (contract DEVIATION 813)."""
+    var s = Int(s_in)
+    var nkv = Int(nkv_in)
+    var hd = Int(hd_in)
+    var bb = Int(bb_in)
+    var kvh = Int(kvh_in)
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if i >= s * hd:
+        return
+    dst.unsafe_store(i, cache.unsafe_load((bb * nkv + kvh) * s * hd + i))
+
+
+def bwd_scatter_head_ls_kernel(
+    dst: MutPointer[Float32, MutAnyOrigin],
+    src: MutPointer[Float32, MutAnyOrigin],
+    l_in: Int32,
+    s_in: Int32,
+    nh_in: Int32,
+    bb_in: Int32,
+    h_in: Int32,
+):
+    """A `[L, S]` per-head block into `[B, n_heads, L, S]`."""
+    var l = Int(l_in)
+    var s = Int(s_in)
+    var nh = Int(nh_in)
+    var bb = Int(bb_in)
+    var h = Int(h_in)
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if i >= l * s:
+        return
+    var t = i // s
+    var j = i - t * s
+    dst.unsafe_store(((bb * nh + h) * l + t) * s + j, src.unsafe_load(i))
+
+
+def bwd_gather_head_ls_kernel(
+    dst: MutPointer[Float32, MutAnyOrigin],
+    src: MutPointer[Float32, MutAnyOrigin],
+    l_in: Int32,
+    s_in: Int32,
+    nh_in: Int32,
+    bb_in: Int32,
+    h_in: Int32,
+):
+    """`bwd_scatter_head_ls_kernel` in reverse. SABOTAGE-ONLY: it exists so
+    the three `*_VIA_GEMM` arms have a body. Nothing in the profile calls
+    it."""
+    var l = Int(l_in)
+    var s = Int(s_in)
+    var nh = Int(nh_in)
+    var bb = Int(bb_in)
+    var h = Int(h_in)
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if i >= l * s:
+        return
+    var t = i // s
+    var j = i - t * s
+    dst.unsafe_store(i, src.unsafe_load(((bb * nh + h) * l + t) * s + j))
+
+
+def bwd_scatter_q_head_kernel(
+    dst: MutPointer[Float32, MutAnyOrigin],
+    src: MutPointer[Float32, MutAnyOrigin],
+    l_in: Int32,
+    nh_in: Int32,
+    hd_in: Int32,
+    bb_in: Int32,
+    h_in: Int32,
+):
+    """A `[L, head_dim]` per-head block into `[M, n_heads*head_dim]`.
+    SABOTAGE-ONLY, the other half of `B11_DQ_VIA_GEMM`."""
+    var l = Int(l_in)
+    var nh = Int(nh_in)
+    var hd = Int(hd_in)
+    var bb = Int(bb_in)
+    var h = Int(h_in)
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if i >= l * hd:
+        return
+    var t = i // hd
+    var d = i - t * hd
+    dst.unsafe_store((bb * l + t) * nh * hd + h * hd + d, src.unsafe_load(i))
+
+
+def bwd_accum_kv_head_kernel(
+    dst: MutPointer[Float32, MutAnyOrigin],
+    src: MutPointer[Float32, MutAnyOrigin],
+    s_in: Int32,
+    nkv_in: Int32,
+    hd_in: Int32,
+    bb_in: Int32,
+    kvh_in: Int32,
+    first_in: Int32,
+):
+    """Add a `[S, head_dim]` per-head partial into one kv head's slice.
+    SABOTAGE-ONLY, the accumulation half of `B11_DK_VIA_GEMM` and
+    `B19_DV_VIA_GEMM`.
+
+    `first_in` non-zero STORES rather than adds, so the per-head partials
+    are accumulated with no `+0.0` seed -- which is what makes the arm a
+    faithful spelling of "route it and add the groups" rather than a
+    straw man carrying a second defect."""
+    var s = Int(s_in)
+    var nkv = Int(nkv_in)
+    var hd = Int(hd_in)
+    var bb = Int(bb_in)
+    var kvh = Int(kvh_in)
+    var first = Int(first_in)
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if i >= s * hd:
+        return
+    var ix = (bb * nkv + kvh) * s * hd + i
+    if first != 0:
+        dst.unsafe_store(ix, src.unsafe_load(i))
+        return
+    dst.unsafe_store(
+        ix, ftz(ftz(dst.unsafe_load(ix)) + ftz(src.unsafe_load(i)))
+    )
+
+
+def bwd_kv_slice_kernel(
+    dst: MutPointer[Float32, MutAnyOrigin],
+    src: MutPointer[Float32, MutAnyOrigin],
+    b_in: Int32,
+    l_in: Int32,
+    nkv_in: Int32,
+    hd_in: Int32,
+    s_in: Int32,
+    own0_in: Int32,
+):
+    """The KV append's backward: a SLICE, no arithmetic. This call's own
+    tokens occupy slots `[own0, S)` of the key span (`own0 = pos0 - key_lo`,
+    which is `pos0` in full causal) and their gradient is read out at the
+    token-major `[M, n_kv*head_dim]` layout the projections expect. Slots
+    `[0, own0)` are the HANDOFF of DEVIATION 1417 and are not consumed
+    here."""
+    var b = Int(b_in)
+    var l = Int(l_in)
+    var nkv = Int(nkv_in)
+    var hd = Int(hd_in)
+    var s = Int(s_in)
+    var pos0 = Int(own0_in)
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if i >= b * l * nkv * hd:
+        return
+    var d = i % hd
+    var rest = i // hd
+    var kvh = rest % nkv
+    var rest2 = rest // nkv
+    var li = rest2 % l
+    var bb = rest2 // l
+    dst.unsafe_store(
+        i, src.unsafe_load((bb * nkv + kvh) * s * hd + (pos0 + li) * hd + d)
+    )
+
+
+def bwd_kv_slice2_kernel(
+    dst_k: MutPointer[Float32, MutAnyOrigin],
+    dst_v: MutPointer[Float32, MutAnyOrigin],
+    src_k: MutPointer[Float32, MutAnyOrigin],
+    src_v: MutPointer[Float32, MutAnyOrigin],
+    b_in: Int32,
+    l_in: Int32,
+    nkv_in: Int32,
+    hd_in: Int32,
+    s_in: Int32,
+    own0_in: Int32,
+):
+    """The independent K and V cache-gradient slices in one traversal.
+
+    Both outputs use `bwd_kv_slice_kernel`'s exact address and are bit copies;
+    sharing its integer index calculation changes no floating-point operation
+    or ordering.
+    """
+    var b = Int(b_in)
+    var l = Int(l_in)
+    var nkv = Int(nkv_in)
+    var hd = Int(hd_in)
+    var s = Int(s_in)
+    var pos0 = Int(own0_in)
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if i >= b * l * nkv * hd:
+        return
+    var d = i % hd
+    var rest = i // hd
+    var kvh = rest % nkv
+    var rest2 = rest // nkv
+    var li = rest2 % l
+    var bb = rest2 // l
+    var src_i = (bb * nkv + kvh) * s * hd + (pos0 + li) * hd + d
+    dst_k.unsafe_store(i, src_k.unsafe_load(src_i))
+    dst_v.unsafe_store(i, src_v.unsafe_load(src_i))
+
+
+# ===========================================================================
+# THE ROUTING DOOR (DEVIATION 1425). Two launchers, and they are the ONLY
+# place in this file where a backward GEMM shape is decided.
+# ===========================================================================
+
+
+def _route_a(
+    ctx: DeviceContext,
+    mut workspace: GemmWorkspace,
+    mut out_buf: DeviceBuffer[DType.float32],
+    mut dc: DeviceBuffer[DType.float32],
+    mut other: DeviceBuffer[DType.float32],
+    op: Int,
+    m: Int,
+    n: Int,
+    k: Int,
+) raises:
+    """`dA` for a forward `C = op(A) . op(B)` at `(m, n, k)`, into
+    `out_buf`. `other` is the forward's `B` operand, unchanged and
+    untransposed.
+
+    **THE SIDE FLAG IS HONORED RATHER THAN ASSUMED.** Two of the GEMM lane's
+    six rows put `dC` on the RIGHT. Neither is reached by this profile --
+    every forward call here is `OP_NT`, whose `dA` and `dB` both put `dC`
+    left -- so plan section 6.3 predicts `SAB_BWD_OPERAND_ORDER` is INERT
+    through these entry points. An inert arm that is WIRED is worth more
+    than one that is not, because the next profile may not be all-`OP_NT`.
+
+    The stage owner retains `workspace` until the caller's completion wait.
+    Workspace sizing follows the actual backward GEMM shape."""
+    var call = gemm_backward_a_call(op, m, n, k)
+    if call[4] == BWD_DC_LEFT:
+        workspace.run(
+            ctx, out_buf, dc, other, call[1], call[2], call[3], call[0]
+        )
+        return
+    workspace.run(
+        ctx, out_buf, other, dc, call[1], call[2], call[3], call[0]
+    )
+
+
+def _route_b(
+    ctx: DeviceContext,
+    mut workspace: GemmWorkspace,
+    mut out_buf: DeviceBuffer[DType.float32],
+    mut dc: DeviceBuffer[DType.float32],
+    mut other: DeviceBuffer[DType.float32],
+    op: Int,
+    m: Int,
+    n: Int,
+    k: Int,
+) raises:
+    """`dB` for a forward `C = op(A) . op(B)` at `(m, n, k)`. `other` is the
+    forward's `A` operand.
+
+    **THIS IS THE CALL WHOSE `k'` IS THE TOKEN COUNT** for every projection
+    in this block, which is `gemm_backward_b_call`'s own headline finding.
+    So it is the call whose partition, whose plan and whose BITS move when
+    the batch size moves. Nothing about that threatens cross-vendor
+    identity and everything about it means a training run has to declare its
+    batch and chunk schedule as part of its numerical specification --
+    plan sections 5.2 and 5.4, and the gate asserts the NEGATIVE property
+    that these outputs MOVE under a change of batch composition."""
+    var call = gemm_backward_b_call(op, m, n, k)
+    # lane w2-lmgrad WGRAD_SPLIT (FAST + Apple + define only): the weight
+    # gradient, whose `k'` is the token count and whose output is small,
+    # on the split-K simdgroup route; falls through when it does not split.
+    comptime if _AFN_WGRAD:
+        if _afn_wgrad(ctx, out_buf, dc, other, call):
+            return
+    if call[4] == BWD_DC_LEFT:
+        workspace.run(
+            ctx, out_buf, dc, other, call[1], call[2], call[3], call[0]
+        )
+        return
+    workspace.run(
+        ctx, out_buf, other, dc, call[1], call[2], call[3], call[0]
+    )
+
+
+# lane w2-lmgrad (2026-10-03): FAST + Apple helpers, reached only from
+# `comptime if _AFN_*` arms; IDENTICAL never instantiates them.
+
+
+def _afn_ptr(mut buf: DeviceBuffer[DType.float32]) -> MutPointer[Float32, MutAnyOrigin]:
+    return buf.unsafe_ptr().unsafe_origin_cast[MutAnyOrigin]()
+
+
+def _afn_wgrad(
+    ctx: DeviceContext,
+    mut out_buf: DeviceBuffer[DType.float32],
+    mut dc: DeviceBuffer[DType.float32],
+    mut other: DeviceBuffer[DType.float32],
+    call: Tuple[Int, Int, Int, Int, Int],
+) raises -> Bool:
+    """`_route_b`'s product (`call` from `gemm_backward_b_call`) on the
+    split-K route (WGRAD_SPLIT). False when it does not serve it."""
+    if call[4] == BWD_DC_LEFT:
+        return afn_lm_wgrad_split_into(
+            ctx, _afn_ptr(out_buf), _afn_ptr(dc), _afn_ptr(other),
+            call[1], call[2], call[3], call[0],
+        )
+    return afn_lm_wgrad_split_into(
+        ctx, _afn_ptr(out_buf), _afn_ptr(other), _afn_ptr(dc),
+        call[1], call[2], call[3], call[0],
+    )
+
+
+# TOMBSTONE: ANONLIB_AFN_LM_BWD_EPILOGUE (_afn_route_a_resid_ok, _afn_bwd_epi_on, _afn_route_a_resid: the fused
+# dA + residual store of the hand walk's two fan-ins) deleted 2026-10-19 by 7b6862e3d; code recoverable at 7b6862e3d^.
+# Restore: git apply experiments/removed/LLAMA_DECODER_LAYER_BACKWARD_HAND_WALK.patch
+
+
+# ===========================================================================
+# THE STAGES AND THE SCRATCH
+# ===========================================================================
+
+
+struct LlamaBackwardStages(Movable):
+    """The thirty-seven recorded backward stages plus the scratch the
+    launchers need. Plan section 6.1 lists the tags and the layouts.
+
+    **FOUR `[B, n_heads, L, S]` BUFFERS is what the eager path costs on the
+    backward**, against the forward's six, so a backward call's peak
+    footprint is roughly 1.7x a forward call's on the dominant term, plus
+    the saved forward stages held for the whole interval. Plan section 7
+    prices it. It is also what makes every attention seam separately
+    recordable, and a lane whose whole instrument is the per-stage card
+    should not begin by fusing the stages away.
+
+    The attention buffers are allocated at `s_max` and USED PACKED at the
+    call's `s`, so `record_device(..., count = b*nh*l*s)` hashes exactly the
+    array the card lists and never folds uninitialized tail memory into a
+    stage. `core/identity_trace.mojo` is emphatic: when a buffer is used
+    short, PASS THE LENGTH.
+
+    **THE SCRATCH FIELDS CARRY NO TAG.** `dh`, `dprod`, `rstd`, `dvcoef`,
+    `ones`, `tmp0`, `tmp1`, `tmp2`, `head_a`, `head_b`, `head_c` hold
+    intermediates and per-head gathers, and no seam records them. `dprod`
+    and `dh` are the two a reader might expect to see on the card: `dprod`
+    is the input to a gemm whose OUTPUT is `bwd.dW_norm*`, and `dh` is the
+    input to a fold whose output is `bwd.norm*.dot`, so both are one step
+    from a recorded stage and neither adds localization."""
+
+    var b: Int
+    var l: Int
+    var s_max: Int
+    var dims: LlamaDims
+
+    var in_d_residual2: DeviceBuffer[DType.float32]
+    var d_down_proj_out: DeviceBuffer[DType.float32]
+    var d_mlp_gated: DeviceBuffer[DType.float32]
+    var dw_down: DeviceBuffer[DType.float32]
+    var d_silu_out: DeviceBuffer[DType.float32]
+    var d_up_proj_out: DeviceBuffer[DType.float32]
+    var d_gate_proj_out: DeviceBuffer[DType.float32]
+    var dw_gate: DeviceBuffer[DType.float32]
+    var dw_up: DeviceBuffer[DType.float32]
+    var d_norm2_out: DeviceBuffer[DType.float32]
+    var norm2_dot: DeviceBuffer[DType.float32]
+    var dw_norm2: DeviceBuffer[DType.float32]
+    var norm2_dx: DeviceBuffer[DType.float32]
+    var d_residual1: DeviceBuffer[DType.float32]
+    var d_o_proj_out: DeviceBuffer[DType.float32]
+    var d_attn_ctx: DeviceBuffer[DType.float32]
+    var dw_o: DeviceBuffer[DType.float32]
+    var d_attn_weights: DeviceBuffer[DType.float32]
+    var attn_zdot: DeviceBuffer[DType.float32]
+    var d_attn_masked: DeviceBuffer[DType.float32]
+    var d_attn_scores: DeviceBuffer[DType.float32]
+    var d_qk_cell: DeviceBuffer[DType.float32]
+    var d_q_rope: DeviceBuffer[DType.float32]
+    var d_k_cache: DeviceBuffer[DType.float32]
+    var d_v_cache: DeviceBuffer[DType.float32]
+    var d_k_rope: DeviceBuffer[DType.float32]
+    var d_v_proj_out: DeviceBuffer[DType.float32]
+    var d_q_proj_out: DeviceBuffer[DType.float32]
+    var d_k_proj_out: DeviceBuffer[DType.float32]
+    var dw_q: DeviceBuffer[DType.float32]
+    var dw_k: DeviceBuffer[DType.float32]
+    var dw_v: DeviceBuffer[DType.float32]
+    var d_norm1_out: DeviceBuffer[DType.float32]
+    var norm1_dot: DeviceBuffer[DType.float32]
+    var dw_norm1: DeviceBuffer[DType.float32]
+    var norm1_dx: DeviceBuffer[DType.float32]
+    var d_x: DeviceBuffer[DType.float32]
+
+    # ---- scratch, no tag ------------------------------------------------
+    var dh: DeviceBuffer[DType.float32]  # [M, d_model]
+    var dprod: DeviceBuffer[DType.float32]  # [M, d_model]
+    var rstd: DeviceBuffer[DType.float32]  # [M]
+    var dvcoef: DeviceBuffer[DType.float32]  # [M]
+    var ones: DeviceBuffer[DType.float32]  # [M], exactly 1.0
+    var tmp0: DeviceBuffer[DType.float32]  # [M, max(d_model, intermediate)]
+    var tmp1: DeviceBuffer[DType.float32]
+    var tmp2: DeviceBuffer[DType.float32]
+    var gemm_workspace: GemmWorkspace
+    var head_a: DeviceBuffer[DType.float32]  # [L, head_dim]
+    var head_b: DeviceBuffer[DType.float32]  # [s_max, head_dim]
+    var attn_repaired: Int  # bit 0 zdot; bit 1 dq; actual masked-tail replay
+    var attn_backward_status: Int  # -1 not attempted; otherwise FUSED_*
+    var attn_bwd_fused_off: Bool
+    """DEVIATION 3110: this layer's fused BACKWARD refused once, so it is not
+    launched again for the life of this struct."""
+    var head_c: DeviceBuffer[DType.float32]  # [L, s_max]
+
+    def __init__(
+        out self,
+        ctx: DeviceContext,
+        b: Int,
+        l: Int,
+        s_max: Int,
+        dims: LlamaDims,
+        lean: Bool = False,
+    ) raises:
+        """`lean`: the four `[B, n_heads, L, S]` attention gradients and
+        `head_c` are allocated at ONE element, for a caller that runs the
+        fused attention backward with the trace off; the eager path grows
+        them on demand (`ensure_backward_attention_capacity`)."""
+        dims.validate()
+        if b <= 0 or l <= 0:
+            raise Error("llama backward: stages need B > 0 and L > 0")
+        if s_max < l:
+            raise Error(
+                String("llama backward: s_max ")
+                + String(s_max)
+                + " is smaller than L "
+                + String(l)
+            )
+        self.gemm_workspace = GemmWorkspace(ctx)
+        self.b = b
+        self.l = l
+        self.s_max = s_max
+        self.dims = dims.copy()
+        var m = b * l
+        var dm = dims.d_model
+        var qw = dims.q_width()
+        var kw = dims.kv_width()
+        var hd = dims.head_dim
+        var it = dims.intermediate
+        var nh = dims.n_heads
+        var nkv = dims.n_kv
+
+        self.in_d_residual2 = _zeros[False](ctx, m * dm)
+        # Both residual-add branches receive the incoming cotangent
+        # unchanged. They are read-only afterward, so retain one allocation
+        # while preserving the two separately named trace stages.
+        self.d_down_proj_out = self.in_d_residual2.create_sub_buffer[DType.float32](0, m * dm)
+        self.d_mlp_gated = _zeros[False](ctx, m * it)
+        self.dw_down = _zeros[False](ctx, dm * it)
+        self.d_silu_out = _zeros[False](ctx, m * it)
+        self.d_up_proj_out = _zeros[False](ctx, m * it)
+        self.d_gate_proj_out = _zeros[False](ctx, m * it)
+        self.dw_gate = _zeros[False](ctx, it * dm)
+        self.dw_up = _zeros[False](ctx, it * dm)
+        self.d_norm2_out = _zeros[False](ctx, m * dm)
+        self.norm2_dot = _zeros[False](ctx, m)
+        self.dw_norm2 = _zeros[False](ctx, dm)
+        self.norm2_dx = _zeros[False](ctx, m * dm)
+        self.d_residual1 = _zeros[False](ctx, m * dm)
+        # `o_proj` receives the residual-add cotangent verbatim. Keep its
+        # separately named trace stage as a view: both consumers are reads,
+        # and `d_residual1` remains live until the final input fan-in.
+        self.d_o_proj_out = self.d_residual1.create_sub_buffer[DType.float32](0, m * dm)
+        self.d_attn_ctx = _zeros[False](ctx, m * qw)
+        self.dw_o = _zeros[False](ctx, dm * qw)
+        var cells = b * nh * l * s_max
+        var head_c_n = l * s_max
+        if lean:
+            cells = 1
+            head_c_n = 1
+        self.d_attn_weights = _zeros[False](ctx, cells)
+        self.attn_zdot = _zeros[False](ctx, b * nh * l)
+        self.d_attn_masked = _zeros[False](ctx, cells)
+        self.d_attn_scores = _zeros[False](ctx, cells)
+        self.d_qk_cell = _zeros[False](ctx, cells)
+        self.d_q_rope = _zeros[False](ctx, m * qw)
+        self.d_k_cache = _zeros[False](ctx, b * nkv * s_max * hd)
+        self.d_v_cache = _zeros[False](ctx, b * nkv * s_max * hd)
+        self.d_k_rope = _zeros[False](ctx, m * kw)
+        self.d_v_proj_out = _zeros[False](ctx, m * kw)
+        self.d_q_proj_out = _zeros[False](ctx, m * qw)
+        self.d_k_proj_out = _zeros[False](ctx, m * kw)
+        self.dw_q = _zeros[False](ctx, qw * dm)
+        self.dw_k = _zeros[False](ctx, kw * dm)
+        self.dw_v = _zeros[False](ctx, kw * dm)
+        self.d_norm1_out = _zeros[False](ctx, m * dm)
+        self.norm1_dot = _zeros[False](ctx, m)
+        self.dw_norm1 = _zeros[False](ctx, dm)
+        self.norm1_dx = _zeros[False](ctx, m * dm)
+        self.d_x = _zeros[False](ctx, m * dm)
+
+        self.dh = _zeros[False](ctx, m * dm)
+        self.dprod = _zeros[False](ctx, m * dm)
+        self.rstd = _zeros[False](ctx, m)
+        self.dvcoef = _zeros[False](ctx, m)
+        self.ones = _fill_ones[False](ctx, m)
+        # The gate/up and q/k/v dA routes all produce [M, d_model].  These
+        # unrecorded fan-in temporaries never hold an intermediate-width
+        # tensor, even when intermediate > d_model.
+        self.tmp0 = _zeros[False](ctx, m * dm)
+        self.tmp1 = _zeros[False](ctx, m * dm)
+        self.tmp2 = _zeros[False](ctx, m * dm)
+        self.head_a = _zeros[False](ctx, l * hd)
+        self.head_b = _zeros[False](ctx, s_max * hd)
+        self.attn_repaired = 0
+        self.attn_backward_status = -1
+        self.attn_bwd_fused_off = False
+        self.head_c = _zeros[False](ctx, head_c_n)
+
+        # All fill targets are fields of self and remain alive through this
+        # fence. Queue every fill on the same context, then wait once before
+        # publishing the initialized stages. Keep zeros AND the ones vector.
+        step_count_sync()
+        ctx.synchronize()
+
+
+
+def ensure_backward_attention_capacity(
+    ctx: DeviceContext, mut bst: LlamaBackwardStages, l: Int, s: Int
+) raises:
+    """Grow a lean struct's attention gradients to this call's `[B,
+    n_heads, L, S]` before the eager path writes them."""
+    var cells = bst.b * bst.dims.n_heads * l * s
+    if len(bst.d_attn_weights) < cells:
+        bst.d_attn_weights = _zeros(ctx, cells)
+        bst.d_attn_masked = _zeros(ctx, cells)
+        bst.d_attn_scores = _zeros(ctx, cells)
+        bst.d_qk_cell = _zeros(ctx, cells)
+    if len(bst.head_c) < l * s:
+        bst.head_c = _zeros(ctx, l * s)
+
+
+def backward_stage_tag(i: Int) raises -> String:
+    """The thirty-seven backward tags, in the plan's order, DUPLICATED from
+    `transformer_backward_oracle.mojo::backward_stage_tag` ON PURPOSE.
+
+    This file may not import from `transformer/checks/`'s oracle half in
+    the direction that would make the two halves one module -- the forward
+    lane made the same split and its `PLANT_AT_*` constants carry the same
+    note. **The MAINTAINER owns keeping these two lists equal.** If they
+    ever disagree, `tools/identity_trace_diff.py` aligns two tag SEQUENCES
+    and produces a WRONG ALIGNMENT that pairs one run's stage against
+    another run's different stage and reports a plausible answer, which
+    reads exactly like an arithmetic bug and is not one."""
+    if i == 0:
+        return String("bwd.in.d_residual2")
+    if i == 1:
+        return String("bwd.d_down_proj_out")
+    if i == 2:
+        return String("bwd.d_mlp_gated")
+    if i == 3:
+        return String("bwd.dW_down")
+    if i == 4:
+        return String("bwd.d_silu_out")
+    if i == 5:
+        return String("bwd.d_up_proj_out")
+    if i == 6:
+        return String("bwd.d_gate_proj_out")
+    if i == 7:
+        return String("bwd.dW_gate")
+    if i == 8:
+        return String("bwd.dW_up")
+    if i == 9:
+        return String("bwd.d_norm2_out")
+    if i == 10:
+        return String("bwd.norm2.dot")
+    if i == 11:
+        return String("bwd.dW_norm2")
+    if i == 12:
+        return String("bwd.norm2.dx")
+    if i == 13:
+        return String("bwd.d_residual1")
+    if i == 14:
+        return String("bwd.d_o_proj_out")
+    if i == 15:
+        return String("bwd.d_attn_ctx")
+    if i == 16:
+        return String("bwd.dW_o")
+    if i == 17:
+        return String("bwd.d_attn_weights")
+    if i == 18:
+        return String("bwd.attn.zdot")
+    if i == 19:
+        return String("bwd.d_attn_masked")
+    if i == 20:
+        return String("bwd.d_attn_scores")
+    if i == 21:
+        return String("bwd.d_qk_cell")
+    if i == 22:
+        return String("bwd.d_q_rope")
+    if i == 23:
+        return String("bwd.d_k_cache")
+    if i == 24:
+        return String("bwd.d_v_cache")
+    if i == 25:
+        return String("bwd.d_k_rope")
+    if i == 26:
+        return String("bwd.d_v_proj_out")
+    if i == 27:
+        return String("bwd.d_q_proj_out")
+    if i == 28:
+        return String("bwd.d_k_proj_out")
+    if i == 29:
+        return String("bwd.dW_q")
+    if i == 30:
+        return String("bwd.dW_k")
+    if i == 31:
+        return String("bwd.dW_v")
+    if i == 32:
+        return String("bwd.d_norm1_out")
+    if i == 33:
+        return String("bwd.norm1.dot")
+    if i == 34:
+        return String("bwd.dW_norm1")
+    if i == 35:
+        return String("bwd.norm1.dx")
+    if i == 36:
+        return String("bwd.d_x")
+    raise Error(
+        String("llama backward: no stage ")
+        + String(i)
+        + " (there are "
+        + String(BWD_STAGE_COUNT)
+        + ", plan section 6.1)"
+    )
+
+
+def _rec(
+    ctx: DeviceContext,
+    mut trace: IdentityTrace,
+    prefix: String,
+    idx: Int,
+    mut buf: DeviceBuffer[DType.float32],
+    count: Int,
+) raises:
+    """One card record, with the tag looked up by INDEX so that the tag and
+    the order come from one place. `count` is the USED length, never
+    `len(buf)`: the attention buffers are allocated at `s_max` and used at
+    `s`, and hashing the tail would report a difference where there is
+    none."""
+    var tag = backward_stage_tag(idx)
+    if prefix.byte_length() > 0:
+        tag = prefix + String(".") + tag
+    trace.record_device[DType.float32](ctx, tag, buf, count)
+
+
+# ===========================================================================
+# THE ATTENTION-WEIGHT GRADIENT: THE ONE ATTENTION SEAM THAT ROUTES.
+# ===========================================================================
+
+
+def bwd_attention_weight_grad(
+    ctx: DeviceContext,
+    mut bst: LlamaBackwardStages,
+    mut fwd: LlamaDeviceStages,
+    b: Int,
+    l: Int,
+    s: Int,
+    dims: LlamaDims,
+) raises:
+    """`dy[b,h,t,j] = sum_d dctx[b,h,t,d] * v_cache[b,kv,j,d]`, ROUTED
+    through a gemm v1 `OP_NT` cell at `(l, s, head_dim)`, one call per
+    `(batch, head)`. DEVIATION 1405.
+
+    **THIS IS THE SEAM WHERE THE ORGANIZING RULE PAYS OFF.** The fold
+    contracts over `head_dim`, which is THE SAME INTEGER in a prefill and in
+    a decode step, so gemm v1's `P = f(k)` is the same partition in both
+    paths and routing is decode-safe. It is the very shape contract
+    DEVIATION 808 already runs for S11.
+
+    **THE ASYMMETRY WITH `bwd_dq_kernel` LOOKS LIKE AN INCONSISTENCY AND IS
+    THE OPPOSITE OF ONE.** S19 was hand-written in the forward because it
+    contracts over the key axis; its `dy` derivative contracts over
+    `head_dim` and routes. S11 was routed in the forward because it
+    contracts over `head_dim`; its `dq` and `dk` derivatives contract over
+    the kv length and the query count and must be pinned. Both are the same
+    rule applied to whichever axis the DERIVATIVE contracts.
+
+    **THIS PIN CANNOT BE FALSIFIED AT THE GATE SHAPE.** `B10_DW_VIA_CHAIN`
+    is bit identical to this whenever `P(head_dim) == 1`, i.e.
+    `head_dim <= 128`, and the fixtures are 16 and 24. So DEVIATION 1405
+    rests on the argument above and on gemm v1's own certificate, not on a
+    fired arm.
+
+    `head_a`, `head_b`, `head_c` and the GEMM workspace are stage-owned.
+    The caller keeps the stages alive through its completion wait."""
+    var nh = dims.n_heads
+    var nkv = dims.n_kv
+    var hd = dims.head_dim
+    var n_rep = dims.n_rep()
+
+    comptime if SAB_B10_DW_VIA_CHAIN:
+        # SABOTAGE: the hand chain over head_dim. INERT at every
+        # head_dim <= 128, which is every fixture in this profile.
+        step_count_launch()
+        ctx.enqueue_function[bwd_dw_chain_kernel](
+            bst.d_attn_weights.unsafe_ptr(),
+            bst.d_attn_ctx.unsafe_ptr(),
+            fwd.v_cache.unsafe_ptr(),
+            Int32(b),
+            Int32(l),
+            Int32(nh),
+            Int32(nkv),
+            Int32(hd),
+            Int32(s),
+            grid_dim=(_grid(b * nh * l * s), 1, 1),
+            block_dim=(BWD_TPB, 1, 1),
+        )
+        step_count_sync()
+        ctx.synchronize()
+        return
+
+    for bb in range(b):
+        for h in range(nh):
+            var kvh = h // n_rep
+            step_count_launch()
+            ctx.enqueue_function[bwd_gather_ctx_head_kernel](
+                bst.head_a.unsafe_ptr(),
+                bst.d_attn_ctx.unsafe_ptr(),
+                Int32(l),
+                Int32(nh),
+                Int32(hd),
+                Int32(bb),
+                Int32(h),
+                grid_dim=(_grid(l * hd), 1, 1),
+                block_dim=(BWD_TPB, 1, 1),
+            )
+            step_count_launch()
+            ctx.enqueue_function[bwd_gather_kv_head_kernel](
+                bst.head_b.unsafe_ptr(),
+                fwd.v_cache.unsafe_ptr(),
+                Int32(s),
+                Int32(nkv),
+                Int32(hd),
+                Int32(bb),
+                Int32(kvh),
+                grid_dim=(_grid(s * hd), 1, 1),
+                block_dim=(BWD_TPB, 1, 1),
+            )
+            bst.gemm_workspace.run(
+                ctx, bst.head_c, bst.head_a, bst.head_b, l, s, hd, OP_NT
+            )
+            step_count_launch()
+            ctx.enqueue_function[bwd_scatter_head_ls_kernel](
+                bst.d_attn_weights.unsafe_ptr(),
+                bst.head_c.unsafe_ptr(),
+                Int32(l),
+                Int32(s),
+                Int32(nh),
+                Int32(bb),
+                Int32(h),
+                grid_dim=(_grid(l * s), 1, 1),
+                block_dim=(BWD_TPB, 1, 1),
+            )
+
+    # All gather/GEMM/scatter operations share one in-order context. Scratch
+    # belongs to bst; the next head cannot overwrite it before this head's
+    # scatter consumes it. Keep completion-on-return, once for the whole loop.
+    step_count_sync()
+    ctx.synchronize()
+
+
+
+def bwd_attention_grads(
+    ctx: DeviceContext,
+    mut bst: LlamaBackwardStages,
+    mut fwd: LlamaDeviceStages,
+    b: Int,
+    l: Int,
+    s: Int,
+    dims: LlamaDims,
+    scale: Float32,
+) raises:
+    """`dq`, `dk_cache` and `dv_cache`. The three PINNED chains, plus the
+    three `*_VIA_GEMM` sabotage arms which are a different CALL GRAPH rather
+    than a different branch and therefore live here.
+
+    Read `bwd_dq_kernel`'s docstring for why gemm v1 is refused; it is the
+    lane's largest finding and it is argued there rather than repeated."""
+    var nh = dims.n_heads
+    var nkv = dims.n_kv
+    var hd = dims.head_dim
+    var qw = dims.q_width()
+    var n_rep = dims.n_rep()
+
+    # ---- dq ------------------------------------------------------------
+    comptime if SAB_B11_DQ_VIA_GEMM:
+        # SABOTAGE: `OP_NN` at `(l, hd, s)`, `k' = S`. INERT at every
+        # S <= 128, where P(S) == 1 and the gemm cell IS the whole-k
+        # ascending chain from +0.0. Passes clause (a) at a fixed shape and
+        # breaks the LENGTH clause.
+        for bb in range(b):
+            for h in range(nh):
+                var kvh = h // n_rep
+                step_count_launch()
+                ctx.enqueue_function[bwd_gather_head_ls_kernel](
+                    bst.head_c.unsafe_ptr(),
+                    bst.d_qk_cell.unsafe_ptr(),
+                    Int32(l),
+                    Int32(s),
+                    Int32(nh),
+                    Int32(bb),
+                    Int32(h),
+                    grid_dim=(_grid(l * s), 1, 1),
+                    block_dim=(BWD_TPB, 1, 1),
+                )
+                step_count_launch()
+                ctx.enqueue_function[bwd_gather_kv_head_kernel](
+                    bst.head_b.unsafe_ptr(),
+                    fwd.k_cache.unsafe_ptr(),
+                    Int32(s),
+                    Int32(nkv),
+                    Int32(hd),
+                    Int32(bb),
+                    Int32(kvh),
+                    grid_dim=(_grid(s * hd), 1, 1),
+                    block_dim=(BWD_TPB, 1, 1),
+                )
+                step_count_sync()
+                ctx.synchronize()
+                bst.gemm_workspace.run(
+                    ctx, bst.head_a, bst.head_c, bst.head_b, l, hd, s, OP_NN
+                )
+                step_count_launch()
+                ctx.enqueue_function[bwd_scatter_q_head_kernel](
+                    bst.d_q_rope.unsafe_ptr(),
+                    bst.head_a.unsafe_ptr(),
+                    Int32(l),
+                    Int32(nh),
+                    Int32(hd),
+                    Int32(bb),
+                    Int32(h),
+                    grid_dim=(_grid(l * hd), 1, 1),
+                    block_dim=(BWD_TPB, 1, 1),
+                )
+                step_count_sync()
+                ctx.synchronize()
+    else:
+        step_count_launch()
+        ctx.enqueue_function[bwd_dq_kernel](
+            bst.d_q_rope.unsafe_ptr(),
+            bst.d_qk_cell.unsafe_ptr(),
+            fwd.k_cache.unsafe_ptr(),
+            Int32(b),
+            Int32(l),
+            Int32(nh),
+            Int32(nkv),
+            Int32(hd),
+            Int32(s),
+            scale,
+            grid_dim=(_grid(b * l * qw), 1, 1),
+            block_dim=(BWD_TPB, 1, 1),
+        )
+        # Caller-owned outputs stay live; the final dv completion wait
+        # drains this kernel too. The intervening work only enqueues.
+
+    # ---- dk ------------------------------------------------------------
+    comptime if SAB_B11_DK_VIA_GEMM:
+        # SABOTAGE: `OP_TN` at `(s, hd, l)`, `k' = L`, with the head group
+        # accumulated as per-head PARTIALS -- a different association from
+        # the profile's single chain. INERT only when L <= 128 AND
+        # n_rep == 1 together.
+        for bb2 in range(b):
+            for kv2 in range(nkv):
+                for hh in range(n_rep):
+                    var h2 = kv2 * n_rep + hh
+                    step_count_launch()
+                    ctx.enqueue_function[bwd_gather_head_ls_kernel](
+                        bst.head_c.unsafe_ptr(),
+                        bst.d_qk_cell.unsafe_ptr(),
+                        Int32(l),
+                        Int32(s),
+                        Int32(nh),
+                        Int32(bb2),
+                        Int32(h2),
+                        grid_dim=(_grid(l * s), 1, 1),
+                        block_dim=(BWD_TPB, 1, 1),
+                    )
+                    step_count_launch()
+                    ctx.enqueue_function[bwd_gather_ctx_head_kernel](
+                        bst.head_a.unsafe_ptr(),
+                        bst.d_q_rope.unsafe_ptr(),
+                        Int32(l),
+                        Int32(nh),
+                        Int32(hd),
+                        Int32(bb2),
+                        Int32(h2),
+                        grid_dim=(_grid(l * hd), 1, 1),
+                        block_dim=(BWD_TPB, 1, 1),
+                    )
+                    step_count_sync()
+                    ctx.synchronize()
+                    bst.gemm_workspace.run(
+                        ctx,
+                        bst.head_b,
+                        bst.head_c,
+                        bst.head_a,
+                        s,
+                        hd,
+                        l,
+                        OP_TN,
+                    )
+                    var first = 0
+                    if hh == 0:
+                        first = 1
+                    step_count_launch()
+                    ctx.enqueue_function[bwd_accum_kv_head_kernel](
+                        bst.d_k_cache.unsafe_ptr(),
+                        bst.head_b.unsafe_ptr(),
+                        Int32(s),
+                        Int32(nkv),
+                        Int32(hd),
+                        Int32(bb2),
+                        Int32(kv2),
+                        Int32(first),
+                        grid_dim=(_grid(s * hd), 1, 1),
+                        block_dim=(BWD_TPB, 1, 1),
+                    )
+                    step_count_sync()
+                    ctx.synchronize()
+    else:
+        step_count_launch()
+        ctx.enqueue_function[bwd_dk_kernel](
+            bst.d_k_cache.unsafe_ptr(),
+            bst.d_qk_cell.unsafe_ptr(),
+            fwd.q_rope.unsafe_ptr(),
+            Int32(b),
+            Int32(l),
+            Int32(nh),
+            Int32(nkv),
+            Int32(hd),
+            Int32(s),
+            grid_dim=(_grid(b * nkv * s * hd), 1, 1),
+            block_dim=(BWD_TPB, 1, 1),
+        )
+        # Caller-owned outputs stay live; the final dv completion wait
+        # drains this kernel too. The intervening work only enqueues.
+
+    # ---- dv ------------------------------------------------------------
+    comptime if SAB_B19_DV_VIA_GEMM:
+        # SABOTAGE: the backward twin of the forward's
+        # S19_VALUE_SUM_VIA_GEMM, same shape, same warning.
+        for bb3 in range(b):
+            for kv3 in range(nkv):
+                for hh3 in range(n_rep):
+                    var h3 = kv3 * n_rep + hh3
+                    step_count_launch()
+                    ctx.enqueue_function[bwd_gather_head_ls_kernel](
+                        bst.head_c.unsafe_ptr(),
+                        fwd.weights.unsafe_ptr(),
+                        Int32(l),
+                        Int32(s),
+                        Int32(nh),
+                        Int32(bb3),
+                        Int32(h3),
+                        grid_dim=(_grid(l * s), 1, 1),
+                        block_dim=(BWD_TPB, 1, 1),
+                    )
+                    step_count_launch()
+                    ctx.enqueue_function[bwd_gather_ctx_head_kernel](
+                        bst.head_a.unsafe_ptr(),
+                        bst.d_attn_ctx.unsafe_ptr(),
+                        Int32(l),
+                        Int32(nh),
+                        Int32(hd),
+                        Int32(bb3),
+                        Int32(h3),
+                        grid_dim=(_grid(l * hd), 1, 1),
+                        block_dim=(BWD_TPB, 1, 1),
+                    )
+                    step_count_sync()
+                    ctx.synchronize()
+                    bst.gemm_workspace.run(
+                        ctx,
+                        bst.head_b,
+                        bst.head_c,
+                        bst.head_a,
+                        s,
+                        hd,
+                        l,
+                        OP_TN,
+                    )
+                    var first3 = 0
+                    if hh3 == 0:
+                        first3 = 1
+                    step_count_launch()
+                    ctx.enqueue_function[bwd_accum_kv_head_kernel](
+                        bst.d_v_cache.unsafe_ptr(),
+                        bst.head_b.unsafe_ptr(),
+                        Int32(s),
+                        Int32(nkv),
+                        Int32(hd),
+                        Int32(bb3),
+                        Int32(kv3),
+                        Int32(first3),
+                        grid_dim=(_grid(s * hd), 1, 1),
+                        block_dim=(BWD_TPB, 1, 1),
+                    )
+                    step_count_sync()
+                    ctx.synchronize()
+    else:
+        step_count_launch()
+        ctx.enqueue_function[bwd_dv_kernel](
+            bst.d_v_cache.unsafe_ptr(),
+            fwd.weights.unsafe_ptr(),
+            bst.d_attn_ctx.unsafe_ptr(),
+            Int32(b),
+            Int32(l),
+            Int32(nh),
+            Int32(nkv),
+            Int32(hd),
+            Int32(s),
+            grid_dim=(_grid(b * nkv * s * hd), 1, 1),
+            block_dim=(BWD_TPB, 1, 1),
+        )
+        step_count_sync()
+        ctx.synchronize()
+
+
+
+
+# TOMBSTONE: ANONLIB_IDN_ATTN_SOFTMAX=2 (slower) deleted 2026-10-10 by c1bf9d832; code recoverable at ca25d9321.
+# Restore: git apply experiments/removed/ANONLIB_IDN_ATTN_SOFTMAX-arm2.patch
+
+
+def bwd_attention_eager_stages(
+    ctx: DeviceContext,
+    mut bst: LlamaBackwardStages,
+    mut fwd: LlamaDeviceStages,
+    b: Int,
+    l: Int,
+    s: Int,
+    pos0: Int,
+    key_lo: Int,
+    window: Int,
+    dims: LlamaDims,
+    scale: Float32,
+    mut trace: IdentityTrace,
+    prefix: String,
+) raises:
+    """Stages 17-24 as the eager kernels: the routed attention-weight
+    gradient, the closed-form softmax backward, the mask and scale
+    backwards, and the three pinned chains. Records 17-21; the driver
+    records 22-24 after the path decision. Needs the forward's `weights`,
+    so a fused forward is materialized first."""
+    var nh = dims.n_heads
+    var cells = b * nh * l * s
+    ensure_attention_materialized(ctx, fwd, b, l, s, pos0, key_lo, window)
+    ensure_backward_attention_capacity(ctx, bst, l, s)
+
+    # =====================================================================
+    # STAGE 17. The attention-weight gradient, the ONE attention seam that
+    # ROUTES. DEVIATION 1405.
+    # =====================================================================
+    bwd_attention_weight_grad(ctx, bst, fwd, b, l, s, dims)
+    _rec(ctx, trace, prefix, 17, bst.d_attn_weights, cells)
+    # =====================================================================
+    # STAGE 18-19. The softmax backward, ONE closed form. DEVIATION 1406.
+    # =====================================================================
+    step_count_launch()
+    ctx.enqueue_function[bwd_softmax_zdot_kernel](
+        bst.attn_zdot.unsafe_ptr(),
+        bst.d_attn_weights.unsafe_ptr(),
+        fwd.weights.unsafe_ptr(),
+        Int32(b),
+        Int32(nh),
+        Int32(l),
+        Int32(s),
+        grid_dim=(_grid(b * nh * l), 1, 1),
+        block_dim=(BWD_TPB, 1, 1),
+    )
+    # DEVIATION 2721 (lane/wait-removal): WAIT REMOVED here. The next
+    # statement is a trace record. `IdentityTrace.record_device` returns
+    # at once when tracing is off; when it is on it enqueues its OWN copy
+    # behind this kernel on the same in-order context and drains AFTER
+    # it. This wait ordered nothing in either branch.
+    _rec(ctx, trace, prefix, 18, bst.attn_zdot, b * nh * l)
+    step_count_launch()
+    ctx.enqueue_function[bwd_softmax_ds_kernel](
+        bst.d_attn_masked.unsafe_ptr(),
+        bst.d_attn_weights.unsafe_ptr(),
+        fwd.weights.unsafe_ptr(),
+        bst.attn_zdot.unsafe_ptr(),
+        Int32(cells),
+        Int32(s),
+        grid_dim=(_grid(cells), 1, 1),
+        block_dim=(BWD_TPB, 1, 1),
+    )
+    # DEVIATION 2721 (lane/wait-removal): WAIT REMOVED here. The next
+    # statement is a trace record. `IdentityTrace.record_device` returns
+    # at once when tracing is off; when it is on it enqueues its OWN copy
+    # behind this kernel on the same in-order context and drains AFTER
+    # it. This wait ordered nothing in either branch.
+    _rec(ctx, trace, prefix, 19, bst.d_attn_masked, cells)
+
+    # =====================================================================
+    # STAGE 20. S13's backward, an EXACT IDENTITY. DEVIATION 1414.
+    # =====================================================================
+    step_count_launch()
+    ctx.enqueue_function[bwd_mask_grad_kernel](
+        bst.d_attn_scores.unsafe_ptr(),
+        bst.d_attn_masked.unsafe_ptr(),
+        Int32(b),
+        Int32(nh),
+        Int32(l),
+        Int32(s),
+        Int32(pos0),
+        Int32(key_lo),
+        Int32(window),
+        grid_dim=(_grid(cells), 1, 1),
+        block_dim=(BWD_TPB, 1, 1),
+    )
+    # DEVIATION 2721 (lane/wait-removal): WAIT REMOVED here. The next
+    # statement is a trace record. `IdentityTrace.record_device` returns
+    # at once when tracing is off; when it is on it enqueues its OWN copy
+    # behind this kernel on the same in-order context and drains AFTER
+    # it. This wait ordered nothing in either branch.
+    _rec(ctx, trace, prefix, 20, bst.d_attn_scores, cells)
+
+    # =====================================================================
+    # STAGE 21. S12's backward. DEVIATION 1415.
+    # =====================================================================
+    step_count_launch()
+    ctx.enqueue_function[bwd_scale_kernel](
+        bst.d_qk_cell.unsafe_ptr(),
+        bst.d_attn_scores.unsafe_ptr(),
+        Int32(cells),
+        scale,
+        grid_dim=(_grid(cells), 1, 1),
+        block_dim=(BWD_TPB, 1, 1),
+    )
+    # DEVIATION 2721 (lane/wait-removal): WAIT REMOVED here. The next
+    # statement is a trace record. `IdentityTrace.record_device` returns
+    # at once when tracing is off; when it is on it enqueues its OWN copy
+    # behind this kernel on the same in-order context and drains AFTER
+    # it. This wait ordered nothing in either branch.
+    _rec(ctx, trace, prefix, 21, bst.d_qk_cell, cells)
+
+    # =====================================================================
+    # STAGE 22-24. The three PINNED attention chains. DEVIATIONS 1402, 1403,
+    # 1404, 1424, and the lane's largest finding is argued at
+    # `bwd_dq_kernel`.
+    # =====================================================================
+    bwd_attention_grads(ctx, bst, fwd, b, l, s, dims, scale)
+
+
+def bwd_attention_dispatch(
+    ctx: DeviceContext,
+    mut bst: LlamaBackwardStages,
+    mut fwd: LlamaDeviceStages,
+    b: Int,
+    l: Int,
+    s: Int,
+    pos0: Int,
+    key_lo: Int,
+    window: Int,
+    dims: LlamaDims,
+    scale: Float32,
+    materialize: Bool,
+    mut trace: IdentityTrace,
+    prefix: String,
+) raises:
+    """Stages 17-24's path decision and launches: the eager kernels, the
+    fused backward (with its estash and recompute arms) or the eager
+    fallback after a fused refusal, writing `bst.attn_zdot`, `bst.d_q_rope`,
+    `bst.d_k_cache` and `bst.d_v_cache` from `bst.d_attn_ctx`. Moved verbatim
+    out of the hand decoder-layer backward walk (lane ag-transformer,
+    2026-10-19; the walk is deleted) so the autograd attention rule
+    (`autograd/rules_transformer.mojo`) runs the same launches. A traced
+    call records cards 17-21 here."""
+    var nh = dims.n_heads
+    var nkv = dims.n_kv
+    var hd = dims.head_dim
+    bst.attn_repaired = 0
+    bst.attn_backward_status = -1
+    # Tried 2026-10-08 (ANONLIB_IDN_ATTN_SOFTMAX=1, the NN20 summary_tree arm, run ge123e6f9): NV/AMD lm-forward
+    # 4.86x/16.79x, lm-train-step 42.89x/40.18x, samba-forward 1.79x/4.79x, samba-train-step 1.64x/1.81x, transformer-forward
+    # 5.48x/21.89x SLOWER (mean_nll not judged). Deleted (transformer/experiments/attention_summary_*.mojo,
+    # summary_model*.mojo, the NN20 split-KV) and =1 refused; recoverable at main bc10b8b56.
+    # TOMBSTONE: ANONLIB_IDN_ATTN_SOFTMAX=2 (slower) deleted 2026-10-10 by c1bf9d832; code recoverable at ca25d9321.
+    # Restore: git apply experiments/removed/ANONLIB_IDN_ATTN_SOFTMAX-arm2.patch
+    var choice = attention_path_choice(PLANT_AT_NONE)
+    if choice == ATTN_PATH_AUTO and fwd.attn_prefer_eager:
+        choice = ATTN_PATH_EAGER
+    var need_eager = materialize or trace.enabled or choice == ATTN_PATH_EAGER
+    if need_eager:
+        bwd_attention_eager_stages(
+            ctx, bst, fwd, b, l, s, pos0, key_lo, window, dims, scale,
+            trace, prefix,
+        )
+    # DEVIATION 3110: see fused_attention.mojo. A backward refusal is worse
+    # than a forward one -- `bwd_attention_eager_stages` calls
+    # `ensure_attention_materialized`, which recomputes this layer's whole
+    # EAGER FORWARD as well -- so the discarded launch is paid on top of two
+    # eager passes. The latch removes the launch.
+    # `not need_eager` confines the latch to the trace-off trainer path; see
+    # `eager_attention_forward`. Under `need_eager` this branch reduces to the
+    # code that was here before, so the identity card is untouched.
+    if (choice != ATTN_PATH_EAGER and bst.attn_bwd_fused_off
+            and ATTN_STICKY and not need_eager):
+        bst.attn_backward_status = FUSED_SKIPPED_STICKY
+        if not need_eager:
+            bwd_attention_eager_stages(
+                ctx, bst, fwd, b, l, s, pos0, key_lo, window, dims, scale,
+                trace, prefix,
+            )
+    elif choice != ATTN_PATH_EAGER:
+        var status = -1
+        var estash_done = False
+        # IDN_ATTN_BWD_SCAN_REUSE: the forward's q/k/v regime maxima when
+        # its record matches these very buffers and lengths (-1 otherwise:
+        # the launcher then scans all four buffers as before).
+        var fqmax = Float64(-1.0)
+        var fkmax = Float64(-1.0)
+        var fvmax = Float64(-1.0)
+        if fwd.attn_fwd_scan.valid_for(
+            Int(fwd.q_rope.unsafe_ptr()), b * l * nh * hd,
+            Int(fwd.k_cache.unsafe_ptr()), Int(fwd.v_cache.unsafe_ptr()),
+            b * nkv * s * hd,
+        ):
+            fqmax = fwd.attn_fwd_scan.qmax
+            fkmax = fwd.attn_fwd_scan.kmax
+            fvmax = fwd.attn_fwd_scan.vmax
+        comptime if ATTN_ARM_TRIAL or ATTN_SHIPPED_BWD_ESTASH:
+            # DEVIATION 2652 (brief section 20.3): under an `_estash` arm the
+            # backward reads the exp stash this call's forward kept in
+            # `fwd.aexp` (valid when `fwd.attn_estash_cells` is this call's
+            # cell count; otherwise the launcher runs the shipped backward).
+            # A trial build, or a shipped build whose column default carries
+            # the estash bits (DEVIATION 2657); every other build takes the
+            # call below unchanged.
+            var arm = fused_attention_arm_from_env()
+            if fused_attention_arm_estash_runs(arm):
+                var kept_cells = fwd.attn_estash_cells
+                var ran = 0
+                status = fused_backward_launch_estash_report(
+                    ctx, bst.attn_zdot, bst.d_q_rope, bst.d_k_cache, bst.d_v_cache,
+                    fwd.q_rope, bst.d_attn_ctx, fwd.k_cache, fwd.v_cache, fwd.amax,
+                    fwd.denom, fwd.aexp, kept_cells, b, l, nh, nkv, hd, s, pos0,
+                    key_lo, window, scale, arm, ran, bst.attn_repaired,
+                    fwd_qmax=fqmax, fwd_kmax=fkmax, fwd_vmax=fvmax,
+                )
+                estash_done = True
+        comptime if ATTN_APPLE_ESTASH_RECOMPUTE:
+            # lane/neural-apple2: a process denied the kept stashes
+            # recomputes this layer's (fused_attention.mojo,
+            # ATTN_APPLE_ESTASH_RECOMPUTE); same bits, one extra forward.
+            if not estash_done and attention_estash_recompute_granted():
+                status = fused_backward_launch_erecomp_report(
+                    ctx, bst.attn_zdot, bst.d_q_rope, bst.d_k_cache, bst.d_v_cache,
+                    fwd.q_rope, bst.d_attn_ctx, fwd.k_cache, fwd.v_cache, fwd.amax,
+                    fwd.denom, b, l, nh, nkv, hd, s, pos0, key_lo, window, scale,
+                    bst.attn_repaired,
+                )
+                estash_done = True
+        if not estash_done:
+            status = fused_backward_launch(
+                ctx, bst.attn_zdot, bst.d_q_rope, bst.d_k_cache, bst.d_v_cache,
+                fwd.q_rope, bst.d_attn_ctx, fwd.k_cache, fwd.v_cache, fwd.amax,
+                fwd.denom, b, l, nh, nkv, hd, s, pos0, key_lo, window, scale,
+                fwd_qmax=fqmax, fwd_kmax=fkmax, fwd_vmax=fvmax,
+            )
+        bst.attn_backward_status = status
+        if status != FUSED_RAN and not need_eager:
+            bst.attn_bwd_fused_off = True
+        if status != FUSED_RAN and not need_eager:
+            bwd_attention_eager_stages(
+                ctx, bst, fwd, b, l, s, pos0, key_lo, window, dims, scale,
+                trace, prefix,
+            )
+
+
+# ===========================================================================
+# THE RMSNORM BACKWARD LAUNCHER
+# ===========================================================================
+
+
+def _bwd_rms_norm_kernels[which: Int](
+    ctx: DeviceContext,
+    mut dot_out: DeviceBuffer[DType.float32],
+    mut dx_out: DeviceBuffer[DType.float32],
+    mut dw_out: DeviceBuffer[DType.float32],
+    mut dh: DeviceBuffer[DType.float32],
+    mut dprod: DeviceBuffer[DType.float32],
+    mut rstd: DeviceBuffer[DType.float32],
+    mut dvcoef: DeviceBuffer[DType.float32],
+    mut ones: DeviceBuffer[DType.float32],
+    mut dy: DeviceBuffer[DType.float32],
+    mut x: DeviceBuffer[DType.float32],
+    mut weight: DeviceBuffer[DType.float32],
+    mut sumsq: DeviceBuffer[DType.float32],
+    residual_out: MutPointer[Float32, MutAnyOrigin],
+    residual_branch: MutPointer[Float32, MutAnyOrigin],
+    fuse_residual: Bool,
+    m: Int,
+    dm: Int,
+    eps: Float32,
+) raises:
+    """Three kernels then one gemm. `dot_out`, `dx_out` and `dw_out` are the
+    three recorded stages; `dh`, `dprod`, `rstd`, `dvcoef` and `ones` are
+    the untagged scratch.
+
+    **THE BUFFERS ARE PASSED ONE BY ONE RATHER THAN AS `mut bst`**, and that
+    is not style. Taking `mut bst: LlamaBackwardStages` here and calling it
+    as `bwd_rms_norm(ctx, bst, bst.norm2_dot, ...)` would alias the whole
+    struct against one of its own fields at the call site, which no borrow
+    checker should accept and which this lane cannot test. Twelve arguments
+    is the cost of not writing an aliasing call. Distinct FIELDS of one
+    struct as separate `mut` arguments is a milder version of the same
+    question and it is on this file's RISK list.
+
+    The weight gradient is `ones[1 x M] . dprod[M x dm]`, an `OP_NN` at
+    `(1, dm, M)` -- **the GEMM lane's own bias-gradient trick lifted intact**
+    (DEVIATION 851 becoming DEVIATION 1410). Its `k'` is `M`, THE TOKEN
+    COUNT, so this output is not batch-composition invariant and the gate
+    asserts that it MOVES."""
+    comptime assert not (BWD_NORM_SPLIT_TRIAL and BWD_NORM_FUSED_TRIAL), (
+        "RMSNorm backward trial cannot force both split and fused paths"
+    )
+    # DEVIATION 2630: `which` picks this call site's timer names at
+    # compile time (1 the input norm, 2 the post-attention norm, 0 any
+    # other caller) and nothing else; the ticks exist only under
+    # -D ANONLIB_STEP_PHASE_TIMERS=1 (core/step_phase.mojo).
+    # IDENTICAL's three kernels and final GEMM share one in-order context;
+    # the caller owns every buffer, and there are no intervening host reads.
+    # identical_gemm retains the completion wait. Preserve the old fences
+    # in other modes, whose vendor GEMM may return asynchronously.
+    var pc = StepPhaseClock(ctx)
+    # DEVIATION 2645:
+    # a trial build under an arm carrying `rows16`, `rows8` or `rows4` launches
+    # the ONE row kernel here (the `c` fold) at that many threads per block;
+    # the two cell kernels keep `BWD_TPB`. One token row per thread, the fold
+    # never leaves the thread, so every geometry covering [0, m) computes the
+    # same bits. Without the trial define and without a column default
+    # carrying a rows token (DEVIATION 2649) the two values below are the
+    # shipped `_grid(m)` and `BWD_TPB`.
+    var dot_blocks = _grid(m)
+    var dot_threads = BWD_TPB
+    comptime if STEP_GLUE_TRIAL or STEP_GLUE_SHIPPED_ROWS:
+        var glue_rows = step_glue_rows_of(step_glue_arm_from_env())
+        if glue_rows > 0:
+            dot_blocks = step_glue_blocks(m, glue_rows)
+            dot_threads = glue_rows
+    step_count_launch()
+    comptime if (
+        BWD_ANY_SABOTAGE
+        or BWD_NORM_SPLIT_TRIAL
+        or (GLOBAL_NUMERIC_MODE != NUMERIC_IDENTICAL and not AFN_LM_BWD_FUSE)
+    ):
+        ctx.enqueue_function[bwd_norm_dh_kernel](
+            dh.unsafe_ptr(), dy.unsafe_ptr(), weight.unsafe_ptr(), Int32(m),
+            Int32(dm), grid_dim=(_grid(m * dm), 1, 1),
+            block_dim=(BWD_TPB, 1, 1),
+        )
+        comptime if GLOBAL_NUMERIC_MODE != NUMERIC_IDENTICAL and not AFN_LM_BWD_NOSYNC:
+            step_count_sync()
+            ctx.synchronize()
+        step_count_launch()
+        ctx.enqueue_function[bwd_norm_dot_kernel](
+            dot_out.unsafe_ptr(), rstd.unsafe_ptr(), dvcoef.unsafe_ptr(),
+            dh.unsafe_ptr(), x.unsafe_ptr(), sumsq.unsafe_ptr(), Int32(m),
+            Int32(dm), eps, grid_dim=(dot_blocks, 1, 1),
+            block_dim=(dot_threads, 1, 1),
+        )
+    else:
+        # Each fused row already owns the serial dot performed by the split
+        # route. Fusion additionally computes dh locally and avoids its
+        # separate launch/reread. Require two independent row blocks per
+        # reported SM/CU to cover scheduling latency; this depends on actual
+        # row parallelism, row launch geometry and hardware, not a board
+        # shape or feature threshold. Unknown hardware conservatively splits.
+        # No timing qualification is implied by removing the old size rule.
+        var use_fused = False
+        comptime if BWD_NORM_FUSED_TRIAL:
+            use_fused = True  # explicit experiment really forces the row owner
+        elif BWD_NORM_LEGACY_SHAPE_RULE:
+            # Historical B only: retained verbatim for neighbor/full-workload A/B.
+            comptime if TARGET_COLUMN == COLUMN_APPLE:
+                use_fused = m >= 8192 and dm >= 768
+            elif TARGET_COLUMN == COLUMN_NVIDIA:
+                use_fused = m >= 32768 and dm >= 768
+        elif not is_defined["ANONLIB_IDN_ALL_OFF"]():
+            var units = attn_device_units(ctx)
+            use_fused = units > 0 and dot_blocks >= 2 * units
+        if use_fused:
+            ctx.enqueue_function[bwd_norm_dh_dot_kernel](
+                dh.unsafe_ptr(), dot_out.unsafe_ptr(), rstd.unsafe_ptr(),
+                dvcoef.unsafe_ptr(), dy.unsafe_ptr(), weight.unsafe_ptr(),
+                x.unsafe_ptr(), sumsq.unsafe_ptr(), Int32(m), Int32(dm), eps,
+                grid_dim=(dot_blocks, 1, 1), block_dim=(dot_threads, 1, 1),
+            )
+        else:
+            ctx.enqueue_function[bwd_norm_dh_kernel](
+                dh.unsafe_ptr(), dy.unsafe_ptr(), weight.unsafe_ptr(),
+                Int32(m), Int32(dm), grid_dim=(_grid(m * dm), 1, 1),
+                block_dim=(BWD_TPB, 1, 1),
+            )
+            step_count_launch()
+            ctx.enqueue_function[bwd_norm_dot_kernel](
+                dot_out.unsafe_ptr(), rstd.unsafe_ptr(), dvcoef.unsafe_ptr(),
+                dh.unsafe_ptr(), x.unsafe_ptr(), sumsq.unsafe_ptr(), Int32(m),
+                Int32(dm), eps, grid_dim=(dot_blocks, 1, 1),
+                block_dim=(dot_threads, 1, 1),
+            )
+    comptime if GLOBAL_NUMERIC_MODE != NUMERIC_IDENTICAL and not AFN_LM_BWD_NOSYNC:
+        step_count_sync()
+        ctx.synchronize()
+    step_count_launch()
+    ctx.enqueue_function[bwd_norm_dx_kernel](
+        dx_out.unsafe_ptr(),
+        residual_out,
+        residual_branch,
+        dprod.unsafe_ptr(),
+        dh.unsafe_ptr(),
+        dy.unsafe_ptr(),
+        x.unsafe_ptr(),
+        rstd.unsafe_ptr(),
+        dvcoef.unsafe_ptr(),
+        Int32(m),
+        Int32(dm),
+        Int32(1 if fuse_residual else 0),
+        grid_dim=(_grid(m * dm), 1, 1),
+        block_dim=(BWD_TPB, 1, 1),
+    )
+    comptime if GLOBAL_NUMERIC_MODE != NUMERIC_IDENTICAL and not AFN_LM_BWD_NOSYNC:
+        step_count_sync()
+        ctx.synchronize()
+    comptime if which == 1:
+        pc.tick(ctx, "grad.norm1_kernels")
+    comptime if which == 2:
+        pc.tick(ctx, "grad.norm2_kernels")
+    comptime if which != 1 and which != 2:
+        pc.tick(ctx, "grad.rmsnorm_kernels")
+
+
+def _bwd_rms_norm_dw_tick[which: Int](ctx: DeviceContext, mut pc: StepPhaseClock) raises:
+    comptime if which == 1:
+        pc.tick(ctx, "grad.norm1_dW", "norm_dW")
+    comptime if which == 2:
+        pc.tick(ctx, "grad.norm2_dW", "norm_dW")
+    comptime if which != 1 and which != 2:
+        pc.tick(ctx, "grad.rmsnorm_dW", "norm_dW")
+
+
+def bwd_rms_norm[which: Int](
+    ctx: DeviceContext,
+    mut dot_out: DeviceBuffer[DType.float32],
+    mut dx_out: DeviceBuffer[DType.float32],
+    mut dw_out: DeviceBuffer[DType.float32],
+    mut dh: DeviceBuffer[DType.float32],
+    mut dprod: DeviceBuffer[DType.float32],
+    mut rstd: DeviceBuffer[DType.float32],
+    mut dvcoef: DeviceBuffer[DType.float32],
+    mut ones: DeviceBuffer[DType.float32],
+    mut dy: DeviceBuffer[DType.float32],
+    mut x: DeviceBuffer[DType.float32],
+    mut weight: DeviceBuffer[DType.float32],
+    mut sumsq: DeviceBuffer[DType.float32],
+    residual_out: MutPointer[Float32, MutAnyOrigin],
+    residual_branch: MutPointer[Float32, MutAnyOrigin],
+    fuse_residual: Bool,
+    m: Int,
+    dm: Int,
+    eps: Float32,
+) raises:
+    """The three kernels (`_bwd_rms_norm_kernels`) then the weight-gradient
+    GEMM through `identical_gemm`, which allocates its own workspace and
+    waits twice (the entry every caller outside the transformer backward
+    uses)."""
+    _bwd_rms_norm_kernels[which](
+        ctx, dot_out, dx_out, dw_out, dh, dprod, rstd, dvcoef, ones, dy, x, weight, sumsq,
+        residual_out, residual_branch, fuse_residual, m, dm, eps,
+    )
+    var pc = StepPhaseClock(ctx)
+    identical_gemm(ctx, dw_out, ones, dprod, 1, dm, m, OP_NN)
+    _bwd_rms_norm_dw_tick[which](ctx, pc)
+
+
+def _norm_dw_own_workspace() -> Bool:
+    """ANONLIB_TRANSFORMER_NORM_DW_OWN_WS=1 restores `identical_gemm`
+    (its own workspace, two waits) for the norm weight gradients: the A/B
+    against the routed form below."""
+    return String(getenv("ANONLIB_TRANSFORMER_NORM_DW_OWN_WS")) == "1"
+
+
+def bwd_rms_norm_routed[which: Int](
+    ctx: DeviceContext,
+    mut workspace: GemmWorkspace,
+    mut dot_out: DeviceBuffer[DType.float32],
+    mut dx_out: DeviceBuffer[DType.float32],
+    mut dw_out: DeviceBuffer[DType.float32],
+    mut dh: DeviceBuffer[DType.float32],
+    mut dprod: DeviceBuffer[DType.float32],
+    mut rstd: DeviceBuffer[DType.float32],
+    mut dvcoef: DeviceBuffer[DType.float32],
+    mut ones: DeviceBuffer[DType.float32],
+    mut dy: DeviceBuffer[DType.float32],
+    mut x: DeviceBuffer[DType.float32],
+    mut weight: DeviceBuffer[DType.float32],
+    mut sumsq: DeviceBuffer[DType.float32],
+    residual_out: MutPointer[Float32, MutAnyOrigin],
+    residual_branch: MutPointer[Float32, MutAnyOrigin],
+    fuse_residual: Bool,
+    m: Int,
+    dm: Int,
+    eps: Float32,
+) raises:
+    """`bwd_rms_norm` with the weight-gradient GEMM on the block's retained
+    `GemmWorkspace` (lane/neural-net-experiment, 2026-09-30). Every other
+    GEMM of the block backward is routed that way; this one was the last
+    `identical_gemm` on the step path, and `identical_gemm` allocates a
+    workspace and WAITS TWICE per call to keep it alive
+    (`syncs.gemm.norm_dW`, 16 of the LM step's 162 waits on the L40S).
+    `GemmWorkspace.run` hands the same `identical_gemm_into` the same
+    operands and shape, so the same plan and the same bits; it waits only
+    when the workspace grows."""
+    _bwd_rms_norm_kernels[which](
+        ctx, dot_out, dx_out, dw_out, dh, dprod, rstd, dvcoef, ones, dy, x, weight, sumsq,
+        residual_out, residual_branch, fuse_residual, m, dm, eps,
+    )
+    var pc = StepPhaseClock(ctx)
+    # lane w2-lmgrad WGRAD_SPLIT (FAST + Apple + define only): `ones . dprod`
+    # at (1, dm, M) is a weight gradient over the tokens too; split-K, no
+    # env read, no workspace.
+    comptime if _AFN_WGRAD:
+        if afn_lm_wgrad_split_into(
+            ctx, _afn_ptr(dw_out), _afn_ptr(ones), _afn_ptr(dprod), 1, dm, m, OP_NN
+        ):
+            _bwd_rms_norm_dw_tick[which](ctx, pc)
+            return
+    if _norm_dw_own_workspace():
+        identical_gemm(ctx, dw_out, ones, dprod, 1, dm, m, OP_NN)
+    else:
+        workspace.run(ctx, dw_out, ones, dprod, 1, dm, m, OP_NN)
+    _bwd_rms_norm_dw_tick[which](ctx, pc)
+
+
+# ===========================================================================
+# THE BLOCK BACKWARD
+# ===========================================================================
+
+
+def bwd_refuse_nonfinite_d_out(ctx: DeviceContext, mut d_out: DeviceBuffer[DType.float32]) raises:
+    """The layer backward's synchronous refusal of a non-finite incoming
+    gradient (DEVIATION 1423: refused BY BITS through the device scan, then
+    the one offending word read back to name NaN or infinity). Raises
+    before any launch of the backward; returns when `d_out` is finite.
+    The autograd decoder-layer entry calls it on traced and materialized
+    calls (and under -D ANONLIB_AUTOGRAD_REFUSE_DEFER_OFF)."""
+    var bad = device_first_nonfinite(ctx, d_out, len(d_out))
+    if bad >= 0:
+        var bad_view = d_out.create_sub_buffer[DType.float32](bad, 1)
+        var bad_value = _download(ctx, bad_view, 1)
+        var au = bitcast[DType.uint32](bad_value[0]) & UInt32(0x7FFFFFFF)
+        if au > UInt32(0x7F800000):
+            raise Error(
+                String("llama backward: NaN in d_residual2 at flat index ")
+                + String(bad)
+                + " REFUSED (row 39: NaN payloads are vendor-shaped; no"
+                + " stage may record one)"
+            )
+        raise Error(
+            String("llama backward: infinity in d_residual2 at flat index ")
+            + String(bad)
+            + " REFUSED (row 39)"
+        )
+
+
+# TOMBSTONE: llama_decoder_layer_backward_device (hand decoder-layer backward walk; superseded by the tape) deleted 2026-10-19 by 7b6862e3d; code recoverable at 7b6862e3d^.
+# Restore: git apply experiments/removed/LLAMA_DECODER_LAYER_BACKWARD_HAND_WALK.patch
+# The walk, its host-list wrapper llama_decoder_layer_backward (now autograd/rules_transformer.mojo, on the tape) and the
+# ANONLIB_AFN_LM_BWD_EPILOGUE arm it alone carried. Every layer backward runs autograd/rules_transformer.mojo::
+# llama_decoder_layer_backward_autograd, whose seven rules call the launchers above (_route_a/_route_b,
+# bwd_rms_norm_routed, bwd_attention_dispatch, the bwd_* kernels) and record the identity cards 0-36 (_rec) on a traced
+# call. docs/TOMBSTONES.md#llama_decoder_layer_backward_hand_walk.

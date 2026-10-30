@@ -1,0 +1,786 @@
+"""tools/release_wheel_smoke.sh without a rental: the dry run, its refusals,
+the transfer deadline, the whole --ssh path against a local ssh shim whose
+`timeout` stands in for the smoke, and the provider decision (RunPod once,
+DigitalOcean when RunPod has no stock) against a local HTTP shim that answers
+as both clouds. Nothing here reaches RunPod or DigitalOcean: the dry run's
+free listings are skipped when no key is configured, and the rented paths
+point RP / ANONLIB_SMOKE_DO_API at the shim."""
+import http.server
+import json
+import os
+import pathlib
+import re
+import signal
+import subprocess
+import tempfile
+import threading
+import time
+import unittest
+import zipfile
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+SMOKE = ROOT / 'tools/release_wheel_smoke.sh'
+COMMIT = 'c' * 40
+
+
+def make_wheel(directory, commit=COMMIT, name='anonlib-0.0.0-py3-none-manylinux_2_35_x86_64.whl'):
+    path = pathlib.Path(directory) / name
+    with zipfile.ZipFile(path, 'w') as z:
+        z.writestr('anonlib/identity_columns/COMMIT', commit + '\n')
+        z.writestr('anonlib/verify_reference/models/models.json', '{"models": []}')
+    return path
+
+
+SSH_SHIM = '#!/bin/bash\n# every call passes the remote command as its last argument\nexec bash -c "${@: -1}"\n'
+SHA_SHIM = '#!/bin/sh\nexec shasum -a 256 "$@"\n'
+# The stand-in smoke: `timeout -k 20 N PY qualify.py WHEEL --scope ... --output OUT`
+TIMEOUT_SHIM = r'''#!/usr/bin/env python3
+import hashlib, json, pathlib, sys
+args = sys.argv[4:]
+wheel = pathlib.Path(args[2])
+out = pathlib.Path(args[args.index('--output') + 1]); out.mkdir(parents=True)
+commit = args[args.index('--expected-source-commit') + 1]
+status = pathlib.Path(__file__).with_name('STATUS').read_text().strip()
+vendor = pathlib.Path(__file__).with_name('VENDOR')
+plugins = [dict(wheel=args[i + 1], wheel_sha256=hashlib.sha256(pathlib.Path(args[i + 1]).read_bytes()).hexdigest())
+           for i, a in enumerate(args) if a == '--plugin']
+json.dump(dict(wheel=str(wheel), wheel_sha256=hashlib.sha256(wheel.read_bytes()).hexdigest(),
+               status=status, scope='expanded', source_commit=commit, jobs=[{'name': 'x'}],
+               installed=dict(vendor=vendor.read_text().strip() if vendor.is_file() else 'cuda'),
+               **(dict(plugins=plugins) if plugins else {})), open(out / 'results.json', 'w'))
+print('fake smoke', status)
+sys.exit(0 if status == 'PASSED' else 1)
+'''
+# The DigitalOcean path's box: the box command itself is replaced by a column
+# that ran to the end (the column's own judging is the --ssh path's business).
+DO_SSH_SHIM = r'''#!/bin/bash
+cmd="${@: -1}"
+case "$cmd" in
+  *"nohup bash "*"/box.sh "*)
+    d="$FAKE_BOX_DIR"
+    if [ -n "${FAKE_COLUMN:-}" ]; then cp "$FAKE_COLUMN" "$d/column.json"; else printf '{"lanes": {}}\n' > "$d/column.json"; fi
+    echo 0 > "$d/column.exit"
+    echo install_exit=0 > "$d/column.txt"; echo done > "$d/box.done"
+    echo STARTED; exit 0 ;;
+esac
+exec bash -c "$cmd"
+'''
+
+
+class FakeCloud(http.server.BaseHTTPRequestHandler):
+    """RunPod under /rp and DigitalOcean under /do, as the runner sees them."""
+
+    def log_message(self, *args):
+        pass
+
+    def _send(self, code, body=None):
+        data = b'' if body is None else json.dumps(body).encode()
+        self.send_response(code)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):
+        s = self.server
+        s.log.append(('GET', self.path))
+        p = self.path
+        if p.startswith('/rp/pods'):
+            return self._send(200, [])
+        if p.startswith('/do/sizes'):
+            return self._send(200, {'sizes': [{'slug': 'gpu-mi325x1-256gb', 'price_hourly': 3.8,
+                                               'regions': ['tor1', 'nyc2'], 'available': True}]})
+        if p.startswith('/do/droplets/'):
+            if s.droplet and p.rsplit('/', 1)[1] == str(s.droplet['id']):
+                return self._send(200, {'droplet': s.droplet})
+            return self._send(404, {'id': 'not_found', 'message': 'The resource you were accessing could not be found.'})
+        if p.startswith('/do/droplets'):
+            return self._send(200, {'droplets': [s.droplet] if s.droplet else []})
+        self._send(404, {})
+
+    def do_POST(self):
+        s = self.server
+        n = int(self.headers.get('Content-Length') or 0)
+        body = json.loads(self.rfile.read(n) or b'{}')
+        s.log.append(('POST', self.path, body))
+        if self.path == '/rp/pods':
+            if s.runpod == 'nostock':
+                # the real answer of 2026-09-23, HTTP 200 and all
+                return self._send(200, {'error': 'create pod: There are no instances currently available', 'status': 500})
+            return self._send(401, {'error': 'unauthorized'})
+        if self.path == '/do/droplets':
+            if body.get('region') in s.refuse_regions:
+                return self._send(422, {'id': 'unprocessable_entity', 'message': 'Region is not available'})
+            s.droplet = {'id': 4242, 'name': body['name'], 'status': 'active',
+                         'size': {'slug': body['size']}, 'region': {'slug': body['region']},
+                         'networks': {'v4': [{'type': 'public', 'ip_address': '127.0.0.1'}]}}
+            return self._send(202, {'droplet': dict(s.droplet, status='new', networks={'v4': []})})
+        self._send(404, {})
+
+    def do_DELETE(self):
+        s = self.server
+        s.log.append(('DELETE', self.path))
+        if self.path.startswith('/do/droplets/') and s.droplet and self.path.endswith('/' + str(s.droplet['id'])):
+            s.droplet = None
+            return self._send(204)
+        self._send(404, {})
+
+
+class SmokeTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = pathlib.Path(self.tmp.name)
+        self.wheel = make_wheel(self.dir)
+        self.cloud = None
+
+    def tearDown(self):
+        if self.cloud:
+            self.cloud.shutdown()
+            self.cloud.server_close()
+        # the on-"droplet" self-destruct the ssh shim started on this machine
+        pid_file = self.dir / 'box' / 'wheel-smoke-guard' / 'selfkill.pid'
+        if pid_file.exists():
+            pid = int(pid_file.read_text().strip() or 0)
+            if pid:
+                subprocess.run(['pkill', '-P', str(pid)], capture_output=True)
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+        self.tmp.cleanup()
+
+    def run_smoke(self, *args, env=None, timeout=120):
+        e = dict(os.environ, ANONLIB_RUNPOD_KEY_FILE=str(self.dir / 'no-key'),
+                 ANONLIB_DO_TOKEN_FILE=str(self.dir / 'no-token'),
+                 ANONLIB_DO_GPU_LOCK=str(self.dir / 'gpu.lock'),
+                 # never the real Hot Aisle key or API from a test
+                 ANONLIB_HOTAISLE_KEY_FILE=str(self.dir / 'no-hotaisle-key'),
+                 ANONLIB_HOTAISLE_API='http://127.0.0.1:9/nothing-here',
+                 ANONLIB_HOTAISLE_SLOT_PREFIX=str(self.dir / 'ha-slot'),
+                 ANONLIB_HOTAISLE_CREATE_LOCK=str(self.dir / 'ha-create.lock'))
+        e.pop('RUNPOD_API_KEY', None)
+        e.update(env or {})
+        result = subprocess.run(['bash', str(SMOKE), *args], capture_output=True, text=True,
+                                timeout=timeout, env=e)
+        # Ambiguous-create tests deliberately retain the guard. These guards
+        # target this fixture's localhost API; stop only its reported process.
+        if self.cloud:
+            for pid in re.findall(r'dead-man ARMED before the create: pid (\d+)', result.stdout):
+                command = subprocess.run(['ps', '-p', pid, '-o', 'command='], capture_output=True, text=True).stdout
+                if 'anonlib-smoke-deadman-' not in command:
+                    continue
+                subprocess.run(['pkill', '-P', pid], capture_output=True)
+                try:
+                    os.kill(int(pid), signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+        return result
+
+    def selection(self, backend='hip'):
+        path = self.dir / f'selection-{backend}.json'
+        path.write_text(json.dumps({'backend': backend, 'lanes': ['hf-checkpoint']}))
+        return str(path)
+
+    def test_dry_run_plans_one_pod_and_two_files(self):
+        r = self.run_smoke(str(self.wheel), '--expected-source-commit', COMMIT, '--out', str(self.dir / 'o'))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('DRY RUN', r.stdout)
+        self.assertIn('"gpuTypeIds": ["NVIDIA GeForce RTX 4090"]', r.stdout)
+        self.assertIn('"allowedCudaVersions": ["13.0"]', r.stdout)
+        self.assertIn('qualify_verifier_wheel.py', r.stdout)
+        self.assertIn('provider runpod', r.stdout)
+        self.assertNotIn('gpu-mi325x1-256gb', r.stdout)
+        self.assertFalse((self.dir / 'o').exists())
+
+    def test_refuses_wrong_commit_and_unrepaired_wheel(self):
+        r = self.run_smoke(str(self.wheel), '--expected-source-commit', 'd' * 40)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn('records source commit ' + COMMIT, r.stderr)
+        raw = make_wheel(self.dir, name='anonlib-0.0.0-py3-none-linux_x86_64.whl')
+        r = self.run_smoke(str(raw), '--expected-source-commit', COMMIT)
+        self.assertIn('not a final manylinux', r.stderr)
+        r = self.run_smoke(str(self.wheel), '--expected-source-commit', COMMIT, '--rent', '--ssh', 'x')
+        self.assertIn('exclusive', r.stderr)
+
+    def test_with_timeout_kills_a_stalled_transfer(self):
+        t = time.time()
+        r = subprocess.run(['bash', '-c', 'die(){ exit 1; }; . tools/runpod_pod_lib.sh; with_timeout 2 sleep 30'],
+                           cwd=ROOT, capture_output=True, timeout=20)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertLess(time.time() - t, 10)
+
+    # ---------------------------------------------------------------- providers
+    def test_hip_dry_run_default_auto_plans_runpod_then_digitalocean(self):
+        r = self.run_smoke(str(self.wheel), '--expected-source-commit', COMMIT, '--vendor', 'hip',
+                           '--column', self.selection(), '--out', str(self.dir / 'o'))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('provider auto: RunPod once, Hot Aisle when RunPod has no', r.stdout)
+        self.assertIn('DigitalOcean when Hot Aisle refuses before a create', r.stdout)
+        self.assertIn('hotaisle MI300X VM spec auto', r.stdout)
+        self.assertIn('Hot Aisle dead-men compose', r.stdout)
+        self.assertIn('no Hot Aisle key here', r.stdout)
+        self.assertIn('"gpuTypeIds": ["AMD Instinct MI300X OAM"]', r.stdout)
+        self.assertIn('size gpu-mi325x1-256gb  regions tor1,nyc2', r.stdout)
+        self.assertIn('"region":"tor1","size":"gpu-mi325x1-256gb","image":188571990', r.stdout)
+        self.assertIn('dead-men compose', r.stdout)
+        self.assertIn(str(self.dir / 'gpu.lock') + ' is free', r.stdout)
+        self.assertIn('no DigitalOcean token here', r.stdout)
+        self.assertIn('have no fallback', r.stdout)
+        self.assertFalse((self.dir / 'o').exists())
+
+    def test_hip_dry_run_provider_do_plans_only_the_droplet(self):
+        (self.dir / 'gpu.lock').mkdir()
+        (self.dir / 'gpu.lock' / 'owner').write_text('lane=someone-else\n')
+        r = self.run_smoke(str(self.wheel), '--expected-source-commit', COMMIT, '--vendor', 'hip',
+                           '--provider', 'do', '--do-regions', 'nyc2', '--column', self.selection(),
+                           '--out', str(self.dir / 'o'))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('provider do (DigitalOcean only)', r.stdout)
+        self.assertNotIn('gpuTypeIds', r.stdout)
+        self.assertIn('"region":"nyc2"', r.stdout)
+        self.assertIn('is HELD', r.stdout)
+        self.assertIn('lane=someone-else', r.stdout)
+        self.assertIn('a rent would refuse', r.stdout)
+
+    def test_provider_refusals(self):
+        r = self.run_smoke(str(self.wheel), '--expected-source-commit', COMMIT, '--provider', 'do')
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn('--provider do is for --vendor hip', r.stderr)
+        r = self.run_smoke(str(self.wheel), '--expected-source-commit', COMMIT, '--provider', 'lambda')
+        self.assertIn('--provider must be runpod, hotaisle, do or auto', r.stderr)
+        r = self.run_smoke(str(self.wheel), '--expected-source-commit', COMMIT, '--provider', 'hotaisle')
+        self.assertIn('--provider hotaisle is for --vendor hip', r.stderr)
+        r = self.run_smoke(str(self.wheel), '--expected-source-commit', COMMIT, '--vendor', 'hip',
+                           '--column', self.selection(), '--hotaisle-spec', '4gpu')
+        self.assertIn('--hotaisle-spec must be 1gpu, 2gpu or auto', r.stderr)
+        r = self.run_smoke(str(self.wheel), '--expected-source-commit', COMMIT, '--vendor', 'hip',
+                           '--column', self.selection(), '--hotaisle-cap', 'ten')
+        self.assertIn('--hotaisle-cap must be a dollar figure', r.stderr)
+        r = self.run_smoke(str(self.wheel), '--expected-source-commit', COMMIT, '--vendor', 'hip',
+                           '--column', self.selection(), '--do-regions', 'tor1;rm')
+        self.assertIn('--do-regions', r.stderr)
+
+    def start_cloud(self, runpod='nostock', refuse_regions=()):
+        srv = http.server.ThreadingHTTPServer(('127.0.0.1', 0), FakeCloud)
+        srv.log, srv.runpod, srv.droplet, srv.refuse_regions = [], runpod, None, set(refuse_regions)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.cloud = srv
+        return 'http://127.0.0.1:%d' % srv.server_address[1]
+
+    def rented_env(self, base, shim=DO_SSH_SHIM):
+        shims = self.dir / 'bin'
+        shims.mkdir()
+        for name, body in (('ssh', shim), ('sha256sum', SHA_SHIM)):
+            (shims / name).write_text(body)
+            (shims / name).chmod(0o755)
+        for name, text in (('runpod.key', 'fake-runpod-key'), ('do.token', 'dop_v1_fake')):
+            (self.dir / name).write_text(text + '\n')
+            (self.dir / name).chmod(0o600)
+        box = self.dir / 'box' / 'wheel-smoke'
+        return {'PATH': str(shims) + ':' + os.environ['PATH'],
+                'RP': base + '/rp', 'RP_V2': base + '/rpv2', 'ANONLIB_SMOKE_DO_API': base + '/do',
+                'ANONLIB_RUNPOD_KEY_FILE': str(self.dir / 'runpod.key'),
+                'ANONLIB_DO_TOKEN_FILE': str(self.dir / 'do.token'),
+                'ANONLIB_SMOKE_REMOTE_DIR': str(box), 'FAKE_BOX_DIR': str(box)}
+
+    def rent(self, provider, runpod='nostock', refuse_regions=(), env=None, extra=()):
+        base = self.start_cloud(runpod, refuse_regions)
+        e = self.rented_env(base)
+        e.update(env or {})
+        out = self.dir / 'out'
+        r = self.run_smoke(str(self.wheel), '--expected-source-commit', COMMIT, '--vendor', 'hip',
+                           '--provider', provider, '--column', self.selection(), '--rent',
+                           '--lease', '10', '--smoke-seconds', '60', '--out', str(out), *extra, env=e, timeout=240)
+        return r, out, self.cloud.log
+
+    # ---------------------------------------------------------------- reference columns
+    def columns(self, amd_hash):
+        """The Apple reference and the column the fake AMD box brings home."""
+        def col(vendor, h):
+            return {'mode': 'identical', 'repeats': 1, 'vendor': vendor, 'commit': COMMIT, 'complete': True,
+                    'cells': {'rf-clf/base': {'verdict': 'STABLE', 'hashes': [h], 'parts': [{'predict': h}]}}}
+        apple, amd = self.dir / 'apple.json', self.dir / 'amd.json'
+        apple.write_text(json.dumps(col('apple-m4', 'aaaa')))
+        amd.write_text(json.dumps(col('amd-mi300x', amd_hash)))
+        return apple, amd
+
+    def test_column_agreeing_with_the_apple_reference_passes(self):
+        apple, amd = self.columns('aaaa')
+        r, out, _ = self.rent('do', env={'FAKE_COLUMN': str(amd)}, extra=('--ref-column', str(apple)))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn('no DIVERGENT cell against the reference column(s)', r.stdout)
+        self.assertIn('summary: IDENTICAL=1', (out / 'diff-ref-hip.txt').read_text())
+
+    def test_a_divergent_cell_against_the_apple_reference_fails(self):
+        apple, amd = self.columns('bbbb')
+        r, out, _ = self.rent('do', env={'FAKE_COLUMN': str(amd)}, extra=('--ref-column', str(apple)))
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn('DIVERGENT against the reference column(s)', r.stdout)
+        self.assertIn('rf-clf/base', r.stdout)
+        self.assertIn('destroy_confirmed=1', (out / 'teardown.txt').read_text())
+
+    def test_cpu_column_is_still_a_reference_by_its_old_name(self):
+        apple, amd = self.columns('bbbb')
+        r, out, _ = self.rent('do', env={'FAKE_COLUMN': str(amd)}, extra=('--cpu-column', str(apple)))
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn('DIVERGENT against the reference column(s)', r.stdout)
+
+    def test_ref_column_refusals(self):
+        apple, _ = self.columns('aaaa')
+        r = self.run_smoke(str(self.wheel), '--expected-source-commit', COMMIT, '--ref-column', str(apple))
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn('--ref-column needs --column', r.stderr)
+        r = self.run_smoke(str(self.wheel), '--expected-source-commit', COMMIT, '--vendor', 'hip',
+                           '--column', self.selection(), '--ref-column', str(self.dir / 'missing.json'))
+        self.assertIn('no reference column', r.stderr)
+
+    def posts(self, log, path):
+        return [x for x in log if x[0] == 'POST' and x[1] == path]
+
+    def test_auto_falls_back_to_digitalocean_when_runpod_has_no_stock(self):
+        r, out, log = self.rent('auto')
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(len(self.posts(log, '/rp/pods')), 1, log)            # RunPod tried ONCE
+        self.assertIn("RunPod has no 'AMD Instinct MI300X OAM' to give", r.stdout)
+        self.assertIn('Hot Aisle REFUSED: no usable Hot Aisle key', r.stdout)
+        self.assertIn('FALLING BACK to DigitalOcean', r.stdout)
+        do_posts = self.posts(log, '/do/droplets')
+        self.assertEqual(len(do_posts), 1, log)
+        self.assertEqual(do_posts[0][2]['region'], 'tor1')
+        self.assertEqual(do_posts[0][2]['size'], 'gpu-mi325x1-256gb')
+        self.assertEqual(do_posts[0][2]['image'], 188571990)
+        self.assertEqual(do_posts[0][2]['tags'], ['smoke'])
+        # the order: RunPod create, then the droplet, its DELETE, and a GET that answered 404
+        seq = [(x[0], x[1]) for x in log if x[1] in ('/rp/pods', '/do/droplets', '/do/droplets/4242') and x[0] != 'GET'
+               or (x[0], x[1]) == ('GET', '/do/droplets/4242')]
+        self.assertEqual(seq.index(('POST', '/rp/pods')), 0)
+        self.assertLess(seq.index(('POST', '/do/droplets')), seq.index(('DELETE', '/do/droplets/4242')))
+        self.assertIn(('GET', '/do/droplets/4242'), seq[seq.index(('DELETE', '/do/droplets/4242')):])
+        provider = (out / 'provider.txt').read_text()
+        self.assertIn('runpod=no_stock http=200', provider)
+        self.assertIn('gpu_lock=taken', provider)
+        self.assertIn('provider=do droplet=4242 size=gpu-mi325x1-256gb region=tor1 image=188571990 ip=127.0.0.1', provider)
+        teardown = (out / 'teardown.txt').read_text()
+        self.assertIn('destroy_confirmed=1', teardown)
+        self.assertIn('spend=$', teardown)
+        self.assertIn('DigitalOcean dead-man cancelled', r.stdout)
+        self.assertIn('released the shared GPU lock', r.stdout)
+        self.assertFalse((self.dir / 'gpu.lock').exists())
+        self.assertTrue((out / 'column-hip.json').is_file())
+        self.assertIn('rented=do target=root@127.0.0.1', (out / 'smoke.txt').read_text())
+        watchdog = (out / 'watchdog_check.txt').read_text()
+        self.assertIn('WATCHDOG_ALIVE', watchdog)
+        self.assertIn('ID_BAKED_IN=1', watchdog)
+        self.assertIn('TOKEN_GET_200', watchdog)
+        self.assertIn("droplets/4242", (out / 'droplet_deadman.sh').read_text())
+        self.assertNotIn('dop_v1_fake', r.stdout + r.stderr)
+
+    def test_auto_tries_the_next_region_on_422(self):
+        r, out, log = self.rent('auto', refuse_regions=('tor1',))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual([x[2]['region'] for x in self.posts(log, '/do/droplets')], ['tor1', 'nyc2'])
+        self.assertIn('tor1 refused gpu-mi325x1-256gb (HTTP 422', r.stdout)
+        self.assertIn('region=nyc2', (out / 'provider.txt').read_text())
+        self.assertIn('destroy_confirmed=1', (out / 'teardown.txt').read_text())
+
+    def test_provider_runpod_never_falls_back(self):
+        r, out, log = self.rent('runpod')
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn('create FAILED (HTTP 200)', r.stderr)
+        self.assertEqual(len(self.posts(log, '/rp/pods')), 1)
+        self.assertEqual([x for x in log if x[1].startswith('/do')], [])
+        self.assertFalse((self.dir / 'gpu.lock').exists())
+        self.assertIn('dead-man cancelled', r.stdout)
+
+    def test_auto_falls_back_only_on_no_stock(self):
+        r, out, log = self.rent('auto', runpod='auth')
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn('create FAILED (HTTP 401)', r.stderr)
+        self.assertEqual([x for x in log if x[1].startswith('/do')], [])
+        self.assertFalse((out / 'provider.txt').exists())
+
+    def test_digitalocean_refuses_a_held_gpu_lock(self):
+        lock = self.dir / 'gpu.lock'
+        lock.mkdir()
+        (lock / 'owner').write_text('lane=another-leg\nnonce=x\n')
+        r, out, log = self.rent('do')
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn('the shared GPU lock', r.stderr)
+        self.assertIn('lane=another-leg', r.stderr)
+        self.assertIn('Nothing was created', r.stderr)
+        self.assertEqual(self.posts(log, '/do/droplets'), [])
+        self.assertEqual(self.posts(log, '/rp/pods'), [])
+        self.assertTrue((lock / 'owner').exists())     # not ours, untouched
+
+    def test_digitalocean_refuses_a_bad_token_file(self):
+        base = self.start_cloud()
+        e = self.rented_env(base)
+        (self.dir / 'do.token').chmod(0o644)
+        r = self.run_smoke(str(self.wheel), '--expected-source-commit', COMMIT, '--vendor', 'hip',
+                           '--provider', 'do', '--column', self.selection(), '--rent',
+                           '--out', str(self.dir / 'out'), env=e)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn('mode 644, must be 600', r.stderr)
+        self.assertEqual([x for x in self.cloud.log if x[1].startswith('/do')], [])
+
+    # ---------------------------------------------------------------- an existing box
+    def ssh_path(self, status, *extra, vendor=None, timeout_wrapper=None):
+        shims = self.dir / 'bin'
+        shims.mkdir()
+        bodies = [('ssh', SSH_SHIM), ('sha256sum', SHA_SHIM), ('timeout', TIMEOUT_SHIM)]
+        if timeout_wrapper:
+            bodies[2:] = [('timeout.real', TIMEOUT_SHIM), ('timeout', timeout_wrapper)]
+        for name, body in bodies:
+            (shims / name).write_text(body)
+            (shims / name).chmod(0o755)
+        (shims / 'STATUS').write_text(status)
+        if vendor:
+            (shims / 'VENDOR').write_text(vendor)
+        out = self.dir / 'out'
+        r = self.run_smoke(str(self.wheel), '--expected-source-commit', COMMIT, '--ssh', 'fake@box',
+                           *extra, '--out', str(out), env={
+                               'PATH': str(shims) + ':' + os.environ['PATH'],
+                               'ANONLIB_SMOKE_REMOTE_DIR': str(self.dir / 'box' / 'wheel-smoke')})
+        return r, out
+
+    def test_ssh_path_brings_home_a_passed_receipt(self):
+        r, out = self.ssh_path('PASSED')
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        receipt = json.loads((out / 'results.json').read_text())
+        self.assertEqual(receipt['status'], 'PASSED')
+        self.assertIn('verdict=PASSED', (out / 'smoke.txt').read_text())
+
+    def test_local_path_runs_on_this_box_and_never_ssh(self):
+        """--local (tools/release.py --smoke-via lq, 2026-10-08): the box flow
+        runs on the held box itself; no ssh, no rental, the box directory
+        beside --out, the receipt in --out as --ssh brings it home."""
+        shims = self.dir / 'bin'
+        shims.mkdir()
+        for name, body in (('ssh', '#!/bin/sh\necho SSH-CALLED >&2\nexit 99\n'), ('sha256sum', SHA_SHIM),
+                           ('timeout', TIMEOUT_SHIM)):
+            (shims / name).write_text(body)
+            (shims / name).chmod(0o755)
+        (shims / 'STATUS').write_text('PASSED')
+        out = self.dir / 'local-out'
+        r = self.run_smoke(str(self.wheel), '--expected-source-commit', COMMIT, '--local', '--out', str(out),
+                           env={'PATH': str(shims) + ':' + os.environ['PATH']})
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn('THIS BOX (--local, nothing rented)', r.stdout)
+        self.assertNotIn('SSH-CALLED', r.stdout + r.stderr)
+        self.assertEqual(json.loads((out / 'results.json').read_text())['status'], 'PASSED')
+        self.assertTrue((self.dir / 'local-out.run' / 'wheel-smoke' / 'box.done').is_file())
+        self.assertIn('verdict=PASSED', (out / 'smoke.txt').read_text())
+
+    def test_local_refusals(self):
+        r = self.run_smoke(str(self.wheel), '--expected-source-commit', COMMIT, '--local')
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn('--local needs --out', r.stderr)
+        r = self.run_smoke(str(self.wheel), '--expected-source-commit', COMMIT, '--local', '--rent',
+                           '--out', str(self.dir / 'o'))
+        self.assertIn('--local and --rent are exclusive', r.stderr)
+        r = self.run_smoke(str(self.wheel), '--expected-source-commit', COMMIT, '--local', '--ssh', 'x@y',
+                           '--out', str(self.dir / 'o'))
+        self.assertIn('--local and --ssh are exclusive', r.stderr)
+
+    def plugin(self, dist='anonlib_nvidia', version='0.0.0'):
+        path = self.dir / f'{dist}-{version}-py3-none-manylinux_2_35_x86_64.whl'
+        with zipfile.ZipFile(path, 'w') as z:
+            z.writestr('anonlib/cuda/sm_89/_anonlib_knn.so', 'inert')
+        return path
+
+    def test_split_ssh_path_ships_and_names_the_plugin(self):
+        plugin = self.plugin()
+        r, out = self.ssh_path('PASSED', '--plugin', str(plugin))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        receipt = json.loads((out / 'results.json').read_text())
+        self.assertEqual([p['wheel'].rsplit('/', 1)[-1] for p in receipt['plugins']], [plugin.name])
+        self.assertIn('plugin_sha256=', (out / 'smoke.txt').read_text())
+        self.assertIn('--plugin', (out / 'box.sh').read_text())
+
+    def test_split_ssh_path_ships_all_dependencies_as_pip_installs_them(self):
+        """Every dependency is shipped, hashed, installed and named."""
+        nvidia, amd, ptx = self.plugin(), self.plugin('anonlib_amd'), self.plugin('anonlib_nvidia_ptx')
+        r, out = self.ssh_path('PASSED', '--vendor', 'hip', '--plugin', str(amd), '--plugin', str(nvidia),
+                               '--plugin', str(ptx), vendor='hip')
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        receipt = json.loads((out / 'results.json').read_text())
+        self.assertEqual(sorted(p['wheel'].rsplit('/', 1)[-1] for p in receipt['plugins']),
+                         sorted([nvidia.name, amd.name, ptx.name]))
+        box = (out / 'box.sh').read_text()
+        self.assertEqual(box.count(f'--plugin {self.dir / "box" / "wheel-smoke"}/'), 3)
+        self.assertIn(nvidia.name, (out / 'smoke.txt').read_text())
+        self.assertIn('verdict=PASSED', (out / 'smoke.txt').read_text())
+
+    def test_split_receipt_missing_a_plugin_fails(self):
+        """The receipt must name every plugin given, no fewer: a box that
+        installed one of the two fails the verdict."""
+        nvidia, amd = self.plugin(), self.plugin('anonlib_amd')
+        shim = r'''#!/usr/bin/env python3
+import json, pathlib, runpy, sys
+args = sys.argv[4:]
+drop = [i for i, a in enumerate(args) if a == '--plugin' and 'anonlib_amd' in args[i + 1]]
+for i in reversed(drop):
+    del args[i:i + 2]
+sys.argv = sys.argv[:4] + args
+runpy.run_path(str(pathlib.Path(__file__).with_name('timeout.real')), run_name='__main__')
+'''
+        r, out = self.ssh_path('PASSED', '--plugin', str(nvidia), '--plugin', str(amd), timeout_wrapper=shim)
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn('receipt plugins', (out / 'smoke.txt').read_text())
+
+    def test_split_two_plugins_of_one_distribution_refused(self):
+        first = self.plugin()
+        (self.dir / 'again').mkdir()
+        second = self.dir / 'again' / first.name
+        second.write_bytes(first.read_bytes())
+        r = self.run_smoke(str(self.wheel), '--expected-source-commit', COMMIT, '--plugin', str(first),
+                           '--plugin', str(second), '--out', str(self.dir / 'o'))
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn('two --plugin wheels of anonlib_nvidia', r.stderr)
+
+    def test_split_amd_plugin_runs_the_smoke_on_hip(self):
+        plugin = self.plugin('anonlib_amd')
+        r, out = self.ssh_path('PASSED', '--vendor', 'hip', '--plugin', str(plugin), vendor='hip')
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn('verdict=PASSED', (out / 'smoke.txt').read_text())
+
+    def test_split_receipt_of_the_wrong_vendor_fails(self):
+        plugin = self.plugin('anonlib_amd')
+        r, out = self.ssh_path('PASSED', '--vendor', 'hip', '--plugin', str(plugin), vendor='cuda')
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn('installed vendor cuda, not hip', (out / 'smoke.txt').read_text())
+
+    def test_split_plugin_refusals(self):
+        for plugin, extra, why in ((self.plugin('anonlib_amd'), (), 'plugin of --vendor cuda'),
+                                   (self.plugin('anonlib_nvidia', '0.0.1'), (), 'plugin of --vendor cuda'),
+                                   (self.plugin('anonlib_nvidia'), ('--vendor', 'hip', '--column', self.selection()),
+                                    'plugin of --vendor hip')):
+            with self.subTest(plugin=plugin.name, extra=extra):
+                r = self.run_smoke(str(self.wheel), '--expected-source-commit', COMMIT, '--plugin', str(plugin),
+                                   *extra, '--out', str(self.dir / 'o'))
+                self.assertNotEqual(r.returncode, 0)
+                self.assertIn(why, r.stderr)
+
+    def test_ssh_path_fails_a_failed_smoke(self):
+        r, out = self.ssh_path('FAILED')
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn('verdict=FAILED', (out / 'smoke.txt').read_text())
+
+
+# ---------------------------------------------------------------- --from-index
+IV = '0.9.0'
+PROJECTS = {name: name.replace('-', '_') for name in (
+    'anonlib', 'anonlib-nvidia', 'anonlib-amd', 'anonlib-nvidia-ptx')}
+PROJECT_REQUIRES = {
+    'anonlib': ('anonlib-nvidia', 'anonlib-amd'),
+    'anonlib-nvidia': ('anonlib', 'anonlib-nvidia-ptx'),
+    'anonlib-amd': ('anonlib',),
+    'anonlib-nvidia-ptx': ('anonlib',),
+}
+
+
+class FakeIndex(http.server.BaseHTTPRequestHandler):
+    """The JSON API of an index serving the split release at IV (minus
+    server.missing), and each Linux wheel's PEP 658 METADATA."""
+
+    def log_message(self, *args):
+        pass
+
+    def do_GET(self):
+        s = self.server
+        base = 'http://127.0.0.1:%d' % s.server_address[1]
+        for project, prefix in PROJECTS.items():
+            name = f'{prefix}-{IV}-py3-none-manylinux_2_35_x86_64.whl'
+            if self.path == f'/pypi/{project}/{IV}/json' and project not in s.missing:
+                body = json.dumps({'info': {'requires_dist': None}, 'urls': [
+                    {'filename': name, 'packagetype': 'bdist_wheel', 'url': f'{base}/files/{name}', 'yanked': False}]})
+            elif self.path == f'/files/{name}.metadata':
+                pins = [f'{name}=={IV}' for name in PROJECT_REQUIRES[project]]
+                body = 'Metadata-Version: 2.1\nName: %s\n%s\n' % (project, '\n'.join('Requires-Dist: ' + p for p in pins))
+            else:
+                continue
+            data = body.encode()
+            self.send_response(200)
+            self.send_header('Content-Length', str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
+        self.send_response(404)
+        self.send_header('Content-Length', '0')
+        self.end_headers()
+
+
+# The box of an index run: box.sh is replaced by the files it would leave.
+INDEX_SSH_SHIM = r'''#!/bin/bash
+cmd="${@: -1}"
+case "$cmd" in
+  *"nohup bash "*"/box.sh "*) python3 "$(dirname "$0")/fakebox.py" && echo STARTED; exit 0 ;;
+esac
+exec bash -c "$cmd"
+'''
+FAKE_BOX = r'''import json, os, pathlib
+d = pathlib.Path(os.environ['FAKE_BOX_DIR']); v = os.environ['FAKE_VERSION']
+vendor = os.environ.get('FAKE_VENDOR', 'cuda'); index = os.environ.get('FAKE_INDEX', 'testpypi')
+(d / 'install.exit').write_text('0\n'); (d / 'box.txt').write_text('fake box\n')
+projects = ('anonlib', 'anonlib-nvidia', 'anonlib-amd', 'anonlib-nvidia-ptx')
+(d / 'install.log').write_text('Successfully installed ' + ' '.join(projects) + ' numpy\n')
+(d / 'pip_report.json').write_text(json.dumps({'install': []}))
+(d / 'dists.txt').write_text(''.join(n + '==' + v + '\n' for n in projects))
+verdict = os.environ.get('FAKE_INDEX_VERDICT', 'PASSED')
+(d / 'index_check.json').write_text(json.dumps(dict(index=index, version=v, vendor=vendor, verdict=verdict,
+    problems=[] if verdict == 'PASSED' else ['anonlib came from files.pythonhosted.org, not test-files.pythonhosted.org'])))
+(d / 'index_check.log').write_text('verdict=%s\n' % verdict)
+(d / 'out').mkdir(exist_ok=True)
+installed_projects = {n: v for n in projects}
+(d / 'out' / 'results.json').write_text(json.dumps(dict(wheel=None, wheel_sha256=None, status='PASSED', scope='expanded',
+    source_commit='c' * 40, jobs=[{'name': 'x'}], installed=dict(vendor=vendor, version=v, gpu_arch='sm_89' if vendor == 'cuda' else 'gfx942'),
+    installed_from=dict(python='/x/iv/bin/python', expected_version=v, distributions=installed_projects))))
+if vendor == 'hip':  # the column the AMD leg ran from the same install
+    (d / 'column.json').write_text('{"lanes": {}}\n'); (d / 'column.exit').write_text('0\n')
+    (d / 'column.txt').write_text('install_exit=0\n')
+(d / 'smoke.exit').write_text('0\n'); (d / 'box.done').write_text('done\n')
+'''
+
+
+class FromIndexTests(unittest.TestCase):
+    def setUp(self):
+        self.cloud = None
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = pathlib.Path(self.tmp.name)
+        self.index = None
+
+    def tearDown(self):
+        if self.index:
+            self.index.shutdown()
+            self.index.server_close()
+        self.tmp.cleanup()
+
+    run_smoke = SmokeTests.run_smoke
+
+    def serve(self, missing=()):
+        if self.index:
+            self.index.shutdown()
+            self.index.server_close()
+        srv = http.server.ThreadingHTTPServer(('127.0.0.1', 0), FakeIndex)
+        srv.missing = set(missing)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.index = srv
+        return {'ANONLIB_INDEX_JSON_API': 'http://127.0.0.1:%d/pypi' % srv.server_address[1]}
+
+    def test_dry_run_plans_the_users_install(self):
+        env = self.serve()
+        for index, args in (('testpypi', '--index-url https://test.pypi.org/simple/ --extra-index-url https://pypi.org/simple/'),
+                            ('pypi', f"pip_report.json  'anonlib=={IV}'")):
+            with self.subTest(index=index):
+                r = self.run_smoke('--from-index', index, '--version', IV, '--out', str(self.dir / 'o'), env=env)
+                self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+                self.assertIn('DRY RUN', r.stdout)
+                self.assertIn(args, r.stdout)
+                self.assertIn(f"'anonlib=={IV}'", r.stdout)
+                self.assertRegex(r.stdout, rf'index precheck PASSED: .*projects serve {IV} on {index}')
+                self.assertIn('no wheel', r.stdout)
+                self.assertIn('provider runpod', r.stdout)
+                self.assertFalse((self.dir / 'o').exists())
+
+    def test_precheck_refuses_a_missing_plugin_before_renting(self):
+        env = self.serve(missing=('anonlib-amd',))
+        r = self.run_smoke('--from-index', 'testpypi', '--version', IV, '--rent', '--out', str(self.dir / 'o'), env=env)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn(f'anonlib-amd=={IV} is not on testpypi (HTTP 404)', r.stderr)
+        self.assertIn('nothing was rented', r.stderr)
+        self.assertFalse((self.dir / 'o').exists())
+
+    def test_missing_native_payload_is_refused_before_renting(self):
+        env = self.serve(missing=('anonlib-nvidia',))
+        r = self.run_smoke('--from-index', 'testpypi', '--version', IV, '--rent',
+                           '--out', str(self.dir / 'o'), env=env)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn(f'anonlib-nvidia=={IV} is not on testpypi (HTTP 404)', r.stderr)
+        self.assertIn('nothing was rented', r.stderr)
+        self.assertFalse((self.dir / 'o').exists())
+
+    def test_refusals(self):
+        wheel = make_wheel(self.dir)
+        for args, why in (((str(wheel), '--from-index', 'pypi', '--version', IV), 'give no wheel file'),
+                          (('--from-index', 'pypi', '--version', IV, '--plugin', str(wheel)), '--plugin is refused'),
+                          ((str(wheel), '--expected-source-commit', COMMIT, '--version', IV), '--version goes with --from-index'),
+                          (('--from-index', 'pypi', '--version', 'latest'), 'needs --version V'),
+                          (('--from-index', 'pypi'), 'needs --version V'),
+                          (('--from-index', 'devpi', '--version', IV), 'must be testpypi or pypi'),
+                          (('--from-index', 'pypi', '--version', IV, '--expected-source-commit', 'abc'), '40-hex')):
+            with self.subTest(args=args):
+                r = self.run_smoke(*args, '--out', str(self.dir / 'o'))
+                self.assertNotEqual(r.returncode, 0)
+                self.assertIn(why, r.stderr)
+
+    def ssh_index(self, verdict='PASSED', vendor='cuda', index='testpypi'):
+        env = self.serve()
+        shims = self.dir / 'bin'
+        shims.mkdir()
+        for name, body in (('ssh', INDEX_SSH_SHIM), ('sha256sum', SHA_SHIM), ('fakebox.py', FAKE_BOX)):
+            (shims / name).write_text(body)
+            (shims / name).chmod(0o755)
+        box = self.dir / 'box' / 'wheel-smoke'
+        env.update({'PATH': str(shims) + ':' + os.environ['PATH'], 'ANONLIB_SMOKE_REMOTE_DIR': str(box),
+                    'FAKE_BOX_DIR': str(box), 'FAKE_VERSION': IV, 'FAKE_INDEX_VERDICT': verdict,
+                    'FAKE_VENDOR': vendor, 'FAKE_INDEX': index})
+        out = self.dir / 'out'
+        r = self.run_smoke('--from-index', index, '--version', IV, '--vendor', vendor, '--ssh', 'fake@box',
+                           *(('--column', SmokeTests.selection(self)) if vendor == 'hip' else ()),
+                           '--out', str(out), env=env)
+        return r, out, box
+
+    def test_ssh_path_installs_from_the_index_and_passes(self):
+        r, out, box = self.ssh_index()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn('verdict=PASSED index=testpypi', (out / 'smoke.txt').read_text())
+        for name in ('pip_report.json', 'index_check.json', 'dists.txt', 'results.json'):
+            self.assertTrue((out / name).is_file(), name)
+        script = (out / 'box.sh').read_text()
+        self.assertIn(f'--report {box}/pip_report.json --index-url https://test.pypi.org/simple/ '
+                      f'--extra-index-url https://pypi.org/simple/ "anonlib=={IV}"', script)
+        self.assertIn(f'--installed-python $IV/bin/python --expected-version {IV}', script)
+        self.assertIn('index_release_check.py verify --index testpypi', script)
+        self.assertEqual(sorted(p.name for p in box.iterdir() if p.suffix == '.whl'), [])
+        self.assertTrue((box / 'index_release_check.py').is_file())
+
+    def test_ssh_path_fails_on_the_index_verdict(self):
+        r, out, _ = self.ssh_index(verdict='FAILED')
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn('index check FAILED: anonlib came from files.pythonhosted.org', (out / 'smoke.txt').read_text())
+
+    def test_ssh_path_amd_with_a_column_uses_the_same_install(self):
+        r, out, _ = self.ssh_index(vendor='hip', index='pypi')
+        script = (out / 'box.sh').read_text()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn('$IV/bin/python -m anonlib._identity_break', script)
+        self.assertNotIn('rv/bin/pip install', script)
+        self.assertIn(f'"anonlib=={IV}"', script)
+        self.assertNotIn('test.pypi.org', script)
+
+    def test_index_install_check_dry_run_runs_both_legs(self):
+        env = self.serve()
+        e = dict(os.environ, ANONLIB_RUNPOD_KEY_FILE=str(self.dir / 'no-key'),
+                 ANONLIB_DO_TOKEN_FILE=str(self.dir / 'no-token'), ANONLIB_DO_GPU_LOCK=str(self.dir / 'gpu.lock'),
+                 ANONLIB_HOTAISLE_KEY_FILE=str(self.dir / 'no-hotaisle-key'),
+                 ANONLIB_HOTAISLE_API='http://127.0.0.1:9/nothing-here', **env)
+        e.pop('RUNPOD_API_KEY', None)
+        r = subprocess.run(['bash', str(ROOT / 'tools/index_install_check.sh'), IV, 'testpypi',
+                            '--out', str(self.dir / 'o')], capture_output=True, text=True, timeout=120, env=e)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn('DRY RUN NVIDIA: plan composed', r.stdout)
+        self.assertIn('DRY RUN AMD: plan composed', r.stdout)
+        self.assertIn('provider hotaisle (Hot Aisle only)', r.stdout)
+        self.assertIn('vendor hip', r.stdout)
+        self.assertFalse((self.dir / 'o').exists())
+        env = self.serve(missing=('anonlib-nvidia',))
+        e.update(env)
+        r = subprocess.run(['bash', str(ROOT / 'tools/index_install_check.sh'), IV, 'pypi'],
+                           capture_output=True, text=True, timeout=120, env=e)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn(f'anonlib-nvidia=={IV} is not on pypi', r.stderr)
+        self.assertNotIn('NVIDIA leg', r.stdout)
+
+
+if __name__ == '__main__':
+    unittest.main()

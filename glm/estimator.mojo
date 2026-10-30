@@ -1,0 +1,1045 @@
+"""Host-pointer surfaces for the GLM section: OLS, Ridge, logistic regression.
+
+**THIS IS THE ENTRY THE PYTHON PACKAGE USES.** `bindings/
+_anonlib_estimators.mojo:198` calls `ols_fit_host` and
+`python/anonlib/linear_model.py` calls that, so everything below is what a
+`anonlib.LinearRegression().fit(X, y)` actually runs.
+
+DEVIATION 527 -- THE GUARD WAS BYPASSED ON EXACTLY THIS PATH
+-------------------------------------------------------------
+`ols_fit_host` called `lstsq_eig` DIRECTLY. `glm/impl/ols.mojo` exists
+because that is not safe: `ols.cuh:112-113` switches away from the
+normal-equations solver when `n_cols > n_rows` or `n_cols == 1`, because
+`A^T A` is singular by construction in the first case and cuML's own Python
+layer refuses the second by name (`linear_regression.pyx:390`). That file's
+docstring records the bypass as a defect that was found and closed --
+**and it was closed only for the Mojo callers.** The host surface, the one
+with a Python user on the other end, still went around it and returned a
+plausible vector of garbage from a singular inverse, with no error.
+
+It now goes through `ols_fit_traced` (the same guards and dispatch as
+`ols_fit`, carrying the identity card -- DEVIATION 517 below), so the host
+surface takes the same dispatch every other caller does.
+
+CORRECTED 2026-09-01. The sentence that stood here said the host surface now
+gets "the same REFUSAL every other caller already got" at both shapes. There
+is no refusal at either shape any more: `n_cols == 1` takes `lstsq_eig`
+(DEVIATION 551) and `n_cols > n_rows` takes `lstsq_min_norm` (DEVIATION 550),
+and `glm/impl/ols.mojo`'s docstring carries why. What the gate
+`check_ols_host_surface_takes_the_guard` asserts is therefore no longer that
+those shapes raise; it is that the host surface takes the same DISPATCH --
+that a wide fit through this door lands on the min-norm route and leaves the
+min-norm card, which a bypass to `lstsq_eig` cannot do.
+"""
+from experiments.classical_identical_ideas.shared_controls import C05_OLS_PHASE
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 the authors. Part of anonlib, DOI-WITHHELD
+
+
+from std.gpu import block_dim, block_idx, thread_idx
+from max.gpu.host import DeviceBuffer, DeviceContext
+from std.sys.compile import is_defined
+
+from core.gemm import gemv_n
+from core.identity_trace import IdentityTrace
+from glm.impl.ols import (
+    OLS_ALGO_EIG,
+    ols_fit_traced,
+    ols_fit_weighted_traced,
+)
+from glm.impl.qn.qn import qn_decision_function, qn_fit_x
+from glm.impl.ridge import RIDGE_ALGO_EIG, ridge_eig_scratch_traced, ridge_fit_traced
+from glm.impl.linear_model.qn import (
+    QN_LOSS_ABS,
+    QN_LOSS_LOGISTIC,
+    QN_LOSS_SOFTMAX,
+    QN_LOSS_SQUARED,
+    QN_LOSS_SVC_L1,
+    QN_LOSS_SVC_L2,
+    QN_LOSS_SVR_L1,
+    QN_LOSS_SVR_L2,
+    QNParams,
+)
+from checks.numerics import ftz
+from std.memory import bitcast
+from core.gram_splitk import (
+    gram_splitk_applies,
+    gram_splitk_chunk_count,
+    gram_splitk_scratch_covers,
+)
+from glm.impl.center_device import center_buf, col_means_buf, col_sums_buf, col_sums_pair_buf
+
+
+def _add_scalar_kernel(
+    dst: MutPointer[Float32, MutAnyOrigin], n_in: Int32, value: Float32
+):
+    """`dst += value`, one thread per element. The intercept epilogue.
+
+    IDENTITY_PATHS row 10, DEVIATION 527. `dst` is the prediction vector a
+    caller reads and this add is the last operation performed on it, so it
+    is a float SEAM in row 10's sense: the operand comes from `gemv_n` and
+    the result leaves the device. A prediction near zero -- an ordinary
+    thing for a centered regression -- plus a small intercept is exactly
+    where the cancellation lands in the denormal range, and there CUDA
+    keeps a number Metal has already flushed. Bitwise inert on an FTZ
+    backend, which is why it costs nothing to have.
+
+    Row 9 is NOT reachable here: there is no multiply, so there is no
+    contraction to pin, and `identical_mul_add` is deliberately not called
+    rather than called-and-inert.
+    """
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if i < Int(n_in):
+        var v = ftz(dst.unsafe_load(i))
+        dst.unsafe_store(i, ftz(v + ftz(value)))
+
+
+def ols_fit_host(
+    ctx: DeviceContext,
+    x_ptr: MutPointer[Float32, MutUntrackedOrigin],
+    y_ptr: MutPointer[Float32, MutUntrackedOrigin],
+    coef_ptr: MutPointer[Float32, MutUntrackedOrigin],
+    n_rows: Int,
+    n_features: Int,
+) raises:
+    var x = ctx.enqueue_create_buffer[DType.float32](n_rows * n_features)
+    var y = ctx.enqueue_create_buffer[DType.float32](n_rows)
+    var w = ctx.enqueue_create_buffer[DType.float32](n_features)
+    var cov = ctx.enqueue_create_buffer[DType.float32](n_features * n_features)
+    var q = ctx.enqueue_create_buffer[DType.float32](n_features * n_features)
+    var qs = ctx.enqueue_create_buffer[DType.float32](n_features * n_features)
+    var s = ctx.enqueue_create_buffer[DType.float32](n_features)
+    var ab = ctx.enqueue_create_buffer[DType.float32](n_features)
+    # C05: Jacobi and diagonal extraction finish before inv is first written;
+    # cov has no later consumer. The inverse GEMM overwrites every cell.
+    # Two DeviceBuffer handles own one per-invocation allocation, as in
+    # ridge_eig_scratch_traced's u/u_scratch handles. No global retention.
+    # NOT COMPILED — NOT TESTED — IDENTITY NOT VERIFIED — QUALITY NOT VERIFIED — NOT MEASURED.
+    var inv: DeviceBuffer[DType.float32]
+    comptime if C05_OLS_PHASE:
+        inv = cov
+    else:
+        inv = ctx.enqueue_create_buffer[DType.float32](n_features * n_features)
+    var xa = ctx.enqueue_create_buffer[DType.float32](n_rows * n_features)
+    var xa2 = ctx.enqueue_create_buffer[DType.float32](n_rows * n_features)
+    ctx.enqueue_copy(dst_buf=x, src_ptr=x_ptr)
+    ctx.enqueue_copy(dst_buf=y, src_ptr=y_ptr)
+    ctx.synchronize()
+    # THROUGH `olsFit`'s DISPATCH (`ols.cuh:112`), NOT AROUND IT. See the
+    # module docstring: this line used to call `lstsq_eig` and that is the
+    # DEVIATION 527 defect.
+    #
+    # AND THROUGH THE TRACED ENTRY (DEVIATION 517, 2026-08-23). This is the
+    # path `anonlib.LinearRegression().fit` takes, and until now it called
+    # `ols_fit`, whose trace is constructed DISABLED -- so the one OLS path
+    # with a Python user on the other end was the one path that could not
+    # leave an identity card, while `glm/ols_trace_main.mojo` carded a path
+    # no user takes. `IdentityTrace()` reads `ANONLIB_IDENTITY_TRACE` and
+    # is off unless it is set, so the shipping behaviour is unchanged; set,
+    # `tools/e2u_matrix_fit.py` gets the same `ols.step*` stages the Mojo
+    # driver does.
+    var trace = IdentityTrace()
+    if trace.enabled:
+        trace.header(
+            String("ols n=") + String(n_rows) + " d=" + String(n_features)
+            + " algo=" + String(OLS_ALGO_EIG)
+        )
+    ols_fit_traced(
+        ctx, x, y, w, cov, q, qs, s, ab, inv, xa, xa2,
+        n_rows, n_features, trace, OLS_ALGO_EIG,
+    )
+    var hw = ctx.enqueue_create_host_buffer[DType.float32](n_features)
+    ctx.enqueue_copy(dst_ptr=hw.unsafe_ptr(), src_buf=w)
+    ctx.synchronize()
+    for i in range(n_features):
+        coef_ptr.unsafe_store(i, hw.unsafe_ptr().unsafe_load(i))
+
+
+def ols_fit_resident_host(
+    ctx: DeviceContext,
+    x_ptr: MutPointer[Float32, MutUntrackedOrigin],
+    y_ptr: MutPointer[Float32, MutUntrackedOrigin],
+    coef_ptr: MutPointer[Float32, MutUntrackedOrigin],
+    mu_ptr: MutPointer[Float32, MutUntrackedOrigin],
+    ymean_ptr: MutPointer[Float64, MutUntrackedOrigin],
+    n_rows: Int,
+    n_features: Int,
+    center: Bool,
+) raises:
+    """LinearRegression's unweighted normal-equations fit with X and y
+    uploaded ONCE (lane apple-fast-olsne, 2026-10-03).
+
+    The Python route it replaces made four trips over the rows: `lm_col_sums`
+    of X and of y, `lm_center` of X and of y (each an upload and a download)
+    and `ols_fit` (another upload of the centered X). Here X and y go up once
+    and stay: the exact column sums (`col_sums_buf`), the means, the center
+    (`center_buf`) and `ols_fit_traced` all read the resident buffers. Same
+    kernels, launch shapes and inputs as that route, so the same words.
+
+    The means are what `linear_model._column_means` computes: the float64
+    sum / rows (one binary64 division) rounded once to float32 (round to
+    nearest even); the y mean is returned in float64 (`ymean_ptr[0]`) for
+    the intercept and shifts y after its float32 rounding, as `_shift` does.
+    These are `n_features + 1` scalar divisions, the same host arithmetic the
+    Python route did (no float64 on the Apple GPU). `mu_ptr` gets the float32
+    means; with `center` False neither is written and X, y are solved raw.
+
+    The raw X buffer, dead after the center, is handed to the solve as
+    `gemm_tn`'s `xt` scratch (its `k * m` contract), so the route allocates
+    one fewer rows x cols buffer; the second alias is full size only on a
+    shape where `gemm_tn` can reach it (no split-K)."""
+    var cells = n_rows * n_features
+    var d_x = ctx.enqueue_create_buffer[DType.float32](cells)
+    var d_y = ctx.enqueue_create_buffer[DType.float32](n_rows)
+    ctx.enqueue_copy(dst_buf=d_x, src_ptr=x_ptr)
+    ctx.enqueue_copy(dst_buf=d_y, src_ptr=y_ptr)
+    var w = ctx.enqueue_create_buffer[DType.float32](n_features)
+    var cov = ctx.enqueue_create_buffer[DType.float32](n_features * n_features)
+    var q = ctx.enqueue_create_buffer[DType.float32](n_features * n_features)
+    var qs = ctx.enqueue_create_buffer[DType.float32](n_features * n_features)
+    var s = ctx.enqueue_create_buffer[DType.float32](n_features)
+    var ab = ctx.enqueue_create_buffer[DType.float32](n_features)
+    # C05: Jacobi and diagonal extraction finish before inv is first written;
+    # cov has no later consumer. The inverse GEMM overwrites every cell.
+    # Two DeviceBuffer handles own one per-invocation allocation, as in
+    # ridge_eig_scratch_traced's u/u_scratch handles. No global retention.
+    # NOT COMPILED — NOT TESTED — IDENTITY NOT VERIFIED — QUALITY NOT VERIFIED — NOT MEASURED.
+    var inv: DeviceBuffer[DType.float32]
+    comptime if C05_OLS_PHASE:
+        inv = cov
+    else:
+        inv = ctx.enqueue_create_buffer[DType.float32](n_features * n_features)
+    var splitk = gram_splitk_applies(n_features, n_features, n_rows)
+    var alias2_n = 1 if splitk else cells
+    var xa2 = ctx.enqueue_create_buffer[DType.float32](alias2_n)
+    var trace = IdentityTrace()
+    if trace.enabled:
+        trace.header(
+            String("ols n=") + String(n_rows) + " d=" + String(n_features)
+            + " algo=" + String(OLS_ALGO_EIG)
+        )
+    if center:
+        var d_sx = ctx.enqueue_create_buffer[DType.uint64](n_features)
+        var d_sy = ctx.enqueue_create_buffer[DType.uint64](1)
+        col_sums_pair_buf(ctx, d_x, d_y, d_sx, d_sy, n_rows, n_features)
+        var d_mx = ctx.enqueue_create_buffer[DType.float32](n_features)
+        var d_my = ctx.enqueue_create_buffer[DType.float32](1)
+        var h_s = ctx.enqueue_create_host_buffer[DType.uint64](n_features + 1)
+        var h_m = ctx.enqueue_create_host_buffer[DType.float32](n_features + 1)
+        comptime if is_defined["ANONLIB_PURITY_1_OFF"]():
+            ctx.enqueue_copy(dst_ptr=h_s.unsafe_ptr(), src_buf=d_sx)
+            ctx.enqueue_copy(dst_ptr=h_s.unsafe_ptr() + n_features, src_buf=d_sy)
+            ctx.synchronize()
+            var rows_f = Float64(n_rows)
+            for j in range(n_features + 1):
+                var mean = bitcast[DType.float64](h_s.unsafe_ptr().unsafe_load(j)) / rows_f
+                h_m.unsafe_ptr().unsafe_store(j, mean.cast[DType.float32]())
+                if j < n_features:
+                    mu_ptr.unsafe_store(j, mean.cast[DType.float32]())
+                else:
+                    ymean_ptr.unsafe_store(0, mean)
+            ctx.enqueue_copy(dst_buf=d_mx, src_ptr=h_m.unsafe_ptr())
+            ctx.enqueue_copy(dst_buf=d_my, src_ptr=h_m.unsafe_ptr() + n_features)
+        else:
+            # lane apple-fast-purity: the means on the device (soft binary64,
+            # center_device.col_means_buf), downloaded once as the fit's outputs.
+            var d_m64 = ctx.enqueue_create_buffer[DType.uint64](n_features + 1)
+            col_means_buf(ctx, d_sx, d_sy, d_mx, d_my, d_m64, n_rows, n_features)
+            ctx.enqueue_copy(dst_ptr=h_s.unsafe_ptr(), src_buf=d_m64)
+            ctx.synchronize()
+            for j in range(n_features + 1):
+                var mean = bitcast[DType.float64](h_s.unsafe_ptr().unsafe_load(j))
+                if j < n_features:
+                    mu_ptr.unsafe_store(j, mean.cast[DType.float32]())
+                else:
+                    ymean_ptr.unsafe_store(0, mean)
+            _ = d_m64^
+        var d_cx = ctx.enqueue_create_buffer[DType.float32](cells)
+        var d_cy = ctx.enqueue_create_buffer[DType.float32](n_rows)
+        center_buf(ctx, d_x, d_mx, d_cx, n_rows, n_features)
+        center_buf(ctx, d_y, d_my, d_cy, n_rows, 1)
+        ctx.synchronize()
+        # d_x is dead from here: gemm_tn's xt scratch (k * m floats).
+        ols_fit_traced(
+            ctx, d_cx, d_cy, w, cov, q, qs, s, ab, inv, d_x, xa2,
+            n_rows, n_features, trace, OLS_ALGO_EIG,
+        )
+        _ = h_s^
+        _ = h_m^
+        _ = d_sx^
+        _ = d_sy^
+        _ = d_mx^
+        _ = d_my^
+        _ = d_cx^
+        _ = d_cy^
+    else:
+        var xa_n = cells
+        if splitk and gram_splitk_scratch_covers(n_features, n_rows):
+            xa_n = gram_splitk_chunk_count() * n_features * n_features
+        var xa = ctx.enqueue_create_buffer[DType.float32](xa_n)
+        ctx.synchronize()
+        ols_fit_traced(
+            ctx, d_x, d_y, w, cov, q, qs, s, ab, inv, xa, xa2,
+            n_rows, n_features, trace, OLS_ALGO_EIG,
+        )
+        _ = xa^
+    var hw = ctx.enqueue_create_host_buffer[DType.float32](n_features)
+    ctx.enqueue_copy(dst_ptr=hw.unsafe_ptr(), src_buf=w)
+    ctx.synchronize()
+    for i in range(n_features):
+        coef_ptr.unsafe_store(i, hw.unsafe_ptr().unsafe_load(i))
+    _ = hw^
+    _ = d_x^
+    _ = d_y^
+    _ = xa2^
+
+
+def ols_fit_weighted_host(
+    ctx: DeviceContext,
+    x_ptr: MutPointer[Float32, MutUntrackedOrigin],
+    y_ptr: MutPointer[Float32, MutUntrackedOrigin],
+    weight_ptr: MutPointer[Float32, MutUntrackedOrigin],
+    coef_ptr: MutPointer[Float32, MutUntrackedOrigin],
+    n_rows: Int,
+    n_features: Int,
+) raises:
+    """`olsFit` with `sample_weight != nullptr` (`ols.cuh:99-110`, `:129-141`),
+    through the same dispatch `ols_fit_host` takes.
+
+    NOT YET REACHED FROM PYTHON, AND THAT IS RECORDED RATHER THAN HIDDEN.
+    `bindings/_anonlib_estimators.mojo::ols_fit_binding` takes a fixed
+    four-argument shape with `len(params) == 2` and has no slot for a weight
+    pointer, and `bindings/` is not this lane's file. Until a weight
+    binding exists, `python/anonlib/linear_model.py` applies the SAME two
+    operations on the host in numpy -- `sqrt` and a row multiply, both
+    single correctly-rounded float32 operations -- and calls the unweighted
+    entry, which it documents. `check_ols_sample_weight_host_rescale_matches
+    _device` in `glm/checks/ols_check.mojo` is the gate on those two being
+    the same fit, so the Python route is checked against THIS one rather
+    than asserted to match it.
+
+    The weights are copied into a device buffer this function owns, so
+    `olsFit`'s in-place mutation of them (their documented behaviour) is not
+    visible to the caller through this surface.
+    """
+    var x = ctx.enqueue_create_buffer[DType.float32](n_rows * n_features)
+    var y = ctx.enqueue_create_buffer[DType.float32](n_rows)
+    var sw = ctx.enqueue_create_buffer[DType.float32](n_rows)
+    var w = ctx.enqueue_create_buffer[DType.float32](n_features)
+    var cov = ctx.enqueue_create_buffer[DType.float32](n_features * n_features)
+    var q = ctx.enqueue_create_buffer[DType.float32](n_features * n_features)
+    var qs = ctx.enqueue_create_buffer[DType.float32](n_features * n_features)
+    var s = ctx.enqueue_create_buffer[DType.float32](n_features)
+    var ab = ctx.enqueue_create_buffer[DType.float32](n_features)
+    # C05: Jacobi and diagonal extraction finish before inv is first written;
+    # cov has no later consumer. The inverse GEMM overwrites every cell.
+    # Two DeviceBuffer handles own one per-invocation allocation, as in
+    # ridge_eig_scratch_traced's u/u_scratch handles. No global retention.
+    # NOT COMPILED — NOT TESTED — IDENTITY NOT VERIFIED — QUALITY NOT VERIFIED — NOT MEASURED.
+    var inv: DeviceBuffer[DType.float32]
+    comptime if C05_OLS_PHASE:
+        inv = cov
+    else:
+        inv = ctx.enqueue_create_buffer[DType.float32](n_features * n_features)
+    var xa = ctx.enqueue_create_buffer[DType.float32](n_rows * n_features)
+    var xa2 = ctx.enqueue_create_buffer[DType.float32](n_rows * n_features)
+    ctx.enqueue_copy(dst_buf=x, src_ptr=x_ptr)
+    ctx.enqueue_copy(dst_buf=y, src_ptr=y_ptr)
+    ctx.enqueue_copy(dst_buf=sw, src_ptr=weight_ptr)
+    ctx.synchronize()
+    var trace = IdentityTrace()
+    if trace.enabled:
+        trace.header(
+            String("ols n=") + String(n_rows) + " d=" + String(n_features)
+            + " algo=" + String(OLS_ALGO_EIG) + " weighted"
+        )
+    ols_fit_weighted_traced(
+        ctx, x, y, w, cov, q, qs, s, ab, inv, xa, xa2, sw, True,
+        n_rows, n_features, trace, OLS_ALGO_EIG,
+    )
+    var hw = ctx.enqueue_create_host_buffer[DType.float32](n_features)
+    ctx.enqueue_copy(dst_ptr=hw.unsafe_ptr(), src_buf=w)
+    ctx.synchronize()
+    for i in range(n_features):
+        coef_ptr.unsafe_store(i, hw.unsafe_ptr().unsafe_load(i))
+    _ = hw^
+    _ = sw^
+
+
+def ols_predict_host(
+    ctx: DeviceContext,
+    x_ptr: MutPointer[Float32, MutUntrackedOrigin],
+    coef_ptr: MutPointer[Float32, MutUntrackedOrigin],
+    out_ptr: MutPointer[Float32, MutUntrackedOrigin],
+    n_rows: Int,
+    n_features: Int,
+    intercept: Float32,
+) raises:
+    var x = ctx.enqueue_create_buffer[DType.float32](n_rows * n_features)
+    var coef = ctx.enqueue_create_buffer[DType.float32](n_features)
+    var out = ctx.enqueue_create_buffer[DType.float32](n_rows)
+    ctx.enqueue_copy(dst_buf=x, src_ptr=x_ptr)
+    ctx.enqueue_copy(dst_buf=coef, src_ptr=coef_ptr)
+    ctx.synchronize()
+    gemv_n(ctx, out, x, coef, n_rows, n_features)
+    # A HOST FLOAT COMPARISON DECIDING A LAUNCH, audited for DEVIATION 527
+    # and left as it is. `intercept` is a value the caller hands in, not one
+    # this repository computed on the device, so the compare is against a
+    # host constant and is the same answer on every host. THE SENTENCE THAT
+    # STOOD HERE -- "`ols_fit_host` refuses `fit_intercept`, so on the
+    # fitted path it is always exactly 0.0" -- WAS FALSE at the surface
+    # (corrected 2026-08-23, DEVIATION 517): the implemented `ols_fit` refuses
+    # `fit_intercept`, but `python/anonlib/linear_model.py` centers X and
+    # y ON THE HOST before calling this file and hands a NON-ZERO intercept
+    # back in, so `anonlib.LinearRegression()`'s default takes this
+    # branch on every fit. The intercept is a host float64 quantity
+    # (exactly-rounded sums, no BLAS; see that file), so the compare is
+    # still a function of the inputs alone. What the branch DOES change,
+    # and it is the honest residue: `x + 0.0` is `x` for every `x` except
+    # `-0.0`, which becomes `+0.0`. That is one sign bit on one value,
+    # identical on every vendor, and taking the branch out would launch a
+    # kernel over every prediction to achieve it.
+    if intercept != Float32(0.0):
+        ctx.enqueue_function[_add_scalar_kernel](
+            out.unsafe_ptr(), Int32(n_rows), intercept,
+            grid_dim=((n_rows + 255) // 256, 1, 1), block_dim=(256, 1, 1),
+        )
+    var hout = ctx.enqueue_create_host_buffer[DType.float32](n_rows)
+    ctx.enqueue_copy(dst_ptr=hout.unsafe_ptr(), src_buf=out)
+    ctx.synchronize()
+    for i in range(n_rows):
+        out_ptr.unsafe_store(i, hout.unsafe_ptr().unsafe_load(i))
+
+
+# ===========================================================================
+# RIDGE (DEVIATION 545) -- the entry `anonlib.Ridge` reaches
+# ===========================================================================
+
+
+def ridge_fit_host(
+    ctx: DeviceContext,
+    x_ptr: MutPointer[Float32, MutUntrackedOrigin],
+    y_ptr: MutPointer[Float32, MutUntrackedOrigin],
+    coef_ptr: MutPointer[Float32, MutUntrackedOrigin],
+    n_rows: Int,
+    n_features: Int,
+    alpha: Float32,
+) raises:
+    """`ridgeFit` through `ridge_fit_traced`'s guards and dispatch, with the
+    identity card when `ANONLIB_IDENTITY_TRACE` is set (the same shape as
+    `ols_fit_host`, DEVIATION 517). `fit_intercept` is the HOST centering
+    `python/anonlib/linear_model.py` does, exactly as for
+    `LinearRegression`; the implemented `ridge_fit` sees a centered design and
+    `fit_intercept=False`."""
+    var x = ctx.enqueue_create_buffer[DType.float32](n_rows * n_features)
+    var y = ctx.enqueue_create_buffer[DType.float32](n_rows)
+    var w = ctx.enqueue_create_buffer[DType.float32](n_features)
+    # TOMBSTONE: ANONLIB_IDN_LINEAR_PINNED_UPLOAD_OFF (pinned stage slower) deleted 2026-10-11 by 47a3af928; code recoverable at 47a3af928^.
+    # Restore: git apply experiments/removed/ANONLIB_IDN_LINEAR_PINNED_UPLOAD.patch; record in docs/TOMBSTONES.md.
+    ctx.enqueue_copy(dst_buf=x, src_ptr=x_ptr)
+    ctx.enqueue_copy(dst_buf=y, src_ptr=y_ptr)
+    ctx.synchronize()
+    var trace = IdentityTrace()
+    if trace.enabled:
+        trace.header(
+            String("ridge n=") + String(n_rows) + " d=" + String(n_features)
+            + " algo=" + String(RIDGE_ALGO_EIG)
+        )
+    ridge_fit_traced(ctx, x, y, w, n_rows, n_features, alpha, trace, RIDGE_ALGO_EIG)
+    var hw = ctx.enqueue_create_host_buffer[DType.float32](n_features)
+    ctx.enqueue_copy(dst_ptr=hw.unsafe_ptr(), src_buf=w)
+    ctx.synchronize()
+    for i in range(n_features):
+        coef_ptr.unsafe_store(i, hw.unsafe_ptr().unsafe_load(i))
+    _ = hw^
+
+
+def ridge_fit_resident_host(
+    ctx: DeviceContext,
+    x_ptr: MutPointer[Float32, MutUntrackedOrigin],
+    y_ptr: MutPointer[Float32, MutUntrackedOrigin],
+    coef_ptr: MutPointer[Float32, MutUntrackedOrigin],
+    mu_ptr: MutPointer[Float32, MutUntrackedOrigin],
+    ymean_ptr: MutPointer[Float64, MutUntrackedOrigin],
+    n_rows: Int,
+    n_features: Int,
+    alpha: Float32,
+    center: Bool,
+) raises:
+    """Ridge's fit with X and y uploaded ONCE (lane apple-fast-ridgespeed,
+    2026-10-03; `ols_fit_resident_host`'s shape).
+
+    The Python route it replaces made four trips over the rows: `lm_col_sums`
+    of X and of y, `lm_center` of X and of y (each an upload and a download
+    of the full design) and `ridge_fit` (another upload of the centered X).
+    Here X and y go up once and stay: the exact column sums (`col_sums_buf`),
+    the means, the center (`center_buf`) and `ridgeEig` read the resident
+    buffers. Same kernels, launch shapes and inputs as that route, so the
+    same words. The means are `linear_model._column_means`' (float64 sum /
+    rows, rounded once to float32); the y mean is returned in float64
+    (`ymean_ptr[0]`) and y is shifted by its float32 rounding, as `_shift`
+    does. The raw X, dead after the center, is the Gram's scratch."""
+    if n_features <= 0:
+        raise Error("ridgeFit: number of columns cannot be less than one")
+    if n_rows <= 1:
+        raise Error("ridgeFit: number of rows cannot be less than two")
+    if n_features == 1:
+        raise Error(
+            "ridgeFit: n_cols == 1 selects ridgeSVD (ridge.cuh:210),"
+            " which is NOT IMPLEMENTED (raft svdQR is cuSOLVER gesvd, no"
+            " equivalent). cuML's Python layer forces the same switch"
+            " (ridge.pyx:355). See glm/NOT_IMPLEMENTED.tsv"
+        )
+    if alpha < Float32(0.0):
+        raise Error("ridgeFit: alpha must be non-negative")
+    var cells = n_rows * n_features
+    var d_x = ctx.enqueue_create_buffer[DType.float32](cells)
+    var d_y = ctx.enqueue_create_buffer[DType.float32](n_rows)
+    ctx.enqueue_copy(dst_buf=d_x, src_ptr=x_ptr)
+    ctx.enqueue_copy(dst_buf=d_y, src_ptr=y_ptr)
+    var w = ctx.enqueue_create_buffer[DType.float32](n_features)
+    var trace = IdentityTrace()
+    if trace.enabled:
+        trace.header(
+            String("ridge n=") + String(n_rows) + " d=" + String(n_features)
+            + " algo=" + String(RIDGE_ALGO_EIG)
+        )
+    if center:
+        var d_sx = ctx.enqueue_create_buffer[DType.uint64](n_features)
+        var d_sy = ctx.enqueue_create_buffer[DType.uint64](1)
+        col_sums_pair_buf(ctx, d_x, d_y, d_sx, d_sy, n_rows, n_features)
+        var d_mx = ctx.enqueue_create_buffer[DType.float32](n_features)
+        var d_my = ctx.enqueue_create_buffer[DType.float32](1)
+        var h_s = ctx.enqueue_create_host_buffer[DType.uint64](n_features + 1)
+        var h_m = ctx.enqueue_create_host_buffer[DType.float32](n_features + 1)
+        comptime if is_defined["ANONLIB_PURITY_1_OFF"]():
+            ctx.enqueue_copy(dst_ptr=h_s.unsafe_ptr(), src_buf=d_sx)
+            ctx.enqueue_copy(dst_ptr=h_s.unsafe_ptr() + n_features, src_buf=d_sy)
+            ctx.synchronize()
+            var rows_f = Float64(n_rows)
+            for j in range(n_features + 1):
+                var mean = bitcast[DType.float64](h_s.unsafe_ptr().unsafe_load(j)) / rows_f
+                h_m.unsafe_ptr().unsafe_store(j, mean.cast[DType.float32]())
+                if j < n_features:
+                    mu_ptr.unsafe_store(j, mean.cast[DType.float32]())
+                else:
+                    ymean_ptr.unsafe_store(0, mean)
+            ctx.enqueue_copy(dst_buf=d_mx, src_ptr=h_m.unsafe_ptr())
+            ctx.enqueue_copy(dst_buf=d_my, src_ptr=h_m.unsafe_ptr() + n_features)
+        else:
+            # lane apple-fast-purity: the means on the device (soft binary64,
+            # center_device.col_means_buf), downloaded once as the fit's outputs.
+            var d_m64 = ctx.enqueue_create_buffer[DType.uint64](n_features + 1)
+            col_means_buf(ctx, d_sx, d_sy, d_mx, d_my, d_m64, n_rows, n_features)
+            ctx.enqueue_copy(dst_ptr=h_s.unsafe_ptr(), src_buf=d_m64)
+            ctx.synchronize()
+            for j in range(n_features + 1):
+                var mean = bitcast[DType.float64](h_s.unsafe_ptr().unsafe_load(j))
+                if j < n_features:
+                    mu_ptr.unsafe_store(j, mean.cast[DType.float32]())
+                else:
+                    ymean_ptr.unsafe_store(0, mean)
+            _ = d_m64^
+        var d_cx = ctx.enqueue_create_buffer[DType.float32](cells)
+        var d_cy = ctx.enqueue_create_buffer[DType.float32](n_rows)
+        center_buf(ctx, d_x, d_mx, d_cx, n_rows, n_features)
+        center_buf(ctx, d_y, d_my, d_cy, n_rows, 1)
+        ctx.synchronize()
+        trace.record_device[DType.float32](ctx, "ridge.input.A", d_cx, cells)
+        trace.record_device[DType.float32](ctx, "ridge.input.b", d_cy, n_rows)
+        trace.record_scalar_f32("ridge.input.alpha", alpha)
+        # d_x is dead from here: the Gram's gemm_tn scratch.
+        ridge_eig_scratch_traced(ctx, d_cx, n_rows, n_features, d_cy, alpha, w, d_x, trace)
+        _ = h_s^
+        _ = h_m^
+        _ = d_sx^
+        _ = d_sy^
+        _ = d_mx^
+        _ = d_my^
+        _ = d_cx^
+        _ = d_cy^
+    else:
+        var xa = ctx.enqueue_create_buffer[DType.float32](cells)
+        ctx.synchronize()
+        trace.record_device[DType.float32](ctx, "ridge.input.A", d_x, cells)
+        trace.record_device[DType.float32](ctx, "ridge.input.b", d_y, n_rows)
+        trace.record_scalar_f32("ridge.input.alpha", alpha)
+        ridge_eig_scratch_traced(ctx, d_x, n_rows, n_features, d_y, alpha, w, xa, trace)
+        _ = xa^
+    trace.record_device[DType.float32](ctx, "ridge.coef", w, n_features)
+    var hw = ctx.enqueue_create_host_buffer[DType.float32](n_features)
+    ctx.enqueue_copy(dst_ptr=hw.unsafe_ptr(), src_buf=w)
+    ctx.synchronize()
+    for i in range(n_features):
+        coef_ptr.unsafe_store(i, hw.unsafe_ptr().unsafe_load(i))
+    _ = hw^
+    _ = w^
+    _ = d_x^
+    _ = d_y^
+
+
+# ===========================================================================
+# LOGISTIC REGRESSION (DEVIATIONS 546-549) -- the entry
+# `anonlib.LogisticRegression` reaches
+# ===========================================================================
+
+
+def qn_loss_name(loss: Int) -> String:
+    """The identity card's header word for a loss id."""
+    if loss == QN_LOSS_LOGISTIC:
+        return "logistic"
+    if loss == QN_LOSS_SOFTMAX:
+        return "softmax"
+    if loss == QN_LOSS_SQUARED:
+        return "qn-squared"
+    if loss == QN_LOSS_ABS:
+        return "qn-absolute"
+    if loss == QN_LOSS_SVC_L1:
+        return "svc-l1"
+    if loss == QN_LOSS_SVC_L2:
+        return "svc-l2"
+    if loss == QN_LOSS_SVR_L1:
+        return "svr-l1"
+    return "svr-l2"
+
+
+def qn_check_loss_args(loss: Int, n_classes: Int, svr_eps: Float64) raises:
+    """The entry's refusals: the eight routed ids, the `C` each one's
+    `ASSERT` in `qn_fit_x` demands (`qn.cuh:121-173`), and `svr_eps` finite,
+    non-negative and nonzero only where the loss reads it."""
+    var is_svr = loss == QN_LOSS_SVR_L1 or loss == QN_LOSS_SVR_L2
+    var is_regression = is_svr or loss == QN_LOSS_SQUARED or loss == QN_LOSS_ABS
+    var is_binary = (
+        loss == QN_LOSS_LOGISTIC or loss == QN_LOSS_SVC_L1 or loss == QN_LOSS_SVC_L2
+    )
+    if not (is_regression or is_binary or loss == QN_LOSS_SOFTMAX):
+        raise Error(
+            "qn_fit: loss " + String(loss) + " is not a qn_loss_type id;"
+            " 0 to 7 are (glm/impl/linear_model/qn.mojo)"
+        )
+    if is_regression and n_classes != 1:
+        raise Error(
+            "qn_fit: loss " + String(loss) + " is a regression loss and needs"
+            " n_classes == 1, got " + String(n_classes)
+        )
+    if is_binary and n_classes != 2:
+        raise Error(
+            "qn_fit: loss " + String(loss) + " needs n_classes == 2, got "
+            + String(n_classes)
+        )
+    if loss == QN_LOSS_SOFTMAX and not (n_classes > 2):
+        raise Error("qn_fit: the softmax loss needs n_classes > 2, got " + String(n_classes))
+    if not (svr_eps >= 0.0) or svr_eps > 3.0e38:
+        raise Error("qn_fit: svr_eps must be finite and non-negative, got " + String(svr_eps))
+    if svr_eps != 0.0 and not is_svr:
+        raise Error(
+            "qn_fit: svr_eps is read by the two SVR losses only; loss "
+            + String(loss) + " must be given 0"
+        )
+
+
+def qn_fit_host(
+    ctx: DeviceContext,
+    x_ptr: MutPointer[Float32, MutUntrackedOrigin],
+    y_ptr: MutPointer[Float32, MutUntrackedOrigin],
+    coef_ptr: MutPointer[Float32, MutUntrackedOrigin],
+    info_ptr: MutPointer[Float32, MutUntrackedOrigin],
+    n_rows: Int,
+    n_features: Int,
+    n_classes: Int,
+    penalty_l1: Float64,
+    penalty_l2: Float64,
+    grad_tol: Float64,
+    change_tol: Float64,
+    max_iter: Int,
+    linesearch_max_iter: Int,
+    lbfgs_memory: Int,
+    fit_intercept: Bool,
+    penalty_normalized: Bool,
+    has_sample_weight: Bool,
+    sw_ptr: MutPointer[Float32, MutUntrackedOrigin],
+    loss: Int = QN_LOSS_LOGISTIC,
+    svr_eps: Float64 = 0.0,
+) raises -> Int:
+    """`qnFit` (`qn.cuh:176-193`) for a dense row-major `X`, through
+    `qn_fit_x`'s loss switch. `loss` is QN_LOSS_LOGISTIC (the default) with
+    `n_classes == 2`, QN_LOSS_SOFTMAX with `n_classes > 2`, the two SVC
+    losses with `n_classes == 2`, or one of the four regression losses
+    (squared, absolute, the two SVR) with `n_classes == 1`
+    (lane/expose-qn-objectives, 2026-09-20); `svr_eps` is the SVR
+    sensitivity, non-negative, and must be 0 for every other loss. An
+    unknown id or a mismatched `n_classes` is refused here by name before a
+    buffer exists. `coef_ptr` holds `n_targets * (n_features
+    + fit_intercept)` floats, cuML's column-major `W` (`w[c + C*j]`, the
+    bias column last; `n_targets` is 1 for the logistic loss), zero-
+    initialized here as `solvers/qn.pyx:552-554` does (no warm start).
+    `info_ptr[0]` receives the final objective, `info_ptr[1]` the
+    `OPT_RETCODE`; the return value is `num_iters`. Carries the identity
+    card (`qn.*`); the logistic header line is the string it always was.
+
+    `has_sample_weight` (lane sk-kernels): `sw_ptr` holds `n_rows` per-row
+    weights, uploaded here and installed into the objective; unset, `sw_ptr`
+    is never read (any valid pointer will do)."""
+    qn_check_loss_args(loss, n_classes, svr_eps)
+    var n_targets = 1 if n_classes == 2 else n_classes
+    var n_param = (n_features + (1 if fit_intercept else 0)) * n_targets
+    var x = ctx.enqueue_create_buffer[DType.float32](n_rows * n_features)
+    var y = ctx.enqueue_create_buffer[DType.float32](n_rows)
+    var w = ctx.enqueue_create_buffer[DType.float32](n_param)
+    # TOMBSTONE: ANONLIB_IDN_LINEAR_PINNED_UPLOAD_OFF (pinned stage slower) deleted 2026-10-11 by 47a3af928; code recoverable at 47a3af928^.
+    # Restore: git apply experiments/removed/ANONLIB_IDN_LINEAR_PINNED_UPLOAD.patch; record in docs/TOMBSTONES.md.
+    ctx.enqueue_copy(dst_buf=x, src_ptr=x_ptr)
+    ctx.enqueue_copy(dst_buf=y, src_ptr=y_ptr)
+    ctx.enqueue_memset(w, Float32(0.0))
+    var sw = Optional[DeviceBuffer[DType.float32]]()
+    if has_sample_weight:
+        var swb = ctx.enqueue_create_buffer[DType.float32](n_rows)
+        ctx.enqueue_copy(dst_buf=swb, src_ptr=sw_ptr)
+        sw = Optional[DeviceBuffer[DType.float32]](swb^)
+    ctx.synchronize()
+    var pams = QNParams.default()
+    pams.loss = loss
+    pams.penalty_l1 = penalty_l1
+    pams.penalty_l2 = penalty_l2
+    pams.grad_tol = grad_tol
+    pams.change_tol = change_tol
+    pams.max_iter = max_iter
+    pams.linesearch_max_iter = linesearch_max_iter
+    pams.lbfgs_memory = lbfgs_memory
+    pams.fit_intercept = fit_intercept
+    pams.penalty_normalized = penalty_normalized
+    var trace = IdentityTrace()
+    if trace.enabled:
+        trace.header(
+            qn_loss_name(loss) + " n=" + String(n_rows) + " d=" + String(n_features)
+            + " loss=" + String(loss)
+        )
+    var fx = Float32(0.0)
+    var iters = 0
+    var ret = qn_fit_x(
+        ctx, pams, x^, y^, n_rows, n_features, n_classes, w, fx, iters,
+        has_sample_weight, trace, Float32(svr_eps), sw^,
+    )
+    var hw = ctx.enqueue_create_host_buffer[DType.float32](n_param)
+    ctx.enqueue_copy(dst_ptr=hw.unsafe_ptr(), src_buf=w)
+    ctx.synchronize()
+    for i in range(n_param):
+        coef_ptr.unsafe_store(i, hw.unsafe_ptr().unsafe_load(i))
+    info_ptr.unsafe_store(0, fx)
+    info_ptr.unsafe_store(1, Float32(ret))
+    _ = hw^
+    return iters
+
+
+#: lane fam2-linear (2026-10-04): LinearSVC one-vs-rest crossed the bus with
+#: X once per class (`svm.py` called `qn_fit` per class, each uploading the
+#: whole design and a host-built 0/1 target). `qn_fit_ovr_host` uploads X and
+#: the int32 class codes once, builds every 0/1 target on the device and
+#: hands each class's solver a device copy of X. Same fits, same bits.
+#: `-D ANONLIB_QN_OVR_ONE_UPLOAD_OFF` (or the master
+#: `ANONLIB_IDN_ALL_OFF`) leaves the entry unregistered and the Python
+#: layer keeps one `qn_fit` call per class.
+comptime QN_OVR_ONE_UPLOAD = not (
+    is_defined["ANONLIB_QN_OVR_ONE_UPLOAD_OFF"]() or is_defined["ANONLIB_IDN_ALL_OFF"]()
+)
+
+
+def _ovr_target_kernel(
+    codes: MutPointer[Int32, MutAnyOrigin],
+    y: MutPointer[Float32, MutAnyOrigin],
+    n_in: Int32,
+    cls: Int32,
+):
+    """y[i] = 1.0 where codes[i] == cls, else 0.0 (`OvrSelector`,
+    `linear.cu:50-54`). Integer compare; both stored values are exact."""
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if i < Int(n_in):
+        var hit = codes.unsafe_load(i) == cls
+        y.unsafe_store(i, Float32(1.0) if hit else Float32(0.0))
+
+
+def qn_fit_ovr_host(
+    ctx: DeviceContext,
+    x_ptr: MutPointer[Float32, MutUntrackedOrigin],
+    codes_ptr: MutPointer[Int32, MutUntrackedOrigin],
+    coef_ptr: MutPointer[Float32, MutUntrackedOrigin],
+    info_ptr: MutPointer[Float32, MutUntrackedOrigin],
+    n_rows: Int,
+    n_features: Int,
+    first_class: Int,
+    n_fits: Int,
+    penalty_l1: Float64,
+    penalty_l2: Float64,
+    grad_tol: Float64,
+    change_tol: Float64,
+    max_iter: Int,
+    linesearch_max_iter: Int,
+    lbfgs_memory: Int,
+    fit_intercept: Bool,
+    penalty_normalized: Bool,
+    loss: Int,
+    has_sample_weight: Bool,
+    sw_ptr: MutPointer[Float32, MutUntrackedOrigin],
+) raises:
+    """One-vs-rest `qnFit` for the binary classification losses: `n_fits`
+    independent fits, fit `k` on the target `codes == first_class + k`, each
+    exactly `qn_fit_host(..., n_classes=2, loss)` on that target. X and the
+    codes cross the bus once. `coef_ptr` receives `n_fits` rows of
+    `n_features + fit_intercept` floats (row k = fit k); `info_ptr` receives
+    three floats per fit: objective, OPT_RETCODE, num_iters.
+    `has_sample_weight` (lane sk-kernels): `sw_ptr` holds `n_rows` per-row
+    weights, uploaded once; every fit gets a device copy. Unset, `sw_ptr`
+    is never read."""
+    qn_check_loss_args(loss, 2, 0.0)
+    if n_fits <= 0 or n_rows <= 0:
+        raise Error("qn_fit_ovr: n_rows and n_fits must be positive")
+    var n_param = n_features + (1 if fit_intercept else 0)
+    var x = ctx.enqueue_create_buffer[DType.float32](n_rows * n_features)
+    var codes = ctx.enqueue_create_buffer[DType.int32](n_rows)
+    ctx.enqueue_copy(dst_buf=x, src_ptr=x_ptr)
+    ctx.enqueue_copy(dst_buf=codes, src_ptr=codes_ptr)
+    var sw_all = ctx.enqueue_create_buffer[DType.float32](n_rows if has_sample_weight else 1)
+    if has_sample_weight:
+        ctx.enqueue_copy(dst_buf=sw_all, src_ptr=sw_ptr)
+    ctx.synchronize()
+    var pams = QNParams.default()
+    pams.loss = loss
+    pams.penalty_l1 = penalty_l1
+    pams.penalty_l2 = penalty_l2
+    pams.grad_tol = grad_tol
+    pams.change_tol = change_tol
+    pams.max_iter = max_iter
+    pams.linesearch_max_iter = linesearch_max_iter
+    pams.lbfgs_memory = lbfgs_memory
+    pams.fit_intercept = fit_intercept
+    pams.penalty_normalized = penalty_normalized
+    var hw = ctx.enqueue_create_host_buffer[DType.float32](n_param)
+    for k in range(n_fits):
+        # the solver takes X and y by transfer: a device-to-device copy of X
+        # and a device-built target per class, nothing over the bus
+        var xk = ctx.enqueue_create_buffer[DType.float32](n_rows * n_features)
+        var yk = ctx.enqueue_create_buffer[DType.float32](n_rows)
+        var w = ctx.enqueue_create_buffer[DType.float32](n_param)
+        ctx.enqueue_copy(dst_buf=xk, src_buf=x)
+        ctx.enqueue_function[_ovr_target_kernel](
+            codes.unsafe_ptr(), yk.unsafe_ptr(), Int32(n_rows), Int32(first_class + k),
+            grid_dim=((n_rows + 255) // 256, 1, 1), block_dim=(256, 1, 1),
+        )
+        ctx.enqueue_memset(w, Float32(0.0))
+        var swk = Optional[DeviceBuffer[DType.float32]]()
+        if has_sample_weight:
+            var swb = ctx.enqueue_create_buffer[DType.float32](n_rows)
+            ctx.enqueue_copy(dst_buf=swb, src_buf=sw_all)
+            swk = Optional[DeviceBuffer[DType.float32]](swb^)
+        ctx.synchronize()
+        var trace = IdentityTrace()
+        if trace.enabled:
+            trace.header(
+                qn_loss_name(loss) + " n=" + String(n_rows) + " d=" + String(n_features)
+                + " loss=" + String(loss)
+            )
+        var fx = Float32(0.0)
+        var iters = 0
+        var ret = qn_fit_x(
+            ctx, pams, xk^, yk^, n_rows, n_features, 2, w, fx, iters,
+            has_sample_weight, trace, Float32(0.0), swk^,
+        )
+        ctx.enqueue_copy(dst_ptr=hw.unsafe_ptr(), src_buf=w)
+        ctx.synchronize()
+        for i in range(n_param):
+            coef_ptr.unsafe_store(k * n_param + i, hw.unsafe_ptr().unsafe_load(i))
+        info_ptr.unsafe_store(3 * k, fx)
+        info_ptr.unsafe_store(3 * k + 1, Float32(ret))
+        info_ptr.unsafe_store(3 * k + 2, Float32(iters))
+        _ = w^
+    _ = hw^
+    _ = sw_all^
+    _ = codes^
+    _ = x^
+
+
+def qn_decision_function_host(
+    ctx: DeviceContext,
+    x_ptr: MutPointer[Float32, MutUntrackedOrigin],
+    coef_ptr: MutPointer[Float32, MutUntrackedOrigin],
+    out_ptr: MutPointer[Float32, MutUntrackedOrigin],
+    n_rows: Int,
+    n_features: Int,
+    fit_intercept: Bool,
+    n_classes: Int = 1,
+) raises:
+    """`qnDecisionFunction` (`qn.cuh:231-243`): `scores = X w + b` on the
+    device, the fitted `W` layout in. `n_classes` (lane/logistic-multiclass,
+    2026-09-14) is 1 for the binary logistic shape, the default and the
+    only value until that day: `n_targets = 1`, `scores` is `n_rows`
+    floats, `predict` is `z > 0` and `predict_proba` the sigmoid, both in
+    the Python layer. `n_classes > 2` is the softmax shape: `w` is the
+    column-major `C x dims` block, `n_targets = C`, and `scores` is
+    `n_rows * C` floats, `scores[i*C + c]` (row-major, which IS cuML's
+    column-major `z[c + C*i]`, `glm_base.mojo::linear_fwd`); `predict` is
+    the row argmax and `predict_proba` the softmax (`qn_softmax_host`)."""
+    var n_targets = n_classes if n_classes > 2 else 1
+    var n_param = (n_features + (1 if fit_intercept else 0)) * n_targets
+    var x = ctx.enqueue_create_buffer[DType.float32](n_rows * n_features)
+    var w = ctx.enqueue_create_buffer[DType.float32](n_param)
+    var scores = ctx.enqueue_create_buffer[DType.float32](n_rows * n_targets)
+    ctx.enqueue_copy(dst_buf=x, src_ptr=x_ptr)
+    ctx.enqueue_copy(dst_buf=w, src_ptr=coef_ptr)
+    ctx.synchronize()
+    var pams = QNParams.default()
+    pams.loss = QN_LOSS_SOFTMAX if n_targets > 1 else QN_LOSS_LOGISTIC
+    pams.fit_intercept = fit_intercept
+    qn_decision_function(ctx, pams, x, n_rows, n_features, w, scores, n_targets)
+    var hs = ctx.enqueue_create_host_buffer[DType.float32](n_rows * n_targets)
+    ctx.enqueue_copy(dst_ptr=hs.unsafe_ptr(), src_buf=scores)
+    ctx.synchronize()
+    for i in range(n_rows * n_targets):
+        out_ptr.unsafe_store(i, hs.unsafe_ptr().unsafe_load(i))
+    _ = hs^
+
+
+def _positive_code_kernel(
+    scores: MutPointer[Float32, MutAnyOrigin],
+    codes: MutPointer[Int64, MutAnyOrigin],
+    n_in: Int32,
+):
+    """codes[i] = 1 if scores[i] > 0 else 0, decided BY BITS (Metal flushes
+    compare operands): sign clear, magnitude nonzero and not a NaN. That is
+    the host's `score > 0.0` for every float, subnormals included."""
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if i < Int(n_in):
+        var b = bitcast[DType.uint32](scores.unsafe_load(i))
+        var mag = b & UInt32(0x7FFFFFFF)
+        var pos = (b >> 31) == UInt32(0) and mag != UInt32(0) and mag <= UInt32(0x7F800000)
+        codes.unsafe_store(i, Int64(1) if pos else Int64(0))
+
+
+def qn_predict_binary_host(
+    ctx: DeviceContext,
+    x_ptr: MutPointer[Float32, MutUntrackedOrigin],
+    coef_ptr: MutPointer[Float32, MutUntrackedOrigin],
+    out_ptr: MutPointer[Int64, MutUntrackedOrigin],
+    n_rows: Int,
+    n_features: Int,
+    fit_intercept: Bool,
+) raises:
+    """Binary `qn_predict`, retaining the score and threshold boundary in
+    native code so Python never materializes scalar score/code objects."""
+    var n_param = n_features + (1 if fit_intercept else 0)
+    var x = ctx.enqueue_create_buffer[DType.float32](n_rows * n_features)
+    var w = ctx.enqueue_create_buffer[DType.float32](n_param)
+    var scores = ctx.enqueue_create_buffer[DType.float32](n_rows)
+    ctx.enqueue_copy(dst_buf=x, src_ptr=x_ptr)
+    ctx.enqueue_copy(dst_buf=w, src_ptr=coef_ptr)
+    ctx.synchronize()
+    var pams = QNParams.default()
+    pams.loss = QN_LOSS_LOGISTIC
+    pams.fit_intercept = fit_intercept
+    qn_decision_function(ctx, pams, x, n_rows, n_features, w, scores)
+    # lane cgr4-download-loop: the threshold runs on the device and the codes
+    # download straight into the caller's buffer (was a host loop over rows)
+    if n_rows <= 0:
+        return
+    var codes = ctx.enqueue_create_buffer[DType.int64](n_rows)
+    ctx.enqueue_function[_positive_code_kernel](
+        scores.unsafe_ptr(), codes.unsafe_ptr(), Int32(n_rows),
+        grid_dim=((n_rows + 255) // 256, 1, 1), block_dim=(256, 1, 1),
+    )
+    ctx.enqueue_copy(dst_ptr=out_ptr, src_buf=codes)
+    ctx.synchronize()
+    _ = codes^
+    _ = scores^
+# TOMBSTONE: ANONLIB_OLS_FAST_DEVICE_CENTER (DROPPED-semantics) deleted 2026-10-03 by dd83da010; code recoverable at dd83da010^.
+# Restore: git apply experiments/removed/ANONLIB_OLS_FAST_DEVICE_CENTER.patch; record in docs/TOMBSTONES.md.
+
+
+#: lane fam2-linear (2026-10-04): multiclass `LogisticRegression.predict`
+#: took the row argmax on the host (`_labels.argmax_rows`) after the device
+#: scored. The argmax now runs on the device (one thread per row) and the
+#: int64 codes download straight into the caller's buffer.
+#: `-D ANONLIB_QN_DEV_ARGMAX_OFF` (or the master `ANONLIB_IDN_ALL_OFF`)
+#: leaves the entry unregistered, and the Python layer falls back to the host
+#: scan. No bit moves: the same strict `>` from column 0.
+comptime QN_DEV_ARGMAX = not (
+    is_defined["ANONLIB_QN_DEV_ARGMAX_OFF"]() or is_defined["ANONLIB_IDN_ALL_OFF"]()
+)
+
+
+@always_inline
+def _argmax_key(b: UInt32) -> UInt32:
+    """A float's bits as an unsigned key whose integer order is the float
+    order of the non-NaN values, `-0.0` and `+0.0` sharing one key (so
+    neither is greater than the other, as IEEE `>` says)."""
+    var mag = b & UInt32(0x7FFFFFFF)
+    if mag == UInt32(0):
+        return UInt32(0x80000000)
+    if (b >> 31) == UInt32(0):
+        return b | UInt32(0x80000000)
+    return ~b
+
+
+def _row_argmax_code_kernel(
+    scores: MutPointer[Float32, MutAnyOrigin],
+    codes: MutPointer[Int64, MutAnyOrigin],
+    n_in: Int32,
+    n_cls: Int32,
+):
+    """codes[i] = the first maximum of scores[i*C .. i*C + C), decided BY
+    BITS (Metal flushes compare operands): a later column replaces only
+    when strictly greater, and a NaN on either side never replaces. That is
+    `_labels.argmax_rows` (`argmax_rows_f32_binding`) for every float."""
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if i < Int(n_in):
+        var c_n = Int(n_cls)
+        var base = i * c_n
+        var best = 0
+        var bb = bitcast[DType.uint32](scores.unsafe_load(base))
+        var best_nan = (bb & UInt32(0x7FFFFFFF)) > UInt32(0x7F800000)
+        var best_key = _argmax_key(bb)
+        for c in range(1, c_n):
+            var b = bitcast[DType.uint32](scores.unsafe_load(base + c))
+            var is_nan = (b & UInt32(0x7FFFFFFF)) > UInt32(0x7F800000)
+            var key = _argmax_key(b)
+            if (not is_nan) and (not best_nan) and key > best_key:
+                best = c
+                best_key = key
+        codes.unsafe_store(i, Int64(best))
+
+
+def qn_predict_multiclass_host(
+    ctx: DeviceContext,
+    x_ptr: MutPointer[Float32, MutUntrackedOrigin],
+    coef_ptr: MutPointer[Float32, MutUntrackedOrigin],
+    out_ptr: MutPointer[Int64, MutUntrackedOrigin],
+    n_rows: Int,
+    n_features: Int,
+    fit_intercept: Bool,
+    n_classes: Int,
+) raises:
+    """Multiclass `qn_predict` (`n_classes > 2`): the softmax decision
+    function and the row argmax both on the device; the int64 class codes
+    are the only download."""
+    if n_classes <= 2:
+        raise Error("qn_predict_multiclass: n_classes must exceed 2, got " + String(n_classes))
+    if n_rows <= 0:
+        return
+    var n_param = (n_features + (1 if fit_intercept else 0)) * n_classes
+    var x = ctx.enqueue_create_buffer[DType.float32](n_rows * n_features)
+    var w = ctx.enqueue_create_buffer[DType.float32](n_param)
+    var scores = ctx.enqueue_create_buffer[DType.float32](n_rows * n_classes)
+    ctx.enqueue_copy(dst_buf=x, src_ptr=x_ptr)
+    ctx.enqueue_copy(dst_buf=w, src_ptr=coef_ptr)
+    ctx.synchronize()
+    var pams = QNParams.default()
+    pams.loss = QN_LOSS_SOFTMAX
+    pams.fit_intercept = fit_intercept
+    qn_decision_function(ctx, pams, x, n_rows, n_features, w, scores, n_classes)
+    var codes = ctx.enqueue_create_buffer[DType.int64](n_rows)
+    ctx.enqueue_function[_row_argmax_code_kernel](
+        scores.unsafe_ptr(), codes.unsafe_ptr(), Int32(n_rows), Int32(n_classes),
+        grid_dim=((n_rows + 255) // 256, 1, 1), block_dim=(256, 1, 1),
+    )
+    ctx.enqueue_copy(dst_ptr=out_ptr, src_buf=codes)
+    ctx.synchronize()
+    _ = codes^
+    _ = scores^

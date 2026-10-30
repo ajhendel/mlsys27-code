@@ -1,0 +1,3224 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 the authors. Part of anonlib, DOI-WITHHELD
+"""ExtraTrees builder kernels.
+
+Ports cuML `builder_kernels_impl.cuh` at `00094f7`. Split search deliberately
+uses one threshold drawn from the node-local feature range, following sklearn's
+RandomSplitter, instead of cuML's quantile histogram (DEVIATION 137).
+"""
+
+from ensemble.tree_identical_ideas import T14, T14_EXACT
+from ensemble.tree_moments import moment_pair, moment_finish, et_leaf_moment_host
+from checks.soft_f64 import sf64_from_f32
+from std.sys.compile import is_defined
+from std.sys.info import has_amd_gpu_accelerator, has_apple_gpu_accelerator, has_nvidia_gpu_accelerator
+
+from extratrees.checks.pcg_rng import SplitKey, key_for, uniform_float
+from extratrees.impl.decisiontree.batched_levelalgo.dataset import Dataset
+from extratrees.impl.decisiontree.batched_levelalgo.split import (
+    Split,
+    split_reduce_seed_at,
+)
+from extratrees.impl.decisiontree.batched_levelalgo.kernels.builder_kernels import (
+    NodeWorkItem,
+    SAMPLER_UNVISITED,
+)
+
+
+comptime TPB_DEFAULT = 128
+"""`builder_kernels_impl.cuh:33`, `static constexpr int TPB_DEFAULT = 128`."""
+
+comptime T05_SMALL_NODE_ROWS = 128
+# One row per lane in the portable T05 block; same admission for both range
+# launchers and its fused consumer. No benchmark dimension enters this bound.
+# NOT COMPILED — NOT TESTED — IDENTITY NOT VERIFIED — QUALITY NOT VERIFIED — NOT MEASURED.
+
+
+comptime SEARCH_ROWS_PER_THREAD = _search_rows_per_thread()
+"""Rows each thread of the range and score passes folds -- DEVIATION 2020."""
+
+
+def _search_rows_per_thread() -> Int:
+    """DEVIATION 2020's measurement arms; 1 (cuML's one row per thread,
+    `builder.cuh:393-408`) is the default on every column.
+
+    DEVIATION 3020 (lane/forest-train-speed, 2026-09-17) -- THE ARMS WERE
+    FINALLY RUN ON NVIDIA, AND THEY STAY ARMS. RTX 4090, driver 580.159.04,
+    pod 6x6vfh2zqas3n4, 16-tree depth-16 fits, one process each, model
+    hashes equal in every arm. Under the seq_cst publish this file shipped
+    until DEVIATION 3022: taxi 4.0M x 16 took 16.5 s at 1, 9.0 at 2, 4.4 at
+    4, 2.9 at 8, 2.0 at 16, 1.7 at 32, 1.45 at 64, 1.03 at 128, 1.02 at 256;
+    Istella-S 2.0M x 220 took 28.4 s at 1, 4.7 at 16, 3.7 at 64, 3.8 at 256.
+    The tile was dividing a per-BLOCK cost, and DEVIATION 3022 removed that
+    cost at its root: with the RELAXED publish, 1 row per thread runs taxi in
+    0.89 s and Istella-S in 2.53 s, and 64 rows per thread 0.84 s and 2.45 s.
+    That is 3 to 5 percent from single samples, it costs the level loop a
+    restage and a drain per cycle (`builder.mojo`, the
+    `SEARCH_ROWS_PER_THREAD > 1` arm), so the default does not move.
+    `_32`, `_64`, `_128`, `_256` and the explicit `_1` were added for this
+    measurement. Bit-inert at every width for DEVIATION 2020's reasons:
+    integer sums, a key-space range fold, draws keyed by (seed, tree, node,
+    feature); `ANONLIB_ET_SAB_RPT_TAIL_DROP` is the arm that must move and
+    was seen to (15 of 15 ExtraTrees cells) at 64, and seen NOT to at 1.
+    """
+    if is_defined["ANONLIB_ET_SEARCH_RPT_256"]():
+        return 256
+    if is_defined["ANONLIB_ET_SEARCH_RPT_128"]():
+        return 128
+    if is_defined["ANONLIB_ET_SEARCH_RPT_64"]():
+        return 64
+    if is_defined["ANONLIB_ET_SEARCH_RPT_32"]():
+        return 32
+    if is_defined["ANONLIB_ET_SEARCH_RPT_16"]():
+        return 16
+    if is_defined["ANONLIB_ET_SEARCH_RPT_8"]():
+        return 8
+    if is_defined["ANONLIB_ET_SEARCH_RPT_4"]():
+        return 4
+    if is_defined["ANONLIB_ET_SEARCH_RPT_2"]():
+        return 2
+    if is_defined["ANONLIB_ET_SEARCH_RPT_1"]():
+        return 1
+    # APPLE: 16, FAST since 2026-09-25 and IDENTICAL since 2026-09-28. Apple
+    # M4, 1M rows, 100 trees, alternating processes, same model hash in every
+    # arm (2026-09-25, FAST): taxi 1 -> 16 0.766, 16 -> 8 0.978, 16 -> 32
+    # 0.995, 1 -> 64 0.811; Istella-S 1 -> 16 0.585. Metal pays far more per
+    # search block than the RTX 4090 above did. IDENTICAL had stayed at 1 on
+    # Apple (ExtraTreesRegressor Istella-S 27.0 s on the M3 Ultra, the H100's
+    # 28.6 s at 1 below); the width is bit-inert (integer sums, the key-space
+    # range fold, draws keyed by (seed, tree, node, feature)), which is why
+    # NVIDIA and AMD run IDENTICAL at 64. `_1=1` restores one row per thread
+    # on Apple for an A/B.
+    comptime if has_apple_gpu_accelerator():
+        return 16
+    # NVIDIA AND AMD: 64, both modes (lane trees speed pass, 2026-09-28).
+    # 1M rows, 100 trees depth 12, IDENTICAL, one process per arm, the same
+    # rmse/accuracy in every arm. H100 (RELAXED publish): Istella-S
+    # regressor (220 features) 28.6 s at 1 -> 4.19 at 16 -> 2.74 at 64;
+    # taxi regressor 2.34 -> 0.44 -> 0.37; classifiers 0.98 -> 0.62 -> 0.64
+    # and 0.37 -> 0.25 -> 0.24. MI300X (RELAXED publish): Istella-S
+    # regressor 7.9 -> 2.50 -> 2.39, taxi 0.72 -> 0.30 -> 0.29. At 1M x 220
+    # the root search is 7.8k blocks per feature at one row per thread; the
+    # per-block reduce + publish, not the rows, was the cost the 4090
+    # measurement above could not see at 16 features.
+    comptime if has_nvidia_gpu_accelerator() or has_amd_gpu_accelerator():
+        return 64
+    return 1
+
+
+comptime SEARCH_SAB_RPT_TAIL_DROP = is_defined[
+    "ANONLIB_ET_SAB_RPT_TAIL_DROP"
+]()
+"""DEVIATION 2020's required-RED arm (a measurement arm, never a gate; it must never reach a shipped build)."""
+
+
+def partition_samples(
+    dataset: Dataset,
+    split: Split,
+    work_item: NodeWorkItem,
+    tpb: Int = TPB_DEFAULT,
+):
+    """Partition `row_ids` into left/right by the best split, in place."""
+    var row_ids = dataset.row_ids
+    var range_start = Int(work_item.instances.begin)
+    var range_len = Int(work_item.instances.count)
+    var col_base = Int(split.colid) * Int(dataset.m)
+    var quesval = split.quesval
+
+    var loffset = range_start
+    var part = loffset + Int(split.n_left)
+    var roffset = part
+    var end = range_start + range_len
+
+    var lflag = List[Int](length=tpb, fill=0)
+    var rflag = List[Int](length=tpb, fill=0)
+    var lidx = List[Int](length=tpb, fill=0)
+    var ridx = List[Int](length=tpb, fill=0)
+    var lcomp = List[Int](length=tpb, fill=0)
+    var rcomp = List[Int](length=tpb, fill=0)
+
+    var llen = 0
+    var rlen = 0
+    var minlen = 0
+
+    while loffset < part and roffset < end:
+        for tid in range(tpb):
+            var loff = loffset + tid
+            var roff = roffset + tid
+            if llen == minlen:
+                if loff < part:
+                    lflag[tid] = 1 if dataset.data[
+                        unsafe_offset = col_base + Int(row_ids[unsafe_offset=loff])
+                    ] > quesval else 0
+                else:
+                    lflag[tid] = 0
+            if rlen == minlen:
+                if roff < end:
+                    rflag[tid] = 1 if dataset.data[
+                        unsafe_offset = col_base + Int(row_ids[unsafe_offset=roff])
+                    ] <= quesval else 0
+                else:
+                    rflag[tid] = 0
+
+        var lrun = 0
+        var rrun = 0
+        for tid in range(tpb):
+            lidx[tid] = lrun
+            lrun += lflag[tid]
+            ridx[tid] = rrun
+            rrun += rflag[tid]
+        llen = lrun
+        rlen = rrun
+
+        minlen = llen if llen < rlen else rlen
+
+        for tid in range(tpb):
+            if lflag[tid] != 0:
+                lcomp[lidx[tid]] = loffset + tid
+            if rflag[tid] != 0:
+                rcomp[ridx[tid]] = roffset + tid
+
+        for tid in range(tpb):
+            if lidx[tid] < minlen:
+                lflag[tid] = 0
+            if ridx[tid] < minlen:
+                rflag[tid] = 0
+        if llen == minlen:
+            loffset += tpb
+        if rlen == minlen:
+            roffset += tpb
+
+        for tid in range(minlen):
+            var a = row_ids[unsafe_offset= lcomp[tid]]
+            var b = row_ids[unsafe_offset= rcomp[tid]]
+            row_ids[unsafe_offset= lcomp[tid]] = b
+            row_ids[unsafe_offset= rcomp[tid]] = a
+
+
+comptime FEATURE_THRESHOLD: Float32 = 1e-7
+"""`sklearn/tree/_partitioner.pxd:13`, `cdef const float32_t FEATURE_THRESHOLD = 1e-7`."""
+
+
+@fieldwise_init
+struct FeatureRange(ImplicitlyCopyable, Movable):
+    """The output of the range pass: one feature's extent over one node."""
+
+    var min_value: Float32
+    var max_value: Float32
+    var n_missing: Int32
+    """NaN count."""
+
+
+def node_feature_min_max(
+    dataset: Dataset, work_item: NodeWorkItem, col: Int32
+) -> FeatureRange:
+    """Min and max of one feature over one node's rows."""
+    var begin = Int(work_item.instances.begin)
+    var end = begin + Int(work_item.instances.count)
+    var col_base = Int(col) * Int(dataset.m)
+
+    var min_value = Float32(0.0)
+    var max_value = Float32(0.0)
+    var n_missing = 0
+    var seen_non_missing = False
+
+    for p in range(begin, end):
+        var row = Int(dataset.row_ids[unsafe_offset=p])
+        var v = dataset.data[unsafe_offset = col_base + row]
+        if v != v:  # isnan, without importing one
+            n_missing += 1
+        elif not seen_non_missing:
+            min_value = v
+            max_value = v
+            seen_non_missing = True
+        elif v < min_value:
+            min_value = v
+        elif v > max_value:
+            max_value = v
+
+    if not seen_non_missing:
+        return FeatureRange(1.0, -1.0, Int32(n_missing))
+    return FeatureRange(min_value, max_value, Int32(n_missing))
+
+
+def node_feature_is_constant(extent: FeatureRange, n_rows: Int32) -> Bool:
+    """Whether this feature is constant over this node, sklearn's test."""
+    if n_rows == extent.n_missing:
+        return True
+    return (
+        extent.max_value <= extent.min_value + FEATURE_THRESHOLD
+        and extent.n_missing == 0
+    )
+
+
+def draw_threshold(key: SplitKey, extent: FeatureRange) -> Float32:
+    """One threshold for one (node, feature), keyed rather than streamed."""
+    var gen = key.generator()
+    var threshold = uniform_float(gen, extent.min_value, extent.max_value)
+    if threshold == extent.max_value:
+        return extent.min_value
+    return threshold
+
+
+def draw_threshold_raw(key: SplitKey, extent: FeatureRange) -> Float32:
+    """`draw_threshold` WITHOUT sklearn's `== max` guard."""
+    var gen = key.generator()
+    return uniform_float(gen, extent.min_value, extent.max_value)
+
+
+# ============================================================================
+
+from std.atomic import Atomic, Ordering
+from std.gpu.primitives.warp import shuffle_xor
+from std.memory import bitcast
+from std.gpu import WARP_SIZE, block_dim, block_idx, grid_dim, thread_idx
+from std.math import ceildiv, inf
+from max.gpu.primitives.block import max as block_max
+from max.gpu.primitives.block import min as block_min
+from max.gpu.primitives.block import sum as block_sum
+from max.gpu.sync import barrier
+
+from checks.numerics import (
+    GLOBAL_NUMERIC_MODE,
+    NUMERIC_FAST,
+    NUMERIC_IDENTICAL,
+    ftz,
+)
+
+@always_inline
+def _search_barrier():
+    """The explicit barrier after each block reduction of the range and score
+    passes. `-D ANONLIB_ET_EXP_NO_SEARCH_BARRIER=1` is a MEASUREMENT ARM that
+    drops it, to price the barrier per block on one vendor; it is never set by
+    a build script and never a default (Metal needs the barrier)."""
+    comptime if not is_defined["ANONLIB_ET_EXP_NO_SEARCH_BARRIER"]():
+        barrier()
+
+
+comptime SINGLE_WRITER_PLAIN_PUBLISH = is_defined[
+    "ANONLIB_ET_PLAIN_SINGLE_PUBLISH"
+]()
+"""DEVIATION 3021 (lane/forest-train-speed, 2026-09-17), A MEASUREMENT ARM,
+OFF BY DEFAULT: a node that fits in ONE search block publishes its range and
+score cells with plain stores.
+
+A cell is `(node, feature slot)`. Its publishers are the thread 0 of each of
+the node's `num_blocks` blocks on that feature slot's grid row, and nothing
+else in the launch writes it. When `num_blocks == 1` the cell has exactly one
+writer in the whole launch, the seeder that initialized it ran earlier on the
+in-order queue, and no reader runs until the launch is behind it. One writer
+needs no atomic: `cell = min(cell, x)` and `cell += x` store the very integers
+the atomic forms store, so no bit moves. It was written when the publish
+atomics were the two hot passes' whole price; DEVIATION 3022 removed that
+price at its root, after which this arm measured inside the noise (16-tree
+fits, RTX 4090: taxi 0.84 s without it and 0.88 s with it, Istella-S 2.45 s
+and 2.41 s), so it stays an arm. `-D ANONLIB_ET_SAB_PLAIN_PUBLISH=1` is the
+arm that must move: the plain path adds one to every count it publishes."""
+
+comptime SAB_PLAIN_PUBLISH = is_defined["ANONLIB_ET_SAB_PLAIN_PUBLISH"]()
+
+comptime RELAXED_PUBLISH = (
+    has_nvidia_gpu_accelerator()
+    or has_amd_gpu_accelerator()
+    or is_defined["ANONLIB_ET_RELAXED_PUBLISH"]()
+) and not is_defined["ANONLIB_ET_SEQCST_PUBLISH"]()
+"""DEVIATION 3022 (lane/forest-train-speed, 2026-09-17): the search's publish
+atomics are RELAXED on an NVIDIA build, and on an AMD build since
+2026-09-28 (lane trees, speed pass): Hot Aisle MI300X, 1M rows, 100 trees
+depth 12, IDENTICAL, one process each, same rmse/accuracy in every arm:
+ExtraTreesRegressor Istella-S 107.7 s -> 7.9 s, taxi 8.2 s -> 0.72 s;
+ExtraTreesClassifier Istella-S 9.6 s -> 0.86 s. The same per-block seq_cst
+publish cost the paragraphs below measured on CUDA.
+
+WHAT WAS MEASURED (RTX 4090, driver 580.159.04, pod 6x6vfh2zqas3n4, `nsys`,
+taxi 4.0M x 16, 100 trees depth 16, IDENTICAL). Two kernels were 99.5 percent
+of device time and the host was idle: the score pass 53.3 s and the range
+pass 38.3 s of a 94 s fit, at a CONSTANT 1.4 to 1.9 ns per thread from the
+root level to the deepest, while the partition pass tiled the same rows one
+per thread, published with a plain store, and ran the same grid in under
+1 ms. The cost was per BLOCK and it was the publish: every block's thread 0
+ends in four (range) or `3 + 2 * n_classes` (score) atomic read-modify-writes
+on global memory. A measurement arm that replaced the range pass's four with
+plain stores (`ANONLIB_ET_EXP_RACY_RANGE_PUBLISH`, wrong on purpose) took
+the whole range pass out of a 16-tree fit, 16.5 s to 10.0 s; dropping the
+explicit barriers moved nothing (`ANONLIB_ET_EXP_NO_SEARCH_BARRIER`, 16.5 s
+to 15.1 s).
+
+THE ROOT CAUSE. Mojo's non-Apple default ordering is seq_cst, and on CUDA a
+seq_cst read-modify-write carries fences: about 47 ns of WALL time per
+publish, serialized across the launch. The random forest lane met this first
+and pinned every histogram add to `Ordering.RELAXED`
+(`ensemble/decisiontree/batched_levelalgo/bins.mojo`, "Fences only -- the
+totals cannot move"); this file never did. With the ordering alone changed,
+the 16-tree fits went from 16.5 s to 0.89 s on taxi and from 28.4 s to 2.53 s
+on Istella-S 2.0M x 220, model hashes equal.
+
+WHY NO BIT MOVES. The ordering changes fences, never the read-modify-write:
+an `atomicrmw add`, `min` or `max` loses no update under any ordering, and an
+integer sum, min or max is the same value under any interleaving. No thread
+of a launch READS a published cell; the readers are later launches on the
+same in-order queue, which is a full barrier. cuML's own `atomicAdd` is
+relaxed. `-D ANONLIB_ET_SAB_RELAXED_PUBLISH=1` is the arm that must move:
+the relaxed `_publish_add` adds one to every count it publishes.
+
+NVIDIA AND AMD by default (AMD's Mojo default is seq_cst too).
+`-D ANONLIB_ET_RELAXED_PUBLISH=1` opts any other column in;
+`-D ANONLIB_ET_SEQCST_PUBLISH=1` restores the default ordering for the
+A/B. Apple's default is already relaxed."""
+
+comptime SAB_RELAXED_PUBLISH = is_defined["ANONLIB_ET_SAB_RELAXED_PUBLISH"]()
+
+
+@always_inline
+def _publish_add(
+    cell: MutPointer[Int32, MutAnyOrigin], idx: Int, value: Int32, single: Bool
+):
+    """`cell[idx] += value` for one publish of the search: a RELAXED
+    `Atomic.fetch_add` on NVIDIA (DEVIATION 3022), the default ordering
+    elsewhere, and a plain store for a single-writer cell only under
+    DEVIATION 3021's opt-in arm."""
+    comptime if SINGLE_WRITER_PLAIN_PUBLISH:
+        if single:
+            comptime if SAB_PLAIN_PUBLISH:
+                cell[unsafe_offset=idx] += value + Int32(1)
+            else:
+                cell[unsafe_offset=idx] += value
+            return
+    comptime if RELAXED_PUBLISH:
+        comptime if SAB_RELAXED_PUBLISH:
+            _ = Atomic.fetch_add[ordering = Ordering.RELAXED](
+                cell.unsafe_offset(idx), value + Int32(1)
+            )
+        else:
+            _ = Atomic.fetch_add[ordering = Ordering.RELAXED](
+                cell.unsafe_offset(idx), value
+            )
+    else:
+        _ = Atomic.fetch_add(cell.unsafe_offset(idx), value)
+
+
+@always_inline
+def _publish_min_max(
+    minkey: MutPointer[UInt32, MutAnyOrigin],
+    maxkey: MutPointer[UInt32, MutAnyOrigin],
+    idx: Int,
+    kmin: UInt32,
+    kmax: UInt32,
+):
+    """The range cell's atomic min and max, RELAXED under DEVIATION 3022."""
+    comptime if RELAXED_PUBLISH:
+        Atomic.min[ordering = Ordering.RELAXED](minkey.unsafe_offset(idx), kmin)
+        Atomic.max[ordering = Ordering.RELAXED](maxkey.unsafe_offset(idx), kmax)
+    else:
+        Atomic.min(minkey.unsafe_offset(idx), kmin)
+        Atomic.max(maxkey.unsafe_offset(idx), kmax)
+
+
+comptime BUILD_MODE = GLOBAL_NUMERIC_MODE
+"""The repo-wide numeric mode (`checks/numerics.mojo`)."""
+
+from extratrees.impl.decisiontree.batched_levelalgo.kernels.builder_kernels import (
+    WorkloadInfo,
+)
+
+
+comptime RANGE_SAB_NONE = 0
+"""No sabotage."""
+
+comptime RANGE_SAB_ROW_MAJOR = 1
+"""Index the feature matrix as `row * N + col` instead of cuML's column-major `col * M + row` (`dataset.h:24`)."""
+
+comptime RANGE_SAB_NO_ROW_IDS = 2
+"""Drop the `row_ids` indirection and treat the slot index as the row id."""
+
+comptime RANGE_SAB_BLOCK0_ONLY = 3
+"""Publish only from `offset_blockid == 0`, so a large node sees just the first block's slice."""
+
+comptime RANGE_SAB_NAN_AS_VALUE = 4
+"""Skip the `v != v` test, so NaN is neither counted nor diverted."""
+
+comptime RANGE_SAB_NO_SENTINEL = 5
+"""Publish `(+inf, -inf)` for an empty cell instead of the host's `(1.0, -1.0)` sentinel."""
+
+comptime RANGE_SAB_EMPTY_NOT_IDENTITY = 7
+"""An empty block publishes `range_key(0.0)` rather than its `+inf`/`-inf` identities."""
+
+comptime RANGE_SAB_SIGN_UNFLIPPED = 6
+"""Skip `range_key`'s NEGATIVE branch: set the sign bit unconditionally instead of inverting a negative's bits."""
+
+
+def range_key(v: Float32) -> UInt32:
+    """A float as an unsigned key whose INTEGER order is the float's order."""
+    var b = rebind[UInt32](v.to_bits())
+    if (b & UInt32(0x80000000)) != 0:
+        return ~b
+    return b | UInt32(0x80000000)
+
+
+def range_unkey(k: UInt32) -> Float32:
+    """The exact inverse of `range_key`."""
+    if (k & UInt32(0x80000000)) != 0:
+        return bitcast[DType.float32](k ^ UInt32(0x80000000))
+    return bitcast[DType.float32](~k)
+
+
+comptime RANGE_KEY_MIN_SEED: UInt32 = 0xFF800000
+"""`range_key(+inf)`: the largest key, so an untouched cell loses every min."""
+comptime RANGE_KEY_MAX_SEED: UInt32 = 0x007FFFFF
+"""`range_key(-inf)`: the smallest key, so an untouched cell loses every max."""
+
+
+def node_feature_range_decode_kernel(
+    out_min: MutPointer[Float32, MutAnyOrigin],
+    out_max: MutPointer[Float32, MutAnyOrigin],
+    minkey: MutPointer[UInt32, MutAnyOrigin],
+    maxkey: MutPointer[UInt32, MutAnyOrigin],
+    len: Int32,
+    sabotage_in: Int32,
+):
+    """Keys back into the `(min, max)` floats every later pass reads."""
+    var idx = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    var stride = Int(grid_dim.x) * Int(block_dim.x)
+    while idx < Int(len):
+        var lo = range_unkey(minkey[unsafe_offset=idx])
+        var hi = range_unkey(maxkey[unsafe_offset=idx])
+        if lo > hi and sabotage_in != RANGE_SAB_NO_SENTINEL:
+            out_min[unsafe_offset=idx] = Float32(1.0)
+            out_max[unsafe_offset=idx] = Float32(-1.0)
+        else:
+            out_min[unsafe_offset=idx] = lo
+            out_max[unsafe_offset=idx] = hi
+        idx += stride
+
+
+def node_feature_range_kernel[
+    TPB: Int, ROW_MAJOR: Bool = False, FUSED_SMALL: Bool = False
+](
+    out_minkey: MutPointer[UInt32, MutAnyOrigin],
+    out_maxkey: MutPointer[UInt32, MutAnyOrigin],
+    out_n_missing: MutPointer[Int32, MutAnyOrigin],
+    out_n_merges: MutPointer[Int32, MutAnyOrigin],
+    data: MutPointer[Float32, MutAnyOrigin],
+    row_ids: MutPointer[Int32, MutAnyOrigin],
+    work_items: MutPointer[NodeWorkItem, MutAnyOrigin],
+    workload_info: MutPointer[WorkloadInfo, MutAnyOrigin],
+    colids: MutPointer[Int32, MutAnyOrigin],
+    m_in: Int32,
+    n_in: Int32,
+    n_sampled_cols_in: Int32,
+    sabotage_in: Int32,
+):
+    """Min, max and NaN count of one feature over one node's rows, on device."""
+    var wb = Int(block_idx.x)
+    var fslot = Int(block_idx.y)
+    comptime if ROW_MAJOR:
+        # the feature slot is the FAST axis, so the blocks reading one row
+        # chunk's features are dispatched together and share its lines
+        wb = Int(block_idx.y)
+        fslot = Int(block_idx.x)
+    var nid = Int(workload_info[unsafe_offset=wb].nodeid)
+    if nid < 0:
+        # cpu4-forest: a map entry past the live total (the device
+        # level loop launches at a proven bound); the whole block
+        # leaves before any barrier. `build_workload_info` never
+        # emits one, so the host-staged path is unchanged.
+        return
+    var offset_blockid = Int(workload_info[unsafe_offset=wb].offset_blockid)
+    var num_blocks = Int(workload_info[unsafe_offset=wb].num_blocks)
+
+    var range_start = Int(work_items[unsafe_offset=nid].instances.begin)
+    var range_len = Int(work_items[unsafe_offset=nid].instances.count)
+    # T05 production dispatch reserves these nodes for the one-block raw-value
+    # range/draw/score consumer. The ordinary setup's empty range makes the
+    # following separate score kernels return without reading rows. Direct
+    # kernel callers retain B through the False compile-time default.
+    # NOT COMPILED — NOT TESTED — IDENTITY NOT VERIFIED — QUALITY NOT VERIFIED — NOT MEASURED.
+    comptime if FUSED_SMALL:
+        if range_len <= T05_SMALL_NODE_ROWS:
+            return
+
+    var m = Int(m_in)
+    var n = Int(n_in)
+    var n_sampled_cols = Int(n_sampled_cols_in)
+    var sabotage = Int(sabotage_in)
+
+    var col = Int(colids[unsafe_offset = nid * n_sampled_cols + fslot])
+
+    var end = range_start + range_len
+    var stride = TPB * num_blocks
+    var tid = Int(thread_idx.x) + offset_blockid * TPB
+
+    var local_min = inf[DType.float32]()
+    var local_max = -inf[DType.float32]()
+    var local_missing = Int32(0)
+
+    var col_offset = col * m
+    var i = range_start + tid
+    while i < end:
+        var slot_row = Int(row_ids[unsafe_offset=i])
+        if sabotage == RANGE_SAB_NO_ROW_IDS:
+            slot_row = i
+        var v: Float32
+        comptime if ROW_MAJOR:
+            v = data[unsafe_offset = slot_row * n + col]
+        else:
+            if sabotage == RANGE_SAB_ROW_MAJOR:
+                v = data[unsafe_offset = slot_row * n + col]
+            else:
+                v = data[unsafe_offset = col_offset + slot_row]
+
+        if v != v and sabotage != RANGE_SAB_NAN_AS_VALUE:
+            local_missing += 1
+        else:
+            comptime if SEARCH_ROWS_PER_THREAD > 1:
+                if range_key(v) < range_key(local_min):
+                    local_min = v
+                if range_key(v) > range_key(local_max):
+                    local_max = v
+            else:
+                if v < local_min:
+                    local_min = v
+                if v > local_max:
+                    local_max = v
+        i += stride
+        comptime if SEARCH_SAB_RPT_TAIL_DROP:
+            break
+
+    var kmin: UInt32
+    var kmax: UInt32
+    comptime if BUILD_MODE == NUMERIC_IDENTICAL:
+        kmin = block_min[block_size=TPB](range_key(local_min))
+        _search_barrier()
+        kmax = block_max[block_size=TPB](range_key(local_max))
+        _search_barrier()
+    else:
+        var blk_min = block_min[block_size=TPB](local_min)
+        _search_barrier()
+        var blk_max = block_max[block_size=TPB](local_max)
+        _search_barrier()
+        kmin = range_key(blk_min)
+        kmax = range_key(blk_max)
+    var blk_missing = block_sum[block_size=TPB](local_missing)
+    _search_barrier()
+
+    if Int(thread_idx.x) != 0:
+        return
+    if sabotage == RANGE_SAB_BLOCK0_ONLY and offset_blockid != 0:
+        return
+
+    var slot = nid * n_sampled_cols + fslot
+
+    var empty_block = kmin > kmax
+    if sabotage == RANGE_SAB_SIGN_UNFLIPPED and not empty_block:
+        kmin = rebind[UInt32](range_unkey(kmin).to_bits()) | UInt32(0x80000000)
+        kmax = rebind[UInt32](range_unkey(kmax).to_bits()) | UInt32(0x80000000)
+    if sabotage == RANGE_SAB_EMPTY_NOT_IDENTITY and empty_block:
+        kmin = range_key(Float32(0.0))
+        kmax = range_key(Float32(0.0))
+    comptime if is_defined["ANONLIB_ET_EXP_RACY_RANGE_PUBLISH"]():
+        # MEASUREMENT ARM, WRONG ON PURPOSE: plain read-modify-writes where the
+        # shipped publish is four atomics, to price the atomics per block. It
+        # loses updates under contention and must never reach a shipped build.
+        if kmin < out_minkey[unsafe_offset=slot]:
+            out_minkey[unsafe_offset=slot] = kmin
+        if kmax > out_maxkey[unsafe_offset=slot]:
+            out_maxkey[unsafe_offset=slot] = kmax
+        out_n_missing[unsafe_offset=slot] += blk_missing
+        out_n_merges[unsafe_offset=slot] += Int32(1)
+    else:
+        # DEVIATION 3021: one block means one writer for this cell.
+        var single = num_blocks == 1
+        comptime if SINGLE_WRITER_PLAIN_PUBLISH:
+            if single:
+                if kmin < out_minkey[unsafe_offset=slot]:
+                    out_minkey[unsafe_offset=slot] = kmin
+                if kmax > out_maxkey[unsafe_offset=slot]:
+                    out_maxkey[unsafe_offset=slot] = kmax
+            else:
+                _publish_min_max(out_minkey, out_maxkey, slot, kmin, kmax)
+        else:
+            _publish_min_max(out_minkey, out_maxkey, slot, kmin, kmax)
+        _publish_add(out_n_missing, slot, blk_missing, single)
+        _publish_add(out_n_merges, slot, Int32(1), single)
+
+
+@always_inline
+def _warp_fold_min_f32(v: Float32) -> Float32:
+    var x = v
+    comptime for step in range(8):
+        comptime off = WARP_SIZE >> (step + 1)
+        comptime if off > 0:
+            var y = shuffle_xor(x, UInt32(off))
+            x = y if y < x else x
+    return x
+
+
+@always_inline
+def _warp_fold_max_f32(v: Float32) -> Float32:
+    var x = v
+    comptime for step in range(8):
+        comptime off = WARP_SIZE >> (step + 1)
+        comptime if off > 0:
+            var y = shuffle_xor(x, UInt32(off))
+            x = y if y > x else x
+    return x
+
+
+@always_inline
+def _warp_fold_min_u32(v: UInt32) -> UInt32:
+    var x = v
+    comptime for step in range(8):
+        comptime off = WARP_SIZE >> (step + 1)
+        comptime if off > 0:
+            var y = shuffle_xor(x, UInt32(off))
+            x = y if y < x else x
+    return x
+
+
+@always_inline
+def _warp_fold_max_u32(v: UInt32) -> UInt32:
+    var x = v
+    comptime for step in range(8):
+        comptime off = WARP_SIZE >> (step + 1)
+        comptime if off > 0:
+            var y = shuffle_xor(x, UInt32(off))
+            x = y if y > x else x
+    return x
+
+
+@always_inline
+def _warp_fold_sum_i32(v: Int32) -> Int32:
+    var x = v
+    comptime for step in range(8):
+        comptime off = WARP_SIZE >> (step + 1)
+        comptime if off > 0:
+            x += shuffle_xor(x, UInt32(off))
+    return x
+
+
+comptime ET_QSTRIDE = 65536
+"""Row stride of the FAST ExtraTrees border table (`builder.ET_BINS`)."""
+
+
+@always_inline
+def et_snap_code(
+    qc: MutPointer[Float32, MutAnyOrigin], nb: Int32, thr: Float32
+) -> Int:
+    """The largest code c with `qc[c] <= thr` (-1 when none): a value-space
+    threshold snapped down to a border, so `code <= c` and `x <= qc[c]`
+    split the rows the same way."""
+    var lo = Int32(0)
+    var hi = nb
+    while lo < hi:
+        var mid = (lo + hi) // 2
+        if qc[Int(mid)] <= thr:
+            lo = mid + 1
+        else:
+            hi = mid
+    return Int(lo) - 1
+
+
+# AFT F09: gather two row addresses before scanning the feature tile, then
+# reuse each feature descriptor for both independent rows. Preserve FT (and
+# especially the accepted 8-code tile); this does NOT retry the slower
+# 16/32-code feature tiles recorded in builder.mojo. Adjacent lanes still
+# read adjacent row-id slots, and the guarded second row preserves tails.
+# experiments/apple_fast_trees/IDEAS.md; opt-in, no quality/speed evidence.
+comptime AFT_ET_RANGE_ROW_TILE = 2 if (
+    GLOBAL_NUMERIC_MODE == NUMERIC_FAST
+    and has_apple_gpu_accelerator()
+    and is_defined["ANONLIB_AFT_F09"]()
+) else 1
+
+
+def node_feature_range_tiled_kernel[
+    TPB: Int, FT: Int, DT: DType = DType.float32, FUSED_SMALL: Bool = False
+](
+    out_minkey: MutPointer[UInt32, MutAnyOrigin],
+    out_maxkey: MutPointer[UInt32, MutAnyOrigin],
+    out_n_missing: MutPointer[Int32, MutAnyOrigin],
+    out_n_merges: MutPointer[Int32, MutAnyOrigin],
+    data_rm: MutPointer[Scalar[DT], MutAnyOrigin],
+    row_ids: MutPointer[Int32, MutAnyOrigin],
+    work_items: MutPointer[NodeWorkItem, MutAnyOrigin],
+    workload_info: MutPointer[WorkloadInfo, MutAnyOrigin],
+    colids: MutPointer[Int32, MutAnyOrigin],
+    n_in: Int32,
+    n_sampled_cols_in: Int32,
+    quant: MutPointer[Float32, MutAnyOrigin],
+):
+    """FAST, and Apple IDENTICAL (key-space fold, trees-apple2):
+    `node_feature_range_kernel` for
+    up to `FT` sampled features per block over a ROW-MAJOR copy of X. Each
+    row's `row_ids` entry is read once and its features come from one row's
+    bytes instead of `FT` separate column gathers. Grid `(row blocks,
+    ceil(k / FT))`; every cell gets the same min, max and NaN count as the
+    one-feature kernel publishes, through the same publish helpers."""
+    var wb = Int(block_idx.x)
+    var ftile = Int(block_idx.y)
+    var nid = Int(workload_info[unsafe_offset=wb].nodeid)
+    if nid < 0:
+        # cpu4-forest: a map entry past the live total (the device
+        # level loop launches at a proven bound); the whole block
+        # leaves before any barrier. `build_workload_info` never
+        # emits one, so the host-staged path is unchanged.
+        return
+    var offset_blockid = Int(workload_info[unsafe_offset=wb].offset_blockid)
+    var num_blocks = Int(workload_info[unsafe_offset=wb].num_blocks)
+    var range_start = Int(work_items[unsafe_offset=nid].instances.begin)
+    var range_len = Int(work_items[unsafe_offset=nid].instances.count)
+    # T05: same exclusive node ownership as the scalar raw-value range pass.
+    # Coded/quantized production callers retain False and their own contract.
+    # NOT COMPILED — NOT TESTED — IDENTITY NOT VERIFIED — QUALITY NOT VERIFIED — NOT MEASURED.
+    comptime if FUSED_SMALL:
+        if range_len <= T05_SMALL_NODE_ROWS:
+            return
+    var n = Int(n_in)
+    var k = Int(n_sampled_cols_in)
+    var f0 = ftile * FT
+    var nf = k - f0
+    if nf > FT:
+        nf = FT
+    var cols = SIMD[DType.int32, FT](0)
+    comptime for j in range(FT):
+        if j < nf:
+            cols[j] = colids[unsafe_offset = nid * k + f0 + j]
+    var lmin = SIMD[DType.float32, FT](inf[DType.float32]())
+    var lmax = SIMD[DType.float32, FT](-inf[DType.float32]())
+    var lmiss = SIMD[DType.int32, FT](0)
+    var end = range_start + range_len
+    var stride = TPB * num_blocks
+    var i = range_start + Int(thread_idx.x) + offset_blockid * TPB
+    while i < end:
+        var bases = SIMD[DType.int64, AFT_ET_RANGE_ROW_TILE](0)
+        comptime for r in range(AFT_ET_RANGE_ROW_TILE):
+            if i + r * stride < end:
+                bases[r] = Int64(Int(row_ids[unsafe_offset=i + r * stride]) * n)
+        comptime for j in range(FT):
+            if j < nf:
+                var col = Int(cols[j])
+                comptime for r in range(AFT_ET_RANGE_ROW_TILE):
+                    if i + r * stride < end:
+                        var v = Float32(data_rm[unsafe_offset = Int(bases[r]) + col])
+                        if v != v:
+                            lmiss[j] += 1
+                        else:
+                            if range_key(v) < range_key(lmin[j]):
+                                lmin[j] = v
+                            if range_key(v) > range_key(lmax[j]):
+                                lmax[j] = v
+        i += stride * AFT_ET_RANGE_ROW_TILE
+    # One barrier for the whole tile: each warp folds its FT features with
+    # shuffles, lane 0 parks them in shared memory, and thread j folds
+    # feature j across the warps. Same min, max and count as the block
+    # reductions this replaces.
+    comptime N_WARPS = TPB // WARP_SIZE
+    comptime if BUILD_MODE == NUMERIC_IDENTICAL:
+        # IDENTICAL folds in KEY space, as `node_feature_range_kernel`'s
+        # IDENTICAL arm does (`block_min(range_key(...))`): a float compare
+        # treats -0.0 and +0.0 as equal and could keep either, the key
+        # order keeps -0.0 as the min and +0.0 as the max on every vendor.
+        var k_min = stack_allocation[
+            N_WARPS * FT, Scalar[DType.uint32], address_space = AddressSpace.SHARED
+        ]()
+        var k_max = stack_allocation[
+            N_WARPS * FT, Scalar[DType.uint32], address_space = AddressSpace.SHARED
+        ]()
+        var k_miss = stack_allocation[
+            N_WARPS * FT, Scalar[DType.int32], address_space = AddressSpace.SHARED
+        ]()
+        var kwarp = Int(thread_idx.x) // WARP_SIZE
+        var klane = Int(thread_idx.x) % WARP_SIZE
+        comptime for j in range(FT):
+            var wmin = _warp_fold_min_u32(range_key(lmin[j]))
+            var wmax = _warp_fold_max_u32(range_key(lmax[j]))
+            var wmiss = _warp_fold_sum_i32(lmiss[j])
+            if klane == 0:
+                k_min[kwarp * FT + j] = wmin
+                k_max[kwarp * FT + j] = wmax
+                k_miss[kwarp * FT + j] = wmiss
+        barrier()
+        var kt = Int(thread_idx.x)
+        if kt < nf:
+            var kmin = k_min[kt]
+            var kmax = k_max[kt]
+            var bmiss = k_miss[kt]
+            for w in range(1, N_WARPS):
+                var a = k_min[w * FT + kt]
+                var b = k_max[w * FT + kt]
+                kmin = a if a < kmin else kmin
+                kmax = b if b > kmax else kmax
+                bmiss += k_miss[w * FT + kt]
+            comptime if DT != DType.float32:
+                var qc = quant + Int(cols[kt]) * ET_QSTRIDE
+                if kmin <= kmax:
+                    kmin = range_key(qc[Int(range_unkey(kmin))])
+                    kmax = range_key(qc[Int(range_unkey(kmax))])
+            var slot = nid * k + f0 + kt
+            var single = num_blocks == 1
+            comptime if SINGLE_WRITER_PLAIN_PUBLISH:
+                if single:
+                    if kmin < out_minkey[unsafe_offset=slot]:
+                        out_minkey[unsafe_offset=slot] = kmin
+                    if kmax > out_maxkey[unsafe_offset=slot]:
+                        out_maxkey[unsafe_offset=slot] = kmax
+                else:
+                    _publish_min_max(out_minkey, out_maxkey, slot, kmin, kmax)
+            else:
+                _publish_min_max(out_minkey, out_maxkey, slot, kmin, kmax)
+            _publish_add(out_n_missing, slot, bmiss, single)
+            _publish_add(out_n_merges, slot, Int32(1), single)
+        return
+    var s_min = stack_allocation[
+        N_WARPS * FT, Scalar[DType.float32], address_space = AddressSpace.SHARED
+    ]()
+    var s_max = stack_allocation[
+        N_WARPS * FT, Scalar[DType.float32], address_space = AddressSpace.SHARED
+    ]()
+    var s_miss = stack_allocation[
+        N_WARPS * FT, Scalar[DType.int32], address_space = AddressSpace.SHARED
+    ]()
+    var warp = Int(thread_idx.x) // WARP_SIZE
+    var lane = Int(thread_idx.x) % WARP_SIZE
+    comptime for j in range(FT):
+        var wmin = _warp_fold_min_f32(lmin[j])
+        var wmax = _warp_fold_max_f32(lmax[j])
+        var wmiss = _warp_fold_sum_i32(lmiss[j])
+        if lane == 0:
+            s_min[warp * FT + j] = wmin
+            s_max[warp * FT + j] = wmax
+            s_miss[warp * FT + j] = wmiss
+    barrier()
+    var t = Int(thread_idx.x)
+    if t < nf:
+        var bmin = s_min[t]
+        var bmax = s_max[t]
+        var bmiss = s_miss[t]
+        for w in range(1, N_WARPS):
+            var a = s_min[w * FT + t]
+            var b = s_max[w * FT + t]
+            bmin = a if a < bmin else bmin
+            bmax = b if b > bmax else bmax
+            bmiss += s_miss[w * FT + t]
+        comptime if DT != DType.float32:
+            # Codes: publish the borders they stand for (monotone, so the
+            # cross-block min/max fold is unchanged).
+            var qc = quant + Int(cols[t]) * ET_QSTRIDE
+            if bmin != inf[DType.float32]():
+                bmin = qc[Int(bmin)]
+            if bmax != -inf[DType.float32]():
+                bmax = qc[Int(bmax)]
+        var kmin = range_key(bmin)
+        var kmax = range_key(bmax)
+        var slot = nid * k + f0 + t
+        var single = num_blocks == 1
+        comptime if SINGLE_WRITER_PLAIN_PUBLISH:
+            if single:
+                if kmin < out_minkey[unsafe_offset=slot]:
+                    out_minkey[unsafe_offset=slot] = kmin
+                if kmax > out_maxkey[unsafe_offset=slot]:
+                    out_maxkey[unsafe_offset=slot] = kmax
+            else:
+                _publish_min_max(out_minkey, out_maxkey, slot, kmin, kmax)
+        else:
+            _publish_min_max(out_minkey, out_maxkey, slot, kmin, kmax)
+        _publish_add(out_n_missing, slot, bmiss, single)
+        _publish_add(out_n_merges, slot, Int32(1), single)
+
+
+@always_inline
+def range_init_seed_at(
+    out_min: MutPointer[Float32, MutAnyOrigin],
+    out_max: MutPointer[Float32, MutAnyOrigin],
+    out_minkey: MutPointer[UInt32, MutAnyOrigin],
+    out_maxkey: MutPointer[UInt32, MutAnyOrigin],
+    out_n_missing: MutPointer[Int32, MutAnyOrigin],
+    out_n_merges: MutPointer[Int32, MutAnyOrigin],
+    idx: Int,
+):
+    """Seed ONE range cell: `node_feature_range_init_kernel`'s per-index body."""
+    out_min[unsafe_offset=idx] = Float32(1.0)
+    out_max[unsafe_offset=idx] = Float32(-1.0)
+    out_minkey[unsafe_offset=idx] = RANGE_KEY_MIN_SEED
+    out_maxkey[unsafe_offset=idx] = RANGE_KEY_MAX_SEED
+    out_n_missing[unsafe_offset=idx] = Int32(0)
+    out_n_merges[unsafe_offset=idx] = Int32(0)
+
+
+def node_feature_range_init_kernel(
+    out_min: MutPointer[Float32, MutAnyOrigin],
+    out_max: MutPointer[Float32, MutAnyOrigin],
+    out_minkey: MutPointer[UInt32, MutAnyOrigin],
+    out_maxkey: MutPointer[UInt32, MutAnyOrigin],
+    out_n_missing: MutPointer[Int32, MutAnyOrigin],
+    out_n_merges: MutPointer[Int32, MutAnyOrigin],
+    len: Int32,
+):
+    """Seed every output cell with the EMPTY range, before any merge."""
+    var idx = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    var stride = Int(grid_dim.x) * Int(block_dim.x)
+    while idx < Int(len):
+        range_init_seed_at(
+            out_min,
+            out_max,
+            out_minkey,
+            out_maxkey,
+            out_n_missing,
+            out_n_merges,
+            idx,
+        )
+        idx += stride
+
+
+def node_nonconstant_flag_kernel(
+    out_flag: MutPointer[Int32, MutAnyOrigin],
+    out_min: MutPointer[Float32, MutAnyOrigin],
+    out_max: MutPointer[Float32, MutAnyOrigin],
+    out_n_missing: MutPointer[Int32, MutAnyOrigin],
+    work_items: MutPointer[NodeWorkItem, MutAnyOrigin],
+    n_cells: Int32,
+    n_sampled_cols: Int32,
+):
+    """Per node: did ANY of its sampled columns vary?"""
+    var idx = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    var stride = Int(grid_dim.x) * Int(block_dim.x)
+    while idx < Int(n_cells):
+        var nid = idx // Int(n_sampled_cols)
+        var extent = FeatureRange(
+            out_min[unsafe_offset=idx],
+            out_max[unsafe_offset=idx],
+            out_n_missing[unsafe_offset=idx],
+        )
+        if not node_feature_is_constant(
+            extent, work_items[unsafe_offset=nid].instances.count
+        ):
+            # DEVIATION 3022: RELAXED on NVIDIA, like every other publish of
+            # the search; never the single-writer form (k writers per node).
+            _publish_add(out_flag, nid, Int32(1), False)
+        idx += stride
+
+
+def feature_range_at(
+    out_min: MutPointer[Float32, MutAnyOrigin],
+    out_max: MutPointer[Float32, MutAnyOrigin],
+    out_n_missing: MutPointer[Int32, MutAnyOrigin],
+    nid: Int,
+    fslot: Int,
+    n_sampled_cols: Int,
+) -> FeatureRange:
+    """Reassemble one cell of the kernel's output as a `FeatureRange`."""
+    var slot = nid * n_sampled_cols + fslot
+    return FeatureRange(
+        out_min[unsafe_offset=slot],
+        out_max[unsafe_offset=slot],
+        out_n_missing[unsafe_offset=slot],
+    )
+
+
+@fieldwise_init
+struct WorkloadPlan(Copyable, Movable):
+    """What `updateWorkloadInfo` returns, as a struct because Mojo will not return their `std::pair` plus an out-parameter."""
+
+    var info: List[WorkloadInfo]
+    """`n_blocks_dimx` entries, one per threadblock along x."""
+
+    var n_blocks_dimx: Int
+    """`gridDim.x` for the range kernel."""
+
+    var n_large_nodes: Int
+    """Nodes needing more than one block."""
+
+
+def build_workload_info(
+    work_items: List[NodeWorkItem], tpb: Int = TPB_DEFAULT
+) -> WorkloadPlan:
+    """Flatten a ragged batch of nodes into a list of threadblocks."""
+    var info = List[WorkloadInfo]()
+    var n_large_nodes = 0
+    var n_blocks_dimx = 0
+    for i in range(len(work_items)):
+        var count = Int(work_items[i].instances.count)
+        var n_blocks_per_node = ceildiv(count, tpb)
+        if n_blocks_per_node < 1:
+            n_blocks_per_node = 1
+        if n_blocks_per_node > 1:
+            n_large_nodes += 1
+        for b in range(n_blocks_per_node):
+            info.append(
+                WorkloadInfo(
+                    Int32(i),
+                    Int32(n_large_nodes - 1),
+                    Int32(b),
+                    Int32(n_blocks_per_node),
+                )
+            )
+        n_blocks_dimx += n_blocks_per_node
+    return WorkloadPlan(info^, n_blocks_dimx, n_large_nodes)
+
+
+# ============================================================================
+#     invariant than recomputing something that cannot vary.
+
+
+comptime SCORE_STATUS_UNVISITED: Int32 = 0
+"""The initialized value, and it is not a legal outcome."""
+
+comptime SCORE_STATUS_SCORED: Int32 = 1
+"""Reached `_splitter.pyx:691`: not constant, not refused, not rejected."""
+
+comptime SCORE_STATUS_CONSTANT: Int32 = 2
+"""`_splitter.pyx:613-618` said constant, so `:619-626` skipped it."""
+
+comptime SCORE_STATUS_MISSING_REFUSED: Int32 = 3
+"""`n_missing != 0`."""
+
+comptime SCORE_STATUS_REJECTED_MIN_SAMPLES_LEAF: Int32 = 4
+"""`_splitter.pyx:664-666`, a `continue` and NOT a redraw."""
+
+comptime SCORE_STATUS_REGRESSION_REFUSED: Int32 = 5
+"""REGRESSION ONLY, and OURS: a partial sum larger than the fixed-point slot, so the published key would wrap."""
+
+comptime SCORE_STATUS_PURE_NODE: Int32 = 6
+"""DEVIATION 216's companion (sklearn `_tree.pyx:240`): the node is PURE -- one class holds every row, Gini exactly 0 -- so it is a leaf before any candidate can win."""
+
+
+comptime SCORE_MAX_ACC_DEFAULT: Int = 16
+"""Default comptime bound on `n_acc` (classes, or 1 for regression)."""
+
+
+comptime SCORE_MAX_ROWS_EXACT: Int = 1 << 21
+"""Rows in ONE NODE above which the published `Int64` Gini numerator wraps."""
+
+
+def score_row_bound_ok(row_count: Int) -> Bool:
+    """Is the published classification rational exact at this node size?"""
+    if row_count <= 0:
+        return True
+    var n = Int128(row_count)
+    var worst = (n * n * n) // Int128(4)
+    return worst <= (Int128(1) << Int128(63)) - Int128(1)
+
+
+# ---------------------------------------------------------------------------
+
+comptime REGRESSION_SUM_BITS: Int = 30
+"""The fixed-point slot a partial label sum must fit, `2^REGRESSION_SUM_BITS`."""
+
+comptime REGRESSION_KEY_BITS: Int = 31
+"""Bits `|A| >> j` is allowed to occupy, so `num = (|A| >> j)^2 <= 2^62`."""
+
+
+def classification_key_shift(row_count: Int) -> Int:
+    """`s`, the NODE-UNIFORM right shift on the classification squared sums."""
+    var bits = 0
+    var acc = 1
+    while acc < row_count:
+        acc *= 2
+        bits += 1
+    var s = 3 * bits - 64
+    return s if s > 0 else 0
+
+
+def float_gain_key(gain: Float32) -> Int64:
+    """The order-preserving SIGN-MAGNITUDE map of a Float32 gain onto `Int64`, the ENTROPY cell's `num` (with `den = 1`)."""
+    var bits = Int64(Int(gain.to_bits()))
+    var mag = bits & Int64(0x7FFFFFFF)
+    if (bits & Int64(0x80000000)) != 0:
+        return -mag
+    return mag
+
+
+def regression_key_shift(row_count: Int) -> Int:
+    """`j`, the NODE-UNIFORM right shift on `|A|`."""
+    var bits = 0
+    var acc = 1
+    while acc < row_count:
+        acc *= 2
+        bits += 1
+    var j = bits + REGRESSION_SUM_BITS - REGRESSION_KEY_BITS
+    return j if j > 0 else 0
+
+
+def regression_key_bound_ok(row_count: Int, max_abs_sum: Int) -> Bool:
+    """Does the published `Int64` numerator hold at this node size and this largest partial-sum magnitude?"""
+    if row_count <= 0:
+        return True
+    var j = regression_key_shift(row_count)
+    var worst = Int128(row_count) * Int128(max_abs_sum)
+    var scaled = worst >> Int128(j)
+    return scaled * scaled <= (Int128(1) << Int128(63)) - Int128(1)
+
+
+def mse_gain_from_exact_totals(
+    sum_left: Int64,
+    sum_total: Int64,
+    n_left: Int,
+    n_right: Int,
+    inv_scale: Float64,
+) -> Float32:
+    """cuML's `MSEObjectiveFunction::GainPerSplit` for the winning candidate, from EXACT INTEGERS, in the LABEL's own units."""
+    if n_left <= 0 or n_right <= 0:
+        return Float32(0.0)
+    var nl = Float64(n_left)
+    var nr = Float64(n_right)
+    var n = nl + nr
+    var sum_right = sum_total - sum_left
+    var a = Float64(sum_left) * nr - Float64(sum_right) * nl
+    var t = a / n * inv_scale
+    return Float32(0.5 * t * t / (n * nl * nr))
+
+
+comptime SCORE_SAB_NONE: Int32 = 0
+"""No sabotage."""
+
+comptime SCORE_SAB_CONSTANT_STRICT: Int32 = 1
+"""Test `max < min + FEATURE_THRESHOLD` instead of `max <= min + ...` (`_splitter.pyx:616-617`)."""
+
+comptime SCORE_SAB_NO_MAX_GUARD: Int32 = 2
+"""Drop sklearn's `:653-654` `threshold == max -> min` guard, i.e."""
+
+comptime SCORE_SAB_SIDE_INVERTED: Int32 = 3
+"""Accumulate a row into the LEFT child when `value > threshold`."""
+
+comptime SCORE_SAB_STRICT_LESS: Int32 = 4
+"""`value < threshold` goes left, so a row EQUAL to the threshold goes right."""
+
+comptime SCORE_SAB_NO_ROW_IDS: Int32 = 5
+"""Drop the `row_ids` indirection and treat the slot index as the row id, for BOTH the feature value and the label."""
+
+comptime SCORE_SAB_SCALE_X2: Int32 = 6
+"""Regression: accumulate `2 * labels_q[row]`, i.e."""
+
+comptime SCORE_SAB_FLOAT_ACCUM: Int32 = 7
+"""Regression: accumulate the label sum in `Float32` -- per thread AND through the block reduction -- and truncate once at the publish, instead of in fixed point."""
+
+comptime SCORE_SAB_BLOCK0_ONLY: Int32 = 8
+"""Publish only from `offset_blockid == 0`, so a large node sees one block's slice."""
+
+comptime SCORE_SAB_TOTAL_IS_LEFT: Int32 = 9
+"""Accumulate the node TOTALS over left-going rows only, so `total - left` -- cuML's own recovery of the right child (`objectives.cuh:72-73`, DEVIATION 143) -- is zero."""
+
+comptime SCORE_SAB_REG_NO_SHIFT: Int32 = 10
+"""Regression: publish `|A|^2` with NO shift, i.e."""
+
+comptime SCORE_SAB_REG_NO_CENTER: Int32 = 11
+"""Regression: `A = sum_L * n_R` instead of `sum_L * n_R - sum_R * n_L`, i.e."""
+
+comptime SCORE_SAB_REG_DEN_ONE: Int32 = 12
+"""Regression: publish `den = 1`, so the key becomes `A'^2` and the `n_L n_R` weighting -- the difference between cuML's gain and the squared mean gap -- disappears."""
+
+comptime SCORE_SAB_REG_NO_SLOT_GUARD: Int32 = 13
+"""Regression: skip the fixed-point slot precondition of DEVIATION BLOCK 193, so a partial sum outside the slot publishes a WRAPPED numerator instead of `SCORE_STATUS_REGRESSION_REFUSED`."""
+
+
+def regression_key(
+    sum_left: Int64,
+    sum_total: Int64,
+    n_left: Int,
+    n_right: Int,
+    row_count: Int,
+    sabotage: Int32,
+    mut out_num: Int64,
+    mut out_den: Int64,
+) -> Bool:
+    """cuML's MSE gain as an exact rational in `Int64`."""
+    var sum_right = sum_total - sum_left
+    if sabotage != SCORE_SAB_REG_NO_SLOT_GUARD:
+        var abs_left = sum_left if sum_left >= 0 else -sum_left
+        var abs_right = sum_right if sum_right >= 0 else -sum_right
+        var slot = Int64(1) << Int64(REGRESSION_SUM_BITS)
+        if abs_left > slot or abs_right > slot:
+            out_num = Int64(0)
+            out_den = Int64(0)
+            return False
+
+    var nl = Int64(n_left)
+    var nr = Int64(n_right)
+    var a = sum_left * nr - sum_right * nl
+    if sabotage == SCORE_SAB_REG_NO_CENTER:
+        a = sum_left * nr
+    if a < 0:
+        a = -a
+    var j = regression_key_shift(row_count)
+    if sabotage == SCORE_SAB_REG_NO_SHIFT:
+        j = 0
+    # key is invariant under negating every label. DEVIATION BLOCK 191.
+    var scaled = a >> Int64(j)
+    out_num = scaled * scaled
+    out_den = nl * nr
+    if sabotage == SCORE_SAB_REG_DEN_ONE:
+        out_den = Int64(1)
+    return True
+
+
+
+
+def draw_threshold_device(
+    key: SplitKey, extent: FeatureRange, guarded: Bool = True
+) -> Float32:
+    """`draw_threshold`'s draw, written so that NO backend can re-round it."""
+    var gen = key.generator()
+    var res = gen.next_float()
+    var lo = ftz(extent.min_value)
+    var hi = ftz(extent.max_value)
+    var span = ftz(hi - lo)
+    var threshold = ftz(res.fma(span, lo))
+    if guarded and threshold == hi:
+        return lo
+    return threshold
+
+
+@fieldwise_init
+struct ScoredCandidate(Copyable, Movable):
+    """One (node, feature) cell of the score pass, as one value."""
+
+    var status: Int32
+    var threshold: Float32
+    var n_left: Int32
+    var n_total: Int32
+    var acc_left: List[Int32]
+    var acc_total: List[Int32]
+    var gini_num: Int64
+    var gini_den: Int64
+
+    def matches(self, other: Self) -> Bool:
+        """Exact equality, with the threshold on FLOAT BIT PATTERNS."""
+        if self.status != other.status:
+            return False
+        if self.threshold.to_bits() != other.threshold.to_bits():
+            return False
+        if self.n_left != other.n_left or self.n_total != other.n_total:
+            return False
+        if self.gini_num != other.gini_num or self.gini_den != other.gini_den:
+            return False
+        if len(self.acc_left) != len(other.acc_left):
+            return False
+        if len(self.acc_total) != len(other.acc_total):
+            return False
+        for k in range(len(self.acc_left)):
+            if self.acc_left[k] != other.acc_left[k]:
+                return False
+        for k in range(len(self.acc_total)):
+            if self.acc_total[k] != other.acc_total[k]:
+                return False
+        return True
+
+
+def empty_scored_candidate(status: Int32, n_acc: Int) -> ScoredCandidate:
+    """A cell nothing was accumulated into: `_empty_candidate`'s shape (`host_splitter.mojo:418-440`), which reports `threshold = 0.0` and zero accumulators for a candidate that never reached the draw."""
+    return ScoredCandidate(
+        status,
+        Float32(0.0),
+        Int32(0),
+        Int32(0),
+        List[Int32](length=n_acc, fill=Int32(0)),
+        List[Int32](length=n_acc, fill=Int32(0)),
+        Int64(0),
+        Int64(0),
+    )
+
+
+def node_feature_score_host(
+    data: MutPointer[Float32, MutAnyOrigin],
+    row_ids: MutPointer[Int32, MutAnyOrigin],
+    labels_q: MutPointer[Int32, MutAnyOrigin],
+    m: Int,
+    range_start: Int,
+    range_len: Int,
+    col: Int,
+    extent: FeatureRange,
+    key: SplitKey,
+    n_acc: Int,
+    is_classification: Bool,
+    min_samples_leaf: Int,
+    device_draw: Bool = True,
+    row_w_addr: Int = 0,
+    min_weight_units: Int64 = 0,
+) -> ScoredCandidate:
+    """Steps 2, 3 and 4 of DEVIATION 137 for ONE (node, feature), sequentially.
+
+    lane sk-kernels: `row_w_addr` (0: unweighted) is the classifier's Int32
+    fixed-point row-weight plane; the host restatement of
+    `node_feature_score_weighted_kernel` + the finalize pass's WEIGHTED arm
+    (class tallies in weight units, the key over the weight totals, the
+    empty-weight / `min_weight_units` rejection, weighted purity).
+
+    lane sk-final: a regressor with `row_w_addr` restates
+    `node_feature_score_weighted_reg_kernel` + the finalize pass's weighted
+    regression arm: `labels_q` holds the quantized `w * y`, the cell keeps
+    TWO accumulators (slot 0 Z, slot 1 the weight units W; `n_acc` stays the
+    caller's 1 and the cell's lists are two long) and the key is
+    `regression_key` over (Z, W)."""
+    var weighted = is_classification and row_w_addr != 0
+    var weighted_reg = (not is_classification) and row_w_addr != 0
+    var n_slots = Int(2) if weighted_reg else n_acc
+    var row_w = MutPointer[Int32, MutAnyOrigin](unsafe_from_address=row_w_addr if row_w_addr != 0 else Int(labels_q))
+    if extent.n_missing != Int32(0):
+        return empty_scored_candidate(SCORE_STATUS_MISSING_REFUSED, n_slots)
+    if node_feature_is_constant(extent, Int32(range_len)):
+        return empty_scored_candidate(SCORE_STATUS_CONSTANT, n_slots)
+
+    var threshold: Float32
+    if device_draw:
+        threshold = draw_threshold_device(key, extent)
+    else:
+        threshold = draw_threshold(key, extent)
+
+    var acc_left = List[Int32](length=n_slots, fill=Int32(0))
+    var acc_total = List[Int32](length=n_slots, fill=Int32(0))
+    var n_left = 0
+    var n_total = 0
+    var col_offset = col * m
+
+    for p in range(range_start, range_start + range_len):
+        var row = Int(row_ids[unsafe_offset=p])
+        var v = data[unsafe_offset = col_offset + row]
+        var lab = Int(labels_q[unsafe_offset=row])
+        n_total += 1
+        var goes_left = v <= threshold
+        if is_classification:
+            if lab >= 0 and lab < n_acc:
+                var wq = Int32(1)
+                if weighted:
+                    wq = row_w[unsafe_offset=row]
+                acc_total[lab] += wq
+                if goes_left:
+                    acc_left[lab] += wq
+        else:
+            acc_total[0] += Int32(lab)
+            if goes_left:
+                acc_left[0] += Int32(lab)
+            if weighted_reg:
+                var wr = row_w[unsafe_offset=row]
+                acc_total[1] += wr
+                if goes_left:
+                    acc_left[1] += wr
+        if goes_left:
+            n_left += 1
+
+    var n_right = n_total - n_left
+    var status = SCORE_STATUS_SCORED
+    if (
+        n_left < min_samples_leaf
+        or n_right < min_samples_leaf
+        or n_left == 0
+        or n_right == 0
+    ):
+        status = SCORE_STATUS_REJECTED_MIN_SAMPLES_LEAF
+    var w_total = Int64(0)
+    var w_left = Int64(0)
+    if weighted:
+        for kc in range(n_acc):
+            w_total += Int64(Int(acc_total[kc]))
+            w_left += Int64(Int(acc_left[kc]))
+    if status == SCORE_STATUS_SCORED and weighted:
+        var w_right = w_total - w_left
+        if (
+            w_left <= Int64(0)
+            or w_right <= Int64(0)
+            or w_left < min_weight_units
+            or w_right < min_weight_units
+        ):
+            status = SCORE_STATUS_REJECTED_MIN_SAMPLES_LEAF
+        else:
+            for kc in range(n_acc):
+                if Int64(Int(acc_total[kc])) == w_total:
+                    status = SCORE_STATUS_PURE_NODE
+    elif status == SCORE_STATUS_SCORED and weighted_reg:
+        var rw_total = Int64(Int(acc_total[1]))
+        var rw_left = Int64(Int(acc_left[1]))
+        var rw_right = rw_total - rw_left
+        if (
+            rw_left <= Int64(0)
+            or rw_right <= Int64(0)
+            or rw_left < min_weight_units
+            or rw_right < min_weight_units
+        ):
+            status = SCORE_STATUS_REJECTED_MIN_SAMPLES_LEAF
+    elif status == SCORE_STATUS_SCORED and is_classification and n_total > 0:
+        for kc in range(n_acc):
+            if Int(acc_total[kc]) == n_total:
+                status = SCORE_STATUS_PURE_NODE
+
+    var num = Int64(0)
+    var den = Int64(0)
+    if status == SCORE_STATUS_SCORED and is_classification:
+        var sq_left = Int64(0)
+        var sq_right = Int64(0)
+        for k in range(n_acc):
+            var lv = Int64(Int(acc_left[k]))
+            var rv = Int64(Int(acc_total[k] - acc_left[k]))
+            sq_left += lv * lv
+            sq_right += rv * rv
+        var nl = Int64(n_left)
+        var nr = Int64(n_right)
+        var cs = Int64(classification_key_shift(range_len))
+        if weighted:
+            nl = w_left
+            nr = w_total - w_left
+            cs = Int64(classification_key_shift(Int(w_total)))
+        num = (sq_left >> cs) * nr + (sq_right >> cs) * nl
+        den = nl * nr
+    elif status == SCORE_STATUS_SCORED:
+        var k_left = n_left
+        var k_right = n_right
+        var k_rows = range_len
+        if weighted_reg:
+            k_rows = Int(acc_total[1])
+            k_left = Int(acc_left[1])
+            k_right = k_rows - k_left
+        if not regression_key(
+            Int64(Int(acc_left[0])),
+            Int64(Int(acc_total[0])),
+            k_left,
+            k_right,
+            k_rows,
+            SCORE_SAB_NONE,
+            num,
+            den,
+        ):
+            status = SCORE_STATUS_REGRESSION_REFUSED
+
+    return ScoredCandidate(
+        status,
+        threshold,
+        Int32(n_left),
+        Int32(n_total),
+        acc_left^,
+        acc_total^,
+        num,
+        den,
+    )
+
+
+def scored_candidate_at(
+    out_status: MutPointer[Int32, MutAnyOrigin],
+    out_threshold: MutPointer[Float32, MutAnyOrigin],
+    out_n_left: MutPointer[Int32, MutAnyOrigin],
+    out_n_total: MutPointer[Int32, MutAnyOrigin],
+    out_acc_left: MutPointer[Int32, MutAnyOrigin],
+    out_acc_total: MutPointer[Int32, MutAnyOrigin],
+    out_gini_num: MutPointer[Int64, MutAnyOrigin],
+    out_gini_den: MutPointer[Int64, MutAnyOrigin],
+    nid: Int,
+    fslot: Int,
+    n_sampled_cols: Int,
+    n_acc: Int,
+) -> ScoredCandidate:
+    """Reassemble one cell of the kernels' output."""
+    var slot = nid * n_sampled_cols + fslot
+    var left = List[Int32]()
+    var total = List[Int32]()
+    for k in range(n_acc):
+        left.append(out_acc_left[unsafe_offset = slot * n_acc + k])
+        total.append(out_acc_total[unsafe_offset = slot * n_acc + k])
+    return ScoredCandidate(
+        out_status[unsafe_offset=slot],
+        out_threshold[unsafe_offset=slot],
+        out_n_left[unsafe_offset=slot],
+        out_n_total[unsafe_offset=slot],
+        left^,
+        total^,
+        out_gini_num[unsafe_offset=slot],
+        out_gini_den[unsafe_offset=slot],
+    )
+
+
+from std.memory import stack_allocation
+
+
+@always_inline
+def score_init_seed_cell_at(
+    out_status: MutPointer[Int32, MutAnyOrigin],
+    out_threshold: MutPointer[Float32, MutAnyOrigin],
+    out_n_left: MutPointer[Int32, MutAnyOrigin],
+    out_n_total: MutPointer[Int32, MutAnyOrigin],
+    out_gini_num: MutPointer[Int64, MutAnyOrigin],
+    out_gini_den: MutPointer[Int64, MutAnyOrigin],
+    out_n_blocks: MutPointer[Int32, MutAnyOrigin],
+    idx: Int,
+):
+    """Seed ONE score cell: `node_feature_score_init_kernel`'s per-index body over the seven per-cell arrays."""
+    out_status[unsafe_offset=idx] = SCORE_STATUS_UNVISITED
+    out_threshold[unsafe_offset=idx] = Float32(0.0)
+    out_n_left[unsafe_offset=idx] = Int32(0)
+    out_n_total[unsafe_offset=idx] = Int32(0)
+    out_gini_num[unsafe_offset=idx] = Int64(0)
+    out_gini_den[unsafe_offset=idx] = Int64(0)
+    out_n_blocks[unsafe_offset=idx] = Int32(0)
+
+
+@always_inline
+def score_init_seed_acc_at(
+    out_acc_left: MutPointer[Int32, MutAnyOrigin],
+    out_acc_total: MutPointer[Int32, MutAnyOrigin],
+    idx: Int,
+):
+    """Seed ONE class-accumulator cell: the second loop of `node_feature_score_init_kernel`, extracted for the same DEVIATION 470 reason as `score_init_seed_cell_at` above."""
+    out_acc_left[unsafe_offset=idx] = Int32(0)
+    out_acc_total[unsafe_offset=idx] = Int32(0)
+
+
+def node_feature_score_init_kernel(
+    out_status: MutPointer[Int32, MutAnyOrigin],
+    out_threshold: MutPointer[Float32, MutAnyOrigin],
+    out_n_left: MutPointer[Int32, MutAnyOrigin],
+    out_n_total: MutPointer[Int32, MutAnyOrigin],
+    out_gini_num: MutPointer[Int64, MutAnyOrigin],
+    out_gini_den: MutPointer[Int64, MutAnyOrigin],
+    out_n_blocks: MutPointer[Int32, MutAnyOrigin],
+    out_acc_left: MutPointer[Int32, MutAnyOrigin],
+    out_acc_total: MutPointer[Int32, MutAnyOrigin],
+    n_cells: Int32,
+    n_acc_cells: Int32,
+):
+    """Seed every output cell, before any accumulation."""
+    var idx = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    var stride = Int(grid_dim.x) * Int(block_dim.x)
+    var i = idx
+    while i < Int(n_cells):
+        score_init_seed_cell_at(
+            out_status,
+            out_threshold,
+            out_n_left,
+            out_n_total,
+            out_gini_num,
+            out_gini_den,
+            out_n_blocks,
+            i,
+        )
+        i += stride
+    var j = idx
+    while j < Int(n_acc_cells):
+        score_init_seed_acc_at(out_acc_left, out_acc_total, j)
+        j += stride
+
+
+# ===========================================================================
+
+comptime PHASE_SETUP_TPB = 256
+"""The fused seeders' block width."""
+
+
+def phase_setup_a_kernel(
+    out_report: MutPointer[Int32, MutAnyOrigin],
+    n_report: Int32,
+    out_min: MutPointer[Float32, MutAnyOrigin],
+    out_max: MutPointer[Float32, MutAnyOrigin],
+    out_minkey: MutPointer[UInt32, MutAnyOrigin],
+    out_maxkey: MutPointer[UInt32, MutAnyOrigin],
+    out_n_missing: MutPointer[Int32, MutAnyOrigin],
+    out_n_merges: MutPointer[Int32, MutAnyOrigin],
+    n_range_cells: Int32,
+    out_nonconst: MutPointer[Int32, MutAnyOrigin],
+    n_nonconst: Int32,
+):
+    """DEVIATION 470, half A: the range half of the search cycle's setup -- the `d_samp_report` memset, `node_feature_range_init_kernel` and the `d_nonconst` memset -- as one launch, enqueued (with half B right behind it) after `stage_batch` and before the feature sampler."""
+    var extent = Int(n_report)
+    if Int(n_range_cells) > extent:
+        extent = Int(n_range_cells)
+    if Int(n_nonconst) > extent:
+        extent = Int(n_nonconst)
+    var idx = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    var stride = Int(grid_dim.x) * Int(block_dim.x)
+    while idx < extent:
+        if idx < Int(n_report):
+            out_report[unsafe_offset=idx] = SAMPLER_UNVISITED
+        if idx < Int(n_range_cells):
+            range_init_seed_at(
+                out_min,
+                out_max,
+                out_minkey,
+                out_maxkey,
+                out_n_missing,
+                out_n_merges,
+                idx,
+            )
+        if idx < Int(n_nonconst):
+            out_nonconst[unsafe_offset=idx] = Int32(0)
+        idx += stride
+
+
+def phase_setup_b_kernel(
+    out_status: MutPointer[Int32, MutAnyOrigin],
+    out_threshold: MutPointer[Float32, MutAnyOrigin],
+    out_n_left: MutPointer[Int32, MutAnyOrigin],
+    out_n_total: MutPointer[Int32, MutAnyOrigin],
+    out_gini_num: MutPointer[Int64, MutAnyOrigin],
+    out_gini_den: MutPointer[Int64, MutAnyOrigin],
+    out_n_blocks: MutPointer[Int32, MutAnyOrigin],
+    out_acc_left: MutPointer[Int32, MutAnyOrigin],
+    out_acc_total: MutPointer[Int32, MutAnyOrigin],
+    n_score_cells: Int32,
+    n_acc_cells: Int32,
+    out_mutex: MutPointer[Int32, MutAnyOrigin],
+    n_mutex: Int32,
+    out_r_quesval: MutPointer[Float32, MutAnyOrigin],
+    out_r_colid: MutPointer[Int32, MutAnyOrigin],
+    out_r_metric: MutPointer[Float32, MutAnyOrigin],
+    out_r_nleft: MutPointer[Int32, MutAnyOrigin],
+    out_r_num: MutPointer[Int64, MutAnyOrigin],
+    out_r_den: MutPointer[Int64, MutAnyOrigin],
+    out_r_valid: MutPointer[Int32, MutAnyOrigin],
+    out_r_merges: MutPointer[Int32, MutAnyOrigin],
+    out_r_warps: MutPointer[Int32, MutAnyOrigin],
+    n_reduce_nodes: Int32,
+):
+    """DEVIATION 470, half B: the score/reduce half of the search cycle's setup -- `node_feature_score_init_kernel`, the `r_mx` memset and `split_reduce_init_kernel` -- as one launch, enqueued immediately after half A."""
+    var extent = Int(n_score_cells)
+    if Int(n_acc_cells) > extent:
+        extent = Int(n_acc_cells)
+    if Int(n_mutex) > extent:
+        extent = Int(n_mutex)
+    if Int(n_reduce_nodes) > extent:
+        extent = Int(n_reduce_nodes)
+    var idx = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    var stride = Int(grid_dim.x) * Int(block_dim.x)
+    while idx < extent:
+        if idx < Int(n_score_cells):
+            score_init_seed_cell_at(
+                out_status,
+                out_threshold,
+                out_n_left,
+                out_n_total,
+                out_gini_num,
+                out_gini_den,
+                out_n_blocks,
+                idx,
+            )
+        if idx < Int(n_acc_cells):
+            score_init_seed_acc_at(out_acc_left, out_acc_total, idx)
+            comptime if is_defined["ANONLIB_ET_SAB_PHASE_SETUP"]():
+                out_acc_left[unsafe_offset=idx] = Int32(idx & 1)
+        if idx < Int(n_mutex):
+            out_mutex[unsafe_offset=idx] = Int32(0)
+        if idx < Int(n_reduce_nodes):
+            split_reduce_seed_at(
+                out_r_quesval,
+                out_r_colid,
+                out_r_metric,
+                out_r_nleft,
+                out_r_num,
+                out_r_den,
+                out_r_valid,
+                out_r_merges,
+                out_r_warps,
+                idx,
+            )
+        idx += stride
+
+
+def shared_class_counts_for[MAX_ACC: Int, CLASSIFICATION: Bool]() -> Bool:
+    """Measured Apple multiclass route; explicit off wins over opt-in.
+
+    Widths8/16/32 cover5–32 classes in the normal builder dispatcher.
+    Binary classification keeps private counts by default. Other vendors
+    can opt in for validation without changing their shipped schedule.
+    """
+    if not CLASSIFICATION or is_defined["ANONLIB_ET_NO_SHARED_CLASS_COUNTS"]():
+        return False
+    return is_defined["ANONLIB_ET_SHARED_CLASS_COUNTS"]() or (
+        has_apple_gpu_accelerator() and MAX_ACC >= 8
+    )
+
+
+def shared_class_counts_mask() -> Int:
+    """Actual classification routes for widths4/8/16/32, bits0/1/2/3."""
+    return (
+        Int(shared_class_counts_for[4, True]())
+        + 2 * Int(shared_class_counts_for[8, True]())
+        + 4 * Int(shared_class_counts_for[16, True]())
+        + 8 * Int(shared_class_counts_for[32, True]())
+    )
+
+
+@always_inline
+def _node_feature_score_body[
+    TPB: Int, MAX_ACC: Int, CLASSIFICATION: Bool, ROW_MAJOR: Bool, WEIGHTED: Bool
+](
+    out_n_left: MutPointer[Int32, MutAnyOrigin],
+    out_n_total: MutPointer[Int32, MutAnyOrigin],
+    out_acc_left: MutPointer[Int32, MutAnyOrigin],
+    out_acc_total: MutPointer[Int32, MutAnyOrigin],
+    out_n_blocks: MutPointer[Int32, MutAnyOrigin],
+    in_min: MutPointer[Float32, MutAnyOrigin],
+    in_max: MutPointer[Float32, MutAnyOrigin],
+    in_n_missing: MutPointer[Int32, MutAnyOrigin],
+    data: MutPointer[Float32, MutAnyOrigin],
+    row_ids: MutPointer[Int32, MutAnyOrigin],
+    labels_q: MutPointer[Int32, MutAnyOrigin],
+    work_items: MutPointer[NodeWorkItem, MutAnyOrigin],
+    workload_info: MutPointer[WorkloadInfo, MutAnyOrigin],
+    colids: MutPointer[Int32, MutAnyOrigin],
+    tree_ids: MutPointer[Int32, MutAnyOrigin],
+    m_in: Int32,
+    n_sampled_cols_in: Int32,
+    n_acc_in: Int32,
+    seed: UInt64,
+    sabotage_in: Int32,
+    n_cols_in: Int32,
+    row_w: MutPointer[Int32, MutAnyOrigin],
+):
+    """Steps 2, 3 and 4 of DEVIATION 137: skip, draw, and accumulate.
+    WEIGHTED classification (lane sk-kernels): each row adds its
+    fixed-point weight `row_w[row]` to its class accumulators in place of 1
+    (`n_left` / `n_total` stay row counts). WEIGHTED regression (lane
+    sk-final): `labels_q` holds the quantized `w * y` and each cell keeps
+    TWO accumulators, slot 0 the sum of `w * y` units and slot 1 the sum of
+    `row_w` units (`n_acc_in` is 2). Unweighted, `row_w` is unread."""
+    var wb = Int(block_idx.x)
+    var fslot = Int(block_idx.y)
+    comptime if ROW_MAJOR:
+        wb = Int(block_idx.y)
+        fslot = Int(block_idx.x)
+    var nid = Int(workload_info[unsafe_offset=wb].nodeid)
+    if nid < 0:
+        # cpu4-forest: a map entry past the live total (the device
+        # level loop launches at a proven bound); the whole block
+        # leaves before any barrier. `build_workload_info` never
+        # emits one, so the host-staged path is unchanged.
+        return
+    var offset_blockid = Int(workload_info[unsafe_offset=wb].offset_blockid)
+    var num_blocks = Int(workload_info[unsafe_offset=wb].num_blocks)
+    var range_start = Int(work_items[unsafe_offset=nid].instances.begin)
+    var range_len = Int(work_items[unsafe_offset=nid].instances.count)
+    var node_id = UInt32(Int(work_items[unsafe_offset=nid].idx))
+
+    var m = Int(m_in)
+    var n_sampled_cols = Int(n_sampled_cols_in)
+    var n_acc = Int(n_acc_in)
+    var sabotage = sabotage_in
+
+    var col = Int(colids[unsafe_offset = nid * n_sampled_cols + fslot])
+    var slot = nid * n_sampled_cols + fslot
+
+    if n_acc > MAX_ACC or n_acc < 1:
+        return
+
+    var extent = FeatureRange(
+        in_min[unsafe_offset=slot],
+        in_max[unsafe_offset=slot],
+        in_n_missing[unsafe_offset=slot],
+    )
+    if extent.n_missing != Int32(0):
+        return
+    var constant: Bool
+    if sabotage == SCORE_SAB_CONSTANT_STRICT:
+        constant = Int32(range_len) == extent.n_missing or (
+            extent.max_value < extent.min_value + FEATURE_THRESHOLD
+            and extent.n_missing == 0
+        )
+    else:
+        constant = node_feature_is_constant(extent, Int32(range_len))
+    if constant:
+        return
+
+    var key = key_for(
+        seed,
+        tree_ids[unsafe_offset=nid].cast[DType.uint32](),
+        node_id,
+        UInt32(col),
+    )
+    var threshold = draw_threshold_device(
+        key, extent, sabotage != SCORE_SAB_NO_MAX_GUARD
+    )
+
+    # Shared integer-count candidate, inspired by cuML computeSplitKernel's
+    # shared PDF + global merge (cpp/src/decisiontree/batched-levelalgo/
+    # kernels/builder_kernels_impl.cuh:261-300, commit
+    # 00094f7e4e4b5da3a968d193a4da6085fa38f11b). ET keeps its ONE exact random
+    # threshold, not RF quantile bins. Logical 32-thread shards bound atomic
+    # contention. Only integer accumulation placement changes, so every
+    # numeric mode retains the same counts, draws, ties and leaf arithmetic.
+    # Apple widths8/16/32 passed all-mode identity and full-fit timing gates.
+    # The private reference remains selectable with the force-off define.
+    comptime SHARED_COUNTS = shared_class_counts_for[MAX_ACC, CLASSIFICATION]()
+    comptime SHARDS = (TPB + 31) // 32
+    comptime SHARED_PLANE = SHARDS * MAX_ACC
+    var shared_counts = stack_allocation[
+        2 * SHARED_PLANE if SHARED_COUNTS else 1, Scalar[DType.int32],
+        address_space=AddressSpace.SHARED,
+    ]()
+    comptime if SHARED_COUNTS:
+        for s in range(Int(thread_idx.x), 2 * SHARED_PLANE, TPB):
+            shared_counts[unsafe_offset=s] = Int32(0)
+        barrier()
+
+    var priv_left = stack_allocation[MAX_ACC if not SHARED_COUNTS else 1, Scalar[DType.int32]]()
+    var priv_total = stack_allocation[MAX_ACC if not SHARED_COUNTS else 1, Scalar[DType.int32]]()
+    comptime if not SHARED_COUNTS:
+        for k in range(MAX_ACC):
+            priv_left[unsafe_offset=k] = Int32(0)
+            priv_total[unsafe_offset=k] = Int32(0)
+
+    var col_offset = col * m
+    var end = range_start + range_len
+    var stride = TPB * num_blocks
+    var tid = Int(thread_idx.x) + offset_blockid * TPB
+    var n_left = Int32(0)
+    var n_seen = Int32(0)
+    var f_left = Float32(0.0)
+    var f_total = Float32(0.0)
+
+    var i = range_start + tid
+    while i < end:
+        var row = Int(row_ids[unsafe_offset=i])
+        if sabotage == SCORE_SAB_NO_ROW_IDS:
+            row = i
+        var v: Float32
+        comptime if ROW_MAJOR:
+            v = data[unsafe_offset = row * Int(n_cols_in) + col]
+        else:
+            v = data[unsafe_offset = col_offset + row]
+        var lab = Int(labels_q[unsafe_offset=row])
+        var wq = Int32(1)
+        comptime if WEIGHTED:
+            wq = row_w[unsafe_offset=row]
+        n_seen += 1
+
+        var goes_left: Bool
+        if sabotage == SCORE_SAB_SIDE_INVERTED:
+            goes_left = v > threshold
+        elif sabotage == SCORE_SAB_STRICT_LESS:
+            goes_left = v < threshold
+        else:
+            goes_left = v <= threshold
+
+        var counts_total = True
+        if sabotage == SCORE_SAB_TOTAL_IS_LEFT:
+            counts_total = goes_left
+
+        comptime if CLASSIFICATION:
+            if lab >= 0 and lab < n_acc:
+                comptime if SHARED_COUNTS:
+                    var acc_slot = (Int(thread_idx.x) // 32) * MAX_ACC + lab
+                    if counts_total:
+                        _ = Atomic.fetch_add(
+                            shared_counts.unsafe_offset(SHARED_PLANE + acc_slot), wq
+                        )
+                    if goes_left:
+                        _ = Atomic.fetch_add(shared_counts.unsafe_offset(acc_slot), wq)
+                else:
+                    if counts_total:
+                        priv_total[unsafe_offset=lab] += wq
+                    if goes_left:
+                        priv_left[unsafe_offset=lab] += wq
+        else:
+            var q = Int32(lab)
+            if sabotage == SCORE_SAB_SCALE_X2:
+                q = Int32(2 * lab)
+            if sabotage == SCORE_SAB_FLOAT_ACCUM:
+                if counts_total:
+                    f_total += Float32(lab)
+                if goes_left:
+                    f_left += Float32(lab)
+            else:
+                if counts_total:
+                    priv_total[unsafe_offset=0] += q
+                if goes_left:
+                    priv_left[unsafe_offset=0] += q
+                comptime if WEIGHTED:
+                    # lane sk-final: the weight units, slot 1
+                    if counts_total:
+                        priv_total[unsafe_offset=1] += wq
+                    if goes_left:
+                        priv_left[unsafe_offset=1] += wq
+
+        if goes_left:
+            n_left += 1
+        i += stride
+        comptime if SEARCH_SAB_RPT_TAIL_DROP:
+            break
+
+    comptime if SHARED_COUNTS:
+        barrier()
+
+    var blk_n_left = block_sum[block_size=TPB](n_left)
+    _search_barrier()
+    var blk_n_seen = block_sum[block_size=TPB](n_seen)
+    _search_barrier()
+
+    var publishes = not (
+        sabotage == SCORE_SAB_BLOCK0_ONLY and offset_blockid != 0
+    )
+    # DEVIATION 3021: one block means one writer for this cell.
+    var single = num_blocks == 1
+    if Int(thread_idx.x) == 0 and publishes:
+        _publish_add(out_n_left, slot, blk_n_left, single)
+        _publish_add(out_n_total, slot, blk_n_seen, single)
+        _publish_add(out_n_blocks, slot, Int32(1), single)
+
+    comptime if SHARED_COUNTS:
+        var c = Int(thread_idx.x)
+        while c < n_acc:
+            var left = Int32(0)
+            var total = Int32(0)
+            for shard in range(SHARDS):
+                left += shared_counts[unsafe_offset=shard * MAX_ACC + c]
+                total += shared_counts[unsafe_offset=SHARED_PLANE + shard * MAX_ACC + c]
+            if publishes:
+                _ = Atomic.fetch_add(out_acc_left.unsafe_offset(slot * n_acc + c), left)
+                _ = Atomic.fetch_add(out_acc_total.unsafe_offset(slot * n_acc + c), total)
+            c += TPB
+        return
+
+    comptime if not CLASSIFICATION:
+        if sabotage == SCORE_SAB_FLOAT_ACCUM:
+            var fl = block_sum[block_size=TPB](f_left)
+            barrier()
+            var ft = block_sum[block_size=TPB](f_total)
+            barrier()
+            if Int(thread_idx.x) == 0 and publishes:
+                _ = Atomic.fetch_add(
+                    out_acc_left.unsafe_offset(slot * n_acc), Int32(fl)
+                )
+                _ = Atomic.fetch_add(
+                    out_acc_total.unsafe_offset(slot * n_acc), Int32(ft)
+                )
+            return
+
+    for k in range(n_acc):
+        var bl = block_sum[block_size=TPB](priv_left[unsafe_offset=k])
+        _search_barrier()
+        var bt = block_sum[block_size=TPB](priv_total[unsafe_offset=k])
+        _search_barrier()
+        if Int(thread_idx.x) == 0 and publishes:
+            _publish_add(out_acc_left, slot * n_acc + k, bl, single)
+            _publish_add(out_acc_total, slot * n_acc + k, bt, single)
+
+
+def node_feature_score_kernel[
+    TPB: Int, MAX_ACC: Int, CLASSIFICATION: Bool, ROW_MAJOR: Bool = False
+](
+    out_n_left: MutPointer[Int32, MutAnyOrigin],
+    out_n_total: MutPointer[Int32, MutAnyOrigin],
+    out_acc_left: MutPointer[Int32, MutAnyOrigin],
+    out_acc_total: MutPointer[Int32, MutAnyOrigin],
+    out_n_blocks: MutPointer[Int32, MutAnyOrigin],
+    in_min: MutPointer[Float32, MutAnyOrigin],
+    in_max: MutPointer[Float32, MutAnyOrigin],
+    in_n_missing: MutPointer[Int32, MutAnyOrigin],
+    data: MutPointer[Float32, MutAnyOrigin],
+    row_ids: MutPointer[Int32, MutAnyOrigin],
+    labels_q: MutPointer[Int32, MutAnyOrigin],
+    work_items: MutPointer[NodeWorkItem, MutAnyOrigin],
+    workload_info: MutPointer[WorkloadInfo, MutAnyOrigin],
+    colids: MutPointer[Int32, MutAnyOrigin],
+    tree_ids: MutPointer[Int32, MutAnyOrigin],
+    m_in: Int32,
+    n_sampled_cols_in: Int32,
+    n_acc_in: Int32,
+    seed: UInt64,
+    sabotage_in: Int32,
+    n_cols_in: Int32,
+):
+    """Steps 2, 3 and 4 of DEVIATION 137: skip, draw, and accumulate.
+    The unweighted kernel: `_node_feature_score_body` with WEIGHTED off
+    (`labels_q` stands in for the unread weight pointer)."""
+    _node_feature_score_body[TPB, MAX_ACC, CLASSIFICATION, ROW_MAJOR, False](
+        out_n_left,
+        out_n_total,
+        out_acc_left,
+        out_acc_total,
+        out_n_blocks,
+        in_min,
+        in_max,
+        in_n_missing,
+        data,
+        row_ids,
+        labels_q,
+        work_items,
+        workload_info,
+        colids,
+        tree_ids,
+        m_in,
+        n_sampled_cols_in,
+        n_acc_in,
+        seed,
+        sabotage_in,
+        n_cols_in,
+        labels_q,
+    )
+
+
+def node_feature_score_weighted_kernel[
+    TPB: Int, MAX_ACC: Int, ROW_MAJOR: Bool = False
+](
+    out_n_left: MutPointer[Int32, MutAnyOrigin],
+    out_n_total: MutPointer[Int32, MutAnyOrigin],
+    out_acc_left: MutPointer[Int32, MutAnyOrigin],
+    out_acc_total: MutPointer[Int32, MutAnyOrigin],
+    out_n_blocks: MutPointer[Int32, MutAnyOrigin],
+    in_min: MutPointer[Float32, MutAnyOrigin],
+    in_max: MutPointer[Float32, MutAnyOrigin],
+    in_n_missing: MutPointer[Int32, MutAnyOrigin],
+    data: MutPointer[Float32, MutAnyOrigin],
+    row_ids: MutPointer[Int32, MutAnyOrigin],
+    labels_q: MutPointer[Int32, MutAnyOrigin],
+    work_items: MutPointer[NodeWorkItem, MutAnyOrigin],
+    workload_info: MutPointer[WorkloadInfo, MutAnyOrigin],
+    colids: MutPointer[Int32, MutAnyOrigin],
+    tree_ids: MutPointer[Int32, MutAnyOrigin],
+    m_in: Int32,
+    n_sampled_cols_in: Int32,
+    n_acc_in: Int32,
+    seed: UInt64,
+    sabotage_in: Int32,
+    n_cols_in: Int32,
+    row_w: MutPointer[Int32, MutAnyOrigin],
+):
+    """The classification score pass with row weights (lane sk-kernels):
+    `row_w[row]` is the row's fixed-point weight (`DeviceDataset.d_weights`),
+    added to its class accumulators in place of 1."""
+    _node_feature_score_body[TPB, MAX_ACC, True, ROW_MAJOR, True](
+        out_n_left,
+        out_n_total,
+        out_acc_left,
+        out_acc_total,
+        out_n_blocks,
+        in_min,
+        in_max,
+        in_n_missing,
+        data,
+        row_ids,
+        labels_q,
+        work_items,
+        workload_info,
+        colids,
+        tree_ids,
+        m_in,
+        n_sampled_cols_in,
+        n_acc_in,
+        seed,
+        sabotage_in,
+        n_cols_in,
+        row_w,
+    )
+
+
+def node_feature_score_weighted_reg_kernel[
+    TPB: Int, MAX_ACC: Int, ROW_MAJOR: Bool = False
+](
+    out_n_left: MutPointer[Int32, MutAnyOrigin],
+    out_n_total: MutPointer[Int32, MutAnyOrigin],
+    out_acc_left: MutPointer[Int32, MutAnyOrigin],
+    out_acc_total: MutPointer[Int32, MutAnyOrigin],
+    out_n_blocks: MutPointer[Int32, MutAnyOrigin],
+    in_min: MutPointer[Float32, MutAnyOrigin],
+    in_max: MutPointer[Float32, MutAnyOrigin],
+    in_n_missing: MutPointer[Int32, MutAnyOrigin],
+    data: MutPointer[Float32, MutAnyOrigin],
+    row_ids: MutPointer[Int32, MutAnyOrigin],
+    labels_q: MutPointer[Int32, MutAnyOrigin],
+    work_items: MutPointer[NodeWorkItem, MutAnyOrigin],
+    workload_info: MutPointer[WorkloadInfo, MutAnyOrigin],
+    colids: MutPointer[Int32, MutAnyOrigin],
+    tree_ids: MutPointer[Int32, MutAnyOrigin],
+    m_in: Int32,
+    n_sampled_cols_in: Int32,
+    n_acc_in: Int32,
+    seed: UInt64,
+    sabotage_in: Int32,
+    n_cols_in: Int32,
+    row_w: MutPointer[Int32, MutAnyOrigin],
+):
+    """The regression score pass with row weights (lane sk-final):
+    `labels_q[row]` is the row's quantized `w * y`, `row_w[row]` its
+    quantized weight; each cell publishes the two sums in slots 0 and 1
+    (`n_acc_in` = 2)."""
+    _node_feature_score_body[TPB, MAX_ACC, False, ROW_MAJOR, True](
+        out_n_left,
+        out_n_total,
+        out_acc_left,
+        out_acc_total,
+        out_n_blocks,
+        in_min,
+        in_max,
+        in_n_missing,
+        data,
+        row_ids,
+        labels_q,
+        work_items,
+        workload_info,
+        colids,
+        tree_ids,
+        m_in,
+        n_sampled_cols_in,
+        n_acc_in,
+        seed,
+        sabotage_in,
+        n_cols_in,
+        row_w,
+    )
+
+
+def node_feature_score_reg_tiled_kernel[
+    TPB: Int, FT: Int, DT: DType = DType.float32
+](
+    out_n_left: MutPointer[Int32, MutAnyOrigin],
+    out_n_total: MutPointer[Int32, MutAnyOrigin],
+    out_acc_left: MutPointer[Int32, MutAnyOrigin],
+    out_acc_total: MutPointer[Int32, MutAnyOrigin],
+    out_n_blocks: MutPointer[Int32, MutAnyOrigin],
+    in_min: MutPointer[Float32, MutAnyOrigin],
+    in_max: MutPointer[Float32, MutAnyOrigin],
+    in_n_missing: MutPointer[Int32, MutAnyOrigin],
+    data_rm: MutPointer[Scalar[DT], MutAnyOrigin],
+    row_ids: MutPointer[Int32, MutAnyOrigin],
+    labels_q: MutPointer[Int32, MutAnyOrigin],
+    work_items: MutPointer[NodeWorkItem, MutAnyOrigin],
+    workload_info: MutPointer[WorkloadInfo, MutAnyOrigin],
+    colids: MutPointer[Int32, MutAnyOrigin],
+    tree_ids: MutPointer[Int32, MutAnyOrigin],
+    n_in: Int32,
+    n_sampled_cols_in: Int32,
+    seed: UInt64,
+    quant: MutPointer[Float32, MutAnyOrigin],
+    nbins: MutPointer[Int32, MutAnyOrigin],
+):
+    """FAST, and Apple IDENTICAL (integer counts and sums, so the same
+    integers in any order; trees-apple2): the REGRESSION arm of
+    `node_feature_score_kernel` (`CLASSIFICATION=False`, one accumulator,
+    no sabotage) for up to `FT` sampled features per block over a row-major
+    X. Each row's id and quantized label are read once. A feature the
+    one-feature kernel would skip (missing values, constant) publishes
+    nothing here either; every other cell gets the same integer counts and
+    sums through the same publish helpers."""
+    var wb = Int(block_idx.x)
+    var ftile = Int(block_idx.y)
+    var nid = Int(workload_info[unsafe_offset=wb].nodeid)
+    if nid < 0:
+        # cpu4-forest: a map entry past the live total (the device
+        # level loop launches at a proven bound); the whole block
+        # leaves before any barrier. `build_workload_info` never
+        # emits one, so the host-staged path is unchanged.
+        return
+    var offset_blockid = Int(workload_info[unsafe_offset=wb].offset_blockid)
+    var num_blocks = Int(workload_info[unsafe_offset=wb].num_blocks)
+    var range_start = Int(work_items[unsafe_offset=nid].instances.begin)
+    var range_len = Int(work_items[unsafe_offset=nid].instances.count)
+    var node_id = UInt32(Int(work_items[unsafe_offset=nid].idx))
+    var n = Int(n_in)
+    var k = Int(n_sampled_cols_in)
+    var f0 = ftile * FT
+    var nf = k - f0
+    if nf > FT:
+        nf = FT
+    var cols = SIMD[DType.int32, FT](0)
+    var thr = SIMD[DType.float32, FT](0)
+    var active = SIMD[DType.int32, FT](0)
+    var tree = tree_ids[unsafe_offset=nid].cast[DType.uint32]()
+    comptime for j in range(FT):
+        if j < nf:
+            var slot = nid * k + f0 + j
+            var col = Int(colids[unsafe_offset=slot])
+            cols[j] = Int32(col)
+            var extent = FeatureRange(
+                in_min[unsafe_offset=slot],
+                in_max[unsafe_offset=slot],
+                in_n_missing[unsafe_offset=slot],
+            )
+            if extent.n_missing == Int32(0) and not node_feature_is_constant(
+                extent, Int32(range_len)
+            ):
+                active[j] = 1
+                var key = key_for(seed, tree, node_id, UInt32(col))
+                thr[j] = draw_threshold_device(key, extent, True)
+    comptime if DT != DType.float32:
+        # Compare codes against the snapped border's code: thread j searches
+        # feature j's borders once for the whole block.
+        var s_code = stack_allocation[
+            FT, Scalar[DType.float32], address_space = AddressSpace.SHARED
+        ]()
+        var tj = Int(thread_idx.x)
+        if tj < nf and active[tj] != 0:
+            var cj = Int(cols[tj])
+            s_code[tj] = Float32(
+                et_snap_code(quant + cj * ET_QSTRIDE, nbins[cj], thr[tj])
+            )
+        barrier()
+        comptime for j in range(FT):
+            if j < nf and active[j] != 0:
+                thr[j] = s_code[j]
+    var n_left = SIMD[DType.int32, FT](0)
+    var acc_left = SIMD[DType.int32, FT](0)
+    var n_seen = Int32(0)
+    var acc_total = Int32(0)
+    var end = range_start + range_len
+    var stride = TPB * num_blocks
+    var i = range_start + Int(thread_idx.x) + offset_blockid * TPB
+    while i < end:
+        var row = Int(row_ids[unsafe_offset=i])
+        var q = labels_q[unsafe_offset=row]
+        n_seen += 1
+        acc_total += q
+        var base = row * n
+        comptime for j in range(FT):
+            if j < nf and active[j] != 0:
+                if Float32(data_rm[unsafe_offset = base + Int(cols[j])]) <= thr[j]:
+                    n_left[j] += 1
+                    acc_left[j] += q
+        i += stride
+    # One barrier for the whole tile (see node_feature_range_tiled_kernel).
+    comptime N_WARPS = TPB // WARP_SIZE
+    var s_nl = stack_allocation[
+        N_WARPS * (FT + 1), Scalar[DType.int32], address_space = AddressSpace.SHARED
+    ]()
+    var s_al = stack_allocation[
+        N_WARPS * (FT + 1), Scalar[DType.int32], address_space = AddressSpace.SHARED
+    ]()
+    var warp = Int(thread_idx.x) // WARP_SIZE
+    var lane = Int(thread_idx.x) % WARP_SIZE
+    comptime for j in range(FT):
+        var wl = _warp_fold_sum_i32(n_left[j])
+        var wa = _warp_fold_sum_i32(acc_left[j])
+        if lane == 0:
+            s_nl[warp * (FT + 1) + j] = wl
+            s_al[warp * (FT + 1) + j] = wa
+    var ws = _warp_fold_sum_i32(n_seen)
+    var wt = _warp_fold_sum_i32(acc_total)
+    if lane == 0:
+        s_nl[warp * (FT + 1) + FT] = ws
+        s_al[warp * (FT + 1) + FT] = wt
+    barrier()
+    var t = Int(thread_idx.x)
+    if t < nf and active[t] != 0:
+        var bl = Int32(0)
+        var ba = Int32(0)
+        var bs = Int32(0)
+        var bt = Int32(0)
+        for w in range(N_WARPS):
+            bl += s_nl[w * (FT + 1) + t]
+            ba += s_al[w * (FT + 1) + t]
+            bs += s_nl[w * (FT + 1) + FT]
+            bt += s_al[w * (FT + 1) + FT]
+        var single = num_blocks == 1
+        var slot = nid * k + f0 + t
+        _publish_add(out_n_left, slot, bl, single)
+        _publish_add(out_n_total, slot, bs, single)
+        _publish_add(out_n_blocks, slot, Int32(1), single)
+        _publish_add(out_acc_left, slot, ba, single)
+        _publish_add(out_acc_total, slot, bt, single)
+
+
+@always_inline
+def _node_feature_score_finalize_body[
+    MAX_ACC: Int, CLASSIFICATION: Bool, WEIGHTED: Bool
+](
+    out_status: MutPointer[Int32, MutAnyOrigin],
+    out_threshold: MutPointer[Float32, MutAnyOrigin],
+    out_gini_num: MutPointer[Int64, MutAnyOrigin],
+    out_gini_den: MutPointer[Int64, MutAnyOrigin],
+    out_n_left: MutPointer[Int32, MutAnyOrigin],
+    out_n_total: MutPointer[Int32, MutAnyOrigin],
+    out_acc_left: MutPointer[Int32, MutAnyOrigin],
+    out_acc_total: MutPointer[Int32, MutAnyOrigin],
+    in_min: MutPointer[Float32, MutAnyOrigin],
+    in_max: MutPointer[Float32, MutAnyOrigin],
+    in_n_missing: MutPointer[Int32, MutAnyOrigin],
+    work_items: MutPointer[NodeWorkItem, MutAnyOrigin],
+    colids: MutPointer[Int32, MutAnyOrigin],
+    tree_ids: MutPointer[Int32, MutAnyOrigin],
+    n_cells_in: Int32,
+    n_sampled_cols_in: Int32,
+    n_acc_in: Int32,
+    seed: UInt64,
+    min_samples_leaf_in: Int32,
+    sabotage_in: Int32,
+    min_weight_units: Int64,
+):
+    """Publish each cell's status, threshold and score.
+
+    WEIGHTED (classification, lane sk-kernels): the class accumulators hold
+    fixed-point weight units, so the score's left / right sizes are their
+    sums (WL, WR) and the node-uniform shift is taken over the node's total
+    W, which keeps DEVIATION 175's Int64 bound (WL^2 WR + WR^2 WL <= W^3/4);
+    a node is pure when one class holds all of W; a split is rejected when
+    a side holds no weight or less than `min_weight_units` (scikit-learn's
+    min_weight_leaf in units; 0 checks only the empty side). The row-count
+    `min_samples_leaf` test is unchanged.
+
+    WEIGHTED regression (lane sk-final, `n_acc_in` = 2): slot 0 holds the
+    quantized `w * y` sums Z, slot 1 the weight units W. The same side
+    rejection on W; the exact key is `regression_key` over (Z, W) in place
+    of (label sum, row count): A = ZL WR - ZR WL with |Z| <= 2^30 and
+    W <= 2^30, the node-uniform shift taken over the node's W, so
+    (|A| >> j)^2 <= 2^62 and WL WR <= 2^58 (DEVIATION 189's bounds with W
+    in the row count's place)."""
+    var n_cells = Int(n_cells_in)
+    var n_sampled_cols = Int(n_sampled_cols_in)
+    var n_acc = Int(n_acc_in)
+    var min_samples_leaf = Int(min_samples_leaf_in)
+    var sabotage = sabotage_in
+    if n_acc > MAX_ACC or n_acc < 1:
+        return
+
+    var idx = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    var stride = Int(grid_dim.x) * Int(block_dim.x)
+    var slot = idx
+    while slot < n_cells:
+        var nid = slot // n_sampled_cols
+        var fslot = slot % n_sampled_cols
+        var range_len = Int(work_items[unsafe_offset=nid].instances.count)
+        var node_id = UInt32(Int(work_items[unsafe_offset=nid].idx))
+        var col = Int(colids[unsafe_offset = nid * n_sampled_cols + fslot])
+
+        var extent = FeatureRange(
+            in_min[unsafe_offset=slot],
+            in_max[unsafe_offset=slot],
+            in_n_missing[unsafe_offset=slot],
+        )
+        if extent.n_missing != Int32(0):
+            out_status[unsafe_offset=slot] = SCORE_STATUS_MISSING_REFUSED
+            slot += stride
+            continue
+        var constant: Bool
+        if sabotage == SCORE_SAB_CONSTANT_STRICT:
+            constant = Int32(range_len) == extent.n_missing or (
+                extent.max_value < extent.min_value + FEATURE_THRESHOLD
+                and extent.n_missing == 0
+            )
+        else:
+            constant = node_feature_is_constant(extent, Int32(range_len))
+        if constant:
+            out_status[unsafe_offset=slot] = SCORE_STATUS_CONSTANT
+            slot += stride
+            continue
+
+        var key = key_for(
+            seed,
+            tree_ids[unsafe_offset=nid].cast[DType.uint32](),
+            node_id,
+            UInt32(col),
+        )
+        var threshold = draw_threshold_device(
+            key, extent, sabotage != SCORE_SAB_NO_MAX_GUARD
+        )
+        out_threshold[unsafe_offset=slot] = threshold
+
+        var n_left = Int(out_n_left[unsafe_offset=slot])
+        var n_total = Int(out_n_total[unsafe_offset=slot])
+        var n_right = n_total - n_left
+
+        if (
+            n_left < min_samples_leaf
+            or n_right < min_samples_leaf
+            or n_left == 0
+            or n_right == 0
+        ):
+            out_status[unsafe_offset=slot] = (
+                SCORE_STATUS_REJECTED_MIN_SAMPLES_LEAF
+            )
+            slot += stride
+            continue
+
+        comptime if CLASSIFICATION and WEIGHTED:
+            var w_total = Int64(0)
+            var w_left = Int64(0)
+            for kc in range(n_acc):
+                w_total += Int64(Int(out_acc_total[unsafe_offset = slot * n_acc + kc]))
+                w_left += Int64(Int(out_acc_left[unsafe_offset = slot * n_acc + kc]))
+            var w_right = w_total - w_left
+            if (
+                w_left <= Int64(0)
+                or w_right <= Int64(0)
+                or w_left < min_weight_units
+                or w_right < min_weight_units
+            ):
+                out_status[unsafe_offset=slot] = (
+                    SCORE_STATUS_REJECTED_MIN_SAMPLES_LEAF
+                )
+                slot += stride
+                continue
+            var w_pure = False
+            for kc in range(n_acc):
+                if Int64(Int(out_acc_total[unsafe_offset = slot * n_acc + kc])) == w_total:
+                    w_pure = True
+            if w_pure:
+                out_status[unsafe_offset=slot] = SCORE_STATUS_PURE_NODE
+                slot += stride
+                continue
+        elif WEIGHTED:
+            # lane sk-final: the weighted regressor's side test on slot 1
+            var rw_total = Int64(Int(out_acc_total[unsafe_offset = slot * n_acc + 1]))
+            var rw_left = Int64(Int(out_acc_left[unsafe_offset = slot * n_acc + 1]))
+            var rw_right = rw_total - rw_left
+            if (
+                rw_left <= Int64(0)
+                or rw_right <= Int64(0)
+                or rw_left < min_weight_units
+                or rw_right < min_weight_units
+            ):
+                out_status[unsafe_offset=slot] = (
+                    SCORE_STATUS_REJECTED_MIN_SAMPLES_LEAF
+                )
+                slot += stride
+                continue
+        elif CLASSIFICATION:
+            var pure = False
+            for kc in range(n_acc):
+                if (
+                    Int(out_acc_total[unsafe_offset = slot * n_acc + kc])
+                    == n_total
+                ):
+                    pure = True
+            if pure and n_total > 0:
+                out_status[unsafe_offset=slot] = SCORE_STATUS_PURE_NODE
+                slot += stride
+                continue
+
+        out_status[unsafe_offset=slot] = SCORE_STATUS_SCORED
+        comptime if CLASSIFICATION:
+            var sq_left = Int64(0)
+            var sq_right = Int64(0)
+            for k in range(n_acc):
+                var lv = Int64(
+                    Int(out_acc_left[unsafe_offset = slot * n_acc + k])
+                )
+                var rv = Int64(
+                    Int(
+                        out_acc_total[unsafe_offset = slot * n_acc + k]
+                        - out_acc_left[unsafe_offset = slot * n_acc + k]
+                    )
+                )
+                sq_left += lv * lv
+                sq_right += rv * rv
+            var nl = Int64(n_left)
+            var nr = Int64(n_right)
+            var cs = Int64(classification_key_shift(range_len))
+            comptime if WEIGHTED:
+                var w_sum = Int64(0)
+                nl = Int64(0)
+                for kw in range(n_acc):
+                    w_sum += Int64(Int(out_acc_total[unsafe_offset = slot * n_acc + kw]))
+                    nl += Int64(Int(out_acc_left[unsafe_offset = slot * n_acc + kw]))
+                nr = w_sum - nl
+                cs = Int64(classification_key_shift(Int(w_sum)))
+            out_gini_num[unsafe_offset=slot] = (
+                (sq_left >> cs) * nr + (sq_right >> cs) * nl
+            )
+            out_gini_den[unsafe_offset=slot] = nl * nr
+        else:
+            var key_num = Int64(0)
+            var key_den = Int64(0)
+            var k_left = n_left
+            var k_right = n_right
+            var k_rows = range_len
+            comptime if WEIGHTED:
+                # lane sk-final: the weight units stand where the counts stood
+                k_rows = Int(out_acc_total[unsafe_offset = slot * n_acc + 1])
+                k_left = Int(out_acc_left[unsafe_offset = slot * n_acc + 1])
+                k_right = k_rows - k_left
+            var key_ok = regression_key(
+                Int64(Int(out_acc_left[unsafe_offset = slot * n_acc])),
+                Int64(Int(out_acc_total[unsafe_offset = slot * n_acc])),
+                k_left,
+                k_right,
+                k_rows,
+                sabotage,
+                key_num,
+                key_den,
+            )
+            if not key_ok:
+                out_status[unsafe_offset=slot] = (
+                    SCORE_STATUS_REGRESSION_REFUSED
+                )
+            out_gini_num[unsafe_offset=slot] = key_num
+            out_gini_den[unsafe_offset=slot] = key_den
+        slot += stride
+
+
+def node_feature_score_finalize_kernel[
+    MAX_ACC: Int, CLASSIFICATION: Bool
+](
+    out_status: MutPointer[Int32, MutAnyOrigin],
+    out_threshold: MutPointer[Float32, MutAnyOrigin],
+    out_gini_num: MutPointer[Int64, MutAnyOrigin],
+    out_gini_den: MutPointer[Int64, MutAnyOrigin],
+    out_n_left: MutPointer[Int32, MutAnyOrigin],
+    out_n_total: MutPointer[Int32, MutAnyOrigin],
+    out_acc_left: MutPointer[Int32, MutAnyOrigin],
+    out_acc_total: MutPointer[Int32, MutAnyOrigin],
+    in_min: MutPointer[Float32, MutAnyOrigin],
+    in_max: MutPointer[Float32, MutAnyOrigin],
+    in_n_missing: MutPointer[Int32, MutAnyOrigin],
+    work_items: MutPointer[NodeWorkItem, MutAnyOrigin],
+    colids: MutPointer[Int32, MutAnyOrigin],
+    tree_ids: MutPointer[Int32, MutAnyOrigin],
+    n_cells_in: Int32,
+    n_sampled_cols_in: Int32,
+    n_acc_in: Int32,
+    seed: UInt64,
+    min_samples_leaf_in: Int32,
+    sabotage_in: Int32,
+):
+    """Publish each cell's status, threshold and score
+    (`_node_feature_score_finalize_body`, unweighted)."""
+    _node_feature_score_finalize_body[MAX_ACC, CLASSIFICATION, False](
+        out_status,
+        out_threshold,
+        out_gini_num,
+        out_gini_den,
+        out_n_left,
+        out_n_total,
+        out_acc_left,
+        out_acc_total,
+        in_min,
+        in_max,
+        in_n_missing,
+        work_items,
+        colids,
+        tree_ids,
+        n_cells_in,
+        n_sampled_cols_in,
+        n_acc_in,
+        seed,
+        min_samples_leaf_in,
+        sabotage_in,
+        Int64(0),
+    )
+
+
+def node_feature_score_finalize_weighted_kernel[MAX_ACC: Int](
+    out_status: MutPointer[Int32, MutAnyOrigin],
+    out_threshold: MutPointer[Float32, MutAnyOrigin],
+    out_gini_num: MutPointer[Int64, MutAnyOrigin],
+    out_gini_den: MutPointer[Int64, MutAnyOrigin],
+    out_n_left: MutPointer[Int32, MutAnyOrigin],
+    out_n_total: MutPointer[Int32, MutAnyOrigin],
+    out_acc_left: MutPointer[Int32, MutAnyOrigin],
+    out_acc_total: MutPointer[Int32, MutAnyOrigin],
+    in_min: MutPointer[Float32, MutAnyOrigin],
+    in_max: MutPointer[Float32, MutAnyOrigin],
+    in_n_missing: MutPointer[Int32, MutAnyOrigin],
+    work_items: MutPointer[NodeWorkItem, MutAnyOrigin],
+    colids: MutPointer[Int32, MutAnyOrigin],
+    tree_ids: MutPointer[Int32, MutAnyOrigin],
+    n_cells_in: Int32,
+    n_sampled_cols_in: Int32,
+    n_acc_in: Int32,
+    seed: UInt64,
+    min_samples_leaf_in: Int32,
+    sabotage_in: Int32,
+    min_weight_units: Int64,
+):
+    """The classification finalize pass over weighted accumulators (lane
+    sk-kernels; `_node_feature_score_finalize_body`'s WEIGHTED arm)."""
+    _node_feature_score_finalize_body[MAX_ACC, True, True](
+        out_status,
+        out_threshold,
+        out_gini_num,
+        out_gini_den,
+        out_n_left,
+        out_n_total,
+        out_acc_left,
+        out_acc_total,
+        in_min,
+        in_max,
+        in_n_missing,
+        work_items,
+        colids,
+        tree_ids,
+        n_cells_in,
+        n_sampled_cols_in,
+        n_acc_in,
+        seed,
+        min_samples_leaf_in,
+        sabotage_in,
+        min_weight_units,
+    )
+
+
+def node_feature_score_finalize_weighted_reg_kernel[MAX_ACC: Int](
+    out_status: MutPointer[Int32, MutAnyOrigin],
+    out_threshold: MutPointer[Float32, MutAnyOrigin],
+    out_gini_num: MutPointer[Int64, MutAnyOrigin],
+    out_gini_den: MutPointer[Int64, MutAnyOrigin],
+    out_n_left: MutPointer[Int32, MutAnyOrigin],
+    out_n_total: MutPointer[Int32, MutAnyOrigin],
+    out_acc_left: MutPointer[Int32, MutAnyOrigin],
+    out_acc_total: MutPointer[Int32, MutAnyOrigin],
+    in_min: MutPointer[Float32, MutAnyOrigin],
+    in_max: MutPointer[Float32, MutAnyOrigin],
+    in_n_missing: MutPointer[Int32, MutAnyOrigin],
+    work_items: MutPointer[NodeWorkItem, MutAnyOrigin],
+    colids: MutPointer[Int32, MutAnyOrigin],
+    tree_ids: MutPointer[Int32, MutAnyOrigin],
+    n_cells_in: Int32,
+    n_sampled_cols_in: Int32,
+    n_acc_in: Int32,
+    seed: UInt64,
+    min_samples_leaf_in: Int32,
+    sabotage_in: Int32,
+    min_weight_units: Int64,
+):
+    """The regression finalize pass over (Z, W) accumulators (lane
+    sk-final; `_node_feature_score_finalize_body`'s weighted regression
+    arm, `n_acc_in` = 2)."""
+    _node_feature_score_finalize_body[MAX_ACC, False, True](
+        out_status,
+        out_threshold,
+        out_gini_num,
+        out_gini_den,
+        out_n_left,
+        out_n_total,
+        out_acc_left,
+        out_acc_total,
+        in_min,
+        in_max,
+        in_n_missing,
+        work_items,
+        colids,
+        tree_ids,
+        n_cells_in,
+        n_sampled_cols_in,
+        n_acc_in,
+        seed,
+        min_samples_leaf_in,
+        sabotage_in,
+        min_weight_units,
+    )
+
+
+# ============================================================================
+# THE PARTITION AND THE LEAF PASS, ON THE DEVICE.
+
+from max.gpu.memory import AddressSpace
+from max.gpu.primitives.block import prefix_sum as block_prefix_sum
+
+from extratrees.impl.decisiontree.flatnode import (
+    NODE_IS_LEAF,
+    SparseTreeNode,
+)
+from extratrees.impl.decisiontree.batched_levelalgo.kernels.builder_kernels import (
+    InstanceRange,
+    split_not_valid,
+)
+
+
+# ---------------------------------------------------------------------------
+
+comptime PARTITION_UNVISITED: Int32 = -3
+"""The seed the CALLER must write into `out_n_iters` before the launch."""
+
+comptime PARTITION_SKIPPED: Int32 = -1
+"""`nodeSplitKernel`'s early return, `:100-104`: `SplitNotValid` was true, so NOTHING was partitioned and the node's `row_ids` are untouched."""
+
+comptime PARTITION_OVERRUN: Int32 = -2
+"""The derived iteration bound of DEVIATION 176 was reached."""
+
+
+comptime PART_SAB_NONE: Int32 = 0
+"""No sabotage."""
+
+comptime PART_SAB_LEFT_MISFIT_GE: Int32 = 1
+"""A LEFT-side misfit becomes `col[row] >= quesval` instead of `> quesval` (`:65`), so a row sitting exactly ON the threshold is dragged right."""
+
+comptime PART_SAB_RIGHT_MISFIT_LT: Int32 = 2
+"""A RIGHT-side misfit becomes `col[row] < quesval` instead of `<= quesval` (`:66`), the other half of the same boundary rule and equally invisible with distinct values."""
+
+comptime PART_SAB_NO_SCAN: Int32 = 3
+"""Compact at `thread_idx.x` instead of at the block scan's exclusive prefix (`:69-71`, `:75-77`), so flagged threads scatter into holes instead of packing down."""
+
+comptime PART_SAB_UNPAIRED_SWAP: Int32 = 4
+"""Write only the LEFT half of the swap (`:86-88`), so a row is duplicated and another is dropped."""
+
+comptime PART_SAB_NO_ROW_IDS: Int32 = 5
+"""Drop the `row_ids` indirection in the feature read: `col[row_ids[loff]]` becomes `col[loff]` (`:65-66`)."""
+
+comptime PART_SAB_NO_VALID_GUARD: Int32 = 6
+"""Partition even when `SplitNotValid` says not to (`:100-104`)."""
+
+
+def partition_iteration_bound(range_len: Int, n_left: Int, tpb: Int) -> Int:
+    """The proved bound on `partitionSamples`' `while`."""
+    var n_right = range_len - n_left
+    if n_right < 0:
+        n_right = 0
+    var nl = n_left
+    if nl < 0:
+        nl = 0
+    return ceildiv(nl, tpb) + ceildiv(n_right, tpb) + 2
+
+
+def node_split_kernel[
+    TPB: Int
+](
+    row_ids: MutPointer[Int32, MutAnyOrigin],
+    out_n_iters: MutPointer[Int32, MutAnyOrigin],
+    out_n_swaps: MutPointer[Int32, MutAnyOrigin],
+    data: MutPointer[Float32, MutAnyOrigin],
+    work_items: MutPointer[NodeWorkItem, MutAnyOrigin],
+    splits: MutPointer[Split, MutAnyOrigin],
+    m_in: Int32,
+    min_impurity_decrease: Float32,
+    min_samples_leaf_in: Int32,
+    sabotage_in: Int32,
+):
+    """`nodeSplitKernel` (`:89-107`) and the `partitionSamples` it calls."""
+    var b = Int(block_idx.x)
+    var tid = Int(thread_idx.x)
+    var sabotage = sabotage_in
+
+    var range_start = Int(work_items[unsafe_offset=b].instances.begin)
+    var range_len = Int(work_items[unsafe_offset=b].instances.count)
+    var quesval = splits[unsafe_offset=b].quesval
+    var colid = splits[unsafe_offset=b].colid
+    var best_metric = splits[unsafe_offset=b].best_metric_val
+    var n_left = Int(splits[unsafe_offset=b].n_left)
+
+    var invalid = split_not_valid(
+        Split(quesval, colid, best_metric, Int32(n_left)),
+        min_impurity_decrease,
+        min_samples_leaf_in,
+        Int32(range_len),
+    )
+    if sabotage == PART_SAB_NO_VALID_GUARD:
+        invalid = False
+    if invalid:
+        if tid == 0:
+            out_n_iters[unsafe_offset=b] = PARTITION_SKIPPED
+            out_n_swaps[unsafe_offset=b] = Int32(0)
+        return
+
+    var smem = stack_allocation[
+        2 * TPB, Scalar[DType.int32], address_space = AddressSpace.SHARED
+    ]()
+    # of turning a sabotage into an out-of-bounds write.
+    smem[unsafe_offset=tid] = Int32(range_start)
+    smem[unsafe_offset = TPB + tid] = Int32(range_start)
+    barrier()
+
+    var col_offset = Int(colid) * Int(m_in)
+    var loffset = range_start
+    var part = loffset + n_left
+    var roffset = part
+    var end = range_start + range_len
+
+    var lflag = Int32(0)
+    var rflag = Int32(0)
+    var llen = 0
+    var rlen = 0
+    var minlen = 0
+
+    var iters = 0
+    var swaps = 0
+    var bound = partition_iteration_bound(range_len, n_left, TPB)
+
+    while loffset < part and roffset < end:
+        if iters >= bound:
+            if tid == 0:
+                out_n_iters[unsafe_offset=b] = PARTITION_OVERRUN
+                out_n_swaps[unsafe_offset=b] = Int32(swaps)
+            return
+
+        var loff = loffset + tid
+        var roff = roffset + tid
+        if llen == minlen:
+            if loff < part:
+                var sl = Int(row_ids[unsafe_offset=loff])
+                if sabotage == PART_SAB_NO_ROW_IDS:
+                    sl = loff
+                var v = data[unsafe_offset = col_offset + sl]
+                var misfit: Bool
+                if sabotage == PART_SAB_LEFT_MISFIT_GE:
+                    misfit = v >= quesval
+                else:
+                    misfit = v > quesval
+                lflag = Int32(1) if misfit else Int32(0)
+            else:
+                lflag = Int32(0)
+        if rlen == minlen:
+            if roff < end:
+                var sr = Int(row_ids[unsafe_offset=roff])
+                if sabotage == PART_SAB_NO_ROW_IDS:
+                    sr = roff
+                var v = data[unsafe_offset = col_offset + sr]
+                var misfit: Bool
+                if sabotage == PART_SAB_RIGHT_MISFIT_LT:
+                    misfit = v < quesval
+                else:
+                    misfit = v <= quesval
+                rflag = Int32(1) if misfit else Int32(0)
+            else:
+                rflag = Int32(0)
+
+        barrier()
+
+        var lidx = Int(
+            block_prefix_sum[block_size=TPB, exclusive=True](lflag)
+        )
+        barrier()
+        llen = Int(block_sum[block_size=TPB](lflag))
+        barrier()
+        var ridx = Int(
+            block_prefix_sum[block_size=TPB, exclusive=True](rflag)
+        )
+        barrier()
+        rlen = Int(block_sum[block_size=TPB](rflag))
+        barrier()
+
+        if sabotage == PART_SAB_NO_SCAN:
+            lidx = tid
+            ridx = tid
+
+        minlen = llen if llen < rlen else rlen
+
+        if lflag != Int32(0):
+            smem[unsafe_offset=lidx] = Int32(loff)
+        if rflag != Int32(0):
+            smem[unsafe_offset = TPB + ridx] = Int32(roff)
+        barrier()
+
+        if lidx < minlen:
+            lflag = Int32(0)
+        if ridx < minlen:
+            rflag = Int32(0)
+        if llen == minlen:
+            loffset += TPB
+        if rlen == minlen:
+            roffset += TPB
+
+        if tid < minlen:
+            var lslot = Int(smem[unsafe_offset=tid])
+            var rslot = Int(smem[unsafe_offset = TPB + tid])
+            var a = row_ids[unsafe_offset=lslot]
+            var bv = row_ids[unsafe_offset=rslot]
+            row_ids[unsafe_offset=lslot] = bv
+            if sabotage != PART_SAB_UNPAIRED_SWAP:
+                row_ids[unsafe_offset=rslot] = a
+
+        barrier()
+        iters += 1
+        swaps += minlen
+
+    if tid == 0:
+        out_n_iters[unsafe_offset=b] = Int32(iters)
+        out_n_swaps[unsafe_offset=b] = Int32(swaps)
+
+
+# ---------------------------------------------------------------------------
+
+comptime LEAF_VISIT_NONE: Int32 = 0
+"""The zero the CALLER must seed `out_visit` with."""
+
+comptime LEAF_VISIT_INTERNAL: Int32 = 1
+"""A block ran on this node and took `leafKernel`'s early return at `:403`, because the node is not a leaf."""
+
+comptime LEAF_VISIT_PUBLISHED: Int32 = 2
+"""A block ran on this node, it is a leaf, and `SetLeafVector` wrote its value."""
+
+comptime LEAF_MAX_OUT_DEFAULT: Int = 16
+"""Default comptime bound on `num_outputs`."""
+
+
+comptime LEAF_SAB_NONE: Int32 = 0
+"""No sabotage."""
+
+comptime LEAF_SAB_NO_ISLEAF: Int32 = 1
+"""Drop `if (!node.IsLeaf()) return;` (`:403`), so every node's slot is filled."""
+
+comptime LEAF_SAB_NO_ROW_IDS: Int32 = 2
+"""Read `labels[i]` instead of `labels[row_ids[i]]` (`:409-411`), i.e."""
+
+comptime LEAF_SAB_STRIDE_ONE: Int32 = 3
+"""Write at `node_id + c` instead of `node_id * num_outputs + c` (`:412`, `decisiontree.cuh:218`)."""
+
+comptime LEAF_SAB_NO_NORMALIZE: Int32 = 4
+"""Publish the raw accumulator instead of dividing it: skip the `/ total` of `SetLeafVector` for Gini (`objectives.cuh:97-107`) and the `/ count` for MSE (`:259-264`)."""
+
+
+def leaf_values_host(
+    nodes: MutPointer[SparseTreeNode[DType.float32], MutAnyOrigin],
+    instance_ranges: MutPointer[InstanceRange, MutAnyOrigin],
+    row_ids: MutPointer[Int32, MutAnyOrigin],
+    labels_q: MutPointer[Int32, MutAnyOrigin],
+    n_nodes: Int,
+    num_outputs: Int,
+    inv_scale: Float32,
+    is_classification: Bool,
+) -> List[Float32]:
+    """THE ORACLE for `leaf_kernel`: the same pass, sequentially."""
+    var out = List[Float32](length=n_nodes * num_outputs, fill=Float32(0.0))
+    for node_id in range(n_nodes):
+        if nodes[unsafe_offset=node_id].left_child_id != NODE_IS_LEAF:
+            continue
+        var begin = Int(instance_ranges[unsafe_offset=node_id].begin)
+        var count = Int(instance_ranges[unsafe_offset=node_id].count)
+        comptime if T14 and not T14_EXACT:
+            if not is_classification:
+                out[node_id*num_outputs] = et_leaf_moment_host(row_ids,labels_q,begin,count,inv_scale)
+                continue
+        var acc = List[Int32](length=num_outputs, fill=Int32(0))
+        var seen = 0
+        for i in range(begin, begin + count):
+            var row = Int(row_ids[unsafe_offset=i])
+            var lab = Int(labels_q[unsafe_offset=row])
+            if is_classification:
+                if lab >= 0 and lab < num_outputs:
+                    acc[lab] += Int32(1)
+            else:
+                acc[0] += Int32(lab)
+            seen += 1
+        var base = node_id * num_outputs
+        if is_classification:
+            var total = Int32(0)
+            for c in range(num_outputs):
+                total += acc[c]
+            for c in range(num_outputs):
+                out[base + c] = Float32(Int(acc[c])) / Float32(Int(total))
+        else:
+            for c in range(num_outputs):
+                out[base + c] = ftz(
+                    Float32(Int(acc[c])) / Float32(seen) * inv_scale
+                )
+    return out^
+
+
+@always_inline
+def _leaf_body[
+    TPB: Int, MAX_OUT: Int, CLASSIFICATION: Bool, zero_fill: Bool, WEIGHTED: Bool
+](
+    out_leaves: MutPointer[Float32, MutAnyOrigin],
+    out_visit: MutPointer[Int32, MutAnyOrigin],
+    nodes: MutPointer[SparseTreeNode[DType.float32], MutAnyOrigin],
+    instance_ranges: MutPointer[InstanceRange, MutAnyOrigin],
+    row_ids: MutPointer[Int32, MutAnyOrigin],
+    labels_q: MutPointer[Int32, MutAnyOrigin],
+    num_outputs_in: Int32,
+    inv_scale: Float32,
+    sabotage_in: Int32,
+    row_w: MutPointer[Int32, MutAnyOrigin],
+):
+    """`leafKernel`, `builder_kernels_impl.cuh:391-417`. WEIGHTED
+    (classification, lane sk-kernels): each row adds its fixed-point weight
+    to its class tally, so the leaf vector is the weighted class share.
+    WEIGHTED regression (lane sk-final): `labels_q` holds the quantized
+    `w * y`; the leaf is `Float32(Z) / Float32(W) * inv_scale`, Z the sum of
+    those units, W the sum of `row_w` units and `inv_scale` the power of two
+    `weight scale / label scale` (0 when the leaf holds no weight)."""
+    var node_id = Int(block_idx.x)
+    var tid = Int(thread_idx.x)
+    var k = Int(num_outputs_in)
+    var sabotage = sabotage_in
+
+    comptime if zero_fill:
+        if tid == 0:
+            var zfill = Float32(0.0)
+            comptime if is_defined["ANONLIB_ET_SAB_LEAF_ZERO_FILL"]():
+                zfill = Float32(node_id & 1)
+            out_visit[unsafe_offset=node_id] = LEAF_VISIT_NONE
+            for z in range(k):
+                out_leaves[unsafe_offset = node_id * k + z] = zfill
+
+    if k > MAX_OUT or k < 1:
+        return
+
+    var is_leaf = (
+        nodes[unsafe_offset=node_id].left_child_id == NODE_IS_LEAF
+    )
+    if sabotage == LEAF_SAB_NO_ISLEAF:
+        is_leaf = True
+    if not is_leaf:
+        if tid == 0:
+            out_visit[unsafe_offset=node_id] = LEAF_VISIT_INTERNAL
+        return
+
+    var begin = Int(instance_ranges[unsafe_offset=node_id].begin)
+    var count = Int(instance_ranges[unsafe_offset=node_id].count)
+
+    comptime if T14 and not T14_EXACT and not CLASSIFICATION and not WEIGHTED:
+        # V1: exact row-ID keyed partials, shared portable binary64 pair tree.
+        # Same logical 128 slots as host regardless of TPB/warp width.
+        # NOT COMPILED — NOT TESTED — IDENTITY NOT VERIFIED — QUALITY NOT VERIFIED — NOT MEASURED.
+        var partials = stack_allocation[128,Int32,address_space=AddressSpace.SHARED]()
+        var moments = stack_allocation[128,UInt64,address_space=AddressSpace.SHARED]()
+        var lane = tid
+        while lane < 128:
+            partials[unsafe_offset=lane] = Int32(0)
+            lane += TPB
+        barrier()
+        var pos = begin+tid
+        while pos < begin+count:
+            var row = Int(row_ids[unsafe_offset=pos])
+            _ = Atomic.fetch_add(partials.unsafe_offset(row%128),labels_q[unsafe_offset=row])
+            pos += TPB
+        barrier()
+        lane = tid
+        while lane < 128:
+            moments[unsafe_offset=lane] = sf64_from_f32(ftz(Float32(partials[unsafe_offset=lane])*inv_scale))
+            lane += TPB
+        barrier()
+        var distance = 64
+        while distance > 0:
+            lane = tid
+            while lane < distance:
+                moments[unsafe_offset=lane] = moment_pair(moments[unsafe_offset=lane],moments[unsafe_offset=lane+distance])
+                lane += TPB
+            barrier()
+            distance //= 2
+        if tid == 0:
+            out_leaves[unsafe_offset=node_id*k] = moment_finish(moments[unsafe_offset=0],Float32(count))
+            out_visit[unsafe_offset=node_id] = LEAF_VISIT_PUBLISHED
+        return
+
+    var priv = stack_allocation[MAX_OUT, Scalar[DType.int32]]()
+    for c in range(MAX_OUT):
+        priv[unsafe_offset=c] = Int32(0)
+    var seen = Int32(0)
+    var w_seen = Int32(0)
+
+    var i = begin + tid
+    while i < begin + count:
+        var row = Int(row_ids[unsafe_offset=i])
+        if sabotage == LEAF_SAB_NO_ROW_IDS:
+            row = i
+        var lab = Int(labels_q[unsafe_offset=row])
+        comptime if CLASSIFICATION:
+            if lab >= 0 and lab < k:
+                comptime if WEIGHTED:
+                    priv[unsafe_offset=lab] += row_w[unsafe_offset=row]
+                else:
+                    priv[unsafe_offset=lab] += Int32(1)
+        else:
+            priv[unsafe_offset=0] += Int32(lab)
+            comptime if WEIGHTED:
+                w_seen += row_w[unsafe_offset=row]
+        seen += 1
+        i += TPB
+
+    var blk_seen = block_sum[block_size=TPB](seen)
+    barrier()
+    var blk_w = Int32(0)
+    comptime if WEIGHTED and not CLASSIFICATION:
+        blk_w = block_sum[block_size=TPB](w_seen)
+        barrier()
+
+    var tot = stack_allocation[MAX_OUT, Scalar[DType.int32]]()
+    for c in range(MAX_OUT):
+        tot[unsafe_offset=c] = Int32(0)
+    for c in range(k):
+        var v = block_sum[block_size=TPB](priv[unsafe_offset=c])
+        barrier()
+        tot[unsafe_offset=c] = v
+
+    if tid != 0:
+        return
+
+    var base = node_id * k
+    if sabotage == LEAF_SAB_STRIDE_ONE:
+        base = node_id
+
+    comptime if CLASSIFICATION:
+        var total = Int32(0)
+        for c in range(k):
+            total += tot[unsafe_offset=c]
+        for c in range(k):
+            var num = Float32(Int(tot[unsafe_offset=c]))
+            if sabotage == LEAF_SAB_NO_NORMALIZE:
+                out_leaves[unsafe_offset = base + c] = num
+            else:
+                out_leaves[unsafe_offset = base + c] = num / Float32(
+                    Int(total)
+                )
+    else:
+        var den = blk_seen
+        comptime if WEIGHTED:
+            den = blk_w
+        for c in range(k):
+            var num = Float32(Int(tot[unsafe_offset=c]))
+            if sabotage == LEAF_SAB_NO_NORMALIZE:
+                out_leaves[unsafe_offset = base + c] = num * inv_scale
+            elif WEIGHTED and den == Int32(0):
+                # lane sk-final: a weighted leaf holding no weight
+                out_leaves[unsafe_offset = base + c] = Float32(0.0)
+            else:
+                out_leaves[unsafe_offset = base + c] = ftz(
+                    num / Float32(Int(den)) * inv_scale
+                )
+
+    out_visit[unsafe_offset=node_id] = LEAF_VISIT_PUBLISHED
+
+
+def leaf_kernel[
+    TPB: Int, MAX_OUT: Int, CLASSIFICATION: Bool, zero_fill: Bool = False
+](
+    out_leaves: MutPointer[Float32, MutAnyOrigin],
+    out_visit: MutPointer[Int32, MutAnyOrigin],
+    nodes: MutPointer[SparseTreeNode[DType.float32], MutAnyOrigin],
+    instance_ranges: MutPointer[InstanceRange, MutAnyOrigin],
+    row_ids: MutPointer[Int32, MutAnyOrigin],
+    labels_q: MutPointer[Int32, MutAnyOrigin],
+    num_outputs_in: Int32,
+    inv_scale: Float32,
+    sabotage_in: Int32,
+):
+    """`leafKernel`, `builder_kernels_impl.cuh:391-417` (`_leaf_body`,
+    unweighted)."""
+    _leaf_body[TPB, MAX_OUT, CLASSIFICATION, zero_fill, False](
+        out_leaves,
+        out_visit,
+        nodes,
+        instance_ranges,
+        row_ids,
+        labels_q,
+        num_outputs_in,
+        inv_scale,
+        sabotage_in,
+        labels_q,
+    )
+
+
+def leaf_weighted_kernel[TPB: Int, MAX_OUT: Int, zero_fill: Bool = False](
+    out_leaves: MutPointer[Float32, MutAnyOrigin],
+    out_visit: MutPointer[Int32, MutAnyOrigin],
+    nodes: MutPointer[SparseTreeNode[DType.float32], MutAnyOrigin],
+    instance_ranges: MutPointer[InstanceRange, MutAnyOrigin],
+    row_ids: MutPointer[Int32, MutAnyOrigin],
+    labels_q: MutPointer[Int32, MutAnyOrigin],
+    num_outputs_in: Int32,
+    inv_scale: Float32,
+    sabotage_in: Int32,
+    row_w: MutPointer[Int32, MutAnyOrigin],
+):
+    """The classification leaf pass with row weights (lane sk-kernels)."""
+    _leaf_body[TPB, MAX_OUT, True, zero_fill, True](
+        out_leaves,
+        out_visit,
+        nodes,
+        instance_ranges,
+        row_ids,
+        labels_q,
+        num_outputs_in,
+        inv_scale,
+        sabotage_in,
+        row_w,
+    )
+
+
+def leaf_weighted_reg_kernel[TPB: Int, MAX_OUT: Int, zero_fill: Bool = False](
+    out_leaves: MutPointer[Float32, MutAnyOrigin],
+    out_visit: MutPointer[Int32, MutAnyOrigin],
+    nodes: MutPointer[SparseTreeNode[DType.float32], MutAnyOrigin],
+    instance_ranges: MutPointer[InstanceRange, MutAnyOrigin],
+    row_ids: MutPointer[Int32, MutAnyOrigin],
+    labels_q: MutPointer[Int32, MutAnyOrigin],
+    num_outputs_in: Int32,
+    inv_scale: Float32,
+    sabotage_in: Int32,
+    row_w: MutPointer[Int32, MutAnyOrigin],
+):
+    """The regression leaf pass with row weights (lane sk-final): the
+    weighted mean `Z / W` of each leaf, rescaled by `inv_scale`."""
+    _leaf_body[TPB, MAX_OUT, False, zero_fill, True](
+        out_leaves,
+        out_visit,
+        nodes,
+        instance_ranges,
+        row_ids,
+        labels_q,
+        num_outputs_in,
+        inv_scale,
+        sabotage_in,
+        row_w,
+    )

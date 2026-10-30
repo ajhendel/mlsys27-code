@@ -1,0 +1,2443 @@
+"""Brute-force k-nearest-neighbors: their DISPATCH, and their FALLBACK.
+
+Reference: `cuvs/src/neighbors/detail/knn_brute_force.cuh` (cuVS `94c2819`):
+`brute_force_knn_impl`'s dispatch (`:443-447`) and `tiled_brute_force_knn`
+(`:69-340`). Partial.
+
+WHAT THEIR DISPATCH DOES, WHICH IS NOT WHAT THIS FILE USED TO SAY
+------------------------------------------------------------------
+`brute_force_knn_impl` chooses between two entirely different algorithms at
+`:443`:
+
+    if (k <= 64 && rowMajorQuery == rowMajorIndex && rowMajorQuery == true &&
+        (metric == L2Unexpanded || L2SqrtUnexpanded ||
+         L2Expanded  || L2SqrtExpanded)) {
+      fusedL2Knn(...);                       // fused_l2_knn.cuh
+    } else {
+      switch (metric) {
+        case Haversine: haversine_knn(...);  // not implemented
+        default:        tiled_brute_force_knn(...);
+      }
+    }
+
+`tiled_brute_force_knn` is the **else**. For k <= 64 on row-major L2 - which
+is every k-NN measurement this repository has ever taken - cuVS runs
+`fusedL2Knn`, and until 2026-08-19 this tree had implemented only the fallback and
+compared it against scikit-learn as though it were their algorithm. That is
+now `neighbors/impl/detail/fused_l2_knn.mojo`, and
+`brute_force_knn_impl` below is their dispatch rather than a direct call to
+whichever function we happened to own.
+
+The two paths are not interchangeable and the difference is structural, not a
+constant factor. This one MATERIALIZES a `tile_rows x n_index` distance
+matrix: the GEMM writes it, the epilogue reads and rewrites it, and the
+selector reads it a third time. At 400,000 index points and
+`bench/scaling_main.mojo:46`'s tile of 256 that is 409.6 MB per tile, about
+23 GB of traffic across the run to carry 51.2 GFLOP of arithmetic. The fused
+kernel never writes it at all.
+
+WHAT IS THEIRS ON THIS PATH
+----------------------------
+- `cuvs::distance::pairwise_distance` at `:172-183` is cuBLAS underneath, and
+  cuBLAS has no source to implement, so this calls `linalg.matmul` through
+  `core/gemm.mojo::gemm_nt`. That substitution is legitimate HERE and only
+  here, because a materialized distance matrix is what their own fallback
+  asks for on this path.
+- `cuvs::selection::select_k` at `:265` and `:305`. Their `select_k`
+  dispatches (`raft/matrix/detail/select_k-inl.cuh:47-72`) to WARPSORT for
+  `2 < k <= 256` and to RADIX only above that, so radix is their second
+  choice across the whole practical range. `select_radix.mojo` is implemented and
+  is the selector here; `nn.topk.top_k` stays reachable behind
+  `use_vendor_topk` as a second opinion the implemented selector can be checked
+  against, and `neighbors/checks/knn_check.mojo` runs that comparison.
+- `raft::linalg::rowNorm` at `:110-146` -> `core/row_norms.mojo`, hoisted out
+  of the tile loop exactly as their comment at `:107-109` says.
+- The L2 epilogue at `:184-205` is `raft::linalg::map_offset` over their
+  `l2_exp_cutlass_op`. That is RAFT's own portable elementwise map, so it is
+  an implementation and not a substitution: `core/expand_distances.mojo`. It is MISSING
+  one of the op's two clamp clauses; see the lane file.
+
+WHAT IS NOT IMPLEMENTED
+------------------
+Their `DistanceEpilogue` template, the bitmap/bitset filters at `:229-256`,
+the sparse and non-expanded metrics, `haversine_knn`, and the multi-index
+merge (`knn_merge_parts`). See `neighbors/NOT_IMPLEMENTED.tsv`.
+"""
+from experiments.classical_identical_ideas.shared_controls import C06_ROWS_ON
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 the authors. Part of anonlib, DOI-WITHHELD
+
+
+from max.gpu.host import DeviceBuffer, DeviceContext, HostBuffer
+from std.sys.compile import is_defined
+from std.ffi import _Global
+from std.time import perf_counter_ns
+from std.atomic import Atomic, Ordering
+from std.os import getenv
+
+from experiments.classical_identical_ideas.graph_controls import KNN_DIRECT_DISTANCE
+from core.expand_distances import expand_distances_kernel
+from core.device_fold import device_compact_equal_i32
+from core.column_stats import CUDA_MAX_GRID_YZ, TRANSPOSE_TILE, transpose_kernel
+from core.gemm import gemm_nt
+from core.row_norms import NORM_TPB, row_norm_kernel, enqueue_row_norms
+from checks.kernel_matrix import (
+    K_LIB_SELECT_WARPSORT,
+    TARGET_COLUMN,
+    COLUMN_NVIDIA,
+    knn_nvidia_schedule_column,
+    knn_auto_follows_their_dispatch_for,
+    knn_distance_register_tile_for,
+    knn_distance_metadata_for,
+    knn_distance_metadata_default_for,
+    knn_index_tile_columns_for,
+    knn_smallk_select_for,
+    knn_transposed_index_for,
+    knn_warpsort_select_for,
+    lib_block_size_for,
+    lib_lane_width_for,
+)
+from checks.numerics import (
+    GLOBAL_NUMERIC_MODE,
+    NUMERIC_IDENTICAL,
+    PIN_DETERMINISM,
+    numeric_mode_name,
+)
+from neighbors.checks.pinned_distance_tile import (
+    PINNED_TILE_TPB,
+    RT_ROWS,
+    RT_TILE_COLS,
+    RT_TPB,
+    pinned_distance_register_tile_kernel,
+    vector_exponent_admission_kernel,
+    vector_exponent_minimum_kernel,
+    pinned_distance_tile_kernel,
+    pinned_distance_tile_direct_kernel,
+)
+from checks.kernel_matrix import knn_distance_exact_chain_for, knn_fused_distance_select_for, knn_radix_scratch_shrink_for
+from checks.kernel_matrix import knn_smem_distance_tile_for, knn_smem_min_features_for, knn_block_topk_select_for, KNN_BLOCK_TOPK_MAX_K
+from checks.kernel_matrix import knn_selector_bound_compact_for, KNN_SELECTOR_BOUND_MIN_K
+from checks.kernel_matrix import knn_resident_derived_cache_for
+from checks.kernel_matrix import knn_block_topk_bounded_for, KNN_BOUNDED_FIRST_TILE
+from neighbors.checks.knn_selector_bound_compact import bound_compact_select_launch, bound_compact_lists_launch
+from neighbors.checks.fused_distance_select_identical import fused_distance_select_launch
+from neighbors.checks.smem_distance_tile import (
+    SMT_MAX_K,
+    partial_keys_select_launch,
+    smem_block_topk_launch,
+    smem_distance_tile_launch,
+    smem_tile_col_blocks,
+)
+
+# DEVIATION 2629 (kernel-matrix row `knn_distance_exact_chain_for`): the
+# transposed register-tile distance admits tiles whose request-local exponent
+# metadata proves the per-step flush is the identity to the unflushed chain.
+# OPT-IN ONLY (`-D ANONLIB_EXPERIMENTAL_KNN_EXACT_CHAIN=1`): measured neutral
+# on the H100 2026-09-11 with every output bit equal, so the row is off and
+# this build folds to the pre-2629 path.
+comptime KNN_EXACT_CHAIN = knn_distance_exact_chain_for[
+    TARGET_COLUMN, GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL
+]()
+from neighbors.checks.select_radix_identical import (
+    radix_topk_identical_kernel,
+    select_radix_identical_rounds_launch,
+    wide_topk_merge_launch,
+    IDENTICAL_MAX_K,
+)
+from neighbors.checks.select_smallk_identical_candidate import (
+    SMALLK_MAX_K,
+    partial_topk_merge_launch,
+    smallk_select_arm_from_env,
+    smallk_select_launch,
+)
+from neighbors.checks.transposed_index_distance_candidate import transposed_index_distance_kernel
+from neighbors.checks.apple_mma_distance import (
+    AMD_BM,
+    AMD_BN,
+    AMD_NT,
+    apple_mma_distance_tile_kernel,
+)
+from gemm.checks.gemm_identical import APPLE_MMA
+from layout import TileTensor
+from layout.tile_layout import row_major
+from nn.topk import top_k
+
+# THE IDENTICAL k-NN ROUTING ROWS, read from the kernel matrix since
+# 2026-09-09. The names are kept because the bench and check drivers print
+# them; their values are per column now (NVIDIA and AMD on by default, Apple
+# off until measured), with `-D ANONLIB_EXPERIMENTAL_SMALLK_IDENTICAL=1` /
+# `-D ANONLIB_EXPERIMENTAL_KNN_TRANSPOSE_IDENTICAL=1` forcing a row ON and
+# `-D ANONLIB_KNN_IDENTICAL_LEGACY_SELECT=1` /
+# `-D ANONLIB_KNN_IDENTICAL_LEGACY_LAYOUT=1` forcing it OFF on any column.
+# FAST never enters either.
+comptime IDENTICAL_BUILD = GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL
+comptime EXPERIMENTAL_SMALLK_IDENTICAL = knn_smallk_select_for[
+    TARGET_COLUMN, IDENTICAL_BUILD
+]()
+comptime EXPERIMENTAL_KNN_TRANSPOSE_IDENTICAL = knn_transposed_index_for[
+    TARGET_COLUMN, IDENTICAL_BUILD
+]()
+comptime KNN_REGISTER_TILE_IDENTICAL = knn_distance_register_tile_for[
+    TARGET_COLUMN, IDENTICAL_BUILD
+]()
+comptime KNN_PREFLIGHT_METADATA = knn_distance_metadata_for[TARGET_COLUMN, IDENTICAL_BUILD]()
+comptime KNN_PREFLIGHT_METADATA_DEFAULT = knn_distance_metadata_default_for[TARGET_COLUMN, IDENTICAL_BUILD]()
+
+# Large-request gate for the vector index transport and the preflight
+# metadata default. Both add a fixed cost (alignment branches; two
+# O((n_queries + n_index) x n_features) minimum passes) that only pays back
+# over the n_queries x n_index distance cells, so they admit any request
+# with at least KNN_LARGE_MIN_QUERIES query rows (eight 128-row query tiles,
+# enough to fill the SMs/CUs several times over) and KNN_LARGE_MIN_INDEX
+# index rows (the index no longer fits one small column tile), at small k.
+# Replacement rule is UNMEASURED.
+comptime KNN_LARGE_MIN_QUERIES = 1024
+comptime KNN_LARGE_MIN_INDEX = 65536
+
+
+@always_inline
+def knn_large_request(n_index: Int, n_queries: Int, n_features: Int, k: Int) -> Bool:
+    comptime if is_defined["ANONLIB_LEGACY_SHAPE_KNN_BOARD"]():
+        # LEGACY (default OFF): the exact knn board shape (400k index,
+        # 4k queries, 32 features, k in {10, 15}). Removed Oct 4 as
+        # benchmark-shape tuning; the size rule below is unmeasured.
+        # This define exists ONLY as the B arm of the owed removal A/B
+        # (A = size rule, B = -D ANONLIB_LEGACY_SHAPE_KNN_BOARD), timed on
+        # NVIDIA + AMD over neighboring shapes and one non-board dataset:
+        # experiments/six_lane_integration/grid_controls/classical-misc.json
+        # `owed_removal_ab`. Gates only NVIDIA vector index loads and Apple
+        # preflight metadata (both bit-neutral). Delete it once that A/B lands.
+        # Never enable it in a shipped build.
+        return n_index == 400000 and n_queries == 4000 and n_features == 32 and (k == 10 or k == 15)
+    # merge 2026-10-05: main's KNN_LARGE_MIN_* rule and the IDENTICAL lane's
+    # pair-count rule both replaced the board shape; the IDENTICAL lane's
+    # `knn_large_request(n_index, n_queries)` (below) is the one rule, the
+    # legacy board-shape arm above stays. KNN_LARGE_MIN_* are kept for reference.
+    return knn_large_request(n_index, n_queries)
+comptime KNN_INDEX_TILE_IDENTICAL = knn_index_tile_columns_for[
+    TARGET_COLUMN, IDENTICAL_BUILD
+]()
+# PER-LAUNCH-CLASS HOST TIMERS, 2026-09-09 (lane/knn-selector). Off unless
+# `-D ANONLIB_KNN_PHASE_TIMERS=1`: then the tiled arm synchronizes after
+# every launch class (transpose, distance tile, selection, partial merge)
+# and prints one `KNN_PHASE_TIMERS` line per request with the milliseconds
+# and launch count of each class. The synchronizations serialize the queue,
+# so a timed request is slower than an untimed one; the split, not the sum,
+# is the measurement. Never on in a shipped build.
+comptime KNN_PHASE_TIMERS = is_defined["ANONLIB_KNN_PHASE_TIMERS"]()
+#: lane/apple-identical-neural (2026-09-27): Apple IDENTICAL's expanded-L2
+#: distance tile on the simdgroup matrix unit, same bits as the register
+#: tile (`neighbors/checks/apple_mma_distance.mojo`).
+#: `-D ANONLIB_KNN_APPLE_MMA_OFF` keeps the register tile.
+comptime KNN_APPLE_MMA_DIST = (
+    APPLE_MMA
+    and GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL
+    and not is_defined["ANONLIB_KNN_APPLE_MMA_OFF"]()
+)
+
+
+#: lane/neighbors-apple (2026-09-28): Apple IDENTICAL expanded-L2 k-NN
+#: takes its candidates from the simdgroup-matrix arm and its answer from
+#: the pinned chain under a per-query certificate; an uncertified query is
+#: answered by the tiled arm (`neighbors/impl/detail/certified_mma_knn.mojo`).
+#: Same keys, same bits. `-D ANONLIB_KNN_CERTIFIED_MMA_OFF` keeps the
+#: tiled arm for every query.
+# I15 M3 2026-10-06 measured Apple-only public KNN component: n100000/q2000/
+# d8/k8 baseline19.793ms candidate10.354ms (B/A0.5231); n131071/q1024/d17/k16
+# baseline20.326ms candidate14.339ms (0.7055). One same-process warmup+score;
+# timingdriver f32549d28, ab-20261006/repairs-i15-f32549d28. Prior identity
+# evidence reused, no new numerical oracle or cross-vendor IDENTICAL vote.
+# Confirm existing Apple-only default; keep OFF escape. No default change.
+comptime KNN_CERTIFIED_MMA = (
+    GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL
+    and TARGET_COLUMN == COLUMN_APPLE
+    # I15 2026-10-06: NVIDIA/AMD have NO_DISTINCT_RUNTIME_ARM (Apple-only guard).
+    # Recorded cloud timings are not A/B evidence; Apple qualification remains pending.
+    and not is_defined["ANONLIB_KNN_CERTIFIED_MMA_OFF"]()
+)
+# Experimental metadata only: no new query route or device work. This
+# serial campaign counter uses the exact fallback total already read by
+# the existing driver and is absent from ordinary builds.
+struct _CertifiedReach(Defaultable,Movable):
+    var calls: Int
+    var queries: Int
+    var fallback: Int
+    def __init__(out self):
+        self.calls=0; self.queries=0; self.fallback=0
+comptime _CERTIFIED_REACH = _Global[StorageType=_CertifiedReach,
+    name="AnonlibCertifiedKnnReachV1",init_fn=_CertifiedReach.__init__]
+
+# I15 experiment qualification pending: compile/fixtures do not establish
+# four-column identity or NVIDIA+AMD full-operation speed. Existing promoted
+# defaults stay unchanged; this campaign attributes explicit experiment arms.
+def certified_knn_reach_clear() raises:
+    # NEVER RUN — PENDING MEASUREMENT
+    comptime if is_defined["ANONLIB_IDN_KNN_CERTIFIED_REACH"]():
+        var p=_CERTIFIED_REACH.get_or_create_ptr()
+        p[].calls=0; p[].queries=0; p[].fallback=0
+
+def certified_knn_reach_read() raises -> InlineArray[Int,3]:
+    var values=InlineArray[Int,3](fill=0)
+    # NEVER RUN — PENDING MEASUREMENT
+    comptime if is_defined["ANONLIB_IDN_KNN_CERTIFIED_REACH"]():
+        var p=_CERTIFIED_REACH.get_or_create_ptr()
+        values[0]=p[].calls; values[1]=p[].queries; values[2]=p[].fallback
+    return values^
+
+comptime CERT_MAX_K = 24
+comptime CERT_MAX_D = 32
+
+
+def identical_index_tile(n_index: Int) -> Int:
+    """How many index columns one distance tile holds on this build.
+
+    `n_index` unless the build tiles the index axis (IDENTICAL, kernel-matrix
+    row `knn_index_tile_columns_for`), in which case the row's width. The
+    estimator sizes `dist_tile` from this, so a 400,000-point index no longer
+    needs a 409 MB tile per 256 queries.
+    """
+    comptime if KNN_INDEX_TILE_IDENTICAL > 0:
+        if n_index > KNN_INDEX_TILE_IDENTICAL:
+            return KNN_INDEX_TILE_IDENTICAL
+    return n_index
+
+
+from neighbors.impl.matrix.detail.select_radix import (
+    SELECT_BLOCK,
+    radix_topk_one_block_kernel,
+)
+from neighbors.impl.matrix.detail.select_warpsort import (
+    MAX_CAPACITY,
+    warpsort_topk_block_kernel,
+)
+from neighbors.impl.detail.fused_l2_knn import (
+    FKNN_MAX_NN,
+    fused_l2_knn,
+    fused_l2_knn_grid,
+)
+from neighbors.impl.detail.fast_mma_knn import (
+    FAST_MMA_KNN_ENABLED,
+    fast_mma_knn,
+    fast_mma_knn_applies,
+)
+from neighbors.impl.detail.certified_mma_knn import (
+    CERT_TPB,
+    certified_rescore_kernel,
+    gather_rows_kernel,
+    scatter_rows_f32_kernel,
+    scatter_rows_u32_kernel,
+)
+from checks.kernel_matrix import COLUMN_APPLE
+from neighbors.impl.detail.fast_topk_knn import (
+    FAST_TOPK_KNN_ENABLED,
+    fast_topk_knn,
+    fast_topk_knn_applies,
+)
+from neighbors.impl.distance.detail.distance_ops import (
+    COSINE_NORM_TPB,
+    DIST_COSINE_EXPANDED,
+    DIST_L1,
+    DIST_L2_EXPANDED,
+    DIST_L2_SQRT_EXPANDED,
+    DIST_L2_SQRT_UNEXPANDED,
+    DIST_L2_UNEXPANDED,
+    DIST_LINF,
+    DIST_LP_UNEXPANDED,
+    METRIC_ELEM_TPB,
+    cosine_epilog_kernel,
+    cosine_row_norm_kernel,
+    metric_distance_kernel,
+    metric_is_known,
+    metric_norm_takes_sqrt,
+    metric_uses_norms,
+)
+
+
+# DEVIATION 2667 (kernel-matrix row `knn_fused_distance_select_for`): the
+# transposed IDENTICAL arm computes each column tile's distances inside the
+# small-k selector, one launch and no distance matrix. It needs every row it
+# replaces to be on (transpose, register tile, small-k selector) and none of
+# the opt-in distance variants whose chains it does not carry (Apple's
+# request-local metadata, DEVIATION 2629's exact chain), and trial builds
+# keep the two-launch form so a selector arm from the environment still runs.
+comptime KNN_FUSED_SELECT = (
+    knn_fused_distance_select_for[TARGET_COLUMN, IDENTICAL_BUILD]()
+    and EXPERIMENTAL_SMALLK_IDENTICAL
+    and EXPERIMENTAL_KNN_TRANSPOSE_IDENTICAL
+    and KNN_REGISTER_TILE_IDENTICAL
+    and not KNN_PREFLIGHT_METADATA
+    and not KNN_PREFLIGHT_METADATA_DEFAULT
+    and not KNN_EXACT_CHAIN
+    # NEVER RUN — PENDING MEASUREMENT
+    and not is_defined["ANONLIB_KNN_SELECT_TRIAL"]()
+)
+# DEVIATION 2631 (kernel-matrix row `knn_radix_scratch_shrink_for`).
+comptime KNN_RADIX_SCRATCH_SHRINK = (
+    knn_radix_scratch_shrink_for[TARGET_COLUMN, IDENTICAL_BUILD]()
+    and EXPERIMENTAL_SMALLK_IDENTICAL
+)
+# DEVIATION 3000 (kernel-matrix row `knn_smem_distance_tile_for`): the
+# transposed IDENTICAL arm's distance tile through shared memory. It carries
+# the register tile's chain and DEVIATION 2629's exact-chain admission (per
+# block, from the same request-local metadata); the Apple metadata variant
+# keeps the register tile and the fused select (2667) keeps its own.
+comptime KNN_SMEM_TILE = (
+    knn_smem_distance_tile_for[TARGET_COLUMN, IDENTICAL_BUILD]()
+    and EXPERIMENTAL_KNN_TRANSPOSE_IDENTICAL
+    and KNN_REGISTER_TILE_IDENTICAL
+    and not KNN_PREFLIGHT_METADATA
+    and not KNN_PREFLIGHT_METADATA_DEFAULT
+    and not KNN_FUSED_SELECT
+)
+# DEVIATION 3001 (kernel-matrix row `knn_block_topk_select_for`): the
+# shared-memory tile pops its rows' top-k in the block and a key selector
+# replaces the matrix and the small-k selector's read of it.
+comptime KNN_BLOCK_TOPK = (
+    knn_block_topk_select_for[TARGET_COLUMN, IDENTICAL_BUILD]()
+    and KNN_SMEM_TILE
+    and EXPERIMENTAL_SMALLK_IDENTICAL
+    # NEVER RUN — PENDING MEASUREMENT
+    and not is_defined["ANONLIB_KNN_SELECT_TRIAL"]()
+)
+
+# DEVIATION 3000's measured runtime width gate. On AMD, rows narrower than
+# two 16-feature slices keep the register path; NVIDIA's route is unchanged.
+comptime KNN_SMEM_MIN_FEATURES = knn_smem_min_features_for[
+    TARGET_COLUMN, IDENTICAL_BUILD
+]()
+
+
+# DEVIATION 3061 (kernel-matrix row `knn_resident_derived_cache_for`).
+comptime KNN_RESIDENT_CACHE = knn_resident_derived_cache_for[TARGET_COLUMN, IDENTICAL_BUILD]()
+comptime KNN_RESIDENT_CACHE_SABOTAGE = is_defined["ANONLIB_KNN_RESIDENT_CACHE_SABOTAGE"]()
+
+
+struct KnnIndexCache(Movable):
+    """What a search derives from a resident index's device bytes ALONE
+    (DEVIATION 3061): the transposed layout, the index row norms and
+    DEVIATION 2629's per-row admission metadata. Owned by the resident
+    entry, on the entry's context, built lazily by the search that first
+    needs each one with the kernels a per-call search launches, and dropped
+    with the entry (before its context). `norm_takes_sqrt` names which norm
+    `index_norm` holds (cosine's true norm or L2's squared norm); a search
+    with the other metric rebuilds it."""
+
+    var transposed: Optional[DeviceBuffer[DType.float32]]
+    var y_meta: Optional[DeviceBuffer[DType.float32]]
+    var index_norm: Optional[DeviceBuffer[DType.float32]]
+    var norm_takes_sqrt: Bool
+    # K4 (KNN_SCRATCH_POOL): the per-search scratch, kept at its high-water
+    # size and handed out as exact-length sub-buffers. Scratch, not derived
+    # data: every search writes each cell it reads before reading it.
+    var pool_queries: Optional[DeviceBuffer[DType.float32]]
+    var pool_query_norm: Optional[DeviceBuffer[DType.float32]]
+    var pool_index_norm: Optional[DeviceBuffer[DType.float32]]
+    var pool_dist_tile: Optional[DeviceBuffer[DType.float32]]
+    var pool_buf_val: Optional[DeviceBuffer[DType.float32]]
+    var pool_buf_idx: Optional[DeviceBuffer[DType.uint32]]
+    var pool_out_dist: Optional[DeviceBuffer[DType.float32]]
+    var pool_out_idx: Optional[DeviceBuffer[DType.uint32]]
+    var pool_out_i32: Optional[DeviceBuffer[DType.int32]]
+    var pool_host_dist: Optional[HostBuffer[DType.float32]]
+    var pool_host_idx: Optional[HostBuffer[DType.uint32]]
+    #: elements held by each pinned stage (0 = none yet)
+    var pool_host_dist_cap: Int
+    var pool_host_idx_cap: Int
+    #: 1 while a search holds the pool; a second concurrent search on the
+    #: same handle takes the per-call allocations. A search that raises
+    #: leaves it held, which only turns the pool off for that handle.
+    var pool_busy: Int64
+
+    def __init__(out self):
+        self.transposed = Optional[DeviceBuffer[DType.float32]]()
+        self.y_meta = Optional[DeviceBuffer[DType.float32]]()
+        self.index_norm = Optional[DeviceBuffer[DType.float32]]()
+        self.norm_takes_sqrt = False
+        self.pool_queries = Optional[DeviceBuffer[DType.float32]]()
+        self.pool_query_norm = Optional[DeviceBuffer[DType.float32]]()
+        self.pool_index_norm = Optional[DeviceBuffer[DType.float32]]()
+        self.pool_dist_tile = Optional[DeviceBuffer[DType.float32]]()
+        self.pool_buf_val = Optional[DeviceBuffer[DType.float32]]()
+        self.pool_buf_idx = Optional[DeviceBuffer[DType.uint32]]()
+        self.pool_out_dist = Optional[DeviceBuffer[DType.float32]]()
+        self.pool_out_idx = Optional[DeviceBuffer[DType.uint32]]()
+        self.pool_out_i32 = Optional[DeviceBuffer[DType.int32]]()
+        self.pool_host_dist = Optional[HostBuffer[DType.float32]]()
+        self.pool_host_idx = Optional[HostBuffer[DType.uint32]]()
+        self.pool_host_dist_cap = 0
+        self.pool_host_idx_cap = 0
+        self.pool_busy = 0
+
+
+# K4 (lane fg-knn-nb, 2026-10-09): `-D ANONLIB_KNN_SCRATCH_POOL_OFF=1`
+# restores the per-call allocations. DEFAULT ON (a waste removal): a search
+# over a resident index used to create and free, on every call, the query
+# copy, both norm vectors, the `query_tile x index_tile` distance tile
+# (1 GiB at a 4096 x 65,536 tile), the `query_tile x 2 x buf_len` radix
+# pairs, three output vectors and two pinned readback buffers: about ten
+# allocations and frees per call, hundreds of MB, which ROCm serves 10-100x
+# slower than CUDA. With the pool they are made once at the handle's
+# high-water size and each call takes exact-length sub-buffers (no
+# allocation), so nothing downstream sees a longer buffer than before. Bits:
+# none (every cell is written before it is read on both paths). The pool is
+# owned by the resident entry, dropped with it before its context, and only
+# used on a single-device search; a call that keeps its device indices takes
+# a fresh `out_idx` (it is moved out to the caller).
+comptime KNN_SCRATCH_POOL = not is_defined["ANONLIB_KNN_SCRATCH_POOL_OFF"]()
+
+
+def knn_pool_view[dtype: DType](
+    ctx: DeviceContext, mut slot: Optional[DeviceBuffer[dtype]], n: Int,
+) raises -> DeviceBuffer[dtype]:
+    """An exact-length `n` view of the pooled buffer `slot`, growing the
+    slot (one allocation) only when `n` is above its high-water length. A
+    non-positive `n` gets its own buffer, as the per-call path made it."""
+    if n <= 0:
+        return ctx.enqueue_create_buffer[dtype](n)
+    if not slot or len(slot.value()) < n:
+        # Grow: drain queued work that may still read the buffer this
+        # assignment releases (gemm/host_transport.mojo's rule).
+        ctx.synchronize()
+        slot = ctx.enqueue_create_buffer[dtype](n)
+    return slot.value().create_sub_buffer[dtype](0, n)
+
+
+def knn_pool_acquire(cache: MutPointer[KnnIndexCache, MutAnyOrigin]) -> Bool:
+    """Take the handle's scratch pool; False when another search holds it."""
+    var flag = UnsafePointer(to=cache[].pool_busy)
+    var old = Atomic.fetch_add[ordering = Ordering.SEQUENTIAL](flag, Int64(1))
+    if old == 0:
+        return True
+    _ = Atomic.fetch_add[ordering = Ordering.SEQUENTIAL](flag, Int64(-1))
+    return False
+
+
+def knn_pool_release(cache: MutPointer[KnnIndexCache, MutAnyOrigin]):
+    var flag = UnsafePointer(to=cache[].pool_busy)
+    _ = Atomic.fetch_add[ordering = Ordering.SEQUENTIAL](flag, Int64(-1))
+
+
+def knn_pool_host_dist(
+    ctx: DeviceContext, cache: MutPointer[KnnIndexCache, MutAnyOrigin], n: Int,
+) raises -> MutPointer[Float32, MutAnyOrigin]:
+    """The handle's pinned distance readback stage, at least `n` (>= 1)
+    floats, grown only past its high-water length; read by pointer only."""
+    var want = n if n > 0 else 1
+    if not cache[].pool_host_dist or cache[].pool_host_dist_cap < want:
+        ctx.synchronize()
+        cache[].pool_host_dist = ctx.enqueue_create_host_buffer[DType.float32](want)
+        cache[].pool_host_dist_cap = want
+        ctx.synchronize()
+    return cache[].pool_host_dist.value().unsafe_ptr().unsafe_origin_cast[MutAnyOrigin]()
+
+
+def knn_pool_host_idx(
+    ctx: DeviceContext, cache: MutPointer[KnnIndexCache, MutAnyOrigin], n: Int,
+) raises -> MutPointer[UInt32, MutAnyOrigin]:
+    """The handle's pinned index readback stage (as `knn_pool_host_dist`)."""
+    var want = n if n > 0 else 1
+    if not cache[].pool_host_idx or cache[].pool_host_idx_cap < want:
+        ctx.synchronize()
+        cache[].pool_host_idx = ctx.enqueue_create_host_buffer[DType.uint32](want)
+        cache[].pool_host_idx_cap = want
+        ctx.synchronize()
+    return cache[].pool_host_idx.value().unsafe_ptr().unsafe_origin_cast[MutAnyOrigin]()
+
+
+comptime KnnIndexCachePointer = Optional[MutPointer[KnnIndexCache, MutAnyOrigin]]
+
+
+def cached_index_norm_ready(
+    ctx: DeviceContext,
+    cache: MutPointer[KnnIndexCache, MutAnyOrigin],
+    mut index: DeviceBuffer[DType.float32],
+    n_index: Int, n_features: Int, metric: Int,
+) raises:
+    """Make `cache[].index_norm` the metric's index row norms, computing them
+    with `compute_norms_for_metric` when absent or when they are the other
+    metric's. `metric` is resolved and uses norms."""
+    var takes_sqrt = metric_norm_takes_sqrt(metric)
+    if cache[].index_norm and cache[].norm_takes_sqrt == takes_sqrt:
+        return
+    if not cache[].index_norm:
+        cache[].index_norm = ctx.enqueue_create_buffer[DType.float32](n_index)
+    compute_norms_for_metric(ctx, index, cache[].index_norm.value(), n_index, n_features, metric)
+    cache[].norm_takes_sqrt = takes_sqrt
+
+
+def _cache_sabotage_kernel(transposed: MutPointer[Float32, MutAnyOrigin]):
+    """Reach control, never shipped: feature 0 of index row 0 becomes 1e30."""
+    transposed.unsafe_store(0, Float32(1.0e30))
+
+
+# DEVIATION 3060 (kernel-matrix row `knn_selector_bound_compact_for`): a
+# column tile's top-k for k >= KNN_SELECTOR_BOUND_MIN_K through the
+# bound-and-compact selector. Trial builds keep the small-k selector so a
+# selector arm from the environment still runs.
+comptime KNN_SELECTOR_BOUND = (
+    knn_selector_bound_compact_for[TARGET_COLUMN, IDENTICAL_BUILD]()
+    and EXPERIMENTAL_SMALLK_IDENTICAL
+    # NEVER RUN — PENDING MEASUREMENT
+    and not is_defined["ANONLIB_KNN_SELECT_TRIAL"]()
+)
+
+
+# TOMBSTONE: ANONLIB_KNN_IDENTICAL_WIDEK_RADIX (DROPPED-slower) deleted 2026-10-10 by lane/postmerge-act-6; code recoverable at 9f83ea479.
+# Tried: K2 (lane fg-knn-nb): on a 64-lane column, column-tile top-k for k >= 17 by the block radix selector instead of the small-k / bound-and-compact selectors (knn_widek_radix_applies); AMD knn istella 1.12x / taxi 1.31x slower, NV 0.99-1.00x (fg2 amd a1161-a1190, nv2 v1021-v1050), recall and hashes unchanged.
+# Restore: git apply experiments/removed/ANONLIB_KNN_IDENTICAL_WIDEK_RADIX.patch; record in docs/TOMBSTONES.md.
+
+
+# DEVIATION 3062 (kernel-matrix row `knn_block_topk_bounded_for`): the block
+# top-k's rank loop bounded by the running top-k on every column tile after
+# the first, its lists sentinel-terminated, and every 1 <= k <= 64 served.
+comptime KNN_BLOCK_TOPK_BOUNDED = (
+    knn_block_topk_bounded_for[TARGET_COLUMN, IDENTICAL_BUILD]() and KNN_BLOCK_TOPK
+)
+comptime KNN_BLOCK_TOPK_LIMIT = SMT_MAX_K if KNN_BLOCK_TOPK_BOUNDED else KNN_BLOCK_TOPK_MAX_K
+
+
+def fused_select_applies(
+    n_index: Int, n_features: Int, k: Int, metric: Int, use_vendor_topk: Bool
+) -> Bool:
+    """Whether a transposed IDENTICAL request takes the fused distance and
+    selection launch (DEVIATION 2667) on every column tile. `metric` is the
+    RESOLVED metric. The caller also needs the transposed layout, which
+    `tiled_brute_force_knn` builds for exactly these metrics and shapes."""
+    comptime if KNN_FUSED_SELECT:
+        return (
+            not use_vendor_topk
+            and (metric == DIST_L2_EXPANDED or metric == DIST_L2_SQRT_EXPANDED)
+            and k >= 1 and k <= SMALLK_MAX_K and k <= n_index
+            and n_features > 0 and n_features <= 2147483647
+            and n_index <= 2147483647
+        )
+    return False
+
+
+def block_topk_applies(
+    n_index: Int, n_features: Int, k: Int, metric: Int, use_vendor_topk: Bool
+) -> Bool:
+    """Whether a transposed IDENTICAL request takes the block top-k
+    (DEVIATION 3001) on every column tile and so writes no distance
+    matrix. `metric` is the RESOLVED metric."""
+    comptime if KNN_BLOCK_TOPK:
+        return (
+            not use_vendor_topk
+            and (metric == DIST_L2_EXPANDED or metric == DIST_L2_SQRT_EXPANDED)
+            and k >= 1 and k <= SMT_MAX_K and k <= KNN_BLOCK_TOPK_LIMIT and k <= n_index
+            and n_features >= KNN_SMEM_MIN_FEATURES and n_features <= 2147483647
+            and n_index <= 2147483647
+        )
+    return False
+
+
+#: The large-request scope of two per-request transports in the tiled arm
+#: (2026-10-04; it replaced an exact `n_index == 400000 and n_queries ==
+#: 4000 and n_features == 32 and k in {10, 15}` key, the benchmark row):
+#: NVIDIA's vector index loads and Apple's request-local exponent metadata.
+#: Neither changes arithmetic (same chain, same bits), only cost:
+#: - vector loads save a fixed fraction of the per-(query, column) distance
+#:   pass (3.1-3.6% measured, bench/results/knn_vector_request_2026-09-10),
+#:   independent of d and k; the pass must be long enough that the saving
+#:   is above launch jitter;
+#: - the metadata costs two O((n_queries + n_index) x d) minima launches and
+#:   saves repairs over n_queries x n_index x d pair work, so it pays when
+#:   every index row's minimum is reused by many queries.
+#: Rule: at least KNN_LARGE_REQUEST_MIN_QUERIES queries and at least
+#: KNN_LARGE_REQUEST_MIN_PAIRS (query, index) pairs. Range values, not
+#: measured at their edges: needs neighbor-shape validation.
+comptime KNN_LARGE_REQUEST_MIN_QUERIES = 1024
+comptime KNN_LARGE_REQUEST_MIN_PAIRS = 1 << 28
+
+
+def knn_large_request(n_index: Int, n_queries: Int) -> Bool:
+    """Whether a request is large enough for the per-request transports
+    above. Size-derived; no exact-shape keys."""
+    return (
+        n_queries >= KNN_LARGE_REQUEST_MIN_QUERIES
+        and n_index * n_queries >= KNN_LARGE_REQUEST_MIN_PAIRS
+    )
+
+
+def tiled_radix_scratch_len(n_index: Int, k: Int) -> Int:
+    """`buf_len`, the radix scratch pairs per query row the tiled arm is
+    given: `n_index // 8` (at least `k`) historically. DEVIATION 2631: where
+    the small-k selector serves every column tile (k <= 64 on a column whose
+    `knn_radix_scratch_shrink_for` row is on) the radix kernel is never
+    launched, so the scratch is `k` pairs and 800 MB per 2,048-row tile is
+    not allocated."""
+    var buf_len = n_index // 8
+    if buf_len < k:
+        buf_len = k
+    comptime if KNN_RADIX_SCRATCH_SHRINK:
+        # TOMBSTONE: ANONLIB_KNN_IDENTICAL_WIDEK_RADIX (DROPPED-slower) deleted 2026-10-10 by lane/postmerge-act-6; code recoverable at 9f83ea479.
+        # Tried: K2's radix route kept the scratch for k >= 17 on 64-lane columns.
+        # Restore: git apply experiments/removed/ANONLIB_KNN_IDENTICAL_WIDEK_RADIX.patch; record in docs/TOMBSTONES.md.
+        if k >= 1 and k <= SMALLK_MAX_K and k <= n_index:
+            return k
+    return buf_len
+
+
+def tiled_distance_tile_cells(
+    query_tile: Int, n_index: Int, n_features: Int, k: Int, metric: Int
+) -> Int:
+    """The distance tile a request allocates: one cell when the fused launch
+    (DEVIATION 2667) serves every column tile, which writes no matrix, else
+    `query_tile x identical_index_tile(n_index)`. `metric` is resolved.
+    FAST on Apple: one cell when the simdgroup-matrix arm serves the request
+    (every caller passes row-major operands, the arm's only other test)."""
+    comptime if FAST_MMA_KNN_ENABLED:
+        if (
+            metric == DIST_L2_UNEXPANDED
+            or metric == DIST_L2_SQRT_UNEXPANDED
+            or metric == DIST_L2_EXPANDED
+            or metric == DIST_L2_SQRT_EXPANDED
+        ) and fast_mma_knn_applies(n_features, k):
+            return 1
+    # KNN_DIRECT_DISTANCE closes the transposed layout (tiled_brute_force_knn,
+    # `not KNN_DIRECT_DISTANCE` gate), so neither matrix-free launch can serve
+    # the request: it writes the full query_tile x index_tile matrix. Lane
+    # grid-fixups-1 (2026-10-08): the one-cell answer here made every
+    # knn_direct HDBSCAN cell of grid ge123e6f9 raise "the distance tile holds
+    # 1 cells". The sizing now follows the route for every shape.
+    comptime if not KNN_DIRECT_DISTANCE:
+        if fused_select_applies(n_index, n_features, k, metric, False):
+            return 1
+        if block_topk_applies(n_index, n_features, k, metric, False):
+            return 1
+    return query_tile * identical_index_tile(n_index)
+
+
+#: THE SENTINEL `metric` EVERY PRE-2026-09-01 CALLER GETS.
+#:
+#: This lane had no `metric` parameter at all until the metric lane landed:
+#: `is_sqrt` chose between `L2Expanded` and `L2SqrtExpanded`, which are the
+#: two members of cuVS's set that cuML's `_build_metric_type` sends
+#: `euclidean`/`l2` and `sqeuclidean` to (`nearest_neighbors.pyx:522-525`).
+#: Nine call sites across `metrics/`, `spectral/`, `hdbscan/`, `ivf/`,
+#: `bench/` and five check files pass `is_sqrt` and know nothing about a
+#: metric. Defaulting `metric` to this sentinel means every one of them
+#: keeps computing exactly what it computed before, with no edit and no
+#: bit moved, and the derivation is written down once here instead of nine
+#: times at the call sites.
+comptime METRIC_FROM_IS_SQRT = -1
+
+
+def resolve_metric(metric: Int, is_sqrt: Bool) raises -> Int:
+    """`METRIC_FROM_IS_SQRT` -> the L2 expanded member `is_sqrt` names.
+    Anything else is passed through after a validity check by value."""
+    if metric == METRIC_FROM_IS_SQRT:
+        return DIST_L2_SQRT_EXPANDED if is_sqrt else DIST_L2_EXPANDED
+    if not metric_is_known(metric):
+        raise Error(
+            "brute_force_knn: DistanceType value "
+            + String(metric)
+            + " is not one of the eight this tree computes; see"
+            " neighbors/impl/distance/detail/distance_ops.mojo"
+        )
+    return metric
+
+
+def compute_norms(
+    ctx: DeviceContext,
+    mut a: DeviceBuffer[DType.float32],
+    mut a_norm: DeviceBuffer[DType.float32],
+    n_rows: Int,
+    n_features: Int,
+    take_sqrt: Bool,
+) raises:
+    """`knn_brute_force.cuh:110-146`, hoisted out of the tile loop.
+
+    Cosine wants the L2 norm and L2 wants the SQUARED norm, which is their
+    comment at `:117-118` and is the same flag `cluster/` carries.
+
+    **FOR COSINE USE `compute_norms_for_metric` BELOW.** This paragraph
+    used to say the `row_norm_kernel` sqrt arm ended in the stdlib sqrt
+    (approximate on NVIDIA, DEVIATION 258) and that an IDENTICAL cosine
+    through it differed on that column. Both `core/row_norms.mojo` and the
+    cosine norm in `distance_ops.mojo` route through `identical_sqrt` now,
+    so the defect that sentence described is closed; the parameter stays
+    for the callers that already pass it.
+    """
+    enqueue_row_norms(ctx, a_norm, a, n_rows, n_features, 1 if take_sqrt else 0)
+
+
+def compute_norms_for_metric(
+    ctx: DeviceContext,
+    mut a: DeviceBuffer[DType.float32],
+    mut a_norm: DeviceBuffer[DType.float32],
+    n_rows: Int,
+    n_features: Int,
+    metric: Int,
+) raises:
+    """`knn_brute_force.cuh:117-140`: WHICH norm, decided by the metric.
+
+    The reference branch:
+
+        if (metric == L2Expanded || L2SqrtExpanded || CosineExpanded) {
+          if (metric == CosineExpanded) rowNorm<L2Norm,true>(..., sqrt_op{});
+          else                          rowNorm<L2Norm,true>(...);
+        }
+
+    Every other metric gets no norm at all, and this function writes
+    nothing for one -- the buffer stays whatever the caller made it, and
+    `metric_distance_kernel` never reads it. `metric_uses_norms` and
+    `metric_norm_takes_sqrt` are the two `static constexpr` flags of the
+    op structs, read by name so this branch cannot drift from them.
+    """
+    if not metric_uses_norms(metric):
+        return
+    if metric_norm_takes_sqrt(metric):
+        comptime if C06_ROWS_ON:
+            enqueue_row_norms(ctx, a_norm, a, n_rows, n_features, 1)
+            return
+        ctx.enqueue_function[cosine_row_norm_kernel](
+            a_norm.unsafe_ptr(),
+            a.unsafe_ptr(),
+            Int32(n_features),
+            grid_dim=(n_rows, 1, 1),
+            block_dim=(COSINE_NORM_TPB, 1, 1),
+        )
+        return
+    compute_norms(ctx, a, a_norm, n_rows, n_features, False)
+
+
+def _warpsort_select_tile[
+    capacity: Int
+](
+    ctx: DeviceContext,
+    mut dist_tile: DeviceBuffer[DType.float32],
+    mut dummy_idx: DeviceBuffer[DType.uint32],
+    mut out_dist: DeviceBuffer[DType.float32],
+    mut out_idx: DeviceBuffer[DType.uint32],
+    out_offset: Int,
+    rows: Int,
+    n_index: Int,
+    k: Int,
+) raises:
+    """One query tile's top-k through the implemented RAFT warpsort
+    (DEVIATION 1922; `select_warpsort.mojo::warpsort_topk_block_kernel`).
+
+    LAUNCH GEOMETRY per that file's module docstring: the SINGLE-PASS form,
+    `num_blocks == 1` and `grid = (1, rows, 1)`, which writes the FINAL
+    answer with no second merging launch. Each block grid-strides one whole
+    row of the materialized tile, exactly the shape `_run_warpsort` in
+    `neighbors/checks/warpsort_check.mojo` gates against radix and the
+    host oracle. RAFT's `calc_launch_parameter` (`select_k-inl.cuh:1058`)
+    would additionally split long rows over several blocks and merge with a
+    second launch (`select_k_:1106-1120`); that caller loop is NOT implemented
+    (declared in the module docstring) and is the open item if one block
+    per row underfills a device.
+
+    `capacity` is their `bound_by_power_of_two(k)` clamped to a floor of
+    32: below 32 RAFT shrinks `warp_width` to the capacity and rescales
+    `block_warps`, a subwarp form nothing here instantiates; capacity 32 is
+    correct for every `k <= 32` and keeps `warp_width == 32 == WARP_LANES`,
+    which is the geometry the whole file's uniformity argument is written
+    against.
+
+    `dummy_idx` is the `has_in_idx == 0` contract: a valid, DISTINCT buffer
+    that is never read; the payload is the column index, which is the
+    neighbor id this caller wants.
+    """
+    comptime assert capacity >= 32 and capacity <= MAX_CAPACITY, (
+        "warpsort selection: capacity must be in [32, kMaxCapacity]"
+    )
+    #: `block_warps * warp_width`, keyed off the kernel matrix so the ONE
+    #: place that must widen on AMD (`lib_block_size_for`'s own note) is
+    #: also the one this launch reads. On every column this row admits
+    #: (32-lane), this is 256 = 8 warps, their `__launch_bounds__(256)`.
+    comptime BDX = lib_block_size_for[K_LIB_SELECT_WARPSORT, TARGET_COLUMN]()
+    comptime BW = BDX // 32
+    ctx.enqueue_function[warpsort_topk_block_kernel[capacity, True, BW]](
+        dist_tile.unsafe_ptr(),
+        dummy_idx.unsafe_ptr(),
+        out_dist.unsafe_ptr().unsafe_offset(out_offset),
+        out_idx.unsafe_ptr().unsafe_offset(out_offset),
+        Int32(n_index),
+        Int32(k),
+        Int32(0),
+        grid_dim=(1, rows, 1),
+        block_dim=(BDX, 1, 1),
+    )
+
+
+def _radix_select_tile(
+    ctx: DeviceContext,
+    mut dist_tile: DeviceBuffer[DType.float32],
+    mut buf_val: DeviceBuffer[DType.float32],
+    mut buf_idx: DeviceBuffer[DType.uint32],
+    mut out_dist: DeviceBuffer[DType.float32],
+    mut out_idx: DeviceBuffer[DType.uint32],
+    out_offset: Int,
+    rows: Int,
+    n_index: Int,
+    k: Int,
+    buf_len: Int,
+) raises:
+    """One query tile's top-k through the implemented RAFT radix selector --
+    the FAST launch that sat inline in `tiled_brute_force_knn` before
+    DEVIATION 1922 gave the selection two call sites. Byte-for-byte the
+    same enqueue; hoisted, not changed.
+    """
+    ctx.enqueue_function[radix_topk_one_block_kernel](
+        dist_tile.unsafe_ptr(),
+        out_dist.unsafe_ptr().unsafe_offset(out_offset),
+        out_idx.unsafe_ptr().unsafe_offset(out_offset),
+        buf_val.unsafe_ptr(),
+        buf_idx.unsafe_ptr(),
+        Int32(n_index),
+        Int32(k),
+        Int32(buf_len),
+        Int32(1),
+        grid_dim=(rows, 1, 1),
+        block_dim=(SELECT_BLOCK, 1, 1),
+    )
+
+
+def tiled_brute_force_knn(
+    ctx: DeviceContext,
+    mut queries: DeviceBuffer[DType.float32],
+    mut query_norm: DeviceBuffer[DType.float32],
+    mut index: DeviceBuffer[DType.float32],
+    mut index_norm: DeviceBuffer[DType.float32],
+    mut dist_tile: DeviceBuffer[DType.float32],
+    mut buf_val: DeviceBuffer[DType.float32],
+    mut buf_idx: DeviceBuffer[DType.uint32],
+    mut out_dist: DeviceBuffer[DType.float32],
+    mut out_idx: DeviceBuffer[DType.uint32],
+    mut out_idx32: DeviceBuffer[DType.int32],
+    n_queries: Int,
+    n_index: Int,
+    n_features: Int,
+    k: Int,
+    query_tile: Int,
+    buf_len: Int,
+    is_sqrt: Bool,
+    use_vendor_topk: Bool = False,
+    metric: Int = METRIC_FROM_IS_SQRT,
+    metric_arg: Float32 = Float32(2.0),
+    cache: KnnIndexCachePointer = None,
+) raises:
+    """Own optional transposed index through the complete synchronized request.
+
+    `cache` (DEVIATION 3061): a resident index's derived buffers. When given,
+    the transposed layout and the admission metadata are the cache's, built
+    here on first use by the same launches, and nothing is allocated or
+    transposed per request.
+
+    Only expanded Euclidean metrics can use this layout. Original row-major
+    norm computation, ascending per-distance FMA/FTZ, clamp, sqrt BEFORE
+    selection, selector choice and output offsets are preserved. Other metrics
+    and FAST retains the legacy path without added allocation.
+    The candidate adds 4*n_index*n_features bytes, once per public request.
+    Allocation failure is an explicit failure, never an unrecorded fallback.
+    """
+    # KNN_DIRECT_DISTANCE: every transposed spelling is the expanded form;
+    # the direct form's one device spelling is the row-major direct tile.
+    comptime if EXPERIMENTAL_KNN_TRANSPOSE_IDENTICAL and not KNN_DIRECT_DISTANCE:
+        var resolved = resolve_metric(metric, is_sqrt)
+        if (resolved == DIST_L2_EXPANDED or resolved == DIST_L2_SQRT_EXPANDED) and n_queries > 0 and n_index > 0 and n_features > 0 and n_index <= 2147483647 and n_features <= 2147483647:
+            comptime if KNN_RESIDENT_CACHE:
+                if cache:
+                    var cp = cache.value()
+                    var t_cached = perf_counter_ns()
+                    if not cp[].transposed:
+                        cp[].transposed = ctx.enqueue_create_buffer[DType.float32](n_index * n_features)
+                        ctx.enqueue_function[transpose_kernel](
+                            cp[].transposed.value().unsafe_ptr(), index.unsafe_ptr(), Int32(n_index), Int32(n_features),
+                            grid_dim=((n_features + TRANSPOSE_TILE - 1) // TRANSPOSE_TILE,
+                                      min((n_index + TRANSPOSE_TILE - 1) // TRANSPOSE_TILE, CUDA_MAX_GRID_YZ), 1),
+                            block_dim=(TRANSPOSE_TILE, TRANSPOSE_TILE, 1),
+                        )
+                    else:
+                        comptime if KNN_RESIDENT_CACHE_SABOTAGE:
+                            ctx.enqueue_function[_cache_sabotage_kernel](
+                                cp[].transposed.value().unsafe_ptr().unsafe_origin_cast[MutAnyOrigin](),
+                                grid_dim=(1, 1, 1), block_dim=(1, 1, 1),
+                            )
+                    var cached_y_meta = Optional[MutPointer[Float32, MutAnyOrigin]]()
+                    comptime if KNN_EXACT_CHAIN:
+                        if not cp[].y_meta:
+                            cp[].y_meta = ctx.enqueue_create_buffer[DType.float32](n_index)
+                            ctx.enqueue_function[vector_exponent_admission_kernel](
+                                index.unsafe_ptr(),
+                                cp[].y_meta.value().unsafe_ptr().unsafe_origin_cast[MutAnyOrigin](),
+                                Int32(n_index), Int32(n_features),
+                                grid_dim=((n_index + 127) // 128, 1, 1), block_dim=(128, 1, 1),
+                            )
+                        cached_y_meta = cp[].y_meta.value().unsafe_ptr().unsafe_origin_cast[MutAnyOrigin]()
+                    comptime if KNN_PHASE_TIMERS:
+                        ctx.synchronize()
+                        print(
+                            "KNN_PHASE_TIMERS", "transpose_ms",
+                            Float64(perf_counter_ns() - t_cached) / 1000000.0, "cached", 1,
+                        )
+                    _tiled_brute_force_knn_impl(
+                        ctx, queries, query_norm, index, index_norm, dist_tile, buf_val, buf_idx,
+                        out_dist, out_idx, out_idx32, n_queries, n_index, n_features, k,
+                        query_tile, buf_len, is_sqrt, use_vendor_topk, metric, metric_arg,
+                        Optional(cp[].transposed.value().unsafe_ptr()), True, cached_y_meta,
+                    )
+                    return
+            var transposed = ctx.enqueue_create_buffer[DType.float32](n_index * n_features)
+            try:
+                var t_transpose = perf_counter_ns()
+                ctx.enqueue_function[transpose_kernel](
+                    transposed.unsafe_ptr(), index.unsafe_ptr(), Int32(n_index), Int32(n_features),
+                    grid_dim=((n_features + TRANSPOSE_TILE - 1) // TRANSPOSE_TILE,
+                              min((n_index + TRANSPOSE_TILE - 1) // TRANSPOSE_TILE, CUDA_MAX_GRID_YZ), 1),
+                    block_dim=(TRANSPOSE_TILE, TRANSPOSE_TILE, 1),
+                )
+                comptime if KNN_PHASE_TIMERS:
+                    ctx.synchronize()
+                    print(
+                        "KNN_PHASE_TIMERS", "transpose_ms",
+                        Float64(perf_counter_ns() - t_transpose) / 1000000.0,
+                    )
+                var transposed_ptr = Optional(transposed.unsafe_ptr())
+                _tiled_brute_force_knn_impl(
+                    ctx, queries, query_norm, index, index_norm, dist_tile, buf_val, buf_idx,
+                    out_dist, out_idx, out_idx32, n_queries, n_index, n_features, k,
+                    query_tile, buf_len, is_sqrt, use_vendor_topk, metric, metric_arg,
+                    transposed_ptr, True,
+                )
+            except error:
+                # Even a later launch/refusal must drain pending readers before
+                # unwinding the temporary allocation's owner.
+                ctx.synchronize()
+                _ = transposed^
+                raise error
+            # The implementation synchronizes all query tiles before this
+            # owner is released. No temporary sub-buffer or borrowed view.
+            _ = transposed^
+            return
+    # An absent layout has no pointer and no second mutable alias of index.
+    var no_transpose = Optional[MutPointer[Float32, MutUntrackedOrigin]]()
+    _tiled_brute_force_knn_impl(
+        ctx, queries, query_norm, index, index_norm, dist_tile, buf_val, buf_idx,
+        out_dist, out_idx, out_idx32, n_queries, n_index, n_features, k,
+        query_tile, buf_len, is_sqrt, use_vendor_topk, metric, metric_arg,
+        no_transpose, False,
+    )
+
+
+def _tiled_brute_force_knn_impl[transposed_origin: MutOrigin, //](
+    ctx: DeviceContext,
+    mut queries: DeviceBuffer[DType.float32],
+    mut query_norm: DeviceBuffer[DType.float32],
+    mut index: DeviceBuffer[DType.float32],
+    mut index_norm: DeviceBuffer[DType.float32],
+    mut dist_tile: DeviceBuffer[DType.float32],
+    mut buf_val: DeviceBuffer[DType.float32],
+    mut buf_idx: DeviceBuffer[DType.uint32],
+    mut out_dist: DeviceBuffer[DType.float32],
+    mut out_idx: DeviceBuffer[DType.uint32],
+    mut out_idx32: DeviceBuffer[DType.int32],
+    n_queries: Int,
+    n_index: Int,
+    n_features: Int,
+    k: Int,
+    query_tile: Int,
+    buf_len: Int,
+    is_sqrt: Bool,
+    use_vendor_topk: Bool,
+    metric: Int,
+    metric_arg: Float32,
+    transposed_index: Optional[MutPointer[Float32, transposed_origin]],
+    use_transposed_index: Bool,
+    cached_y_meta: Optional[MutPointer[Float32, MutAnyOrigin]] = None,
+) raises:
+    """Tile the QUERIES, keep the whole index resident, top-k per query row.
+
+    THEIR FALLBACK, reached from `brute_force_knn_impl` below only when the
+    fused path's conditions fail (k > 64, or a metric fusion does not cover).
+
+    IDENTICAL tiles both axes and merges partial top-k lists below, using
+    the pinned (distance, index) order. The vendor top-k path keeps the full
+    index axis. Distance scratch therefore holds query_tile * index_tile
+    cells, with the index tile selected by kernel-matrix policy.
+
+    THE METRIC, 2026-09-01. `metric` follows their `pairwise_metric`
+    rewrite at `:112-142` exactly:
+
+      - `L2Expanded` / `L2SqrtExpanded` and `CosineExpanded` are computed
+        as an INNER PRODUCT plus an epilogue. Theirs sets
+        `pairwise_metric = InnerProduct` (`:141`) and applies
+        `l2_exp_cutlass_op` (`:206`) or the hand-inlined
+        `1 - dot/(nx*ny)` (`:221`) afterwards. Ours does the same, with
+        the product from `gemm_nt` under FAST and folded into
+        `pinned_distance_tile_kernel` / `metric_distance_kernel` under
+        IDENTICAL, because a vendor matmul's k-split is a summation order
+        nothing here can pin.
+      - Every other metric goes to `pairwise_distance` unrewritten
+        (`:181-190`) and needs no epilogue, which is their `else` at
+        `:224`. Here that is `metric_distance_kernel` in BOTH modes: the
+        feature axis is already walked in one thread, so there is nothing
+        for FAST to hand to a library.
+
+    `select_min` is theirs at `:170` and is TRUE for every metric this
+    tree computes (`is_min_close` returns false only for `InnerProduct`,
+    `distance.hpp:38-43`, which is not a metric we expose), so the
+    selectors below are unchanged: smallest-first, as they already were.
+
+    `metric = METRIC_FROM_IS_SQRT` (the default) is the pre-metric-lane
+    behaviour exactly, so every caller that does not name a metric gets
+    the bits it always got.
+    """
+    var mtr = resolve_metric(metric, is_sqrt)
+
+    # INDEX-AXIS TILING, 2026-09-09 (IDENTICAL only; kernel-matrix row
+    # `knn_index_tile_columns_for`). Their loop tiles both axes and merges
+    # the partial top-k lists (`:278-320`); this is that merge for the
+    # pinned arm, whose (distance, index) keys are unique, so merging two
+    # ascending lists is a rank computation and never an arrival order.
+    # Every column tile keeps at least `k` columns: the selectors cannot
+    # take `k > len`, so a remainder shorter than `k` is carved off the tile
+    # before it rather than left to stand alone. The vendor top-k arm
+    # consumes one whole row per call and is not tiled.
+    var index_tile = identical_index_tile(n_index)
+    if use_vendor_topk:
+        index_tile = n_index
+    # DEVIATION 2667: the fused launch writes no distance matrix, so the
+    # caller's tile may be one cell (`tiled_distance_tile_cells`).
+    var use_fused = use_transposed_index and fused_select_applies(
+        n_index, n_features, k, mtr, use_vendor_topk
+    )
+    # DEVIATION 3001: the block top-k writes no matrix either; its key
+    # buffer is sized below from the widest column tile.
+    var use_block_topk = use_transposed_index and block_topk_applies(
+        n_index, n_features, k, mtr, use_vendor_topk
+    )
+    if not use_fused and not use_block_topk and len(dist_tile) < query_tile * index_tile:
+        raise Error(
+            "tiled_brute_force_knn: the distance tile holds "
+            + String(len(dist_tile))
+            + " cells; query_tile x index_tile needs "
+            + String(query_tile * index_tile)
+        )
+    var tiled_index = index_tile < n_index
+    comptime if KNN_BLOCK_TOPK_BOUNDED and KNN_BOUNDED_FIRST_TILE > 0:
+        # DEVIATION 3062: the narrower first column tile (below) tiles an
+        # index that one tile would have held, so the partial scratch exists.
+        if use_block_topk and n_index > KNN_BOUNDED_FIRST_TILE and KNN_BOUNDED_FIRST_TILE >= k:
+            tiled_index = True
+    var part_cells = query_tile * k if tiled_index else 1
+    # RAFT linalg/detail/contractions.cuh:193-219 loads vectors. Our pinned
+    # arithmetic keeps its ascending chain; only the index transport changes.
+    # Large same-process public requests save 3.1-3.6%, all output bits equal:
+    # bench/results/knn_vector_request_2026-09-10. Scope: `knn_large_request`
+    # (size rule; was the exact benchmark row). Per-partition alignment is
+    # checked below, so any n_index that is not a multiple of 4 stays scalar.
+    # K1 (lane fg-knn-nb): the AMD column takes NVIDIA's vector index
+    # transport too (`knn_nvidia_schedule_column`, same chain, same bits);
+    # AMD's legacy scalar-load arm was removed 2026-10-10 (docs/TOMBSTONES.md).
+    var use_vector = knn_nvidia_schedule_column(TARGET_COLUMN) and mtr == DIST_L2_SQRT_EXPANDED and knn_large_request(n_index, n_queries, n_features, k)
+    comptime if is_defined["ANONLIB_KNN_VECTOR_REQUEST_CHECK"]():
+        # Named same-process check exercises scalar, vector and actual default.
+        var vector_override = String(getenv("ANONLIB_KNN_VECTOR_TRIAL"))
+        if vector_override == "0" or vector_override == "1":
+            use_vector = vector_override == "1"
+    # Apple request-local metadata: same scope rule as the vector loads
+    # (`knn_large_request`; was the exact benchmark row). Bits unchanged:
+    # the metadata only admits tiles that need no repair.
+    var use_metadata = KNN_PREFLIGHT_METADATA
+    comptime if KNN_PREFLIGHT_METADATA_DEFAULT:
+        use_metadata = use_metadata or (use_transposed_index and KNN_REGISTER_TILE_IDENTICAL and not use_vendor_topk and mtr == DIST_L2_SQRT_EXPANDED and knn_large_request(n_index, n_queries, n_features, k))
+    # DEVIATION 2629 (kernel-matrix row `knn_distance_exact_chain_for`): the
+    # admission metadata rides in the same request-local scratch slot the
+    # Apple minima use; the two never run in one request.
+    var use_exact = False
+    comptime if KNN_EXACT_CHAIN:
+        use_exact = (
+            use_transposed_index and KNN_REGISTER_TILE_IDENTICAL
+            and not use_vendor_topk and not use_metadata
+            and n_features >= KNN_SMEM_MIN_FEATURES
+            and (mtr == DIST_L2_SQRT_EXPANDED or mtr == DIST_L2_EXPANDED)
+        )
+    var meta_on = use_metadata or use_exact
+    var metadata_cells = n_queries + n_index if meta_on else 0
+    var part_dist = ctx.enqueue_create_buffer[DType.float32](part_cells + metadata_cells)
+    var part_idx = ctx.enqueue_create_buffer[DType.uint32](part_cells)
+    # DEVIATION 3001: `query_tile x col_blocks(index_tile) x k` keys, one
+    # cell when the block top-k does not serve this request.
+    var part_key_cells = 1
+    if use_block_topk:
+        part_key_cells = query_tile * smem_tile_col_blocks(index_tile) * k
+    var part_keys = ctx.enqueue_create_buffer[DType.uint64](part_key_cells)
+    # DEVIATION 3060: the bound-and-compact selector's per-row flags, one
+    # cell when that selector does not serve this request.
+    var select_flag_cells = 1
+    comptime if KNN_SELECTOR_BOUND:
+        if k >= KNN_SELECTOR_BOUND_MIN_K and k <= SMALLK_MAX_K:
+            select_flag_cells = query_tile
+    comptime if KNN_BLOCK_TOPK_BOUNDED:
+        if use_block_topk:
+            select_flag_cells = query_tile
+    var select_flags = ctx.enqueue_create_buffer[DType.uint32](select_flag_cells)
+    # DEVIATION 3000: the shared-memory distance tile serves the requests
+    # the register tile served with no metadata and no exact-chain
+    # admission; those two keep the register tile.
+    var use_smem = False
+    comptime if KNN_SMEM_TILE:
+        use_smem = (
+            use_transposed_index and not use_vendor_topk and not use_metadata
+            and (mtr == DIST_L2_SQRT_EXPANDED or mtr == DIST_L2_EXPANDED)
+            and n_features >= KNN_SMEM_MIN_FEATURES
+        )
+
+    # Metadata is rebuilt for every request, including in-place input mutations.
+    # The existing scratch allocation owns metadata until final synchronize.
+    var q_minima = part_dist.unsafe_ptr().unsafe_offset(part_cells if meta_on else 0).unsafe_origin_cast[MutAnyOrigin]()
+    var y_minima = part_dist.unsafe_ptr().unsafe_offset(part_cells + n_queries if meta_on else 0).unsafe_origin_cast[MutAnyOrigin]()
+    comptime if KNN_EXACT_CHAIN:
+        if use_exact:
+            ctx.enqueue_function[vector_exponent_admission_kernel](
+                queries.unsafe_ptr(), q_minima, Int32(n_queries), Int32(n_features),
+                grid_dim=((n_queries + 127) // 128, 1, 1), block_dim=(128, 1, 1),
+            )
+            if cached_y_meta:
+                # DEVIATION 3061: the resident index's admission metadata,
+                # this very kernel's output over the same device bytes.
+                y_minima = cached_y_meta.value()
+            else:
+                ctx.enqueue_function[vector_exponent_admission_kernel](
+                    index.unsafe_ptr(), y_minima, Int32(n_index), Int32(n_features),
+                    grid_dim=((n_index + 127) // 128, 1, 1), block_dim=(128, 1, 1),
+                )
+    comptime if KNN_PREFLIGHT_METADATA or KNN_PREFLIGHT_METADATA_DEFAULT:
+        if use_metadata:
+            ctx.enqueue_function[vector_exponent_minimum_kernel](
+                queries.unsafe_ptr(), q_minima, Int32(n_queries), Int32(n_features),
+                grid_dim=((n_queries + 127) // 128, 1, 1), block_dim=(128, 1, 1),
+            )
+            ctx.enqueue_function[vector_exponent_minimum_kernel](
+                index.unsafe_ptr(), y_minima, Int32(n_index), Int32(n_features),
+                grid_dim=((n_index + 127) // 128, 1, 1), block_dim=(128, 1, 1),
+            )
+
+    var ns_distance = 0
+    var ns_select = 0
+    var ns_merge = 0
+    var n_distance = 0
+    var n_select = 0
+    var n_merge = 0
+    var t_class = 0
+    comptime if KNN_PHASE_TIMERS:
+        ctx.synchronize()
+
+    # The small-k selector's arm for this request (DEVIATION 2497/2498):
+    # read from ANONLIB_KNN_SELECT / _SABOTAGE once here, on a build with
+    # -D ANONLIB_KNN_SELECT_TRIAL=1 only; every other build gets the
+    # constant default without touching the environment.
+    var select_arm = smallk_select_arm_from_env()
+
+    var q = 0
+    while q < n_queries:
+        var rows = min(query_tile, n_queries - q)
+        var c = 0
+        while c < n_index:
+            var cols = min(index_tile, n_index - c)
+            comptime if KNN_BLOCK_TOPK_BOUNDED and KNN_BOUNDED_FIRST_TILE > 0:
+                # DEVIATION 3062: a narrower first (unbounded) column tile,
+                # so the full rank loop runs over fewer columns. Tiling the
+                # index axis cannot move a bit (the partial merge is exact).
+                if use_block_topk and c == 0 and cols > KNN_BOUNDED_FIRST_TILE and KNN_BOUNDED_FIRST_TILE >= k:
+                    cols = KNN_BOUNDED_FIRST_TILE
+            var remainder = n_index - c - cols
+            if remainder > 0 and remainder < k:
+                cols = n_index - c - k
+            var first = c == 0
+            var cells = rows * cols
+
+            # The selection writes the first column tile's answer straight
+            # into the caller's output at the outer query offset and every
+            # later tile's into the partial scratch, which is then merged.
+            var sel_dist = out_dist.unsafe_ptr().unsafe_offset(
+                q * k
+            ).unsafe_origin_cast[MutAnyOrigin]()
+            var sel_idx = out_idx.unsafe_ptr().unsafe_offset(
+                q * k
+            ).unsafe_origin_cast[MutAnyOrigin]()
+            if not first:
+                sel_dist = part_dist.unsafe_ptr().unsafe_origin_cast[MutAnyOrigin]()
+                sel_idx = part_idx.unsafe_ptr().unsafe_origin_cast[MutAnyOrigin]()
+
+            comptime if KNN_PHASE_TIMERS:
+                t_class = perf_counter_ns()
+            if use_block_topk:
+                # DEVIATION 3001: the shared-memory tile's block top-k and
+                # the partial-key selector, written straight to the same
+                # selection destination; the selection block below records
+                # the tile as selected and the partial merge follows as
+                # before. Both launches are timed under the distance class.
+                comptime if KNN_BLOCK_TOPK:
+                    smem_block_topk_launch(
+                        ctx, part_keys.unsafe_ptr().unsafe_origin_cast[MutAnyOrigin](),
+                        sel_dist,
+                        queries.unsafe_ptr().unsafe_offset(q * n_features).unsafe_origin_cast[MutAnyOrigin](),
+                        transposed_index.value().unsafe_offset(c).unsafe_origin_cast[MutAnyOrigin](),
+                        query_norm.unsafe_ptr().unsafe_offset(q).unsafe_origin_cast[MutAnyOrigin](),
+                        index_norm.unsafe_ptr().unsafe_offset(c).unsafe_origin_cast[MutAnyOrigin](),
+                        q_minima.unsafe_offset(q if use_exact else 0),
+                        y_minima.unsafe_offset(c if use_exact else 0),
+                        rows, cols, n_index, n_features, k,
+                        mtr == DIST_L2_SQRT_EXPANDED, use_exact,
+                        KNN_BLOCK_TOPK_BOUNDED and not first,
+                        Optional(out_dist.unsafe_ptr().unsafe_offset(q * k).unsafe_origin_cast[MutAnyOrigin]()),
+                    )
+                    comptime if KNN_PHASE_TIMERS:
+                        ctx.synchronize()
+                        ns_distance += perf_counter_ns() - t_class
+                        n_distance += 1
+                        t_class = perf_counter_ns()
+                    # The partial-key selector, timed under the selection
+                    # class (the selection block below adds nothing).
+                    comptime if KNN_BLOCK_TOPK_BOUNDED:
+                        bound_compact_lists_launch(
+                            ctx, part_keys.unsafe_ptr().unsafe_origin_cast[MutAnyOrigin](),
+                            sel_dist, sel_idx, select_flags, rows, cols, k,
+                        )
+                    else:
+                        partial_keys_select_launch(
+                            ctx, part_keys.unsafe_ptr().unsafe_origin_cast[MutAnyOrigin](),
+                            sel_dist, sel_idx, rows, cols, k,
+                        )
+                    comptime if KNN_PHASE_TIMERS:
+                        ctx.synchronize()
+                        ns_select += perf_counter_ns() - t_class
+                        n_select += 1
+                        t_class = perf_counter_ns()
+            elif use_fused:
+                # DEVIATION 2667 (kernel-matrix row
+                # `knn_fused_distance_select_for`): distances and the
+                # tile's top-k in one launch, written straight to the same
+                # selection destination; the selection block below records
+                # the tile as selected and the partial merge follows as
+                # before. Timed under the distance class.
+                comptime if KNN_FUSED_SELECT:
+                    fused_distance_select_launch(
+                        ctx, sel_dist, sel_idx,
+                        queries.unsafe_ptr().unsafe_offset(q * n_features).unsafe_origin_cast[MutAnyOrigin](),
+                        transposed_index.value().unsafe_offset(c).unsafe_origin_cast[MutAnyOrigin](),
+                        query_norm.unsafe_ptr().unsafe_offset(q).unsafe_origin_cast[MutAnyOrigin](),
+                        index_norm.unsafe_ptr().unsafe_offset(c).unsafe_origin_cast[MutAnyOrigin](),
+                        rows, cols, n_index, n_features, k,
+                        mtr == DIST_L2_SQRT_EXPANDED,
+                    )
+            elif not metric_uses_norms(mtr):
+                # THEIR `else` AT `:224`: the op did the whole cell, there is
+                # no epilogue and no norm. One kernel, both modes.
+                ctx.enqueue_function[metric_distance_kernel](
+                    dist_tile.unsafe_ptr(),
+                    queries.unsafe_ptr().unsafe_offset(q * n_features),
+                    index.unsafe_ptr().unsafe_offset(c * n_features),
+                    # OFFSET EVEN THOUGH THE KERNEL DOES NOT READ THEM on this
+                    # arm (`use_norms` is false for every metric that reaches
+                    # it): the two norm arguments are then correct at every
+                    # call site, so adding a norm-using metric to this branch
+                    # later cannot introduce an off-by-tile that only shows up
+                    # past the first tile.
+                    query_norm.unsafe_ptr().unsafe_offset(q),
+                    index_norm.unsafe_ptr().unsafe_offset(c),
+                    Int32(rows),
+                    Int32(cols),
+                    Int32(n_features),
+                    Int32(mtr),
+                    metric_arg,
+                    grid_dim=(
+                        (cells + METRIC_ELEM_TPB - 1) // METRIC_ELEM_TPB, 1, 1
+                    ),
+                    block_dim=(METRIC_ELEM_TPB, 1, 1),
+                )
+            elif mtr == DIST_COSINE_EXPANDED:
+                comptime if GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL:
+                    # IDENTITY_PATHS row 24's argument, applied to cosine: the
+                    # dot product and the epilogue in ONE thread over the whole
+                    # feature axis. Same shape as `pinned_distance_tile_kernel`
+                    # and for the same reason; the only difference is which
+                    # epilogue runs on the accumulated product.
+                    ctx.enqueue_function[metric_distance_kernel](
+                        dist_tile.unsafe_ptr(),
+                        queries.unsafe_ptr().unsafe_offset(q * n_features),
+                        index.unsafe_ptr().unsafe_offset(c * n_features),
+                        query_norm.unsafe_ptr().unsafe_offset(q),
+                        index_norm.unsafe_ptr().unsafe_offset(c),
+                        Int32(rows),
+                        Int32(cols),
+                        Int32(n_features),
+                        Int32(mtr),
+                        metric_arg,
+                        grid_dim=(
+                            (cells + METRIC_ELEM_TPB - 1) // METRIC_ELEM_TPB, 1, 1
+                        ),
+                        block_dim=(METRIC_ELEM_TPB, 1, 1),
+                    )
+                else:
+                    # THEIR arm: `pairwise_metric = InnerProduct` (`:141`),
+                    # the vendor product, then `1 - dot/(nx*ny)` by hand
+                    # (`:215-223`). FAST never tiles the index axis, so
+                    # `c == 0` and `cols == n_index` here.
+                    var qc_tile = queries.create_sub_buffer[DType.float32](
+                        q * n_features, rows * n_features
+                    )
+                    gemm_nt(
+                        ctx, dist_tile, qc_tile, index, rows, n_index, n_features
+                    )
+                    ctx.enqueue_function[cosine_epilog_kernel](
+                        dist_tile.unsafe_ptr(),
+                        query_norm.unsafe_ptr().unsafe_offset(q),
+                        index_norm.unsafe_ptr(),
+                        Int32(rows),
+                        Int32(n_index),
+                        grid_dim=(
+                            (cells + METRIC_ELEM_TPB - 1) // METRIC_ELEM_TPB, 1, 1
+                        ),
+                        block_dim=(METRIC_ELEM_TPB, 1, 1),
+                    )
+            else:
+                comptime if GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL:
+                    # IDENTITY_PATHS row 24. The vendor matmul's k-split is a
+                    # summation order nothing here can pin, so under IDENTICAL
+                    # the product and the epilogue are ONE kernel with the
+                    # feature axis walked ascending in a single chain per
+                    # cell. Four spellings of that one chain, chosen by the
+                    # kernel matrix: row-major index one cell per thread
+                    # (`pinned_distance_tile_kernel`), transposed index one
+                    # cell per thread, transposed index with an RT_ROWS x 4
+                    # register tile per thread, and (DEVIATION 3000, the
+                    # NVIDIA default since 2026-09-17) the transposed index
+                    # staged through shared memory. Same bits from all four.
+                    var is_sqrt_arg = Int32(1 if mtr == DIST_L2_SQRT_EXPANDED else 0)
+                    var layout_distance_launched = False
+                    comptime if KNN_SMEM_TILE:
+                        # DEVIATION 3000: the shared-memory tile writes the
+                        # same `rows x cols` matrix the register tile writes.
+                        if use_smem:
+                            smem_distance_tile_launch(
+                                ctx, dist_tile.unsafe_ptr().unsafe_origin_cast[MutAnyOrigin](),
+                                queries.unsafe_ptr().unsafe_offset(q * n_features).unsafe_origin_cast[MutAnyOrigin](),
+                                transposed_index.value().unsafe_offset(c).unsafe_origin_cast[MutAnyOrigin](),
+                                query_norm.unsafe_ptr().unsafe_offset(q).unsafe_origin_cast[MutAnyOrigin](),
+                                index_norm.unsafe_ptr().unsafe_offset(c).unsafe_origin_cast[MutAnyOrigin](),
+                                q_minima.unsafe_offset(q if use_exact else 0),
+                                y_minima.unsafe_offset(c if use_exact else 0),
+                                rows, cols, n_index, n_features,
+                                mtr == DIST_L2_SQRT_EXPANDED, use_exact,
+                            )
+                            layout_distance_launched = True
+                    comptime if KNN_APPLE_MMA_DIST:
+                        # Apple: the same matrix, the dot on the simdgroup
+                        # matrix unit with per-cell admission
+                        # (`neighbors/checks/apple_mma_distance.mojo`).
+                        if use_transposed_index and not layout_distance_launched:
+                            ctx.enqueue_function[apple_mma_distance_tile_kernel](
+                                dist_tile.unsafe_ptr(),
+                                queries.unsafe_ptr().unsafe_offset(q * n_features),
+                                transposed_index.value().unsafe_offset(c),
+                                query_norm.unsafe_ptr().unsafe_offset(q),
+                                index_norm.unsafe_ptr().unsafe_offset(c),
+                                Int32(rows), Int32(cols), Int32(n_index),
+                                Int32(n_features), is_sqrt_arg,
+                                grid_dim=((cols + AMD_BN - 1) // AMD_BN, (rows + AMD_BM - 1) // AMD_BM, 1),
+                                block_dim=(AMD_NT, 1, 1),
+                            )
+                            layout_distance_launched = True
+                    comptime if EXPERIMENTAL_KNN_TRANSPOSE_IDENTICAL:
+                        if use_transposed_index and not layout_distance_launched:
+                            comptime if KNN_REGISTER_TILE_IDENTICAL:
+                                comptime if KNN_PREFLIGHT_METADATA or KNN_PREFLIGHT_METADATA_DEFAULT:
+                                    if use_metadata:
+                                        ctx.enqueue_function[pinned_distance_register_tile_kernel[True]](
+                                            dist_tile.unsafe_ptr(),
+                                            queries.unsafe_ptr().unsafe_offset(q * n_features),
+                                            transposed_index.value().unsafe_offset(c),
+                                            query_norm.unsafe_ptr().unsafe_offset(q),
+                                            index_norm.unsafe_ptr().unsafe_offset(c),
+                                            q_minima.unsafe_offset(q if use_metadata else 0),
+                                            y_minima.unsafe_offset(c if use_metadata else 0),
+                                            Int32(rows), Int32(cols), Int32(n_index),
+                                            Int32(n_features), is_sqrt_arg,
+                                            grid_dim=(
+                                                (cols + RT_TILE_COLS - 1) // RT_TILE_COLS,
+                                                (rows + RT_ROWS - 1) // RT_ROWS,
+                                                1,
+                                            ),
+                                            block_dim=(RT_TPB, 1, 1),
+                                        )
+                                    else:
+                                        ctx.enqueue_function[pinned_distance_register_tile_kernel[False]](
+                                            dist_tile.unsafe_ptr(),
+                                            queries.unsafe_ptr().unsafe_offset(q * n_features),
+                                            transposed_index.value().unsafe_offset(c),
+                                            query_norm.unsafe_ptr().unsafe_offset(q),
+                                            index_norm.unsafe_ptr().unsafe_offset(c),
+                                            q_minima.unsafe_offset(q if use_metadata else 0),
+                                            y_minima.unsafe_offset(c if use_metadata else 0),
+                                            Int32(rows), Int32(cols), Int32(n_index),
+                                            Int32(n_features), is_sqrt_arg,
+                                            grid_dim=(
+                                                (cols + RT_TILE_COLS - 1) // RT_TILE_COLS,
+                                                (rows + RT_ROWS - 1) // RT_ROWS,
+                                                1,
+                                            ),
+                                            block_dim=(RT_TPB, 1, 1),
+                                        )
+                                else:
+                                    # DeviceBuffer base is aligned. Full stride and sub-buffer
+                                    # offset must preserve 16-byte alignment; complete groups
+                                    # prevent a clamped final column from being over-read.
+                                    var exact_launched = False
+                                    comptime if KNN_EXACT_CHAIN:
+                                        # DEVIATION 2629: admitted tiles skip the
+                                        # per-step flush; q_minima / y_minima hold
+                                        # the admission metadata here.
+                                        if use_exact:
+                                            if use_vector and n_index % 4 == 0 and c % 4 == 0 and cols % 4 == 0:
+                                                ctx.enqueue_function[pinned_distance_register_tile_kernel[False, True, True]](
+                                                    dist_tile.unsafe_ptr(),
+                                                    queries.unsafe_ptr().unsafe_offset(q * n_features),
+                                                    transposed_index.value().unsafe_offset(c),
+                                                    query_norm.unsafe_ptr().unsafe_offset(q),
+                                                    index_norm.unsafe_ptr().unsafe_offset(c),
+                                                    q_minima.unsafe_offset(q),
+                                                    y_minima.unsafe_offset(c),
+                                                    Int32(rows), Int32(cols), Int32(n_index),
+                                                    Int32(n_features), is_sqrt_arg,
+                                                    grid_dim=(
+                                                        (cols + RT_TILE_COLS - 1) // RT_TILE_COLS,
+                                                        (rows + RT_ROWS - 1) // RT_ROWS,
+                                                        1,
+                                                    ),
+                                                    block_dim=(RT_TPB, 1, 1),
+                                                )
+                                            else:
+                                                ctx.enqueue_function[pinned_distance_register_tile_kernel[False, False, True]](
+                                                    dist_tile.unsafe_ptr(),
+                                                    queries.unsafe_ptr().unsafe_offset(q * n_features),
+                                                    transposed_index.value().unsafe_offset(c),
+                                                    query_norm.unsafe_ptr().unsafe_offset(q),
+                                                    index_norm.unsafe_ptr().unsafe_offset(c),
+                                                    q_minima.unsafe_offset(q),
+                                                    y_minima.unsafe_offset(c),
+                                                    Int32(rows), Int32(cols), Int32(n_index),
+                                                    Int32(n_features), is_sqrt_arg,
+                                                    grid_dim=(
+                                                        (cols + RT_TILE_COLS - 1) // RT_TILE_COLS,
+                                                        (rows + RT_ROWS - 1) // RT_ROWS,
+                                                        1,
+                                                    ),
+                                                    block_dim=(RT_TPB, 1, 1),
+                                                )
+                                            exact_launched = True
+                                    if exact_launched:
+                                        pass
+                                    elif use_vector and n_index % 4 == 0 and c % 4 == 0 and cols % 4 == 0:
+                                        ctx.enqueue_function[pinned_distance_register_tile_kernel[False, True]](
+                                            dist_tile.unsafe_ptr(),
+                                            queries.unsafe_ptr().unsafe_offset(q * n_features),
+                                            transposed_index.value().unsafe_offset(c),
+                                            query_norm.unsafe_ptr().unsafe_offset(q),
+                                            index_norm.unsafe_ptr().unsafe_offset(c),
+                                            q_minima.unsafe_offset(q if use_metadata else 0),
+                                            y_minima.unsafe_offset(c if use_metadata else 0),
+                                            Int32(rows), Int32(cols), Int32(n_index),
+                                            Int32(n_features), is_sqrt_arg,
+                                            grid_dim=(
+                                                (cols + RT_TILE_COLS - 1) // RT_TILE_COLS,
+                                                (rows + RT_ROWS - 1) // RT_ROWS,
+                                                1,
+                                            ),
+                                            block_dim=(RT_TPB, 1, 1),
+                                        )
+                                    else:
+                                        ctx.enqueue_function[pinned_distance_register_tile_kernel[False]](
+                                            dist_tile.unsafe_ptr(),
+                                            queries.unsafe_ptr().unsafe_offset(q * n_features),
+                                            transposed_index.value().unsafe_offset(c),
+                                            query_norm.unsafe_ptr().unsafe_offset(q),
+                                            index_norm.unsafe_ptr().unsafe_offset(c),
+                                            q_minima.unsafe_offset(q if use_metadata else 0),
+                                            y_minima.unsafe_offset(c if use_metadata else 0),
+                                            Int32(rows), Int32(cols), Int32(n_index),
+                                            Int32(n_features), is_sqrt_arg,
+                                            grid_dim=(
+                                                (cols + RT_TILE_COLS - 1) // RT_TILE_COLS,
+                                                (rows + RT_ROWS - 1) // RT_ROWS,
+                                                1,
+                                            ),
+                                            block_dim=(RT_TPB, 1, 1),
+                                        )
+                            else:
+                                ctx.enqueue_function[transposed_index_distance_kernel](
+                                    dist_tile.unsafe_ptr(),
+                                    queries.unsafe_ptr().unsafe_offset(q * n_features),
+                                    transposed_index.value().unsafe_offset(c),
+                                    query_norm.unsafe_ptr().unsafe_offset(q),
+                                    index_norm.unsafe_ptr().unsafe_offset(c),
+                                    Int32(rows), Int32(cols), Int32(n_index),
+                                    Int32(n_features), is_sqrt_arg,
+                                    grid_dim=((cells + PINNED_TILE_TPB - 1) // PINNED_TILE_TPB, 1, 1),
+                                    block_dim=(PINNED_TILE_TPB, 1, 1),
+                                )
+                            layout_distance_launched = True
+                    if not layout_distance_launched:
+                        ctx.enqueue_function[pinned_distance_tile_direct_kernel[KNN_DIRECT_DISTANCE]](
+                            dist_tile.unsafe_ptr(),
+                            queries.unsafe_ptr().unsafe_offset(q * n_features),
+                            index.unsafe_ptr().unsafe_offset(c * n_features),
+                            query_norm.unsafe_ptr().unsafe_offset(q),
+                            index_norm.unsafe_ptr().unsafe_offset(c),
+                            Int32(rows),
+                            Int32(cols),
+                            Int32(n_features),
+                            # An explicit L2Expanded skips root even when the
+                            # old signature's is_sqrt=True; resolve_metric
+                            # decides it.
+                            is_sqrt_arg,
+                            grid_dim=(
+                                (cells + PINNED_TILE_TPB - 1) // PINNED_TILE_TPB, 1, 1
+                            ),
+                            block_dim=(PINNED_TILE_TPB, 1, 1),
+                        )
+                else:
+                    var q_tile = queries.create_sub_buffer[DType.float32](
+                        q * n_features, rows * n_features
+                    )
+                    gemm_nt(
+                        ctx, dist_tile, q_tile, index, rows, n_index, n_features
+                    )
+
+                    # The epilogue k-means fuses into its reduction has to be
+                    # its own pass here, because the top-k needs every
+                    # distance to survive.
+                    ctx.enqueue_function[expand_distances_kernel](
+                        dist_tile.unsafe_ptr(),
+                        query_norm.unsafe_ptr().unsafe_offset(q),
+                        index_norm.unsafe_ptr(),
+                        Int32(rows),
+                        Int32(n_index),
+                        Int32(1 if mtr == DIST_L2_SQRT_EXPANDED else 0),
+                        grid_dim=((cells + 255) // 256, 1, 1),
+                        block_dim=(256, 1, 1),
+                    )
+
+            comptime if KNN_PHASE_TIMERS:
+                if not use_block_topk:
+                    ctx.synchronize()
+                    ns_distance += perf_counter_ns() - t_class
+                    n_distance += 1
+                    t_class = perf_counter_ns()
+            # THE SELECTION. Three implementations, and which one runs is a
+            # parameter or a kernel-matrix row, never a preference.
+            #
+            # The implemented RAFT radix select is the base default; on the columns
+            # `knn_warpsort_select_for` admits (DEVIATION 1922), the FAST
+            # selector for `2 < k <= 256` is the implemented RAFT warpsort, which is
+            # RAFT's own `select_k` choice for that band. `nn.topk.top_k` is a
+            # device-wide call that consumes a materialized matrix, which is
+            # exactly what this path already has, so it is a legitimate second
+            # opinion HERE - and it is the reason it can never be the fused
+            # path's selector, because a device-wide call cannot live inside a
+            # kernel. `neighbors/checks/knn_check.mojo` diffs the two.
+            if use_vendor_topk:
+                var dv = dist_tile.create_sub_buffer[DType.float32](
+                    0, rows * n_index
+                )
+                var ov = out_dist.create_sub_buffer[DType.float32](q * k, rows * k)
+                var oi = out_idx32.create_sub_buffer[DType.int32](q * k, rows * k)
+                top_k[largest=False, target="gpu"](
+                    TileTensor(dv, row_major(rows, n_index)),
+                    k,
+                    1,
+                    TileTensor(ov, row_major(rows, k)),
+                    TileTensor(oi, row_major(rows, k)),
+                    False,
+                    ctx,
+                )
+            else:
+                comptime if PIN_DETERMINISM:
+                    # IDENTITY_PATHS row 11's closure, DEVIATIONS 500/501: the
+                    # composite (distance, index) key and the ranked placement.
+                    # The implemented selector keeps RAFT's tie handling, which is
+                    # atomic-ordered by construction; this one has no tie class
+                    # and no arrival order in its output.
+                    #
+                    # The pinned tier uses the bounded rank staging. The
+                    # strided pass extends it beyond the 256-thread block; the
+                    # cap still bounds shared storage and quadratic rank work.
+                    # DEVIATION 6300: k above the bounded rank profile's
+                    # IDENTICAL_MAX_K selects in rounds of that width and
+                    # merges column tiles by binary search (both in
+                    # `select_radix_identical.mojo`); k <= IDENTICAL_MAX_K
+                    # takes the launches below, unchanged.
+                    var wide_k = k > IDENTICAL_MAX_K
+                    if wide_k and cols < k:
+                        raise Error(
+                            "select_radix ("
+                            + numeric_mode_name()
+                            + "): k = " + String(k)
+                            + " exceeds the index column tile ("
+                            + String(cols) + " columns)"
+                        )
+                    var selected_smallk = wide_k
+                    if wide_k:
+                        select_radix_identical_rounds_launch(
+                            ctx,
+                            dist_tile.unsafe_ptr().unsafe_origin_cast[MutAnyOrigin](),
+                            sel_dist, sel_idx,
+                            buf_val.unsafe_ptr().unsafe_origin_cast[MutAnyOrigin](),
+                            buf_idx.unsafe_ptr().unsafe_origin_cast[MutAnyOrigin](),
+                            rows, cols, k, buf_len, True,
+                        )
+                    comptime if EXPERIMENTAL_SMALLK_IDENTICAL:
+                        # Kernel-matrix row `knn_smallk_select_for`: for
+                        # k <= 64 the per-thread composite-key selector,
+                        # which returns the same ascending (distance, index)
+                        # rows the radix rank pass does. It needs k real
+                        # keys in the row; every column tile has them.
+                        if use_fused or use_block_topk:
+                            # DEVIATION 2667 / 3001: the launch above already
+                            # wrote this tile's top-k.
+                            selected_smallk = True
+                        # TOMBSTONE: ANONLIB_KNN_IDENTICAL_WIDEK_RADIX (DROPPED-slower) deleted 2026-10-10 by lane/postmerge-act-6; code recoverable at 9f83ea479.
+                        # Tried: K2's wide-k branch to the radix launch.
+                        # Restore: git apply experiments/removed/ANONLIB_KNN_IDENTICAL_WIDEK_RADIX.patch; record in docs/TOMBSTONES.md.
+                        elif cols >= k and k <= SMALLK_MAX_K and cols <= 2147483647:
+                            var bound_compact = False
+                            comptime if KNN_SELECTOR_BOUND:
+                                # DEVIATION 3060: the same ascending
+                                # (distance, tile-local index) rows from the
+                                # same tile cells, without the k-deep lists.
+                                if k >= KNN_SELECTOR_BOUND_MIN_K:
+                                    bound_compact_select_launch(
+                                        ctx,
+                                        dist_tile.unsafe_ptr().unsafe_origin_cast[MutAnyOrigin](),
+                                        sel_dist, sel_idx, select_flags, rows, cols, k, True,
+                                    )
+                                    bound_compact = True
+                            if not bound_compact:
+                                smallk_select_launch(
+                                    ctx,
+                                    dist_tile.unsafe_ptr().unsafe_origin_cast[MutAnyOrigin](),
+                                    sel_dist, sel_idx, rows, cols, k, True, select_arm,
+                                )
+                            selected_smallk = True
+                    if not selected_smallk:
+                        # Preserve the historical shared-memory footprint for
+                        # existing k. Only the extended range stages 1024 pairs.
+                        if k <= SELECT_BLOCK:
+                            ctx.enqueue_function[radix_topk_identical_kernel[SELECT_BLOCK]](
+                                dist_tile.unsafe_ptr(),
+                                sel_dist,
+                                sel_idx,
+                                buf_val.unsafe_ptr(),
+                                buf_idx.unsafe_ptr(),
+                                Int32(cols),
+                                Int32(k),
+                                Int32(buf_len),
+                                Int32(1),
+                                grid_dim=(rows, 1, 1),
+                                block_dim=(SELECT_BLOCK, 1, 1),
+                            )
+                        else:
+                            ctx.enqueue_function[radix_topk_identical_kernel[IDENTICAL_MAX_K]](
+                                dist_tile.unsafe_ptr(),
+                                sel_dist,
+                                sel_idx,
+                                buf_val.unsafe_ptr(),
+                                buf_idx.unsafe_ptr(),
+                                Int32(cols),
+                                Int32(k),
+                                Int32(buf_len),
+                                Int32(1),
+                                grid_dim=(rows, 1, 1),
+                                block_dim=(SELECT_BLOCK, 1, 1),
+                            )
+                    comptime if KNN_PHASE_TIMERS:
+                        if not use_block_topk:
+                            ctx.synchronize()
+                            ns_select += perf_counter_ns() - t_class
+                            n_select += 1
+                            t_class = perf_counter_ns()
+                    if not first and wide_k:
+                        wide_topk_merge_launch(
+                            ctx,
+                            out_dist.unsafe_ptr().unsafe_offset(
+                                q * k
+                            ).unsafe_origin_cast[MutAnyOrigin](),
+                            out_idx.unsafe_ptr().unsafe_offset(
+                                q * k
+                            ).unsafe_origin_cast[MutAnyOrigin](),
+                            part_dist.unsafe_ptr().unsafe_origin_cast[MutAnyOrigin](),
+                            part_idx.unsafe_ptr().unsafe_origin_cast[MutAnyOrigin](),
+                            buf_val.unsafe_ptr().unsafe_origin_cast[MutAnyOrigin](),
+                            buf_idx.unsafe_ptr().unsafe_origin_cast[MutAnyOrigin](),
+                            2 * buf_len, rows, k, c, True,
+                        )
+                        comptime if KNN_PHASE_TIMERS:
+                            ctx.synchronize()
+                            ns_merge += perf_counter_ns() - t_class
+                            n_merge += 1
+                    elif not first:
+                        partial_topk_merge_launch(
+                            ctx,
+                            out_dist.unsafe_ptr().unsafe_offset(
+                                q * k
+                            ).unsafe_origin_cast[MutAnyOrigin](),
+                            out_idx.unsafe_ptr().unsafe_offset(
+                                q * k
+                            ).unsafe_origin_cast[MutAnyOrigin](),
+                            part_dist.unsafe_ptr().unsafe_origin_cast[MutAnyOrigin](),
+                            part_idx.unsafe_ptr().unsafe_origin_cast[MutAnyOrigin](),
+                            rows, k, c, True,
+                        )
+                        comptime if KNN_PHASE_TIMERS:
+                            ctx.synchronize()
+                            ns_merge += perf_counter_ns() - t_class
+                            n_merge += 1
+                else:
+                    # DEVIATION 1922 (kernel-matrix row `knn_warpsort_select_for`):
+                    # RAFT's OWN `select_k` dispatch sends `2 < k <= 256` to the
+                    # WARPSORT family and only `k > 256` to radix
+                    # (`select_k-inl.cuh:38`), and this tree ran radix alone
+                    # across that whole band. On the columns the row admits
+                    # (32-lane FAST), the band takes the implemented warpsort in the
+                    # single-pass block form; everything else -- k outside the
+                    # band, excluded columns, and BOTH UPPER TIERS, whose
+                    # selector is pinned above -- keeps radix byte for byte.
+                    # The `comptime if` is load-bearing, not style: this
+                    # function is non-generic, so any kernel named under a
+                    # RUNTIME `if` here instantiates whenever the module
+                    # builds, reachable or not -- the exact shape that killed
+                    # the first MI300X gbdt build (DEVIATION 1910's lesson).
+                    # The 32-lane warpsort kernel must not be INSTANTIATED on
+                    # a column the row excludes, so the exclusion is comptime.
+                    comptime if knn_warpsort_select_for[TARGET_COLUMN, False]():
+                        if k > 2 and k <= MAX_CAPACITY:
+                            # `bound_by_power_of_two(k)` with a floor of 32;
+                            # the four instantiations match RAFT's template
+                            # dispatch over capacities.
+                            if k <= 32:
+                                _warpsort_select_tile[32](
+                                    ctx, dist_tile, buf_idx, out_dist, out_idx,
+                                    q * k, rows, n_index, k,
+                                )
+                            elif k <= 64:
+                                _warpsort_select_tile[64](
+                                    ctx, dist_tile, buf_idx, out_dist, out_idx,
+                                    q * k, rows, n_index, k,
+                                )
+                            elif k <= 128:
+                                _warpsort_select_tile[128](
+                                    ctx, dist_tile, buf_idx, out_dist, out_idx,
+                                    q * k, rows, n_index, k,
+                                )
+                            else:
+                                _warpsort_select_tile[256](
+                                    ctx, dist_tile, buf_idx, out_dist, out_idx,
+                                    q * k, rows, n_index, k,
+                                )
+                        else:
+                            _radix_select_tile(
+                                ctx, dist_tile, buf_val, buf_idx, out_dist,
+                                out_idx, q * k, rows, n_index, k, buf_len,
+                            )
+                    else:
+                        _radix_select_tile(
+                            ctx, dist_tile, buf_val, buf_idx, out_dist,
+                            out_idx, q * k, rows, n_index, k, buf_len,
+                        )
+            c += cols
+        q += rows
+    ctx.synchronize()
+    comptime if KNN_PHASE_TIMERS:
+        print(
+            "KNN_PHASE_TIMERS", "distance_ms", Float64(ns_distance) / 1000000.0,
+            "select_ms", Float64(ns_select) / 1000000.0,
+            "merge_ms", Float64(ns_merge) / 1000000.0,
+            "distance_launches", n_distance, "select_launches", n_select,
+            "merge_launches", n_merge, "query_tile", query_tile,
+            "index_tile", index_tile, "n_queries", n_queries, "n_index", n_index,
+            "k", k, "fused", Int(use_fused), "smem", Int(use_smem),
+            "block_topk", Int(use_block_topk),
+        )
+    _ = part_dist^
+    _ = part_idx^
+    _ = part_keys^
+    _ = select_flags^
+
+
+#: WHICH SIDE OF `knn_brute_force.cuh:443` THIS IMPLEMENTATION TAKES BY DEFAULT.
+#:
+#: DEVIATION 36 (REVISED 2026-08-19, second measurement round): cuVS sends
+#: `k <= 64` + row-major + L2 to `fusedL2Knn` unconditionally; we send it
+#: there ONLY when `fused_l2_knn_grid` -- their own `launchConfigGenerator`,
+#: fed the hardware matrix's target column (Apple column = the M4 values
+#: every table below was measured on) -- picks `grid_x == 1`, and to
+#: `tiledBruteForceKnn` (their `else`)
+#: when it would engage the x-split. Both arms are theirs; which one runs
+#: unasked is decided by their launch computation evaluated on our hardware.
+#:
+#: HISTORY, because this default has now flipped once and the reason matters.
+#: The first implementation ran the fused kernel at a fixed `grid = (1, ceil(m/16))`
+#: (~125 blocks at 2,000 queries, independent of index size) and measured
+#: 0.84x-0.88x against tiled at every index size 20k-400k, both arm orders.
+#: That table set the original DEVIATION 36 default = TILED. It was a
+#: measurement of the WRONG GEOMETRY: the launch computation is part of their
+#: algorithm, and implementing its A100 output instead of the computation itself
+#: starved the M4. With `launchConfigGenerator` implemented (grid capped at
+#: minGridSize = 120 with a row grid-stride) the same kernel re-measured
+#: 2026-08-19 evening, arms interleaved in the repeat loop, BOTH orders
+#: pooled, n = 6/size, 32 features, k = 10, 2,000 queries:
+#:
+#:     n index    tiled med ms   fused med ms   fused/tiled
+#:      20,000          23.8           26.1        0.91x
+#:      50,000          67.9           63.6        1.07x
+#:     100,000         174.2          154.4        1.13x
+#:     200,000         323.9          274.1        1.18x
+#:     400,000         615.7          517.9        1.19x
+#:
+#: Per-size ranges overlap (a noisy thermal window), so no single row is a
+#: verdict; the query sweep at a fixed 200,000-row index is, in both
+#: directions at once:
+#:
+#:     queries    tiled med ms   fused med ms   fused/tiled   grid
+#:         64            10.6           11.4        0.93x     (16, 4)
+#:        250            40.8           48.6        0.84x     (7, 16)
+#:        500            56.5          293.7        0.19x     (4, 32)
+#:      1,000           111.0          499.7        0.22x     (2, 63)
+#:      2,000           268.0          264.6        1.01x     (1, 120)
+#:      8,000         1,247.7        1,121.2        1.11x     (1, 120)
+#:     32,000         5,575.6        4,445.3        1.25x     (1, 120)
+#:
+#: THE SIGN FLIPS WITH THE GRID SHAPE. Everywhere the computation picks
+#: `grid_x == 1` the fused kernel is at worst a tie and at 32,000 queries a
+#: clean non-overlapping 1.25x win; everywhere it engages the x-split the
+#: mutex merge is a loss, and at 500-1,000 queries a CATASTROPHIC one (down
+#: to 0.19x, with a 2.1-second worst sample at 500 queries against tiled's
+#: 43 ms). The mutex protocol is CORRECT on Metal (the acquire-load spin /
+#: weak-CAS / release-store spelling, probe-verified under contention), but
+#: paying serialized cross-block merges per row costs more here than the
+#: occupancy it buys. So:
+#:
+#:   - `KNN_METHOD_AUTO` (the DEFAULT): fused iff `fused_l2_knn_grid` says
+#:     `grid_x == 1`, else tiled. The number the default flips on is by
+#:     construction the number the launch would use.
+#:   - `KNN_METHOD_FUSED` restores cuVS's dispatch exactly, x-split included.
+#:   - `KNN_METHOD_TILED` restores the 2026-08-19-morning default.
+#:
+#: THE k HOLE, CLOSED. The tables above are all k = 10, and fused's domain
+#: runs to k = 64 with register queues that grow with k, so AUTO could have
+#: been shipping an unmeasured high-k loss. Swept 2026-08-19 late evening,
+#: interleaved, 2,000 queries (grid (1, 120)), fused/tiled median ratios:
+#:
+#:     k      100,000 idx   400,000 idx
+#:     10        1.13x         1.06x
+#:     32        1.10x         1.00x
+#:     64        1.04x         1.05x
+#:
+#: No k-degradation; every range overlaps (INDISTINGUISHABLE singly), fused
+#: never behind on a median. AUTO holds across the whole fused k domain.
+#:
+#: This does not change any answer. Both arms match the host Float64 oracle
+#: slot for slot on the same fixtures (`check_fused_l2_knn`,
+#: `check_fused_griddimx_merge`, `check_fused_edge_shapes`), so the switch
+#: changes a wait and not an output.
+comptime KNN_METHOD_FUSED = 0
+comptime KNN_METHOD_TILED = 1
+comptime KNN_METHOD_AUTO = 2
+
+
+def brute_force_knn_impl(
+    ctx: DeviceContext,
+    mut queries: DeviceBuffer[DType.float32],
+    mut query_norm: DeviceBuffer[DType.float32],
+    mut index: DeviceBuffer[DType.float32],
+    mut index_norm: DeviceBuffer[DType.float32],
+    mut dist_tile: DeviceBuffer[DType.float32],
+    mut buf_val: DeviceBuffer[DType.float32],
+    mut buf_idx: DeviceBuffer[DType.uint32],
+    mut out_dist: DeviceBuffer[DType.float32],
+    mut out_idx: DeviceBuffer[DType.uint32],
+    mut out_idx32: DeviceBuffer[DType.int32],
+    n_queries: Int,
+    n_index: Int,
+    n_features: Int,
+    k: Int,
+    query_tile: Int,
+    buf_len: Int,
+    is_sqrt: Bool,
+    use_vendor_topk: Bool = False,
+    row_major_query: Bool = True,
+    row_major_index: Bool = True,
+    knn_method: Int = KNN_METHOD_AUTO,
+    metric: Int = METRIC_FROM_IS_SQRT,
+    metric_arg: Float32 = Float32(2.0),
+    cache: KnnIndexCachePointer = None,
+) raises:
+    """`brute_force_knn_impl`'s dispatch, `knn_brute_force.cuh:443-447`.
+
+    `cache` (DEVIATION 3061) is handed to the tiled arm and read nowhere else.
+
+    Their four conditions, in their order:
+
+        k <= 64
+        rowMajorQuery == rowMajorIndex
+        rowMajorQuery == true
+        metric is one of L2Unexpanded / L2SqrtUnexpanded / L2Expanded /
+                         L2SqrtExpanded
+
+    **THE METRIC TEST IS NOW A REAL RUNTIME TEST, 2026-09-01.** This
+    paragraph used to say "The metric test is not a runtime test here
+    because this implementation carries only the expanded-L2 arm, so it is satisfied
+    by construction ... If a metric outside that set is ever implemented, this
+    is where it has to become a switch." A metric outside that set IS
+    implemented -- `CosineExpanded`, `L1`, `Linf`, `L2SqrtUnexpanded`,
+    `LpUnexpanded` -- so the sentence is deleted and the switch is written.
+    `fused_l2_knn` is entered ONLY for the four members of their set, which
+    is exactly their `:444-447`; everything else takes their `else` and
+    goes to `tiled_brute_force_knn`, which is exactly their `:485-511`
+    default. Cosine is NEVER fusable in the reference either, and it is worth
+    saying why rather than only that: `fusedL2Knn`'s whole trick is that
+    the expanded L2 epilogue `xn + yn - 2 dot` is MONOTONE in `-dot`, so
+    the register queue can rank on the raw accumulator and fix the value
+    up at the very end. Cosine's `1 - dot/(nx*ny)` is monotone in `-dot`
+    only for a FIXED pair of norms, and the queue compares across
+    different index rows with different `yn`, so the fusion is not merely
+    unimplemented, it is unsound. Their `Haversine` case at `:478-484` is still
+    not implemented and is a `NOT_IMPLEMENTED.tsv` row.
+
+    `metric = METRIC_FROM_IS_SQRT` (the default) reproduces the previous
+    behaviour exactly: `is_sqrt` picks L2SqrtExpanded or L2Expanded, both
+    in their fusable set, so every existing caller keeps its arm and its
+    bits.
+
+    `k > n_index` is refused outright rather than dispatched, because their
+    `n < k` fill at `:157-166` is not implemented on either arm and the fallback's
+    selector cannot take `k > len`. See the raise below.
+
+    `query_tile`, `buf_len`, `dist_tile`, `buf_val`, `buf_idx` and
+    `out_idx32` are only read on the fallback path. The fused path needs none
+    of them, which is the whole point of it.
+
+    **THE DEFAULT ARM IS AUTO, AND WHAT AUTO MEANS IS PER COLUMN.** This
+    paragraph used to say `knn_method` defaults to `KNN_METHOD_TILED`; that
+    was stale the moment the signature below said `KNN_METHOD_AUTO`, and is
+    deleted rather than annotated. Under FAST, AUTO picks by DEVIATION 36's
+    shape test (fused iff the launch computation says `grid_x == 1`) except
+    on columns where `knn_auto_follows_their_dispatch_for` (DEVIATION 1923)
+    restores cuVS's unconditional dispatch; under IDENTICAL, DEVIATION 509
+    pins AUTO to the tiled arm on every column. The four conditions above
+    are still evaluated and still decide the arm whenever
+    `knn_method == KNN_METHOD_FUSED`. Read DEVIATION 36 above the constants
+    before changing any of it.
+    """
+    # THEIR `n < k` CASE IS NOT IMPLEMENTED ON EITHER ARM, SO REFUSE IT.
+    #
+    # `knn_brute_force.cuh:157-166` fills the output with
+    # `numeric_limits<DistanceT>::lowest()` and, for a signed index type,
+    # `-1`, so a row with fewer than k candidates comes back marked. That
+    # fill is not implemented. Worse, the selector this path would reach cannot
+    # take `k > len` at all: `select_radix.mojo:329` looks for the bucket
+    # where `prev_count < current_k <= cur_count`, and when the whole row
+    # holds fewer than k elements no bucket ever satisfies it, so `ctr` is
+    # never updated, every later pass drops every element, and `last_filter`
+    # reads a buffer nothing wrote. That is a silent wrong answer, and
+    # returning one is worse than refusing.
+    #
+    # Read from their file and from ours, NOT measured on hardware. Implementing
+    # the fill needs the selection clamped to `min(k, n)` and its packed
+    # output scattered back to a stride of `k`, which is the same scatter the
+    # two-axis tiling needs; both are in the lane file as one open item.
+    if k > n_index:
+        raise Error(
+            "brute_force_knn_impl: k > n_index. Their `n < k` short-fill at"
+            " knn_brute_force.cuh:157-166 is not implemented and the implemented radix"
+            " selector cannot take k > len; see the lane file."
+        )
+
+    # Their four conditions, unchanged, AND our own method switch. The
+    # switch is a separate clause rather than a rewrite of theirs so that
+    # `knn_method = KNN_METHOD_FUSED` restores their dispatch exactly. The
+    # AUTO default asks the launch computation itself which regime this shape
+    # is in; see DEVIATION 36 above the constants for the measurements.
+    var mtr = resolve_metric(metric, is_sqrt)
+
+    # C29_STREAM_TOPK (one thread per query walking every index row) was
+    # deleted 2026-10-07: forbidden serial shape, incumbent selectors are
+    # block-per-row-per-tile. KNN_DIRECT_DISTANCE no longer routes here; it
+    # keeps ONE device spelling, the row-major direct tile
+    # (`pinned_distance_tile_direct_kernel[KNN_DIRECT_DISTANCE]`), which is
+    # what core/knn_host_predict.mojo's host twin computes. The certified MMA
+    # and transposed-layout routes compute the expanded form only, so they
+    # are closed under KNN_DIRECT_DISTANCE (here and in tiled_brute_force_knn).
+    comptime if KNN_CERTIFIED_MMA and not KNN_DIRECT_DISTANCE:
+        if (
+            (mtr == DIST_L2_EXPANDED or mtr == DIST_L2_SQRT_EXPANDED)
+            and row_major_query
+            and row_major_index
+            and knn_method == KNN_METHOD_AUTO
+            and k >= 1
+            and k <= CERT_MAX_K
+            and n_features >= 1
+            and n_features <= CERT_MAX_D
+            and n_index >= 64
+            and n_queries >= 1
+        ):
+            certified_mma_knn(
+                ctx, queries, query_norm, index, index_norm, dist_tile,
+                buf_val, buf_idx, out_dist, out_idx, out_idx32, n_queries,
+                n_index, n_features, k, query_tile, buf_len, is_sqrt,
+                use_vendor_topk, mtr == DIST_L2_SQRT_EXPANDED, metric,
+                metric_arg, cache,
+            )
+            return
+
+    # THEIR FOURTH CONDITION, `:444-447`, as a value test.
+    # FAST on Apple, k <= 32: the simdgroup-matrix arm
+    # (neighbors/impl/detail/fast_mma_knn.mojo).
+    comptime if FAST_MMA_KNN_ENABLED:
+        if (
+            (
+                mtr == DIST_L2_UNEXPANDED
+                or mtr == DIST_L2_SQRT_UNEXPANDED
+                or mtr == DIST_L2_EXPANDED
+                or mtr == DIST_L2_SQRT_EXPANDED
+            )
+            and row_major_query
+            and row_major_index
+            and fast_mma_knn_applies(n_features, k)
+        ):
+            fast_mma_knn(
+                ctx, queries, index, out_dist, out_idx, n_queries, n_index,
+                n_features, k,
+                mtr == DIST_L2_SQRT_UNEXPANDED or mtr == DIST_L2_SQRT_EXPANDED,
+            )
+            return
+    # FAST on Apple: fused distance + top-k, no distance tile
+    # (neighbors/impl/detail/fast_topk_knn.mojo).
+    comptime if FAST_TOPK_KNN_ENABLED:
+        var l2 = (
+            mtr == DIST_L2_UNEXPANDED
+            or mtr == DIST_L2_SQRT_UNEXPANDED
+            or mtr == DIST_L2_EXPANDED
+            or mtr == DIST_L2_SQRT_EXPANDED
+        )
+        if (
+            l2
+            and row_major_query
+            and row_major_index
+            and fast_topk_knn_applies(n_features, k)
+        ):
+            fast_topk_knn(
+                ctx, queries, index, out_dist, out_idx, n_queries, n_index,
+                n_features, k,
+                mtr == DIST_L2_SQRT_UNEXPANDED or mtr == DIST_L2_SQRT_EXPANDED,
+            )
+            return
+
+    var metric_is_fusable = (
+        mtr == DIST_L2_UNEXPANDED
+        or mtr == DIST_L2_SQRT_UNEXPANDED
+        or mtr == DIST_L2_EXPANDED
+        or mtr == DIST_L2_SQRT_EXPANDED
+    )
+    # ...and OUR narrower one. `fused_l2_knn` carries only the EXPANDED
+    # half of their set (the file's own docstring says so: it is the
+    # `Policy2x8` expanded kernel), so an explicitly requested
+    # `L2Unexpanded` / `L2SqrtUnexpanded` takes the tiled arm here where
+    # cuVS would fuse it. That is a MISSING ARM, not a different answer:
+    # `metric_distance_kernel`'s `l2_unexp_core` is their unexpanded op,
+    # and it is the same distance their fused kernel would compute by the
+    # other identity. Recorded in `neighbors/NOT_IMPLEMENTED.tsv`.
+    var fused_arm_carries = (
+        mtr == DIST_L2_EXPANDED or mtr == DIST_L2_SQRT_EXPANDED
+    )
+
+    var want_fused = knn_method == KNN_METHOD_FUSED
+    if knn_method == KNN_METHOD_AUTO:
+        comptime if GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL:
+            # THE ARM PIN, IDENTITY_PATHS row 23. AUTO normally chooses by
+            # SHAPE -- fused when the launch computation says `grid_x == 1`,
+            # tiled when it would engage the x-split -- and the two arms
+            # resolve a tie in the k-th distance differently: the tiled arm's
+            # composite key takes the LOWEST INDEX (DEVIATION 500) while the
+            # fused arm's FAISS queue compares the distance only. A
+            # shape-dependent arm therefore makes the ANSWER depend on how
+            # many queries the caller happened to pass, which is not a
+            # property an identical column can have.
+            #
+            # DEVIATION 509 SUPERSEDES 502'S CHOICE OF ARM, and the reason is
+            # a column, not a preference. 502 pinned AUTO to the FUSED arm
+            # (cuVS's own dispatch, `knn_brute_force.cuh:443`) and that is
+            # well-defined on a 32-lane column -- but `fused_l2_knn` REFUSES
+            # at its entry wherever `lib_lane_width_for[TARGET_COLUMN]() !=
+            # 32`, because the FAISS queue is a 32-lane bitonic network and
+            # a 64-wide wavefront addresses the wrong half of it (row 23's
+            # own refusal). So under 502 the IDENTICAL build of k-NN did not
+            # merely lose its tie guarantee on AMD, it RAISED: the pinned
+            # arm was one that cannot exist on one of the three columns this
+            # tree claims. A dispatch that is unrunnable on a column is not
+            # that column's dispatch.
+            #
+            # AUTO therefore pins to the TILED arm on EVERY column under
+            # IDENTICAL. That arm is the one whose answer is NAMED rather
+            # than merely reproducible:
+            #
+            #   - `select_radix_identical` ranks over the composite
+            #     `(twiddle_in(distance) << 32) | index` key, so equidistant
+            #     neighbours come back LOWEST INDEX FIRST by construction and
+            #     the tie class does not exist (DEVIATIONS 500, 501);
+            #   - `pinned_distance_tile` accumulates each cell in ONE thread
+            #     over the whole feature axis, ascending, with no vendor
+            #     matmul and no k-split (DEVIATION 505);
+            #   - neither kernel contains a warp primitive or reads a lane
+            #     width, and the selector's only block collective is a
+            #     prefix sum over Int32 histogram counts, which is exact at
+            #     any tree shape.
+            #
+            # The price is measured, not argued: `price-unsupervised-identity`
+            # puts `knn.tiled` at 2.85x `knn.auto`'s FAST arm on the M4, so
+            # this is what the identical column costs for `k <= 64`. It buys
+            # the only thing the column is for -- the same bits on Metal, PTX
+            # and AMDGPU -- and it buys it on all three rather than on two.
+            #
+            # `KNN_METHOD_FUSED` is untouched: it restores their dispatch
+            # exactly, keeps 502's `grid_x = 1` pin so its tie set stays a
+            # pure function of `(m, n, k)`, and keeps refusing on a column
+            # whose lane width is neither32 nor64 (IDENTICAL logical32 groups).
+            want_fused = False
+        else:
+            comptime if knn_auto_follows_their_dispatch_for[
+                TARGET_COLUMN, False
+            ]():
+                # DEVIATION 1923 (kernel-matrix row): on this column AUTO
+                # restores cuVS's dispatch UNCONDITIONALLY -- fused for the
+                # whole `k <= 64` row-major L2 band, x-split and mutex merge
+                # included. DEVIATION 36's `grid_x == 1` gate was measured
+                # entirely on Apple milliseconds (the Metal x-split cliff,
+                # 0.19x at 500-1,000 queries); on the vendor whose own
+                # scheduler the mutex protocol was written for, the gate was
+                # sending the H100's 4,000-query benchmark shape to the
+                # TILED arm cuVS never takes there. The row's docstring in
+                # `checks/kernel_matrix.mojo` carries the argument;
+                # `run_knn`'s `ours-fused` / `ours-tiled` arms are the A/B
+                # that confirms or flips it.
+                want_fused = True
+            else:
+                var g = fused_l2_knn_grid(n_queries, n_index)
+                want_fused = g[0] == 1
+                comptime if is_defined["ANONLIB_KNN_FAST_FORCE_FUSED"]():
+                    want_fused = True
+                comptime if is_defined["ANONLIB_KNN_FAST_FORCE_TILED"]():
+                    want_fused = False
+
+    # DEVIATION 512: THE ARM MUST EXIST ON THIS COLUMN BEFORE AUTO PICKS IT.
+    #
+    # Found by compiling this file against `ANONLIB_COLUMN_AMD` on the Mac
+    # (2026-08-23), which is a build the four-column matrix supports and
+    # nothing had ever run: `check_knn_fused_tie_set_is_geometry_invariant`
+    # died with `fusedL2kNN: the FAISS warp queue is a 32-lane bitonic
+    # network and this target column's lane width is 64`.
+    #
+    # HISTORICAL refusal (row23), now retained outside IDENTICAL. The
+    # IDENTICAL CDNA path uses explicit logical32 queue collectives.
+    # Before that closure the refusal was reached through the
+    # DEFAULT. `fused_l2_knn` is refused wherever the lane width is not 32,
+    # but AUTO's geometry test does not know that, so on a 64-wide wavefront
+    # every `k <= 64` row-major query whose launch computation returns
+    # `grid_x == 1` -- the COMMON shape, and the one DEVIATION 36 measured
+    # the fused arm to be fastest at -- raised instead of running. A caller
+    # who never named an arm got an exception for a shape class, on a
+    # vendor, in the SHIPPED mode. Under IDENTICAL, DEVIATION 509 had
+    # already moved AUTO off the fused arm; this is the same hole in FAST,
+    # and it is a correctness bug rather than an identity one.
+    #
+    # Outside IDENTICAL the refusal stays for an EXPLICIT
+    # `KNN_METHOD_FUSED`: asking for an arm this column cannot express
+    # should say so rather than silently substituting another one with a
+    # different tie rule. AUTO, which by definition did not ask, takes the
+    # tiled arm.
+    comptime fused_arm_exists = lib_lane_width_for[TARGET_COLUMN]() == 32 or (GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL and lib_lane_width_for[TARGET_COLUMN]() == 64)
+    comptime if not fused_arm_exists:
+        if knn_method == KNN_METHOD_AUTO:
+            want_fused = False
+
+    # A METRIC OUTSIDE THE FUSABLE SET IS NOT AN ERROR, IT IS THEIR `else`.
+    # `KNN_METHOD_FUSED` asks for an arm; asking for it with cosine or Lp
+    # is asking for an arm that does not exist in the reference either, so it is
+    # refused BY NAME rather than silently substituted -- the same rule
+    # DEVIATION 512 applies to a column whose lane width cannot express
+    # the FAISS queue.
+    if knn_method == KNN_METHOD_FUSED and not fused_arm_carries:
+        raise Error(
+            "brute_force_knn_impl: KNN_METHOD_FUSED was asked for with"
+            " metric "
+            + String(mtr)
+            + "; fusedL2Knn covers only the L2 expanded pair"
+            " (knn_brute_force.cuh:444-447 admits four L2 tags and cuVS"
+            " itself never fuses cosine or Lp). Use KNN_METHOD_AUTO or"
+            " KNN_METHOD_TILED."
+        )
+    if not metric_is_fusable or not fused_arm_carries:
+        want_fused = False
+
+    var fused_ok = (
+        k <= FKNN_MAX_NN
+        and row_major_query == row_major_index
+        and row_major_query
+        and want_fused
+    )
+    if fused_ok:
+        fused_l2_knn(
+            ctx,
+            queries,
+            query_norm,
+            index,
+            index_norm,
+            out_dist,
+            out_idx,
+            n_queries,
+            n_index,
+            n_features,
+            k,
+            is_sqrt,
+        )
+    else:
+        tiled_brute_force_knn(
+            ctx,
+            queries,
+            query_norm,
+            index,
+            index_norm,
+            dist_tile,
+            buf_val,
+            buf_idx,
+            out_dist,
+            out_idx,
+            out_idx32,
+            n_queries,
+            n_index,
+            n_features,
+            k,
+            query_tile,
+            buf_len,
+            is_sqrt,
+            use_vendor_topk,
+            mtr,
+            metric_arg,
+            cache,
+        )
+
+
+def certified_mma_knn(
+    ctx: DeviceContext,
+    mut queries: DeviceBuffer[DType.float32],
+    mut query_norm: DeviceBuffer[DType.float32],
+    mut index: DeviceBuffer[DType.float32],
+    mut index_norm: DeviceBuffer[DType.float32],
+    mut dist_tile: DeviceBuffer[DType.float32],
+    mut buf_val: DeviceBuffer[DType.float32],
+    mut buf_idx: DeviceBuffer[DType.uint32],
+    mut out_dist: DeviceBuffer[DType.float32],
+    mut out_idx: DeviceBuffer[DType.uint32],
+    mut out_idx32: DeviceBuffer[DType.int32],
+    n_queries: Int,
+    n_index: Int,
+    n_features: Int,
+    k: Int,
+    query_tile: Int,
+    buf_len: Int,
+    is_sqrt: Bool,
+    use_vendor_topk: Bool,
+    root: Bool,
+    metric: Int,
+    metric_arg: Float32,
+    cache: KnnIndexCachePointer,
+) raises:
+    """KNN_CERTIFIED_MMA's driver: candidates, pinned values and the
+    certificate for every query, then the tiled arm (`KNN_METHOD_TILED`,
+    the IDENTICAL arm AUTO pins) for the queries whose certificate failed,
+    scattered into their rows. Same keys as the tiled arm for every query
+    (`certified_mma_knn.mojo`)."""
+    var kc = 16 if k <= 12 else 32
+    var cand_d = ctx.enqueue_create_buffer[DType.float32](n_queries * kc)
+    var cand_i = ctx.enqueue_create_buffer[DType.uint32](n_queries * kc)
+    var flags = ctx.enqueue_create_buffer[DType.int32](n_queries)
+    fast_mma_knn(
+        ctx, queries, index, cand_d, cand_i, n_queries, n_index, n_features,
+        kc, False,
+    )
+    var grid = (n_queries + CERT_TPB - 1) // CERT_TPB
+    var root_arg = Int32(1) if root else Int32(0)
+    if kc == 16:
+        ctx.enqueue_function[certified_rescore_kernel[16, 16]](
+            queries.unsafe_ptr(), index.unsafe_ptr(), query_norm.unsafe_ptr(),
+            index_norm.unsafe_ptr(), cand_d.unsafe_ptr(), cand_i.unsafe_ptr(),
+            out_dist.unsafe_ptr(), out_idx.unsafe_ptr(), flags.unsafe_ptr(),
+            Int32(n_queries), Int32(n_index), Int32(n_features), Int32(k),
+            root_arg, grid_dim=(grid, 1, 1), block_dim=(CERT_TPB, 1, 1),
+        )
+    else:
+        ctx.enqueue_function[certified_rescore_kernel[32, 32]](
+            queries.unsafe_ptr(), index.unsafe_ptr(), query_norm.unsafe_ptr(),
+            index_norm.unsafe_ptr(), cand_d.unsafe_ptr(), cand_i.unsafe_ptr(),
+            out_dist.unsafe_ptr(), out_idx.unsafe_ptr(), flags.unsafe_ptr(),
+            Int32(n_queries), Int32(n_index), Int32(n_features), Int32(k),
+            root_arg, grid_dim=(grid, 1, 1), block_dim=(CERT_TPB, 1, 1),
+        )
+    # lane cgr4-download-loop: the uncertified queries are compacted on the
+    # device (ascending, by an exclusive scan), not downloaded and walked
+    var rows = ctx.enqueue_create_buffer[DType.int32](n_queries)
+    var nf = device_compact_equal_i32(ctx, flags, n_queries, Int32(0), rows)
+    # NEVER RUN — PENDING MEASUREMENT
+    comptime if is_defined["ANONLIB_IDN_KNN_CERTIFIED_REACH"]():
+        var reached=_CERTIFIED_REACH.get_or_create_ptr()
+        reached[].calls+=1; reached[].queries+=n_queries; reached[].fallback+=nf
+    if getenv("ANONLIB_STAGE_TIMES") == "1":
+        print("CERT_KNN queries=" + String(n_queries) + " kc=" + String(kc)
+              + " tiled_fallback=" + String(nf))
+    _ = cand_d^
+    _ = cand_i^
+    _ = flags^
+    if nf == 0:
+        _ = rows^
+        return
+    var sub_q = ctx.enqueue_create_buffer[DType.float32](nf * n_features)
+    var sub_qn = ctx.enqueue_create_buffer[DType.float32](nf)
+    var sub_d = ctx.enqueue_create_buffer[DType.float32](nf * k)
+    var sub_i = ctx.enqueue_create_buffer[DType.uint32](nf * k)
+    ctx.enqueue_function[gather_rows_kernel](
+        sub_q.unsafe_ptr(), queries.unsafe_ptr(), rows.unsafe_ptr(),
+        Int32(nf), Int32(n_features),
+        grid_dim=((nf * n_features + CERT_TPB - 1) // CERT_TPB, 1, 1), block_dim=(CERT_TPB, 1, 1),
+    )
+    ctx.enqueue_function[gather_rows_kernel](
+        sub_qn.unsafe_ptr(), query_norm.unsafe_ptr(), rows.unsafe_ptr(),
+        Int32(nf), Int32(1),
+        grid_dim=((nf + CERT_TPB - 1) // CERT_TPB, 1, 1), block_dim=(CERT_TPB, 1, 1),
+    )
+    ctx.synchronize()
+    brute_force_knn_impl(
+        ctx, sub_q, sub_qn, index, index_norm, dist_tile, buf_val, buf_idx,
+        sub_d, sub_i, out_idx32, nf, n_index, n_features, k, query_tile,
+        buf_len, is_sqrt, use_vendor_topk, True, True, KNN_METHOD_TILED,
+        metric, metric_arg, cache,
+    )
+    ctx.enqueue_function[scatter_rows_f32_kernel](
+        out_dist.unsafe_ptr(), sub_d.unsafe_ptr(), rows.unsafe_ptr(),
+        Int32(nf), Int32(k),
+        grid_dim=((nf * k + CERT_TPB - 1) // CERT_TPB, 1, 1), block_dim=(CERT_TPB, 1, 1),
+    )
+    ctx.enqueue_function[scatter_rows_u32_kernel](
+        out_idx.unsafe_ptr(), sub_i.unsafe_ptr(), rows.unsafe_ptr(),
+        Int32(nf), Int32(k),
+        grid_dim=((nf * k + CERT_TPB - 1) // CERT_TPB, 1, 1), block_dim=(CERT_TPB, 1, 1),
+    )
+    ctx.synchronize()
+    _ = rows^
+    _ = sub_q^
+    _ = sub_qn^
+    _ = sub_d^
+    _ = sub_i^

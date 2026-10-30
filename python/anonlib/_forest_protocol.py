@@ -1,0 +1,640 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Bounded sklearn protocol for RF/ET; sklearn remains an optional dependency.
+
+Constructor parameters retain their original objects. Native configuration is
+validated separately. Changing parameters clears fitted state; inference-only
+legacy forest archives cannot reconstruct training parameters for cloning.
+"""
+import functools
+import inspect
+import weakref
+
+from ._array import Array
+from ._buffer import _materialize, full, empty, as_f32_c
+from ._arrays import _addr, _addr_ro
+
+
+_FOREST_ARRAYS = ("_offsets", "_colid", "_quesval", "_left_child", "_leaves")
+
+
+class _ResidentForest:
+    """Own a device snapshot independently of estimator lifetime or pickling."""
+    def __init__(self, native, arrays, dimensions, mode, ordered=None):
+        self.native = native
+        self.arrays = arrays
+        self.dimensions = dimensions
+        self.mode = mode
+        self.ordered = ordered
+        params = list(dimensions)
+        if ordered is not None:
+            # 1 strict increasing-tree kernel, 0 the 32-grove graph; None
+            # leaves the binary's compiled default.
+            params.append(1 if ordered else 0)
+        self.handle = native.forest_prepare_gpu(
+            *(_addr_ro(a) for a in arrays), params)  # glue: one address per model array (five)
+        self._finalizer = weakref.finalize(self, native.forest_release_gpu, self.handle)
+
+    def matches(self, native, arrays, dimensions, mode, ordered=None):
+        return (native is self.native and dimensions == self.dimensions and mode == self.mode
+                and ordered == self.ordered
+                and all(a is b for a, b in zip(arrays, self.arrays)))  # glue: compares the five model arrays
+
+
+class ForestDataSession:
+    """One X staged on the device for the member fits of ONE boosted ensemble
+    (trees-apple3, `rf_data_session_open`): the NaN scan, the pinned copy and
+    the upload of X run once instead of once per member. `share_tables` also
+    keeps the first member's quantile table and bins for the later members
+    (FAST only; the binding refuses it under IDENTICAL). One thread uses a
+    session at a time; `close` releases the device copy."""
+
+    def __init__(self, native, X, row_major, share_tables):
+        self.native = native
+        self.shape = (int(X.shape[0]), int(X.shape[1]))
+        self.share_tables = bool(share_tables)
+        self.handle = native.rf_data_session_open(
+            _addr_ro(X), [self.shape[0], self.shape[1], 1 if row_major else 0,
+                          1 if share_tables else 0])
+        self._finalizer = weakref.finalize(self, native.rf_data_session_close, self.handle)
+
+    def close(self):
+        if self._finalizer.alive:
+            self._finalizer()
+
+    def fit_regressor(self, y32, params, criterion):
+        return _export_fit_result(self.native, self.native.rf_regressor_fit_session_export(
+            self.handle, _addr_ro(y32), params, criterion))
+
+    def fit_regressor_rows(self, rows, y32, params, criterion):
+        """The fit on the rows `rows` of the staged X (int32 ids, repeats
+        allowed), `y32` their labels in that order."""
+        return _export_fit_result(self.native, self.native.rf_regressor_fit_session_rows_export(
+            self.handle, _addr_ro(rows), _addr_ro(y32), params, criterion))
+
+    def fit_classifier_weighted(self, y32, params, criterion, weights):
+        return _export_fit_result(self.native, self.native.rf_classifier_fit_weighted_session_export(
+            self.handle, _addr_ro(y32), params, criterion, _addr_ro(weights)))
+
+
+def forest_data_session_choice(mode, default="0"):
+    """What `ANONLIB_FOREST_SESSION` asks for: None (no session: every
+    member stages X itself), 'exact' (the session; each member draws its own
+    quantile sample, so its forest is the one its own fit returns) or
+    'share' (FAST only: later members reuse the first member's tables).
+    OPT-IN (trees-apple3, unproven): unset means no session."""
+    import os
+    choice = os.environ.get("ANONLIB_FOREST_SESSION", default).strip().lower()
+    if choice in ("", "0", "off", "no"):
+        return None
+    if choice in ("1", "on", "exact"):
+        return "exact"
+    if choice == "share":
+        return "share" if mode == "fast" else "exact"
+    raise ValueError("ANONLIB_FOREST_SESSION must be 0, 1 (exact) or share")
+
+
+def open_forest_data_session(native, X, *, row_major, mode, default="0"):
+    """A `ForestDataSession` for X on this binding, or None when the choice
+    is off or the binary has no session entry (a CPU host build, an older
+    binding)."""
+    choice = forest_data_session_choice(mode, default)
+    if choice is None or not callable(getattr(native, "rf_data_session_open", None)):
+        return None
+    return ForestDataSession(native, X, row_major, choice == "share")
+
+
+def forest_estimator(kind):
+    """Register the explicit public constructor, including the mode wrapper."""
+    def decorate(cls):
+        original = cls.__init__
+        signature = inspect.signature(original)
+        parameters = list(signature.parameters.values())
+        if "numeric_mode" not in signature.parameters:  # NumericModeMixin may have named it already
+            parameters.append(inspect.Parameter("numeric_mode", inspect.Parameter.KEYWORD_ONLY,
+                                                default=None))
+        signature = signature.replace(parameters=parameters)
+
+        @functools.wraps(original)
+        def initialize(self, *args, **kwargs):
+            # scikit-learn's convention: the constructor stores its
+            # parameters verbatim and checks nothing; `_validate_params`
+            # (run by `_refresh_config` at the start of every fit) does.
+            # Inside `_validate_params` a subclass constructor's
+            # `super().__init__` must reach the parent's checking constructor,
+            # or the parent's native configuration (`_cfg`) is never derived
+            # (DecisionTree* on top of RandomForest*).
+            if self.__dict__.get("_forest_validating"):
+                return original(self, *args, **kwargs)
+            bound = signature.bind(self, *args, **kwargs)
+            bound.apply_defaults()
+            for name in cls._parameter_names:  # glue: copies constructor parameter names
+                setattr(self, name, bound.arguments[name])
+            self._has_constructor_parameters = True
+
+        initialize.__signature__ = signature
+        cls.__init__ = initialize
+        cls._forest_original_init = original
+        cls._parameter_names = tuple(p.name for p in parameters if p.name != "self")  # glue: collects constructor parameter names
+        cls._estimator_type = kind
+        return cls
+    return decorate
+
+
+def _frozen_copy(a):
+    """A read-only copy of a flat int32 or float32 model array."""
+    return Array.from_buffer(memoryview(a.tobytes()).cast("i" if a.dtype == "<i4" else "f"))
+
+
+class ForestProtocol:
+    def get_params(self, deep=True):
+        for owner in type(self).__mro__:  # glue: walks the class hierarchy
+            if "__init__" in owner.__dict__:
+                if "_parameter_names" not in owner.__dict__:
+                    raise TypeError("Forest subclasses with a custom constructor must register "
+                                    "their parameters before cloning or refitting")
+                break
+        if not getattr(self, "_has_constructor_parameters", False):
+            raise ValueError("This inference-only forest archive has no constructor "
+                             "parameters; construct a new estimator for cloning/refitting")
+        return {name: getattr(self, name) for name in self._parameter_names}  # glue: returns constructor parameters by name
+
+    def set_params(self, **params):
+        if not params:
+            return self
+        values = self.get_params()
+        unknown = sorted(set(params) - values.keys())  # glue: names unknown keyword parameters
+        if unknown:
+            raise ValueError(f"Invalid parameter(s) {unknown} for {type(self).__name__}")
+        values.update(params)
+        # The parameter checks run at fit (`_validate_params`), as in
+        # scikit-learn; a new setting drops the fitted state.
+        replacement = type(self)(**values)
+        self.__dict__.clear()
+        self.__dict__.update(replacement.__dict__)
+        return self
+
+    def _validate_params(self):
+        """The constructor checks, run at fit (scikit-learn's convention):
+        refuses a bad parameter with the message the constructor used to
+        raise, and derives the native configuration (`_cfg`) from the
+        stored parameters, which stay as given."""
+        params = {name: getattr(self, name) for name in self._parameter_names}  # glue: reads constructor parameters by name
+        mode = params.get("numeric_mode")
+        if mode is not None and (not isinstance(mode, str) or
+                mode.strip().lower() not in ("fast", "identical")):
+            raise ValueError("numeric_mode must be fast, identical or None")
+        self._validate_inference_engine(params.get("inference_engine", "sequential"))
+        self._forest_validating = True
+        try:
+            type(self)._forest_original_init(self, **params)
+        finally:
+            self.__dict__.pop("_forest_validating", None)
+        for name, value in params.items():  # glue: restores constructor parameters verbatim
+            setattr(self, name, value)
+
+    def _refresh_config(self):
+        replacement = type(self)(**self.get_params())
+        # Checks first: a refused parameter leaves this instance as it was.
+        replacement._validate_params()
+        # sklearn owns this transient context while Pipeline.fit is active,
+        # and the fit tracker (`_mode._track_fit`) its in-fit count.
+        keep = {k: self.__dict__[k] for k in ("_parent_callback_ctx", "_anonlib_fitting")  # glue: two bookkeeping attribute names
+                if k in self.__dict__}
+        # Once a new fit begins, old nodes/classes must not survive a failure.
+        self.__dict__.clear()
+        self.__dict__.update(replacement.__dict__)
+        self.__dict__.update(keep)
+
+    @staticmethod
+    def _validated_mode(mode):
+        if mode is None:
+            return None
+        if not isinstance(mode, str) or mode.strip().lower() not in (
+                "fast", "identical"):
+            raise ValueError("numeric_mode must be fast, identical or None")
+        return mode.strip().lower()
+
+    def _capture_fit_mode(self):
+        from . import _backend
+        requested = self._validated_mode(getattr(self, "numeric_mode", None))
+        self._fit_numeric_mode = self._validated_mode(
+            _backend.default_mode() if requested is None else requested)
+
+    def _effective_mode(self):
+        from . import _backend
+        requested = self._validated_mode(getattr(self, "numeric_mode", None))
+        captured = getattr(self, "_fit_numeric_mode", None)
+        if captured is not None:
+            if requested is not None and requested != captured:
+                raise ValueError(
+                    f"This forest was fitted with numeric_mode={captured!r}; "
+                    "refit or use set_params before changing numeric_mode")
+            return captured
+        # Legacy inference archives have no captured mode. Honor any stored
+        # numeric_mode attribute, otherwise preserve their process default.
+        return requested if requested is not None else _backend.default_mode()
+
+    def _bind(self, name=None):
+        from . import _backend
+        return _backend.binding(name or self._BINDING, self._effective_mode())
+
+    @staticmethod
+    def _validate_inference_engine(engine):
+        if not isinstance(engine, str) or engine not in ("auto", "sequential", "parallel_groves"):
+            raise ValueError("inference_engine must be 'auto', 'sequential' or 'parallel_groves'")
+        return engine
+
+    def _prediction_engine(self):
+        """The engine this model PREDICTS AS, which is also what its archive
+        records: 'sequential' or 'parallel_groves'.
+
+        IDENTICAL `auto` is 'sequential' even where a resident snapshot
+        serves it (`_ordered_resident_auto`): that snapshot runs the strict
+        increasing-tree kernel, the sequential route's arithmetic, so the
+        model's bits and its archive are the sequential ones on every
+        vendor and on the CPU. Until 2026-09-22 it answered
+        'parallel_groves', which wrote a groves archive (every RF lane's
+        saved-model hash moved) and, through the compiled default, moved an
+        explicit IDENTICAL `parallel_groves` model off the 32-grove fold it
+        was recorded with."""
+        engine = self._validate_inference_engine(getattr(self, "inference_engine", "sequential"))
+        if engine == "auto":
+            # FAST permits the grove-parallel reduction and benefits from a
+            # persistent device snapshot.
+            if self._effective_mode() == "fast":
+                return "parallel_groves"
+            return "sequential"
+        return engine
+
+    def _ordered_resident_auto(self):
+        """The `sequential` engine on a GPU binding (one with the
+        `forest_ordered_resident` export): predict through a device-resident
+        snapshot prepared with the strict increasing-tree kernel, the
+        sequential route's arithmetic (cpu-gpu-cleanup t-forest: the GPU
+        install no longer walks the trees on host threads). A host binding
+        (CPU-only install) has no such route; its proxy raises ImportError
+        by name for any function it lacks, so a missing export is an absence
+        here and the host walk runs."""
+        if self._prediction_engine() != "sequential":
+            return False
+        return self._ordered_resident_export() is not None
+
+    def _ordered_resident_export(self):
+        """The binding's `forest_ordered_resident`, or None where it has none:
+        an older binary, or a host binding, whose proxy raises ImportError
+        by name (not AttributeError) for an export it lacks."""
+        try:
+            selected = getattr(self._bind(), "forest_ordered_resident", None)
+        except (AttributeError, ImportError):
+            return None
+        return selected if callable(selected) else None
+
+    def _resident_ordered_flag(self):
+        """The aggregation a resident snapshot is prepared with: True strict
+        increasing-tree, False the 32-grove graph, None the compiled
+        default. The `sequential` engine (served resident by
+        `_ordered_resident_auto` on a GPU binding) is always strict. IDENTICAL
+        names the groves explicitly so the recorded bits do not depend on a
+        vendor build default: `parallel_groves` is the grove
+        fold that the CPU host groves engine and the recorded GPU columns
+        compute. FAST keeps the binary's default, and so
+        does a binary older than the per-snapshot choice (no
+        `forest_ordered_resident` export), whose resident route is groves."""
+        if self._ordered_resident_export() is None:
+            return None
+        if self._prediction_engine() == "sequential":
+            return True
+        if self._effective_mode() != "identical":
+            return None
+        return False
+
+    def _prediction_function(self, sequential_name):
+        engine = self._prediction_engine()
+        native = self._bind()
+        name = sequential_name if engine == "sequential" else sequential_name + "_gpu_parallel"
+        function = getattr(native, name, None)
+        if function is None:
+            raise RuntimeError("rebuild the forest binding for inference_engine=" + repr(engine))
+        return function
+
+    def _resident_prediction_function(self, native):
+        # DEVIATION 2483: this export is predict_into[REUSE_IO=True], so X and
+        # output already cross as borrowed pointers without List staging.
+        # Keep device-buffer reuse; plain into would allocate on every call.
+        return native.forest_predict_resident_reuse_gpu
+
+    def _predict_forest(self, sequential_name, X, out):
+        """Shared RF/ET dispatch; cache nvForest-style owned device model state.
+
+        cuML 26.08.00 randomforest_common.pyx:675-693 caches its nvForest
+        model; :350-353 omits that device object from pickle. Our flat model
+        uses immutable host snapshots to make invalidation unambiguous.
+        """
+        engine = self._prediction_engine()
+        native = self._bind()
+        rows, features = X.shape
+        dimensions = (int(features), int(self._n_trees), int(self._num_outputs))
+        arrays = tuple(getattr(self, name) for name in _FOREST_ARRAYS)  # glue: the five model arrays
+        if engine == "sequential" and not self._ordered_resident_auto():
+            return self._prediction_function(sequential_name)(
+                *(_addr_ro(a) for a in arrays), _addr_ro(X),  # glue: one address per model array (five)
+                _addr(out), [int(rows), *dimensions])
+        resident = self._prepare_resident_forest(native)
+        return self._resident_prediction_function(native)(
+            resident.handle, _addr_ro(X), _addr(out),
+            [int(rows), int(features), dimensions[2]])
+
+    def _predict_forest_labels(self, X):
+        """Resident classifier codes; IDENTICAL requires the explicit T38 build."""
+        native = self._bind()
+        mode = self._effective_mode()
+        # T38/C50: capability readback selects the real compiled caller. No
+        # environment-only flag can make an incumbent binary claim this arm.
+        # NOT COMPILED — NOT TESTED — IDENTITY NOT VERIFIED — QUALITY NOT VERIFIED — NOT MEASURED.
+        capability = getattr(native, "forest_identical_fused_labels", None)
+        if mode == "identical":
+            if not callable(capability) or not capability():
+                return None
+            if not self._ordered_resident_auto() and self._prediction_engine() != "parallel_groves":
+                return None
+        elif mode != "fast" or self._prediction_engine() != "parallel_groves":
+            return None
+        function = getattr(native, "forest_predict_resident_labels_gpu", None)
+        if not callable(function):
+            return None
+        rows, features = X.shape
+        out = full((int(rows),), 0, "<i4")
+        resident = self._prepare_resident_forest(native)
+        wrote = function(resident.handle, _addr_ro(X), _addr(out),
+                         [int(rows), int(features), int(self._num_outputs)])
+        if wrote != rows:
+            raise RuntimeError(f"forest label prediction wrote {wrote} of {rows} rows")
+        return out
+
+    def _forest_auxiliary(self, X, *, leaves=False, prefixes=False, prediction=False):
+        """T39 buffer/argument plumbing; all walks and reductions are Mojo."""
+        # NOT COMPILED — NOT TESTED — IDENTITY NOT VERIFIED — QUALITY NOT VERIFIED — NOT MEASURED.
+        if not hasattr(self, "_offsets"):
+            raise RuntimeError("this estimator is not fitted yet")
+        Xa, _ = as_f32_c(X, ndim=2, name="X")
+        rows, features = Xa.shape
+        if features != self.n_features_in_:
+            raise ValueError(f"X has {features} features, fit saw {self.n_features_in_}")
+        trees, outputs = int(self._n_trees), int(self._num_outputs)
+        leaf = empty((rows, trees), "<i4") if leaves else None
+        prefix = empty((rows, trees, outputs), "<f4") if prefixes else None
+        raw = empty((rows, outputs), "<f4") if prediction else None
+        native = self._bind("_anonlib_x_trees")
+        entry = getattr(native, "x_trees_forest_auxiliary", None)
+        if not callable(entry):
+            raise NotImplementedError("this tree binding does not expose combined auxiliary outputs")
+        arrays = tuple(getattr(self, name) for name in _FOREST_ARRAYS)  # glue: five forest buffers
+        wrote = entry([_addr_ro(a) for a in arrays], _addr_ro(Xa),  # glue: five model addresses
+                      0 if leaf is None else _addr(leaf),
+                      0 if prefix is None else _addr(prefix),
+                      0 if raw is None else _addr(raw),
+                      [rows, features, trees, outputs, int(self._BINDING == "_anonlib_rf")])
+        if wrote != rows:
+            raise RuntimeError(f"forest auxiliary wrote {wrote} of {rows} rows")
+        return raw, leaf, prefix
+
+    def apply(self, X):
+        """Return tree-relative leaf IDs, shape (rows, trees), from the native walk."""
+        return self._forest_auxiliary(X, leaves=True)[1]
+
+    def predict_with_leaves(self, X):
+        """Return ordered raw mean scores (rows, outputs) and leaf IDs (rows, trees).
+
+        Classifier scores are undecoded class votes. This auxiliary ordered
+        contract is independent of an explicitly selected groves engine.
+        """
+        scores, leaves, _ = self._forest_auxiliary(X, leaves=True, prediction=True)
+        return scores, leaves
+
+    def staged_predict(self, X):
+        """Return eager mean prefixes, shape (rows, trees, outputs), in tree order.
+
+        Each prefix uses the fixed increasing-tree fold through that tree.
+        Only this requested API allocates the complete prefix buffer.
+        """
+        return self._forest_auxiliary(X, prefixes=True)[2]
+
+    def _prepare_resident_forest(self, native=None):
+        """Prepare the existing immutable parallel-groves snapshot without a query."""
+        if self._prediction_engine() != "parallel_groves" and not self._ordered_resident_auto():
+            raise ValueError("resident forest preparation requires parallel_groves")
+        if not hasattr(self, "_offsets"):
+            raise RuntimeError("this estimator is not fitted yet")
+        if native is None:
+            native = self._bind()
+        dimensions = (int(self.n_features_in_), int(self._n_trees), int(self._num_outputs))
+        arrays = tuple(getattr(self, name) for name in _FOREST_ARRAYS)  # glue: the five model arrays
+        required = ("forest_prepare_gpu", "forest_predict_resident_reuse_gpu", "forest_release_gpu")
+        if any(not callable(getattr(native, name, None)) for name in required):  # glue: checks three binding entry points
+            raise RuntimeError("rebuild the forest binding for resident parallel_groves inference")
+        mode = self._effective_mode()
+        ordered = self._resident_ordered_flag()
+        resident = getattr(self, "_resident_forest", None)
+        if resident is None or not resident.matches(native, arrays, dimensions, mode, ordered):
+            # A bytes owner cannot be made writable again via setflags(). A
+            # caller retaining an old mutable private-array alias cannot alter
+            # the device snapshot or the host model used by save/sequential.
+            dtypes = ("<i4", "<i4", "<f4", "<i4", "<f4")
+            arrays = tuple(_materialize(a, "forest model")[0] for a in arrays)  # glue: materializes the five model arrays
+            for a, dtype in zip(arrays, dtypes):  # glue: checks the five model arrays
+                if not isinstance(a, Array) or a.dtype != dtype or a.ndim != 1:
+                    raise ValueError("forest model arrays must have their original flat dtypes")
+            nodes = arrays[1].size
+            if (arrays[0].size != dimensions[1] + 1 or nodes < 1
+                    or arrays[2].size != nodes or arrays[3].size != nodes
+                    or arrays[4].size != nodes * dimensions[2]
+                    or int(arrays[0][-1]) != nodes):
+                raise ValueError("forest model array shapes do not match metadata")
+            # A fit leaves its arrays frozen already (`_anonlib_after_fit`),
+            # so a predict after a fit stores nothing new on the instance.
+            frozen = tuple(a if not a.flags["WRITEABLE"] else _frozen_copy(a) for a in arrays)  # glue: freezes the five model arrays
+            resident = _ResidentForest(native, frozen, dimensions, mode, ordered)
+            for name, a in zip(_FOREST_ARRAYS, frozen):  # glue: stores the five model arrays
+                if getattr(self, name) is not a:
+                    setattr(self, name, a)
+            self._resident_forest = resident
+        return resident
+
+    # The device snapshot lives in a holder dict the fit creates, not in an
+    # attribute of its own: a predict that prepares the snapshot changes
+    # the holder's contents, never `__dict__` (scikit-learn's
+    # check_dict_unchanged compares `__dict__` around predict).
+    @property
+    def _resident_forest(self):
+        holder = self.__dict__.get("_resident_holder")
+        if not holder or "forest" not in holder:
+            raise AttributeError("_resident_forest")
+        return holder["forest"]
+
+    @_resident_forest.setter
+    def _resident_forest(self, value):
+        holder = self.__dict__.get("_resident_holder")
+        if holder is None:
+            holder = self.__dict__["_resident_holder"] = {}
+        holder["forest"] = value
+
+    def _anonlib_after_fit(self):
+        """After every fit: freeze the five model arrays (the copy the first
+        predict used to take, so a caller's alias cannot change the model)
+        and give the instance an empty snapshot holder, dropping the last
+        fit's device snapshot."""
+        self.__dict__["_resident_holder"] = {}
+        for name in _FOREST_ARRAYS:  # glue: freezes the five model arrays
+            a = self.__dict__.get(name)
+            if (isinstance(a, Array) and a.ndim == 1 and a.dtype in ("<i4", "<f4")
+                    and a.flags["WRITEABLE"]):
+                self.__dict__[name] = _frozen_copy(a)
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state.pop("_resident_holder", None)
+        state.pop("_resident_forest", None)
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self.__dict__["_resident_holder"] = {}
+
+    def _archive_inference_metadata(self, arrays, sequential_format):
+        if self._prediction_engine() == "parallel_groves":
+            arrays["format"] = sequential_format + "-parallel-groves-1"
+            arrays["numeric_mode"] = self._effective_mode()
+
+    def _restore_inference_metadata(self, arrays, sequential_format):
+        from . import _serialize
+        if _serialize.scalar_str(arrays, "format") == sequential_format:
+            self.inference_engine = "sequential"
+        else:
+            self.inference_engine = "parallel_groves"
+            mode = self._validated_mode(_serialize.scalar_str(arrays, "numeric_mode"))
+            self.numeric_mode = mode
+            self._fit_numeric_mode = mode
+
+    def __sklearn_is_fitted__(self):
+        return hasattr(self, "_offsets")
+
+    def __sklearn_tags__(self):
+        """scikit-learn's tag protocol, read only by scikit-learn: the shared
+        `_mode.ParamsMixin` answer (estimator type, required target, the
+        classifier or regressor tags), which is what this protocol returned."""
+        from ._mode import ParamsMixin
+        return ParamsMixin.__sklearn_tags__(self)
+
+    def score(self, X, y, sample_weight=None):
+        """Mode-aware GPU accuracy or Float32 R², weighted when `sample_weight`
+        is given (scikit-learn's weighted accuracy and R² on the pinned-sum
+        path of `metrics.accuracy_score` and `metrics.r2_score`).
+
+        Class labels are compared without narrowing their values by the
+        x_metrics binding's grouped match count (`accuracy_fraction`).
+        Regression scoring uses the same Float32 target domain as tree fitting.
+        """
+        from . import _metrics_impl as metrics
+        from ._expansion_metrics import accuracy_fraction
+        shape = metrics._shape_of(y)
+        if len(shape) != 1:
+            raise ValueError("score requires one-dimensional targets")
+        prediction = self.predict(X)
+        if len(prediction) != int(shape[0]):
+            raise ValueError("score target and prediction lengths differ")
+        mode = self._effective_mode()
+        if self._estimator_type == "classifier":
+            return accuracy_fraction(y, prediction, sample_weight, mode)
+        return metrics.r2_score(as_f32_c(y, ndim=1, name="y")[0],
+                                as_f32_c(prediction, ndim=1, name="prediction")[0],
+                                sample_weight=sample_weight, numeric_mode=mode)
+
+
+def _export_fit_result(native, descriptor, *, compare_legacy=False):
+    """WP2a: copy one owned native fit into Arrays, always releasing its handle.
+
+    Descriptor: [handle, trees, nodes, outputs, small integer metadata]. Export
+    receives exact capacities as well as addresses. The optional diagnostic
+    reads the SAME fitted handle through the retained List exporter before
+    release; it is a correctness gate, never a second fit or production path.
+    Native same-fit/save gates cover all three modes on Metal (DEVIATION 2482).
+    """
+    import numbers
+    from ._buffer import empty
+
+    if not isinstance(descriptor, (list, tuple)) or not descriptor:
+        raise ValueError('native forest export returned an invalid descriptor')
+    handle = descriptor[0]
+    if isinstance(handle, bool) or not isinstance(handle, numbers.Integral) or handle < 1:
+        raise ValueError('native forest export returned an invalid handle')
+    try:
+        if len(descriptor) != 5:
+            raise ValueError('native forest export descriptor requires five fields')
+        _, trees, nodes, outputs, meta = descriptor
+        counts = (trees, nodes, outputs)
+        if any(isinstance(v, bool) or not isinstance(v, numbers.Integral) for v in counts):  # glue: checks three export counts
+            raise ValueError('native forest export counts must be integers')
+        if not (1 <= trees < 2147483647 and nodes >= trees and outputs >= 1
+                and nodes <= 2147483647 // outputs):
+            raise ValueError('native forest export exceeds supported counts')
+        if not isinstance(meta, (list, tuple)) or len(meta) < 2 or list(meta[:2]) != [trees, outputs]:
+            raise ValueError('native forest export metadata disagrees with counts')
+        if any(isinstance(v, bool) or not isinstance(v, numbers.Integral) for v in meta):  # glue: checks the export metadata integers
+            raise ValueError('native forest export metadata must contain integers')
+        dtypes = ('<i4', '<i4', '<f4', '<i4', '<f4')
+        sizes = (trees + 1, nodes, nodes, nodes, nodes * outputs)
+        arrays = tuple(empty((size,), dtype) for size, dtype in zip(sizes, dtypes))  # glue: allocates the five model arrays
+        native.forest_export(handle, *(_addr(a) for a in arrays), list(counts))  # glue: one address per model array (five)
+        if compare_legacy:
+            old = native.forest_export_legacy(handle)
+            if len(old) != 6 or list(old[5]) != list(meta):
+                raise RuntimeError('forest export legacy metadata mismatch')
+            for name, actual, values, dtype in zip(_FOREST_ARRAYS, arrays, old[:5], dtypes):  # glue: compares the five model arrays
+                expected = Array.from_list(values, dtype)
+                if actual.tobytes() != expected.tobytes():
+                    raise RuntimeError('forest export byte mismatch: ' + name)
+        return (*arrays, list(meta))
+    finally:
+        native.forest_export_release(handle)
+
+
+def _forest_fit_function(native, name):
+    """WP2a caller-buffer default; legacy/verify are diagnostic comparison arms."""
+    import os
+    selection = os.environ.get('ANONLIB_FOREST_EXPORT', 'into')
+    if selection == 'legacy':
+        return getattr(native, name)
+    if selection not in ('into', 'verify'):
+        raise ValueError('ANONLIB_FOREST_EXPORT must be legacy, into or verify')
+    entry = getattr(native, name + '_export', None)
+    if not callable(entry):
+        raise RuntimeError('rebuild the forest binding for caller-buffer model export')
+    def fit(*args):
+        return _export_fit_result(native, entry(*args), compare_legacy=selection == 'verify')
+    return fit
+
+
+def _rowmajor_fit_function(native, name):
+    """DEVIATION 2637: the `<name>_rowmajor` fit (X lent ROW-major) through
+    the same export selection as `_forest_fit_function`, or None when this
+    binary predates it (the caller then keeps the column-major path)."""
+    if not hasattr(native, name + "_rowmajor_export"):
+        return None
+    return _forest_fit_function(native, name + "_rowmajor")
+
+
+def _forest_fit_arrays(result):
+    """One RF/ET model conversion; native exported arrays are retained directly."""
+    *fields, meta = result
+    if len(fields) != 5:
+        raise ValueError('forest fit must return five model fields and metadata')
+    dtypes = ('<i4', '<i4', '<f4', '<i4', '<f4')
+    arrays = []
+    for field, dtype in zip(fields, dtypes):  # glue: checks the five model fields
+        if isinstance(field, Array):
+            if field.dtype != dtype or field.ndim != 1:
+                raise ValueError('forest fit exported an unexpected model dtype or shape')
+            arrays.append(field)
+        else:
+            arrays.append(Array.from_list(field, dtype))
+    return (*arrays, meta)

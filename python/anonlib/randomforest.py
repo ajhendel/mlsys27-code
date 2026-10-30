@@ -1,0 +1,1218 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 the authors. Part of anonlib, DOI-WITHHELD
+"""Random Forest on the GPU: cuML's forest, and cuML's defaults.
+
+The learner is `ensemble/`: a random forest (reference: cuML's `ML::RandomForest`,
+`randomforest.cuh`) with a batched-levelalgo tree builder, quantile
+binning, and the with-replacement `RowSampler` -- THIS wrapper is that
+sampler's first Python caller (the `extratrees` surface refuses
+`bootstrap=True` by name because its copy has no caller).
+
+THE DEFAULTS ARE cuML's, NOT scikit-learn's, per the package rule
+("the defaults follow each algorithm's reference") -- with no
+exception since 2026-09-01, when DEVIATION 409 (this surface shipped
+cuML's RETIRED pre-26.08 `max_depth=16`) was CLOSED by aligning; full
+history at the constant below. Two notes for an sklearn user,
+documented on the classes as well:
+
+* `max_depth` defaults to `None`, UNLIMITED depth -- `None` maps to
+  `np.iinfo(np.int32).max` exactly as the pinned cuML marshals it
+  (`randomforest_common.pyx:480-481`). That matches both cuML (whose own
+  default changed from 16 to `None` in v26.08.00, the release this implementation
+  pins) and sklearn. Until 2026-09-01 an unspecified depth meant 16
+  here; pass `max_depth=16` to keep that behaviour (DEVIATION 409).
+* splits are searched over at most `n_bins` (default 128) per-feature
+  QUANTILES, as in cuML, not sklearn's exact thresholds. Faster, and a
+  different algorithm -- a comparison against sklearn must say so.
+
+EVERY sklearn-SHAPED PARAMETER IS EITHER HONOURED OR REFUSED BY NAME. None
+is accepted and ignored.
+
+`max_leaf_nodes` IS REFUSED, AND IT WAS SILENTLY ALIASED UNTIL 2026-09-01
+(DEVIATION 408). sklearn's `max_leaf_nodes=k` selects BEST-FIRST growth to
+exactly k leaves -- `tree/_classes.py:446-447` swaps in
+`BestFirstTreeBuilder` the moment the value is not None -- and there is no
+best-first grower in `ensemble/`. cuML's `max_leaves` is a CAP on a
+LEVEL-ORDER grower, which answers a different question and returns a
+different tree from the same data, so this wrapper now carries cuML's knob
+under cuML's own name, `max_leaves=`, and refuses sklearn's spelling by
+name. The best-first semantics DO exist in this library, on the
+`extratrees` surface, whose `max_leaf_nodes` IS sklearn's (`extratrees/`,
+DEVIATION BLOCKS 466 to 469). The two are deliberately not spelled alike on
+either surface and are never aliased onto each other.
+
+`random_state=None` is DETERMINISTIC here (seed 0), same deviation as the
+extratrees surface and for the same reason: this library's claim is
+bit-reproducibility, so a nondeterministic default entry point would be the
+wrong default. NOTE cuML's own caveat, measured by the ensemble lane: the
+forest is reproducible from its seed ON ONE GPU MODEL; cuML itself does not
+reproduce across GPU models below `n_sampled_rows > 4 * SM * 256`.
+
+X IS COPIED TWICE PER FIT (the host to column-major float32 through
+`_buffer.as_f32_colmajor`, zero-copy for a float32 F-order input, then
+across the boundary); on large matrices that is the dominant cost of the
+CALL.
+
+INPUTS AND OUTPUTS ARE NOT NumPy (DEVIATION 2341). `X` is anything the
+buffer protocol exposes -- an ndarray, an `array.array`, a
+`anonlib.Array` -- or a nested list; `y` for the regressor likewise, and
+for the classifier any sequence of label objects. `predict_proba` and the
+regressor's `predict` return a `anonlib.Array` (`numpy.asarray(result)`
+is a zero-copy view for a caller who has NumPy). `classes_` is a PYTHON
+LIST of the caller's label objects in the order `_labels.py` defines
+(DEVIATION 2340: numbers by value, strings by code point, NaN refused),
+and the classifier's `predict` returns an int64 or float64 `Array` for
+numeric labels and a Python list for str labels. Nothing in this module
+imports NumPy.
+"""
+
+from . import _portable_math as math
+import numbers
+
+from . import _anonlib_rf, _serialize
+from ._array import Array
+from ._buffer import (
+    addr, addr_ro, all_finite, as_f32_c, as_f32_colmajor, as_f32_forest_layout, empty,
+)
+from ._labels import (
+    argmax_rows, classes_from_member, classes_member, decode_labels,
+    encode_labels, flat_view, flatten_labels, is_bool, sorted_classes,
+)
+from ._mode import NumericModeMixin
+from ._sample_weight import check_sample_weight
+from ._class_weights import _class_weight_rows
+from ._forest_protocol import (ForestProtocol, forest_estimator,
+                               _forest_fit_function, _forest_fit_arrays,
+                               _rowmajor_fit_function, _export_fit_result)
+
+#: The npz model-file format tag `save` writes and `load` requires.
+_MODEL_FORMAT = "anonlib-randomforest-1"
+
+# DEVIATION 409 (2026-09-01, RF lane). CLOSED -- ALIGNED the same day;
+# the closure paragraph is below, after the history. AS FOUND: this
+# surface's `max_depth` default WAS NOT the pinned cuML's, and the name
+# it used to carry said it was.
+# WHAT WAS HERE: `_CUML_DEFAULT_MAX_DEPTH = 16`, and a module docstring
+# citing `randomforestclassifier.pyx` for it.
+# WHY THAT IS WRONG, read out of the pin
+# (`~/CascadeProjects/upstream/cuml-v26.08.00`, 265b9da6): 16 WAS cuML's
+# default, and cuML retired it in THE VERY RELEASE THIS IMPLEMENTATION PINS. Both
+# estimators now default to `None` and both say so in their own words --
+# `randomforestclassifier.py:68-74` and `randomforestregressor.py:62-68`
+# read "max_depth : int or None (default = None)" followed by
+# ".. versionchanged:: 26.08  The default of `max_depth` changed from
+# `16` to `None`", and `randomforest_common.pyx:317` is `max_depth=None`
+# in the shared `__init__`. `None` is not passed through: it is
+# marshalled to `np.iinfo(np.int32).max` on the way to C++
+# (`randomforest_common.pyx:480-481`), because the C++ header's own -1
+# sentinel is a value their validator REFUSES (`ASSERT(params.max_depth
+# >= 0)`, `decisiontree.cu:19`). So the pinned cuML default is UNLIMITED
+# DEPTH, spelled INT32_MAX.
+# The citation was also unresolvable at the pin: there is no
+# `randomforestclassifier.pyx` in v26.08.00, only
+# `randomforestclassifier.py` -- the same stale-citation class that
+# `ensemble/randomforest.mojo:23-31` already names.
+# THE MOJO SURFACE OF THE SAME LEARNER FOLLOWED THE PIN AND THIS ONE DID
+# NOT: `ensemble/randomforest.mojo:1062` (`default_rf_params_classifier`)
+# and `:1091` (`default_rf_params_regressor`) both pass
+# `max_depth=INT32_MAX`, matching the table at
+# `ensemble/randomforest.mojo:43`. Two entry points into one forest
+# therefore disagreed about what an unspecified depth means.
+# CLOSED -- ALIGNED by decision on 2026-09-01. The history above stands: the wrapper shipped 16 (first
+# under a name claiming it was cuML's, then, from the morning of
+# 2026-09-01, honestly as a named deviation) and the value below was 16
+# until the alignment later that same day. It is now 2147483647,
+# `np.iinfo(np.int32).max` spelled as the literal (DEVIATION 2341, the
+# NumPy-free boundary), the exact value the pinned cuML substitutes
+# for `None` (`randomforest_common.pyx:480-481`), so the constant
+# MATCHES the pin and both surfaces of the learner give one answer for
+# an unspecified depth: UNLIMITED, grow to purity. This IS a behaviour
+# change -- deeper and slower trees from the same bare call; pass
+# `max_depth=16` for the old behaviour (CHANGELOG.md, Unreleased). No
+# recorded number depends on the implicit default: every bench and probe
+# arm passes `max_depth` explicitly (`bench/speed/forest_speed_arm.py:230`,
+# `tools/repeat_run_stability.py:117`), and the one bare
+# `RandomForestClassifier()` construction in the tree
+# (`python/anonlib/tests/test_rf_leaf_budget.py:372`) only reaches
+# `_bind` and never fits. The bare call in
+# `tools/preprocess_identity_probe.py:15` is illustrative prose inside a
+# docstring, not a call site. KNOWN-INERT:
+# `bindings/_anonlib_rf.mojo:472` still carries a fourth spelling of
+# 16 on the predict path, inert because predict reads the fitted
+# forest's trees, not these knobs. UNVERIFIED, RUN OWED (the flip was
+# applied from a read): rebuild `_anonlib_rf` on all tiers, then
+# `python -m pytest python/anonlib/tests/ -k rf` and
+# `packaging/macos/smoke.py` on all tiers; the E2 RF identity cells
+# re-run at the next rented leg, since unspecified-depth fits now grow
+# deeper.
+# The other three constants below WERE re-read against the pin in the
+# same pass and are correct: `randomforest_common.pyx:319` is
+# `n_bins=128`, `:324` is `max_batch_size=4096`, `:326` is `n_streams=4`.
+_PORT_DEFAULT_MAX_DEPTH = 2147483647
+_CUML_DEFAULT_N_BINS = 128
+_CUML_DEFAULT_N_STREAMS = 4
+_CUML_DEFAULT_MAX_BATCH = 4096
+
+# DEVIATION 407 (2026-08-23, RF lane): the split criterion crosses the
+# boundary as cuML's `CRITERION` enumerator (`algo_helper.h:10-18`, the
+# same integers `ensemble/decisiontree/decisiontree.mojo` declares: GINI 0,
+# ENTROPY 1, MSE 2, POISSON 4, GAMMA 5, INVERSE_GAUSSIAN 6). The names are
+# sklearn's where sklearn has one and cuML's otherwise, mapped the way
+# `randomforest_common.pyx:104-120` maps cuML's own strings; `log_loss` is
+# sklearn's second spelling of entropy and `mse` is cuML's spelling of
+# squared_error. The binding refuses by name any enumerator its objective
+# has no arm for (`bindings/_anonlib_rf.mojo::_check_criterion`), so a
+# wrong code cannot fit a silent forest of stumps.
+_CLS_CRITERIA = {"gini": 0, "entropy": 1, "log_loss": 1}
+_REG_CRITERIA = {
+    "squared_error": 2, "mse": 2,
+    "poisson": 4, "gamma": 5, "inverse_gaussian": 6,
+}
+# sklearn names the engine enumerates but has no arm for. MAE is value 3
+# of their enum and refused by `DecisionTreeParams.check()`
+# (`ensemble/decisiontree/decisiontree.mojo:286-291`, after
+# `decisiontree.cu:28` and `randomforest_common.pyx:147-151`);
+# friedman_mse has no cuML counterpart at all.
+_UNSUPPORTED_CRITERIA = {
+    "absolute_error": "cuML enumerates MAE (algo_helper.h:14) and refuses"
+                      " it (decisiontree.cu:28); the implementation keeps that refuse"
+                      " at ensemble/decisiontree/decisiontree.mojo:286.",
+    "mae": "cuML enumerates MAE (algo_helper.h:14) and refuses it"
+           " (decisiontree.cu:28); the implementation keeps that refuse at"
+           " ensemble/decisiontree/decisiontree.mojo:286.",
+    "friedman_mse": "no cuML counterpart; RegressionObjectiveFunction"
+                    ".GainPerSplit (ensemble/decisiontree/batched_levelalgo"
+                    "/objectives.mojo:1252-1261) has no arm for it.",
+}
+
+
+# DEVIATION 408 (2026-09-01, RF lane). SKLEARN'S LEAF BUDGET IS REFUSED
+# RATHER THAN ALIASED.
+# WHAT WAS HERE: `max_leaves=(-1 if max_leaf_nodes is None else
+# int(max_leaf_nodes))`, a straight rename of one parameter onto another.
+# WHY THAT IS WRONG: sklearn's `max_leaf_nodes=k` is a GROWTH ORDER, not a
+# bound. `tree/_classes.py:446-447` reads "Use BestFirst if max_leaf_nodes
+# given; use DepthFirst otherwise" and constructs `BestFirstTreeBuilder`,
+# which expands the frontier node with the largest impurity improvement
+# until exactly k leaves exist. cuML's `max_leaves` bounds a LEVEL-ORDER
+# grower and reorders nothing: `NodeQueue::Pop` takes from the FRONT of a
+# FIFO and `Push` appends to the BACK (`builder.cuh:70-78`, `:117`,
+# matched at `ensemble/decisiontree/batched_levelalgo/builder.mojo`),
+# and the budget is spent by whichever nodes that order reaches first --
+# tested in `IsExpandable` (`builder.cuh:82-88`) and again inside `Push`
+# (`:101`). Same k, different tree, no error and no warning.
+# HOW LONG IT STOOD: the E2 cell `rf_clf_maxleaf` has scored IDENTICAL
+# (388 stages) in every recorded round on every column, which certifies
+# that the aliased answer is REPRODUCIBLE and says nothing about whether it
+# is the answer that was asked for.
+# THE FIX IS AT THIS BOUNDARY, not in the builder: cuML's knob is now
+# carried under cuML's own name (`max_leaves=`, slot 5, unchanged), and
+# sklearn's spelling is refused by name with a pointer at the surface that
+# does implement it.
+_MAX_LEAF_NODES_WHY = (
+    "sklearn's max_leaf_nodes=k is BEST-FIRST GROWTH to exactly k leaves"
+    " (tree/_classes.py:446-447 swaps in BestFirstTreeBuilder the moment"
+    " the value is not None), and ensemble/ has no best-first grower."
+    " cuML's nearest knob, max_leaves, is a CAP on a LEVEL-ORDER grower"
+    " that reorders nothing -- NodeQueue pops from the front of a FIFO and"
+    " pushes to the back (builder.cuh:70-78, :117) and the budget is spent"
+    " by whichever nodes that order reaches first (:82-88, :101) -- so the"
+    " same k gives a DIFFERENT TREE. This surface aliased one onto the"
+    " other until 2026-09-01 and returned that different tree without"
+    " saying so. Pass max_leaves= for cuML's cap, which these classes now"
+    " carry under its own name, or use anonlib.ExtraTreesClassifier /"
+    " ExtraTreesRegressor, whose max_leaf_nodes IS sklearn's best-first"
+    " budget (extratrees/, DEVIATION BLOCKS 466 to 469)."
+)
+
+
+_NONFINITE_REFUSAL = "X contains NaN or infinity; the forest has no missing-value arm"
+
+
+def _refuse(name, why):
+    raise NotImplementedError(
+        f"{name} is not implemented: {why} Refused by name rather than accepted"
+        " and ignored."
+    )
+
+
+def _min_weight_fraction(value, who):
+    """scikit-learn's `min_weight_fraction_leaf` check, its wording
+    (`Interval(Real, 0.0, 0.5, closed="both")`). The bound itself is
+    applied by the fit binding (slot 16 of `_fit_params`)."""
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        f = None
+    if isinstance(value, bool) or f is None or not 0.0 <= f <= 0.5:
+        raise ValueError(
+            f"The 'min_weight_fraction_leaf' parameter of {who} must be a float"
+            f" in the range [0.0, 0.5]. Got {value!r} instead.")
+    return f
+
+
+def _criterion_code(criterion, table, who):
+    """A criterion NAME into the engine's `CRITERION` enumerator, or a
+    refusal by name (DEVIATION 407)."""
+    if criterion in table:
+        return table[criterion]
+    if criterion in _UNSUPPORTED_CRITERIA:
+        _refuse(f"criterion={criterion!r}", _UNSUPPORTED_CRITERIA[criterion])
+    raise ValueError(
+        f"criterion={criterion!r} is not a {who} criterion here; accepted"
+        f" are {sorted(table)}"
+    )
+
+
+def _max_features_fraction(max_features, n_features):
+    """sklearn's max_features forms into the fraction the binding takes,
+    resolved the way cuML's python layer resolves them."""
+    if max_features is None:
+        return 1.0
+    if isinstance(max_features, str):
+        if max_features == "sqrt":
+            # The owned host helper uses the correctly rounded CPU sqrt instruction.
+            return math.sqrt(n_features) / n_features
+        if max_features == "log2":
+            # Use the same pinned portable_log2_64 arithmetic as the Mojo
+            # builder. Keep the fraction: the kernel truncates after FP32
+            # conversion. Powers of two are exact; max(2, n) retains the
+            # existing nonzero fraction for a one-feature input.
+            return math.log2(max(2, n_features)) / n_features
+        raise ValueError(
+            f"max_features={max_features!r} is not a recognised form;"
+            " accepted are 'sqrt', 'log2', None, a float fraction or an"
+            " int count"
+        )
+    if isinstance(max_features, numbers.Integral) and not is_bool(
+        max_features
+    ):
+        if not 1 <= int(max_features) <= n_features:
+            raise ValueError(
+                f"max_features={max_features} is outside [1, {n_features}]"
+            )
+        return int(max_features) / n_features
+    f = float(max_features)
+    if not 0.0 < f <= 1.0:
+        raise ValueError(f"max_features={f} is outside (0, 1]")
+    return f
+
+
+def _max_leaves_slot(max_leaves):
+    """cuML's `max_leaves` into slot 5 of the params list.
+
+    -1 is THEIR sentinel for unlimited, not ours (`decisiontree.hpp:83`,
+    `randomforest_common.pyx:318`, and the default table in
+    `ensemble/randomforest.mojo`); a positive int is a cap. `None` is
+    accepted as a spelling of -1 because a Python caller reaches for it.
+    Everything else is refused HERE rather than by
+    `DecisionTreeParams.check()` (`ensemble/decisiontree/decisiontree.mojo`
+    :257-258, which raises "Invalid max leaves"), so the message can name
+    the sentinel the caller was supposed to pass.
+    """
+    if max_leaves is None:
+        return -1
+    if is_bool(max_leaves) or not isinstance(
+        max_leaves, numbers.Integral
+    ):
+        raise ValueError(
+            f"max_leaves={max_leaves!r} must be None, -1 (cuML's sentinel"
+            " for unlimited) or a positive int count"
+        )
+    v = int(max_leaves)
+    if v == -1 or v > 0:
+        return v
+    raise ValueError(
+        f"max_leaves={v} is not a leaf cap: cuML accepts -1 (unlimited) or"
+        " a positive count, and ensemble/decisiontree/decisiontree.mojo"
+        ":257-258 raises on anything else"
+    )
+
+
+class _RandomForestBase(ForestProtocol, NumericModeMixin):
+    #: This family's binding, for `NumericModeMixin._bind`.
+    _BINDING = "_anonlib_rf"
+
+    def __init__(
+        self,
+        n_estimators,
+        max_depth,
+        max_leaf_nodes,
+        max_leaves,
+        max_features,
+        n_bins,
+        min_samples_leaf,
+        min_samples_split,
+        min_impurity_decrease,
+        bootstrap,
+        max_samples,
+        random_state,
+        n_streams,
+        max_batch_size,
+        oob_score,
+        warm_start,
+        ccp_alpha,
+        class_weight,
+        monotonic_cst,
+        n_jobs,
+        verbose,
+        device,
+        criterion_code,
+    ):
+        if device != "gpu":
+            raise ValueError(
+                f"device must be 'gpu', got {device!r}: the fit runs on the"
+                " GPU binding, or, on a CPU-only install with the rf host"
+                " binding built, on its host restatement"
+                " (ensemble/host/rf_oracle.mojo) under the same device='gpu'"
+            )
+        if max_leaf_nodes is not None:
+            _refuse("max_leaf_nodes", _MAX_LEAF_NODES_WHY)
+        if not is_bool(oob_score):
+            raise ValueError("oob_score must be a boolean; callable scoring is not supported")
+        if oob_score and not bootstrap:
+            raise ValueError("oob_score=True requires bootstrap=True")
+        if warm_start:
+            _refuse("warm_start=True", "there is no incremental fit here,"
+                    " and accepting it would silently refit from scratch.")
+        if ccp_alpha:
+            _refuse("ccp_alpha", "cost-complexity pruning is a"
+                    " post-processing pass neither cuML nor this implementation"
+                    " implements. Only 0.0 is accepted.")
+        if class_weight is not None and not isinstance(class_weight, dict):
+            if not isinstance(class_weight, str) or class_weight != "balanced":
+                raise ValueError("class_weight must be None, a dict, or 'balanced'; balanced_subsample is unsupported")
+        if monotonic_cst is not None:
+            _refuse("monotonic_cst", "no cuML counterpart.")
+        if n_jobs is not None:
+            _refuse("n_jobs", "there is no CPU thread pool here -- the fit"
+                    " is one host thread driving the GPU.")
+        if verbose:
+            _refuse("verbose", "nothing in the Mojo layer logs per-tree"
+                    " progress.")
+        if max_samples is not None and not 0.0 < float(max_samples) <= 1.0:
+            raise ValueError(
+                f"max_samples={max_samples} is outside (0, 1]"
+            )
+        self.device = device
+        self._cfg = dict(
+            criterion=int(criterion_code),
+            n_estimators=int(n_estimators),
+            max_depth=(
+                _PORT_DEFAULT_MAX_DEPTH if max_depth is None
+                else int(max_depth)
+            ),
+            max_leaves=_max_leaves_slot(max_leaves),
+            max_features=max_features,
+            n_bins=int(n_bins),
+            min_samples_leaf=int(min_samples_leaf),
+            min_samples_split=int(min_samples_split),
+            min_impurity_decrease=float(min_impurity_decrease),
+            bootstrap=bool(bootstrap),
+            max_samples=(1.0 if max_samples is None else float(max_samples)),
+            random_state=(0 if random_state is None else int(random_state)),
+            n_streams=int(n_streams),
+            max_batch_size=int(max_batch_size),
+            oob_score=bool(oob_score),
+        )
+
+    def _fit_params(self, n_rows, n_features, n_classes):
+        """The 16-slot params list, in _anonlib_rf.mojo's exact order:
+        n_rows, n_cols, n_classes, n_trees, max_depth, max_leaves,
+        max_features_fraction, max_n_bins, min_samples_leaf,
+        min_samples_split, min_impurity_decrease, bootstrap, max_samples,
+        seed, n_streams, max_batch_size; then, only when it is not 0, the
+        optional 17th, min_weight_fraction_leaf (a 16-slot call keeps every
+        other fit entry's contract)."""
+        cfg = self._cfg
+        params = [
+            int(n_rows),
+            int(n_features),
+            int(n_classes),
+            cfg["n_estimators"],
+            cfg["max_depth"],
+            cfg["max_leaves"],
+            _max_features_fraction(cfg["max_features"], n_features),
+            cfg["n_bins"],
+            cfg["min_samples_leaf"],
+            cfg["min_samples_split"],
+            cfg["min_impurity_decrease"],
+            1 if cfg["bootstrap"] else 0,
+            cfg["max_samples"],
+            cfg["random_state"],
+            cfg["n_streams"],
+            cfg["max_batch_size"],
+        ]
+        mwf = cfg.get("min_weight_fraction_leaf", 0.0)
+        if mwf:
+            params.append(mwf)
+        return params
+
+    def _fit_arrays(self, X, y_arr, n_classes, fit_fn, rowmajor_fit_fn=None):
+        # Column-major is the builder's layout (cuML's `data` is
+        # column-major); `as_f32_colmajor` is that copy, named in the
+        # module docstring, and zero for a float32 F-order input
+        # (DEVIATION 2341). Its 2-D refusal reads "anonlib: X must be
+        # 2-D, got ...", the wording `_arrays.py` used.
+        # DEVIATION 2637: a C-order float32 X is lent row-major to the
+        # `*_rowmajor` entry, which transposes it into its pinned stage
+        # across the host pool (same staged bytes, one pass fewer).
+        if rowmajor_fit_fn is not None:
+            Xf, row_major = as_f32_forest_layout(X, name="X")
+            if row_major:
+                fit_fn = rowmajor_fit_fn
+        else:
+            Xf, _ = as_f32_colmajor(X, name="X")
+        n_rows, n_features = Xf.shape
+        if len(y_arr) != n_rows:
+            raise ValueError(f"y has {len(y_arr)} rows, X has {n_rows}")
+        # The builder has no missing-value arm: a NaN or inf in X was
+        # quantized and split on silently (pip smoke 2026-09-22). Refused
+        # here, as cuML documents and scikit-learn's pre-1.4 forests did.
+        # FAST on Apple (lane apple-fast-rfet-scan): the binding refuses a
+        # non-finite cell through a device scan of the uploaded X
+        # (ensemble/device_finite.mojo), so this one-thread host scan of
+        # every cell is not repeated; its refusal is raised as the same
+        # ValueError below.
+        scan = getattr(self._bind("_anonlib_rf"), "rf_device_finite_scan", None)
+        device_scan = scan is not None and int(scan()) == 1
+        if not device_scan and not all_finite(Xf):
+            raise ValueError(_NONFINITE_REFUSAL)
+        params = self._fit_params(n_rows, n_features, n_classes)
+        try:
+            out = fit_fn(
+                addr_ro(Xf, name="X"), addr_ro(y_arr, name="y"), params,
+                self._cfg["criterion"],
+            )
+        except Exception as exc:
+            if device_scan and _NONFINITE_REFUSAL in str(exc):
+                raise ValueError(_NONFINITE_REFUSAL) from None
+            raise
+        del Xf  # the borrow ends with the call
+        (self._offsets, self._colid, self._quesval, self._left_child,
+         self._leaves, meta) = _forest_fit_arrays(out)
+        self.n_features_in_ = int(n_features)
+        self._n_trees = int(meta[0])
+        self._num_outputs = int(meta[1])
+        return self
+
+    def _check_predict_input(self, X):
+        if not hasattr(self, "_offsets"):
+            raise RuntimeError("this estimator is not fitted yet")
+        Xa, _ = as_f32_c(X, ndim=2, name="X")
+        n_rows, n_features = Xa.shape
+        if n_features != self.n_features_in_:
+            raise ValueError(
+                f"X has {n_features} features, fit saw {self.n_features_in_}"
+            )
+        return Xa, n_rows, n_features
+
+    def save(self, path):
+        """Write the fitted forest to `path` as an npz file.
+
+        The file holds the prediction arrays exactly as fitted, with exact
+        dtypes; floats never pass through decimal text. A model saved with the
+        'parallel_groves' inference engine also records its engine and
+        numeric mode. The file bytes depend only on the model, so equal models
+        give equal file hashes on any machine.
+        """
+        if not hasattr(self, "_offsets"):
+            raise RuntimeError("this estimator is not fitted yet")
+        # DEVIATION 2341: members are `Array`s and plain str (which
+        # `_serialize.write_npz` encodes as the `<U` scalar member
+        # `np.asarray(str)` gave); `classes` is `_labels.classes_member`
+        # (int64 / float64 `Array`, or the list of str for str labels).
+        arrays = {
+            "format": _MODEL_FORMAT,
+            "estimator": type(self).__name__,
+            "device": self.device,
+            "offsets": self._offsets,
+            "colid": self._colid,
+            "quesval": self._quesval,
+            "left_child": self._left_child,
+            "leaves": self._leaves,
+            "meta": Array.from_list(
+                [
+                    int(self.n_features_in_),
+                    int(self._n_trees),
+                    int(self._num_outputs),
+                ],
+                "<i8",
+            ),
+        }
+        if hasattr(self, "classes_"):
+            arrays["classes"] = classes_member(self.classes_)
+        self._archive_inference_metadata(arrays, _MODEL_FORMAT)
+        return _serialize.write_npz(path, arrays)
+
+    @classmethod
+    def load(cls, path):
+        """Load a forest saved by `save`.
+
+        The loaded model predicts; it does not refit. Loading a file saved by
+        a different estimator class raises `ValueError`.
+        """
+        arrays = _serialize.read_npz(path, (_MODEL_FORMAT, _MODEL_FORMAT + "-parallel-groves-1"))
+        saved_as = _serialize.scalar_str(arrays, "estimator")
+        if saved_as != cls.__name__:
+            raise ValueError(
+                f"anonlib: {path!r} was saved by {saved_as}, not "
+                f"{cls.__name__}"
+            )
+        obj = cls.__new__(cls)
+        obj.device = _serialize.scalar_str(arrays, "device")
+        obj._restore_inference_metadata(arrays, _MODEL_FORMAT)
+        obj._offsets = _serialize.exact(arrays, "offsets", "<i4")
+        obj._colid = _serialize.exact(arrays, "colid", "<i4")
+        obj._quesval = _serialize.exact(arrays, "quesval", "<f4")
+        obj._left_child = _serialize.exact(arrays, "left_child", "<i4")
+        obj._leaves = _serialize.exact(arrays, "leaves", "<f4")
+        meta = _serialize.exact(arrays, "meta", "<i8")
+        obj.n_features_in_ = int(meta[0])
+        obj._n_trees = int(meta[1])
+        obj._num_outputs = int(meta[2])
+        if "classes" in arrays:
+            # a 0.6.x file's `classes` member loads too (int, float, bool
+            # or `<U` from `np.unique`); bool labels come back as ints
+            obj.classes_ = classes_from_member(arrays["classes"])
+            obj.n_classes_ = int(len(obj.classes_))
+        return obj
+
+
+# Maintainer notes (moved from the docstring): criteria cross as cuML's
+# CRITERION enumerator (DEVIATION 407). `predict` argmaxes exactly as
+# `RandomForest::predict` (`randomforest.cuh:417-427`). Entropy's `log` is
+# DEVIATION 113/406's: it runs in both numeric modes and is bit-comparable to
+# cuML's in neither. `max_depth=None` matches cuML >= v26.08.00; this surface
+# substituted 16 until 2026-09-01 (DEVIATION 409, closed by aligning).
+# `max_leaf_nodes` is refused by name (DEVIATION 408, see _MAX_LEAF_NODES_WHY).
+@forest_estimator("classifier")
+class RandomForestClassifier(_RandomForestBase):
+    """Random forest classifier with cuML's defaults.
+
+    An ensemble of bootstrapped decision trees whose split thresholds are
+    searched over at most `n_bins` per-feature quantiles, as in cuML, rather
+    than scikit-learn's exact thresholds. Defaults follow cuML. Every
+    scikit-learn-shaped parameter is either honoured or refused by name with
+    `NotImplementedError`; none is accepted and ignored.
+
+    `X` is converted to float32; NaN or infinity in `X` raises `ValueError`.
+    `y` may hold numbers or strings; NaN labels are refused. The fit is
+    reproducible from `random_state`, and `random_state=None` means seed 0
+    (deterministic), unlike scikit-learn. Supports the `fast` (Apple GPUs only)
+    and `identical` numeric modes through `numeric_mode`.
+
+    Parameters
+    ----------
+    n_estimators : int, default 100
+        Number of trees.
+    criterion : {'gini', 'entropy', 'log_loss'}, default 'gini'
+        Split criterion; 'log_loss' is a second spelling of 'entropy'.
+    max_depth : int or None, default None
+        Maximum tree depth. None means unlimited, as in cuML and scikit-learn.
+    min_samples_split : int, default 2
+        Minimum rows needed to split a node.
+    min_samples_leaf : int, default 1
+        Minimum rows in a leaf.
+    min_weight_fraction_leaf : float, default 0.0
+        Minimum fraction of the total sample weight (of all rows when no
+        weights are given) required in each leaf, in [0.0, 0.5].
+    max_features : {'sqrt', 'log2'}, int, float or None, default 'sqrt'
+        Features considered per split: a name, a count in [1, n_features],
+        a fraction in (0, 1], or None for all features.
+    max_leaf_nodes : None, default None
+        Refused by name: scikit-learn's best-first growth to exactly k leaves
+        is not available here. Use `max_leaves` for cuML's level-order leaf
+        cap, or `anonlib.ExtraTreesClassifier`, whose `max_leaf_nodes` is
+        scikit-learn's.
+    min_impurity_decrease : float, default 0.0
+        Minimum impurity decrease required to split.
+    bootstrap : bool, default True
+        Sample rows with replacement for each tree.
+    oob_score : bool, default False
+        Compute the out-of-bag score during `fit`; requires
+        `bootstrap=True`. Callable scorers are not supported.
+    n_jobs : None, default None
+        Only None is accepted.
+    random_state : int or None, default None
+        Seed; None means 0.
+    verbose : int, default 0
+        Only 0 is accepted.
+    warm_start : bool, default False
+        Only False is accepted; there is no incremental fit.
+    class_weight : dict, 'balanced' or None, default None
+        Per-class weights. 'balanced_subsample' is not supported.
+    ccp_alpha : float, default 0.0
+        Only 0.0 is accepted; cost-complexity pruning is not implemented.
+    max_samples : float or None, default None
+        Fraction of rows drawn per tree, in (0, 1]. None means all rows.
+    monotonic_cst : None, default None
+        Only None is accepted.
+    max_leaves : int, default -1
+        cuML's leaf cap on a level-order grower; -1 (or None) means
+        unlimited. This is not scikit-learn's `max_leaf_nodes`.
+    n_bins : int, default 128
+        Number of per-feature quantile bins searched for splits.
+    n_streams : int, default 4
+        cuML's stream count parameter.
+    max_batch_size : int, default 4096
+        cuML's node batch size for the tree builder.
+    device : {'gpu'}, default 'gpu'
+        Only 'gpu' is accepted. On a CPU-only install the same setting runs
+        the host build of the forest.
+    inference_engine : {'auto', 'sequential', 'parallel_groves'}, default 'auto'
+        How `predict` reduces over trees. 'auto' uses 'parallel_groves' in
+        `fast` mode and 'sequential' otherwise.
+    numeric_mode : {'fast', 'identical'} or None, default None
+        Numeric mode for this estimator; None uses the package default.
+        ``'fast'`` is available on Apple GPUs only.
+
+    Attributes
+    ----------
+    classes_ : list
+        Class labels in sorted order (numbers by value, strings by code
+        point).
+    n_classes_ : int
+        Number of classes.
+    n_features_in_ : int
+        Number of features seen in `fit`.
+    oob_score_ : float
+        Out-of-bag score; present when `oob_score=True`.
+    oob_decision_function_ : Array
+        Out-of-bag class probabilities, `(n_samples, n_classes)` float64;
+        present when `oob_score=True`.
+    feature_importances_ : Array
+        Impurity importances, float32; present when `fit` was called with
+        `feature_importances=True`.
+
+    Examples
+    --------
+    >>> import numpy as np, anonlib
+    >>> rng = np.random.default_rng(0)
+    >>> X = rng.random((1000, 8), dtype=np.float32)
+    >>> y = (X[:, 0] > 0.5).astype(np.int64)
+    >>> model = anonlib.RandomForestClassifier(n_estimators=50).fit(X, y)
+    >>> proba = model.predict_proba(X)
+    """
+
+    def __init__(
+        self,
+        n_estimators=100,
+        *,
+        criterion="gini",
+        max_depth=None,
+        min_samples_split=2,
+        min_samples_leaf=1,
+        min_weight_fraction_leaf=0.0,
+        max_features="sqrt",
+        max_leaf_nodes=None,
+        min_impurity_decrease=0.0,
+        bootstrap=True,
+        oob_score=False,
+        n_jobs=None,
+        random_state=None,
+        verbose=0,
+        warm_start=False,
+        class_weight=None,
+        ccp_alpha=0.0,
+        max_samples=None,
+        monotonic_cst=None,
+        max_leaves=-1,
+        n_bins=_CUML_DEFAULT_N_BINS,
+        n_streams=_CUML_DEFAULT_N_STREAMS,
+        max_batch_size=_CUML_DEFAULT_MAX_BATCH,
+        device="gpu",
+        inference_engine="auto",
+    ):
+        code = _criterion_code(criterion, _CLS_CRITERIA, "classifier")
+        mwf = _min_weight_fraction(min_weight_fraction_leaf, type(self).__name__)
+        super().__init__(
+            n_estimators, max_depth, max_leaf_nodes, max_leaves,
+            max_features, n_bins,
+            min_samples_leaf, min_samples_split, min_impurity_decrease,
+            bootstrap, max_samples, random_state, n_streams, max_batch_size,
+            oob_score, warm_start, ccp_alpha, class_weight, monotonic_cst,
+            n_jobs, verbose, device, code,
+        )
+        self.criterion = criterion
+        self._cfg["min_weight_fraction_leaf"] = mwf
+
+    def fit(self, X, y, sample_weight=None, *, feature_importances=False):
+        """Fit the forest.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+            Training data, converted to float32.
+        y : array-like of shape (n_samples,)
+            Targets.
+        sample_weight : array-like of shape (n_samples,), default None
+            Per-row weights, non-negative and not all zero. Multiplied into the
+            ``class_weight`` row weights.
+        feature_importances : bool, default False
+            Also compute `feature_importances_` during this fit.
+
+        Returns
+        -------
+        self
+        """
+        return self._fit_with_tree_start(X, y, feature_importances=feature_importances,
+                                         sample_weight=sample_weight)
+
+    def _fit_with_tree_start(self, X, y, tree_start=None, *, feature_importances=False,
+                             sample_weight=None):
+        if not is_bool(feature_importances):
+            raise ValueError("feature_importances must be a boolean fit-output request")
+        self._refresh_config()
+        self._capture_fit_mode()
+        # DEVIATION 2500: one native pass for a numeric buffer, the Python
+        # ORDER RULE for everything else; the codes cross as int32.
+        self.classes_, y32 = encode_labels(y)
+        self.n_classes_ = int(len(self.classes_))
+        if self.n_classes_ < 2:
+            raise ValueError("y has fewer than 2 classes")
+        if sample_weight is not None:
+            # scikit-learn's sample_weight (checked, float32) times the
+            # class_weight row weights, one native product per row; the
+            # weighted entry takes any per-row weights
+            from ._expansion_trees import _trees_weighted_rows
+            weights = _trees_weighted_rows(sample_weight, self.class_weight, self.classes_, y32, self)
+        else:
+            weights = (None if self.class_weight is None else
+                       _class_weight_rows(self.class_weight, self.classes_, y32,
+                                          self._bind("_anonlib_x_trees")))
+        binding = self._bind("_anonlib_rf")
+        self.__dict__.pop("oob_decision_function_", None)
+        self.__dict__.pop("oob_score_", None)
+        self.__dict__.pop("feature_importances_", None)
+        if self._cfg["oob_score"] or feature_importances:
+            # T15: native fit-owned bootstrap membership and split statistics
+            # produce the requested outputs without a second model fit.
+            # NOT COMPILED — NOT TESTED — IDENTITY NOT VERIFIED — QUALITY NOT VERIFIED — NOT MEASURED.
+            if tree_start is not None:
+                raise ValueError("auxiliary outputs require a complete forest, not a tree-ID shard")
+            entry = getattr(binding, "rf_classifier_fit_aux_export", None)
+            if not callable(entry):
+                raise NotImplementedError("this RF binding does not expose native requested fit outputs")
+            oob = empty((len(y32), self.n_classes_), "<f8") if self._cfg["oob_score"] else None
+            score = empty((1,), "<f8") if oob is not None else None
+            importance = [None]  # glue: owns the one optional native result buffer
+            def oob_fit(x_addr, y_addr, params, criterion):
+                if feature_importances:
+                    importance[0] = empty((int(params[1]),), "<f4")
+                return _export_fit_result(binding, entry(
+                    x_addr, y_addr, params, criterion,
+                    0 if weights is None else addr_ro(weights, name="weights"),
+                    0 if oob is None else addr(oob, name="oob"),
+                    0 if score is None else addr(score, name="oob_score"),
+                    0 if importance[0] is None else addr(importance[0], name="importance")))
+            self._fit_arrays(X, y32, self.n_classes_, oob_fit)
+            if oob is not None:
+                self.oob_decision_function_ = oob
+                self.oob_score_ = float(score[0])
+            if importance[0] is not None:
+                self.feature_importances_ = importance[0]
+            return self
+        fit_fn = _forest_fit_function(binding, "rf_classifier_fit")
+        rowmajor_fn = _rowmajor_fit_function(binding, "rf_classifier_fit")
+        if weights is not None:
+            rowmajor_fn = None
+            weighted_fit = (_forest_fit_function(binding, "rf_classifier_fit_weighted")
+                            if hasattr(binding, "rf_classifier_fit_weighted") else None)
+            if weighted_fit is None:
+                raise RuntimeError("rebuild the RF binding for class_weight support")
+            def fit_fn(x_addr, y_addr, params, criterion):
+                return weighted_fit(x_addr, y_addr, params, criterion, addr_ro(weights, name="weights"))
+        if tree_start is not None:
+            if not callable(getattr(binding, 'rf_classifier_fit_shard', None)):
+                raise ImportError('rebuild RF binding for global tree-ID shards')
+            def fit_fn(x_addr, y_addr, params, criterion):
+                return binding.rf_classifier_fit_shard(x_addr, y_addr, params, criterion,
+                    tree_start, 0 if weights is None else addr_ro(weights, name='weights'))
+            rowmajor_fn = None
+        return self._fit_arrays(X, y32, self.n_classes_, fit_fn, rowmajor_fn)
+
+    def predict_proba(self, X):
+        """Class probabilities: the per-class vote fractions over the trees.
+
+        Returns
+        -------
+        Array of shape (n_samples, n_classes), float32
+            Columns in `classes_` order.
+        """
+        Xa, n_rows, n_features = self._check_predict_input(X)
+        out = empty((n_rows * self._num_outputs,), "<f4")
+        wrote = self._predict_forest("rf_predict_proba", Xa, out)
+        if wrote != n_rows:
+            raise RuntimeError(
+                f"rf_predict_proba wrote {wrote} of {n_rows} rows"
+            )
+        return out.reshape((n_rows, self._num_outputs))
+
+    def _predict_with_proba(self, X):
+        """Return both classifier views after one forest traversal.
+
+        This is an internal verification fast path.  ``predict`` is defined
+        as the first-max decode of ``predict_proba`` below, so retaining the
+        exact probability buffer and deriving the labels from it is byte for
+        byte the same work as the two public calls without traversing every
+        tree twice.
+        """
+        proba = self.predict_proba(X)
+        return decode_labels(self.classes_, argmax_rows(proba)), proba
+
+    def predict(self, X):
+        """Predicted class labels: the argmax of `predict_proba`, first
+        maximum winning, mapped through `classes_`.
+
+        Returns
+        -------
+        Array or list of shape (n_samples,)
+            An int64 or float64 `Array` for numeric labels, a Python list for
+            string labels.
+        """
+        Xa, _, _ = self._check_predict_input(X)
+        codes = self._predict_forest_labels(Xa)
+        if codes is not None:
+            return decode_labels(self.classes_, codes)
+        return decode_labels(self.classes_, argmax_rows(self.predict_proba(Xa)))
+
+
+# Maintainer notes (moved from the docstring): the regression criteria are
+# the four arms of cuML's `GainPerSplit` (`objectives.cuh:331-338`);
+# 'absolute_error'/'mae' and 'friedman_mse' are refused (DEVIATION 407).
+# The three deviance criteria return `-max()` for a non-positive label sum
+# (`objectives.cuh:251-253`, `:279-281`, `:306-308`), so cuML silently fits
+# stumps; `fit` refuses instead. `max_features=1.0` is cuML's regressor
+# default (`randomforestregressor.py:162`). `max_depth=None` since
+# 2026-09-01 (DEVIATION 409); `max_leaf_nodes` refused (DEVIATION 408).
+@forest_estimator("regressor")
+class RandomForestRegressor(_RandomForestBase):
+    """Random forest regressor with cuML's defaults.
+
+    An ensemble of bootstrapped regression trees whose split thresholds are
+    searched over at most `n_bins` per-feature quantiles, as in cuML, rather
+    than scikit-learn's exact thresholds. Defaults follow cuML, including
+    `max_features=1.0`. Every scikit-learn-shaped parameter is either
+    honoured or refused by name with `NotImplementedError`.
+
+    `X` and `y` are converted to float32; NaN or infinity in `X` raises
+    `ValueError`. `random_state=None` means seed 0 (deterministic), unlike
+    scikit-learn. Supports the `fast` (Apple GPUs only) and `identical`
+    numeric modes through `numeric_mode`.
+
+    Parameters
+    ----------
+    n_estimators : int, default 100
+        Number of trees.
+    criterion : {'squared_error', 'mse', 'poisson', 'gamma', 'inverse_gaussian'}, default 'squared_error'
+        Split criterion; 'mse' is cuML's spelling of 'squared_error'.
+        'poisson' requires finite `y >= 0` with at least one positive value;
+        'gamma' and 'inverse_gaussian' require finite `y > 0`; otherwise
+        `fit` raises `ValueError`. 'absolute_error', 'mae' and
+        'friedman_mse' raise `NotImplementedError`.
+    max_depth : int or None, default None
+        Maximum tree depth. None means unlimited.
+    min_samples_split : int, default 2
+        Minimum rows needed to split a node.
+    min_samples_leaf : int, default 1
+        Minimum rows in a leaf.
+    min_weight_fraction_leaf : float, default 0.0
+        Minimum fraction of the total sample weight (of all rows when no
+        weights are given) required in each leaf, in [0.0, 0.5].
+    max_features : {'sqrt', 'log2'}, int, float or None, default 1.0
+        Features considered per split: a name, a count, a fraction in
+        (0, 1], or None for all features.
+    max_leaf_nodes : None, default None
+        Refused by name. Use `max_leaves` for cuML's level-order leaf cap, or
+        `anonlib.ExtraTreesRegressor`, whose `max_leaf_nodes` is
+        scikit-learn's best-first budget.
+    min_impurity_decrease : float, default 0.0
+        Minimum impurity decrease required to split.
+    bootstrap : bool, default True
+        Sample rows with replacement for each tree.
+    oob_score : bool, default False
+        Compute the out-of-bag score during `fit`; requires `bootstrap=True`.
+    n_jobs : None, default None
+        Only None is accepted.
+    random_state : int or None, default None
+        Seed; None means 0.
+    verbose : int, default 0
+        Only 0 is accepted.
+    warm_start : bool, default False
+        Only False is accepted.
+    ccp_alpha : float, default 0.0
+        Only 0.0 is accepted.
+    max_samples : float or None, default None
+        Fraction of rows drawn per tree, in (0, 1]. None means all rows.
+    monotonic_cst : None, default None
+        Only None is accepted.
+    max_leaves : int, default -1
+        cuML's leaf cap on a level-order grower; -1 (or None) means
+        unlimited.
+    n_bins : int, default 128
+        Number of per-feature quantile bins searched for splits.
+    n_streams : int, default 4
+        cuML's stream count parameter.
+    max_batch_size : int, default 4096
+        cuML's node batch size for the tree builder.
+    device : {'gpu'}, default 'gpu'
+        Only 'gpu' is accepted. On a CPU-only install the same setting runs
+        the host build of the forest.
+    inference_engine : {'auto', 'sequential', 'parallel_groves'}, default 'auto'
+        How `predict` reduces over trees. 'auto' uses 'parallel_groves' in
+        `fast` mode and 'sequential' otherwise.
+    numeric_mode : {'fast', 'identical'} or None, default None
+        Numeric mode for this estimator; None uses the package default.
+        ``'fast'`` is available on Apple GPUs only.
+
+    Attributes
+    ----------
+    n_features_in_ : int
+        Number of features seen in `fit`.
+    oob_score_ : float
+        Out-of-bag score; present when `oob_score=True`.
+    oob_prediction_ : Array
+        Out-of-bag predictions, float64; present when `oob_score=True`.
+    feature_importances_ : Array
+        Impurity importances, float32; present when `fit` was called with
+        `feature_importances=True`.
+
+    Examples
+    --------
+    >>> import numpy as np, anonlib
+    >>> rng = np.random.default_rng(0)
+    >>> X = rng.random((1000, 8), dtype=np.float32)
+    >>> y = X[:, 0] * 2.0 + X[:, 1]
+    >>> model = anonlib.RandomForestRegressor(n_estimators=50).fit(X, y)
+    >>> pred = model.predict(X)
+    """
+
+    def __init__(
+        self,
+        n_estimators=100,
+        *,
+        criterion="squared_error",
+        max_depth=None,
+        min_samples_split=2,
+        min_samples_leaf=1,
+        min_weight_fraction_leaf=0.0,
+        max_features=1.0,
+        max_leaf_nodes=None,
+        min_impurity_decrease=0.0,
+        bootstrap=True,
+        oob_score=False,
+        n_jobs=None,
+        random_state=None,
+        verbose=0,
+        warm_start=False,
+        ccp_alpha=0.0,
+        max_samples=None,
+        monotonic_cst=None,
+        max_leaves=-1,
+        n_bins=_CUML_DEFAULT_N_BINS,
+        n_streams=_CUML_DEFAULT_N_STREAMS,
+        max_batch_size=_CUML_DEFAULT_MAX_BATCH,
+        device="gpu",
+        inference_engine="auto",
+    ):
+        code = _criterion_code(criterion, _REG_CRITERIA, "regressor")
+        mwf = _min_weight_fraction(min_weight_fraction_leaf, type(self).__name__)
+        super().__init__(
+            n_estimators, max_depth, max_leaf_nodes, max_leaves,
+            max_features, n_bins,
+            min_samples_leaf, min_samples_split, min_impurity_decrease,
+            bootstrap, max_samples, random_state, n_streams, max_batch_size,
+            oob_score, warm_start, ccp_alpha, None, monotonic_cst,
+            n_jobs, verbose, device, code,
+        )
+        self.criterion = criterion
+        self._cfg["min_weight_fraction_leaf"] = mwf
+
+    def fit(self, X, y, sample_weight=None, *, feature_importances=False):
+        """Fit the forest.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+            Training data, converted to float32.
+        y : array-like of shape (n_samples,)
+            Targets.
+        sample_weight : array-like of shape (n_samples,), default None
+            Per-row weights, non-negative and not all zero.
+        feature_importances : bool, default False
+            Also compute `feature_importances_` during this fit.
+
+        Returns
+        -------
+        self
+        """
+        return self._fit_with_tree_start(X, y, feature_importances=feature_importances,
+                                         sample_weight=sample_weight)
+
+    def _fit_in_session(self, session, y, rows=None):
+        """`fit(X, y)` for the X a `ForestDataSession` holds (trees-apple3):
+        the squared-error member fit of a boosted ensemble. Same params,
+        same entry underneath, minus the per-member staging of X (whose
+        finite scan the session ran once). With `rows` (int32 row ids,
+        repeats allowed) the fit is `fit(X[rows], y)`, the rows gathered on
+        the device."""
+        self._refresh_config()
+        self._capture_fit_mode()
+        y32, _ = as_f32_c(y, ndim=1, name="y")
+        code = self._cfg["criterion"]
+        if code != _REG_CRITERIA["squared_error"]:
+            raise ValueError("a forest data session fits squared_error members")
+        n_rows, n_features = session.shape
+        if rows is not None:
+            n_rows = len(rows)
+        if len(y32) != n_rows:
+            raise ValueError(f"y has {len(y32)} rows, X has {n_rows}")
+        params = self._fit_params(n_rows, n_features, 0)
+        out = (session.fit_regressor(y32, params, code) if rows is None
+               else session.fit_regressor_rows(rows, y32, params, code))
+        (self._offsets, self._colid, self._quesval, self._left_child,
+         self._leaves, meta) = _forest_fit_arrays(out)
+        self.n_features_in_ = int(n_features)
+        self._n_trees = int(meta[0])
+        self._num_outputs = int(meta[1])
+        return self
+
+    def _fit_in_dart(self, handle, cls, n_rows, n_features, rows=None, cols=None):
+        """The squared-error member fit of a DART round on the DART
+        session's device buffers (cpu4-forest): X and class `cls`'s fit
+        target stay where `x_trees_dart_step` left them; `rows` (int32 bag
+        rows) and `cols` (int32 sampled columns) select them on the device.
+        Same params and model export as `fit(X[rows][:, cols], target)`."""
+        self._refresh_config()
+        self._capture_fit_mode()
+        code = self._cfg["criterion"]
+        if code != _REG_CRITERIA["squared_error"]:
+            raise ValueError("a DART member fits squared_error")
+        binding = self._bind("_anonlib_rf")
+        entry = getattr(binding, "rf_regressor_fit_dart_export", None)
+        if not callable(entry):
+            raise RuntimeError("rebuild the forest binding for DART member fits on the device")
+        m = int(n_rows) if rows is None else len(rows)
+        dc = int(n_features) if cols is None else len(cols)
+        params = self._fit_params(m, dc, 0)
+        out = _export_fit_result(binding, entry(
+            int(handle), int(cls), 0 if rows is None else addr_ro(rows, name="rows"),
+            0 if cols is None else addr_ro(cols, name="cols"), params, code))
+        (self._offsets, self._colid, self._quesval, self._left_child,
+         self._leaves, meta) = _forest_fit_arrays(out)
+        self.n_features_in_ = int(dc)
+        self._n_trees = int(meta[0])
+        self._num_outputs = int(meta[1])
+        return self
+
+    def _fit_with_tree_start(self, X, y, tree_start=None, *, feature_importances=False,
+                             sample_weight=None):
+        if not is_bool(feature_importances):
+            raise ValueError("feature_importances must be a boolean fit-output request")
+        self._refresh_config()
+        self._capture_fit_mode()
+        y32, _ = as_f32_c(y, ndim=1, name="y")
+        code = self._cfg["criterion"]
+        # DEVIATION 2342: the deviance-domain checks are native
+        # finiteness plus the core helper's `min`/`max` (`reduce_stat`). Poisson's "positive
+        # sum" is "some label positive" once every label is finite and
+        # non-negative, which is what the float64 sum tested; a NaN or
+        # inf label, which made that sum NaN or inf, is refused for all
+        # three criteria rather than passed to a deviance.
+        if code == _REG_CRITERIA["poisson"]:
+            if not all_finite(y32) or y32.min() < 0 or not y32.max() > 0:
+                raise ValueError(
+                    "criterion='poisson' requires y >= 0 with a positive"
+                    " sum: PoissonGain returns -max() for a non-positive"
+                    " label sum (objectives.cuh:251-253), which would fit"
+                    " a stump silently"
+                )
+        elif code in (_REG_CRITERIA["gamma"],
+                      _REG_CRITERIA["inverse_gaussian"]):
+            if not all_finite(y32) or y32.min() <= 0:
+                raise ValueError(
+                    f"criterion={self.criterion!r} requires y > 0: its"
+                    " gain returns -max() for a non-positive label sum"
+                    " (objectives.cuh:279-281, :306-308), which would fit"
+                    " a stump silently"
+                )
+        binding = self._bind("_anonlib_rf")
+        self.__dict__.pop("oob_prediction_", None)
+        self.__dict__.pop("oob_score_", None)
+        self.__dict__.pop("feature_importances_", None)
+        if sample_weight is not None:
+            # sk-edges: scikit-learn's sample_weight through the weighted
+            # regressor entry (bindings/_anonlib_rf.mojo
+            # rf_regressor_fit_weighted). The checked weights are float32
+            # (`_sample_weight.check_sample_weight`); their max, a native
+            # reduction, sizes the label_sum plane's fixed-point scale.
+            if tree_start is not None or self._cfg["oob_score"] or feature_importances:
+                raise NotImplementedError(
+                    "sample_weight is not implemented together with oob_score, feature "
+                    "importances or a tree-ID shard")
+            try:
+                has_weighted = callable(getattr(binding, "rf_regressor_fit_weighted_export", None))
+            except ImportError:  # a host facade refuses an absent export
+                has_weighted = False
+            if not has_weighted:
+                raise NotImplementedError(
+                    "sample_weight for a regression forest needs a forest binding that exports "
+                    "rf_regressor_fit_weighted; this install's binding predates it")
+            w = check_sample_weight(sample_weight, len(y32))
+            w_max = float(w.max())  # glue: native max reduction of the weights
+            weighted = _forest_fit_function(binding, "rf_regressor_fit_weighted")
+
+            def fit_fn(x_addr, y_addr, params, criterion):
+                return weighted(x_addr, y_addr, params, criterion, addr_ro(w, name="sample_weight"), w_max)
+            return self._fit_arrays(X, y32, 0, fit_fn)
+        if self._cfg["oob_score"] or feature_importances:
+            # T15 consumes native fit-owned OOB and importance buffers.
+            # NOT COMPILED — NOT TESTED — IDENTITY NOT VERIFIED — QUALITY NOT VERIFIED — NOT MEASURED.
+            if tree_start is not None:
+                raise ValueError("auxiliary outputs require a complete forest, not a tree-ID shard")
+            entry = getattr(binding, "rf_regressor_fit_aux_export", None)
+            if not callable(entry):
+                raise NotImplementedError("this RF binding does not expose native requested fit outputs")
+            oob = empty((len(y32),), "<f8") if self._cfg["oob_score"] else None
+            score = empty((1,), "<f8") if oob is not None else None
+            importance = [None]
+            def oob_fit(x_addr, y_addr, params, criterion):
+                if feature_importances:
+                    importance[0] = empty((int(params[1]),), "<f4")
+                return _export_fit_result(binding, entry(
+                    x_addr, y_addr, params, criterion,
+                    0 if oob is None else addr(oob, name="oob"),
+                    0 if score is None else addr(score, name="oob_score"),
+                    0 if importance[0] is None else addr(importance[0], name="importance")))
+            self._fit_arrays(X, y32, 0, oob_fit)
+            if oob is not None:
+                self.oob_prediction_ = oob
+                self.oob_score_ = float(score[0])
+            if importance[0] is not None:
+                self.feature_importances_ = importance[0]
+            return self
+        if tree_start is not None:
+            if not callable(getattr(binding, 'rf_regressor_fit_shard', None)):
+                raise ImportError('rebuild RF binding for global tree-ID shards')
+            def fit_fn(x_addr, y_addr, params, criterion):
+                return binding.rf_regressor_fit_shard(x_addr, y_addr, params, criterion, tree_start)
+            return self._fit_arrays(X, y32, 0, fit_fn)
+        return self._fit_arrays(X, y32, 0, _forest_fit_function(binding, "rf_regressor_fit"),
+                                _rowmajor_fit_function(binding, "rf_regressor_fit"))
+
+    def predict(self, X):
+        """Predicted values: the mean of the trees' predictions.
+
+        Returns
+        -------
+        Array of shape (n_samples,), float32
+        """
+        Xa, n_rows, n_features = self._check_predict_input(X)
+        out = empty((n_rows,), "<f4")
+        wrote = self._predict_forest("rf_predict_reg", Xa, out)
+        if wrote != n_rows:
+            raise RuntimeError(
+                f"rf_predict_reg wrote {wrote} of {n_rows} rows"
+            )
+        return out

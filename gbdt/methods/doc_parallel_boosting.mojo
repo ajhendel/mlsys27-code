@@ -1,0 +1,5054 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 the authors. Part of anonlib, DOI-WITHHELD
+"""CatBoost-compatible boosting loop: derive gradients from the current cursor, fit a tree, estimate leaves, and update predictions."""
+
+from gbdt.options.child_hessian import child_hessian_threshold, check_child_hessian_objective
+from std.math import fma
+from max.gpu.host import DeviceBuffer, DeviceContext, HostBuffer
+from core.device_zero import enqueue_fill
+from max.gpu.host.device_attribute import DeviceAttribute
+from std.math import isfinite
+from std.sys.compile import is_defined
+from gbdt.trees_identical_switches import T18, T26, CTR_SORTFREE_SUMS
+from gbdt.methods.leaves_estimation.bin_keyed_stats import (
+    bk_partials_len,
+    enqueue_bin_keyed_apply,
+    enqueue_bin_keyed_counts,
+    enqueue_bk_copy_f32,
+)
+from gbdt.methods.leaves_estimation.tree_t26_device import t26_estimate_apply
+from std.sys.info import has_apple_gpu_accelerator
+from gbdt.methods.kernel_add_model_value import add_model_value_kernel
+from gbdt.metrics.optimal_const_device import optimum_const_approx_device
+
+from gbdt.gpu_lib.gpu_manager import TCudaManager
+from gbdt.gpu_util.kernel.transform import (
+    launch_gather_planes_with_mask_f32,
+    launch_gather_with_mask_f32,
+)
+from core.device_liveness import (
+    DEAD_DEVICE_POISON,
+    SAB_2002_DEAD_DEVICE,
+)
+from core.identity_trace import IdentityTrace
+from gbdt.methods.greedy_subsets_searcher.depthwise_stage_times import (
+    StageTimes,
+)
+from gbdt.methods.leaves_estimation.descent_helpers import (
+    _move,
+    _update_move_direction,
+)
+from gbdt.methods.leaves_estimation.apple_fast_est import (
+    EST_APPLE_ANY,
+    AppleEstScratch,
+    apple_est_ensure,
+    apple_est_handles,
+    apple_fast_estimate_and_apply,
+)
+from gbdt.gpu_util.arena import BufferArena
+from gbdt.methods.leaves_estimation.pointwise_oracle import (
+    BinOptimizedOracle,
+    ORACLE_SCRATCH_POOLED,
+    OracleDeviceScratch,
+    OracleHostScratch,
+    _oracle_dims,
+    make_oracle_device_scratch_in,
+    make_oracle_device_scratch_sharing_rows_in,
+    OracleScratchPool,
+    make_bin_optimized_oracle,
+    merge_stage_times,
+)
+from gbdt.methods.leaves_estimation.step_estimator import (
+    BACKTRACKING_ANY_IMPROVEMENT,
+    StepEstimator,
+    create_step_estimator,
+)
+from checks.fixed_point import choose_scale
+from gbdt.methods.random_score_helper import (
+    calc_score_model_length_mult,
+    compute_score_std_dev,
+)
+from gbdt.methods.oblivious_tree_doc_parallel_structure_searcher import (
+    PointwiseTreeWorkspace,
+    fit_oblivious_tree_structure,
+    fit_oblivious_tree_structure_traced,
+    split_stat_planes,
+)
+#: lane/apple-fast-sym-iter: the pointwise SymmetricTree arm's per-tree
+#: fixed cost, FAST + Apple only, every alias default OFF
+#: (`gbdt/methods/sym_iter_fast.mojo` has the defines and the mechanism).
+#: Under every other build each alias is comptime False, the pool list stays
+#: empty and the runtime flags below are constant False.
+from gbdt.methods.sym_iter_fast import (
+    SYM_BUF_ARENA,
+    SYM_ITER_ANY,
+    SymIterPool,
+    sym_compute_bins_pooled,
+    sym_objective_is_pointwise,
+    sym_pool_get,
+    sym_scale_from_mags,
+    sym_split_planes,
+)
+from gbdt.methods.greedy_subsets_searcher.greedy_search_helper import (
+    SYM_RIDX_SPLITS_2031,
+    run_sequential_two_level_feature_freq_tree,
+    enqueue_snap_plane,
+    run_tree_layout,
+    run_tree_layout_traced,
+    TSynchronizedTensorTreeResult,
+    TTreeWorkspace,
+)
+from gbdt.models.tensor_ctr_value_table import TStagedTensorCandidate, TTensorCtrRegistry
+from gbdt.ctrs.ctr_binarization import TBinarizationOptions
+# ---- the NON-SYMMETRIC arm (DEVIATION 259): CatBoost's
+# `TGreedyTreeLikeStructureSearcher<TNonSymmetricTree>`, the searcher their
+# `pointwise_non_symmetric.cpp:7-29` registers for every single-target
+# pointwise loss under `EGrowPolicy::Depthwise` and `Lossguide`
+from gbdt.methods.greedy_subsets_searcher.greedy_search_helper_depthwise import (
+    IDN_NS_SCALE_DEVICE,
+    NS_INHERIT_PARTITION,
+    TDepthwiseWorkspace,
+    fit_non_symmetric_tree,
+)
+from gbdt.methods.greedy_subsets_searcher.structure_searcher_options import (
+    TTreeStructureSearcherOptions,
+)
+from gbdt.models.non_symmetric_tree import TNonSymmetricTree
+from gbdt.models.ns_bitvector_predict import GBDT_NS_BITVEC
+from gbdt.models.add_non_symmetric_tree_doc_parallel import (
+    IDN_NS_PREDICT_PACKED,
+    add_non_symmetric_tree_to_cursor,
+    add_non_symmetric_trees_packed,
+    compute_non_symmetric_bins_for_model,
+)
+from gbdt.options.catboost_options import (
+    GROW_DEPTHWISE,
+    GROW_LOSSGUIDE,
+    GROW_SYMMETRIC,
+    grow_policy_name,
+)
+from gbdt.models.oblivious_model import (
+    BIN_SPLIT_TAKE_BIN,
+    TAdditiveModel,
+    TBinarySplit,
+    TObliviousTreeModel,
+    TObliviousTreeStructure,
+)
+from gbdt.gpu_data.compressed_index_builder import (
+    CompressedIndexLayout,
+    build_layout,
+)
+from gbdt.methods.leaves_estimation.leaves_estimation import (
+    IDN_EST_ONE_STEP_DEVICE,
+    IDN_GBDT_MC_ONE_STEP_DEVICE,
+    IDN_GBDT_SYM_EST_DEFER_DRAIN,
+    MC_ONE_STEP_MAX_CLASSES,
+    multiclass_one_step_kernel,
+    newton_one_step_kernel,
+    weight_keep_mask_kernel,
+)
+from gbdt.methods.leaves_estimation.device_walker import (
+    GBDT_WALK_DEV_STEP,
+    WALK_FOLD_BLOCK,
+    WalkBuffers,
+    count_nonzero_u32_kernel,
+    device_walk_begin,
+    device_walk_ctl_step,
+    device_walk_ctl_updated,
+    device_walk_enqueue_line_search,
+    device_walk_enqueue_speculative,
+    device_walk_estimate,
+    device_walk_flag,
+    device_walk_supported,
+    MultiWalkBuffers,
+    device_multi_walk_estimate,
+    device_multi_walk_not_pd,
+    device_multi_walk_supported,
+    enqueue_copy_values,
+    enqueue_zero_average,
+    weight_keep_mask_strided_kernel,
+)
+from std.memory import bitcast, memcpy
+from std.gpu import block_dim, block_idx, thread_idx
+from checks.soft_f64 import sf64_div, sf64_from_f32, sf64_from_int, sf64_neg
+from gbdt.methods.kernel.two_level_leaves import (
+    TL_BLOCK,
+    TL_GRID,
+    TL_PREP_LANES,
+    two_level_leaf_partials_kernel,
+    two_level_leaf_values_kernel,
+    two_level_prep_kernel,
+)
+# TOMBSTONE: ANONLIB_SYM_CTR_PERM_BATCH (DROPPED-noise) deleted 2026-10-04 by f4ac2ee28; code recoverable at f4ac2ee28^.
+# Restore: git apply experiments/removed/ANONLIB_SYM_CTR_PERM_BATCH.patch; record in docs/TOMBSTONES.md.
+from gbdt.models.kernel.add_bin_values import (
+    IDN_APPLY_WIDE,
+    IDN_PREDICT_FOUR,
+    compute_bins_and_add_kernel,
+    launch_oblivious_apply_four,
+    launch_oblivious_apply_wide,
+    uniform_positive_depth,
+)
+from checks.kernel_matrix import (
+    TARGET_COLUMN,
+    deterministic_flush_for,
+    greedy_one_byte_fixed_for,
+)
+from gbdt.options.catboost_options import SCORE_FUNCTION_COSINE
+from checks.numerics import PIN_DETERMINISM
+from checks.numerics import GLOBAL_NUMERIC_MODE, NUMERIC_FAST, NUMERIC_IDENTICAL
+from gbdt.gpu_data.sym_feat_switches import GBDT_EVAL_FUSED
+
+#: lane/apple-fast-trees-depthwise (2026-10-02, family `trees-ctr`),
+#: FAST + Apple DEFAULT ON (2026-10-02); `-D ANONLIB_GBDT_CTR_PERM_BATCH_OFF=1`
+#: restores the serial loop (the old `-D ANONLIB_GBDT_CTR_PERM_BATCH=1` is
+#: now harmless). M3 A/B tdw-cat-permbatch-tc (gbdt-categorical taxicat, n=2):
+#: 36,772 -> 35,780 ms (-2.7%, both B runs below both A), auc .6309 -> .6311.
+#: CAUSE: with CTR-bearing categorical features the fit keeps
+#: `permutation_count` (4) column sets, and the non-symmetric per-tree loop
+#: below (`for p in range(perm_count)`) runs each permutation's leaf
+#: estimation ONE AFTER THE OTHER through `_estimate_and_apply`: per
+#: permutation a partition drain, every Newton evaluation's drain
+#: (`leaf_estimation_iterations` rounds plus line search) and the tail
+#: drain. gbdt-categorical taxi (Logloss, 4 permutations, ~500 trees) pays
+#: 4x that per tree. EFFECT: the four tasks run the lock-step walk
+#: `ordered_boosting.mojo` already runs (`_estimate_prepare`,
+#: `estimate_advance`, `_estimate_complete`): one partitioner per
+#: permutation enqueued back to back behind ONE drain, one drain per walker
+#: round for all four, one closing drain per tree. Each task runs the same
+#: kernels on the same inputs in the same order as its serial run, so the
+#: leaf values are the serial loop's; only the drains are shared. Taken
+#: only when `estimate_can_batch` holds (single-dim pointwise loss, Newton
+#: or Gradient) and the device partitioner is on; IDENTICAL compiles the
+#: serial loop unchanged.
+#: lane/fam-gbdt (2026-10-04), IDN_CTR_PERM_BATCH: the same batched walk
+#: under IDENTICAL on every vendor, default on. No arithmetic moves: each
+#: permutation's task launches the kernels of its serial run on the same
+#: inputs in the same order (the paragraph above), and only the drains are
+#: shared, so the bits are the serial loop's on every column and the host
+#: column is untouched. `-D ANONLIB_IDN_GBDT_CTR_PERM_BATCH_OFF` (or the
+#: master `-D ANONLIB_IDN_ALL_OFF`) restores the serial loop under
+#: IDENTICAL.
+comptime IDN_CTR_PERM_BATCH = (
+    GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL
+    and not (
+        is_defined["ANONLIB_IDN_GBDT_CTR_PERM_BATCH_OFF"]()
+        or is_defined["ANONLIB_IDN_ALL_OFF"]()
+    )
+)
+comptime CTR_PERM_BATCH = (
+    GLOBAL_NUMERIC_MODE == NUMERIC_FAST
+    and has_apple_gpu_accelerator()
+    and not is_defined["ANONLIB_GBDT_CTR_PERM_BATCH_OFF"]()
+) or IDN_CTR_PERM_BATCH
+# TOMBSTONE: ANONLIB_IDN_CTR_PERM_GRID (noise) deleted 2026-10-11 by d092b6e2d; code recoverable at d092b6e2d^.
+# Restore: git apply experiments/removed/ANONLIB_IDN_CTR_PERM_GRID.patch
+from gbdt.gpu_util.kernel.fill import launch_make_sequence
+from gbdt.gpu_util.kernel.bootstrap import (
+    bootstrap_grid_blocks,
+    create_bootstrap_seeds,
+    BOOTSTRAP_KERNEL_BAYESIAN,
+    BOOTSTRAP_KERNEL_BERNOULLI,
+    BOOTSTRAP_KERNEL_POISSON,
+    launch_bootstrap,
+)
+from gbdt.methods.greedy_subsets_searcher.kernel.hist_one_byte import (
+    BUILD_MODE as HIST_BUILD_MODE,
+)
+from gbdt.methods.greedy_subsets_searcher.kernel.hist_2_one_byte_base import (
+    HIST2_SMEM_IS_I32,
+    HIST2_SMEM_MODE,
+)
+from gbdt.data.permutation import TRandom
+from gbdt.gpu_data.feature_sampling import check_feature_fraction, sample_tree_folds, FeatureProjectionWorkspace
+from gbdt.methods.leaves_estimation.doc_parallel_leaves_estimator import (
+    DEVICE_LEAF_PARTITION,
+    DeviceLeafPartitioner,
+    LeafPartition,
+    compute_bins_for_model,
+    partition_from_bins,
+)
+from ensemble.instruments import StageTimes as HostStageTimes
+from gbdt.overfitting_detector.overfitting_detector import (
+    OD_NONE,
+    OverfittingDetector,
+    make_overfitting_detector,
+)
+from gbdt.options.overfitting_detector_options import (
+    OD_DEFAULT_STOP_PVALUE,
+    OD_DEFAULT_WAIT_ITERATIONS,
+)
+
+from gbdt.options.catboost_options import (
+    LEAF_ESTIMATION_EXACT,
+    LEAF_ESTIMATION_GRADIENT,
+    LEAF_ESTIMATION_NEWTON,
+    LEAF_ESTIMATION_SIMPLE,
+    is_second_order_score_function,
+)
+from gbdt.targets.kernel.multilogit import (
+    launch_multilogit_value_and_der_search,
+    launch_multi_rmse_value_and_der,
+    launch_one_vs_all_value_and_der,
+    multilogit_blocks,
+)
+from gbdt.targets.kernel.pointwise_targets import (
+    MSE_BLOCK_SIZE,
+    OBJECTIVE_MULTICLASS,
+    OBJECTIVE_MULTICLASS_OVA,
+    OBJECTIVE_MULTIRMSE,
+    OBJECTIVE_PAIR_LOGIT,
+    OBJECTIVE_QUERY_RMSE,
+    OBJECTIVE_YETI_RANK,
+    OBJECTIVE_RMSE,
+    deterministic_sum_lanes_kernel,
+    launch_approximate,
+)
+from gbdt.targets.kernel.pair_logit import (
+    PairwiseTargetBuffers,
+    launch_pair_logit_with,
+    make_pairwise_group_buffers,
+    make_pairwise_target_buffers,
+    pair_blocks,
+)
+from gbdt.targets.kernel.pair_logit_group import PAIRLOGIT_GROUP_FUSED
+from gbdt.targets.kernel.yeti_rank import (
+    YETI_TASK_FUSED,
+    YetiRankTargetBuffers,
+    launch_yeti_rank_with,
+    launch_yeti_rank_zero_value,
+    make_yeti_rank_target_buffers,
+)
+from gbdt.targets.kernel.query_rmse import (
+    QuerywiseTargetBuffers,
+    launch_query_rmse_with,
+    make_querywise_target_buffers,
+)
+from gbdt.gpu_data.kernel.query_helper import launch_inverse_permutation
+
+
+
+
+#: lane/apple-fast-sym-feat (`GBDT_EVAL_FUSED`, FAST + Apple only): the
+#: held-out loss slots kept on the device between readbacks, and the extra
+#: words per level the packed per-tree apply record needs in `h_vals` /
+#: `d_vals`. Outside the switch both are main's sizes (one loss word, no
+#: extra words), so `make_test_arm` allocates exactly what it did.
+comptime _EVAL_FV_SLOTS = 1024 if GBDT_EVAL_FUSED else 1
+comptime _EVAL_PACK_WORDS = 5 if GBDT_EVAL_FUSED else 0
+
+
+@fieldwise_init
+struct TestArm(Movable):
+    """Their `testCursor` and the detector that reads it.
+
+    `AppendModels(dataSet, iterationModels, ..., learnCursors, testCursor)`
+    (`doc_parallel_boosting.h:391-396`) applies each new weak model to the
+    TEST cursor as well as the learn one, and their training loop feeds the
+    resulting error to `DetectOverfitting`
+    (`overfitting_detector.h:25-34`). This struct is that pair.
+
+    `n_rows == 0` means NO TEST SET, and every buffer here is then unread
+    -- the same contract `n_weights == 0` has for the weight column. A
+    detector built without a test set is inert by construction
+    (`overfitting_detector.cpp:122-124`), so the two agree.
+
+    THE TEST ROWS MUST BE QUANTIZED AGAINST THE MODEL'S OWN BORDERS.
+    `gbdt/train.mojo` does that, because it is the only place that owns
+    them; handing this struct a `cindex` built against different borders
+    would score every split against the wrong bins and nothing would
+    assert.
+    """
+
+    var n_rows: Int
+    var cindex: DeviceBuffer[DType.uint32]
+    var targets: DeviceBuffer[DType.float32]
+    var weights: DeviceBuffer[DType.float32]
+    var cursor: DeviceBuffer[DType.float32]
+    var stats: DeviceBuffer[DType.float32]
+    var fv_part: DeviceBuffer[DType.float32]
+    var fv: DeviceBuffer[DType.float32]
+    var h_fv: HostBuffer[DType.float32]
+    var mag_dummy: DeviceBuffer[DType.float32]
+    #: the per-tree apply's packed records, one tree at a time
+    var d_off: DeviceBuffer[DType.uint32]
+    var d_shift: DeviceBuffer[DType.uint32]
+    var d_mask: DeviceBuffer[DType.uint32]
+    var d_bin: DeviceBuffer[DType.uint32]
+    var d_eq: DeviceBuffer[DType.uint8]
+    var d_vals: DeviceBuffer[DType.float32]
+    var h_off: HostBuffer[DType.uint32]
+    var h_shift: HostBuffer[DType.uint32]
+    var h_mask: HostBuffer[DType.uint32]
+    var h_bin: HostBuffer[DType.uint32]
+    var h_eq: HostBuffer[DType.uint8]
+    var h_vals: HostBuffer[DType.float32]
+
+
+def make_test_arm(
+    ctx: DeviceContext,
+    n_rows: Int,
+    var cindex: DeviceBuffer[DType.uint32],
+    var targets: DeviceBuffer[DType.float32],
+    approx_dim: Int,
+    stat_count: Int,
+    max_depth: Int,
+) raises -> TestArm:
+    """Size the held-out arm. `n_rows == 0` still allocates one word per
+    buffer, because a struct field cannot be absent and the contract is
+    that nothing reads them."""
+    var n = n_rows if n_rows > 0 else 1
+    var blocks = (n + MSE_BLOCK_SIZE - 1) // MSE_BLOCK_SIZE
+    if multilogit_blocks(n) > blocks:
+        blocks = multilogit_blocks(n)
+    var max_leaves = 1 << max_depth
+    var w = ctx.enqueue_create_buffer[DType.float32](n)
+    enqueue_fill(ctx, w, Float32(1.0))
+    # main's sizes; only `GBDT_EVAL_FUSED` (FAST + Apple) widens them
+    var fv_n = 1
+    var h_fv_n = blocks
+    var vals_n = max_leaves * approx_dim
+    comptime if GBDT_EVAL_FUSED:
+        fv_n = _EVAL_FV_SLOTS
+        h_fv_n = max(blocks, _EVAL_FV_SLOTS)
+        vals_n = max_leaves * approx_dim + _EVAL_PACK_WORDS * max_depth
+    return TestArm(
+        n_rows,
+        cindex^, targets^, w^,
+        ctx.enqueue_create_buffer[DType.float32](approx_dim * n),
+        ctx.enqueue_create_buffer[DType.float32](stat_count * n),
+        ctx.enqueue_create_buffer[DType.float32](blocks),
+        ctx.enqueue_create_buffer[DType.float32](fv_n),
+        ctx.enqueue_create_host_buffer[DType.float32](h_fv_n),
+        ctx.enqueue_create_buffer[DType.float32](2),
+        ctx.enqueue_create_buffer[DType.uint32](max_depth),
+        ctx.enqueue_create_buffer[DType.uint32](max_depth),
+        ctx.enqueue_create_buffer[DType.uint32](max_depth),
+        ctx.enqueue_create_buffer[DType.uint32](max_depth),
+        ctx.enqueue_create_buffer[DType.uint8](max_depth),
+        ctx.enqueue_create_buffer[DType.float32](vals_n),
+        ctx.enqueue_create_host_buffer[DType.uint32](max_depth),
+        ctx.enqueue_create_host_buffer[DType.uint32](max_depth),
+        ctx.enqueue_create_host_buffer[DType.uint32](max_depth),
+        ctx.enqueue_create_host_buffer[DType.uint32](max_depth),
+        ctx.enqueue_create_host_buffer[DType.uint8](max_depth),
+        ctx.enqueue_create_host_buffer[DType.float32](vals_n),
+    )
+
+
+def _apply_last_tree_to_test(
+    ctx: DeviceContext,
+    model: TAdditiveModel,
+    layout: CompressedIndexLayout,
+    mut test: TestArm,
+    approx_dim: Int,
+    learning_rate: Float32,
+) raises:
+    """One tree onto the held-out cursor, their `AddObliviousTree`.
+
+    The LAST weak model only. `predict` packs the whole ensemble because
+    it is called once; this runs per iteration, so it packs one tree --
+    `depth` level records and `2^depth * dim` values -- and launches once.
+
+    THE LEAF VALUES ALREADY CARRY THE LEARNING RATE. `fit` stores
+    `leaf_values[i] * learning_rate` on the weak model (their
+    `Rescale(step)` folded in), so this passes 1.0 and must NOT reapply
+    it. Reapplying would make the held-out curve fall at a different rate
+    from the learn curve, and the detector would stop on the wrong shape.
+    """
+    var t = model.size() - 1
+    if t < 0:
+        return
+    var n = test.n_rows
+    if not model.is_oblivious():
+        # their `AppendModels` through `TAddModelDocParallel<
+        # TNonSymmetricTree>` (`add_non_symmetric_tree_doc_parallel.cpp:
+        # 182-206`): bins off the model, then `AddBinModelValues`. The
+        # stored values already carry the rate, as above.
+        add_non_symmetric_tree_to_cursor(
+            ctx, layout, model.non_symmetric_models[t], test.cindex, n,
+            test.cursor,
+        )
+        return
+    ref weak = model.weak_models[t]
+    var depth = weak.structure.get_depth()
+    if depth == 0:
+        return
+
+    comptime if GBDT_EVAL_FUSED:
+        # lane/apple-fast-sym-feat: the tree's records and leaf values in
+        # ONE pinned region of `h_vals` -- offsets, shifts, masks, bins
+        # (`depth` words each), the take-equal bytes (`ceil(depth / 4)`
+        # words), then the values -- and ONE upload of the used prefix
+        # instead of six. Same kernel, same records, same adds.
+        var hv = test.h_vals.unsafe_ptr()
+        var hw = hv.bitcast[UInt32]()
+        var eq_words = (depth + 3) // 4
+        var vals_at = 4 * depth + eq_words
+        for k in range(eq_words):
+            hw.unsafe_store(4 * depth + k, UInt32(0))
+        var hb = (hw + 4 * depth).bitcast[UInt8]()
+        # driver-loop: over the tree depth (split records)
+        for level in range(depth):
+            ref pcf = layout.features[
+                Int(weak.structure.splits[level].feature_id)
+            ]
+            hw.unsafe_store(level, pcf.offset * UInt32(n))
+            hw.unsafe_store(depth + level, pcf.shift)
+            hw.unsafe_store(2 * depth + level, pcf.mask)
+            hw.unsafe_store(
+                3 * depth + level,
+                UInt32(Int(weak.structure.splits[level].bin_idx)),
+            )
+            var p_take_bin = (
+                Int(weak.structure.splits[level].split_type)
+                == BIN_SPLIT_TAKE_BIN
+            )
+            hb.unsafe_store(level, UInt8(1) if p_take_bin else UInt8(0))
+        var p_values = (1 << depth) * approx_dim
+        # driver-loop: over the last tree's leaf values (leaves x approx_dim)
+        for i in range(p_values):
+            var v = Float32(0.0)
+            if i < len(weak.leaf_values):
+                v = weak.leaf_values[i]
+            hv.unsafe_store(vals_at + i, v)
+        var used = vals_at + p_values
+        var d_used = test.d_vals.create_sub_buffer[DType.float32](0, used)
+        ctx.enqueue_copy(dst_buf=d_used, src_ptr=hv)
+        # one buffer carries every launch argument: an untracked origin so
+        # the derived pointers are not seen as aliasing mutable arguments
+        var dv = test.d_vals.unsafe_ptr().unsafe_origin_cast[MutAnyOrigin]()
+        var dw = dv.bitcast[UInt32]()
+        var p_wide = (n + 255) // 256
+        if p_wide > 1024:
+            p_wide = 1024
+        ctx.enqueue_function[compute_bins_and_add_kernel](
+            test.cindex.unsafe_ptr(),
+            dw,
+            dw + depth,
+            dw + 2 * depth,
+            dw + 3 * depth,
+            (dw + 4 * depth).bitcast[UInt8](),
+            Int32(depth),
+            dv + vals_at,
+            Int32(n),
+            test.cursor.unsafe_ptr(),
+            Int32(approx_dim),
+            Int32(n),
+            grid_dim=(p_wide, approx_dim, 1),
+            block_dim=(256, 1, 1),
+        )
+        return
+
+    for level in range(depth):  # small-loop(depth: tree levels, at most 16): per-level apply launch arguments
+        ref cf = layout.features[
+            Int(weak.structure.splits[level].feature_id)
+        ]
+        test.h_off.unsafe_ptr().unsafe_store(
+            level, cf.offset * UInt32(n)
+        )
+        test.h_shift.unsafe_ptr().unsafe_store(level, cf.shift)
+        test.h_mask.unsafe_ptr().unsafe_store(level, cf.mask)
+        test.h_bin.unsafe_ptr().unsafe_store(
+            level, UInt32(Int(weak.structure.splits[level].bin_idx))
+        )
+        var take_bin = (
+            Int(weak.structure.splits[level].split_type)
+            == BIN_SPLIT_TAKE_BIN
+        )
+        test.h_eq.unsafe_ptr().unsafe_store(
+            level, UInt8(1) if take_bin else UInt8(0)
+        )
+    var n_values = (1 << depth) * approx_dim
+    # driver-loop: over the last tree's leaf values (leaves x approx_dim)
+    for i in range(n_values):
+        var v = Float32(0.0)
+        if i < len(weak.leaf_values):
+            v = weak.leaf_values[i]
+        test.h_vals.unsafe_ptr().unsafe_store(i, v)
+
+    ctx.enqueue_copy(dst_buf=test.d_off, src_ptr=test.h_off.unsafe_ptr())
+    ctx.enqueue_copy(
+        dst_buf=test.d_shift, src_ptr=test.h_shift.unsafe_ptr()
+    )
+    ctx.enqueue_copy(dst_buf=test.d_mask, src_ptr=test.h_mask.unsafe_ptr())
+    ctx.enqueue_copy(dst_buf=test.d_bin, src_ptr=test.h_bin.unsafe_ptr())
+    ctx.enqueue_copy(dst_buf=test.d_eq, src_ptr=test.h_eq.unsafe_ptr())
+    ctx.enqueue_copy(dst_buf=test.d_vals, src_ptr=test.h_vals.unsafe_ptr())
+
+    var wide = (n + 255) // 256
+    if wide > 1024:
+        wide = 1024
+    ctx.enqueue_function[compute_bins_and_add_kernel](
+        test.cindex.unsafe_ptr(),
+        test.d_off.unsafe_ptr(),
+        test.d_shift.unsafe_ptr(),
+        test.d_mask.unsafe_ptr(),
+        test.d_bin.unsafe_ptr(),
+        test.d_eq.unsafe_ptr(),
+        Int32(depth),
+        test.d_vals.unsafe_ptr(),
+        Int32(n),
+        test.cursor.unsafe_ptr(),
+        Int32(approx_dim),
+        Int32(n),
+        # 1.0: the rate is already inside the stored leaf values
+        grid_dim=(wide, approx_dim, 1),
+        block_dim=(256, 1, 1),
+    )
+
+
+def _test_loss(
+    ctx: DeviceContext,
+    mut test: TestArm,
+    objective: Int,
+    num_classes: Int,
+    alpha: Float32,
+    logloss_border: Float32,
+    approx_dim: Int,
+) raises -> Float64:
+    """The held-out loss, through the SAME target kernel the learn loss
+    uses, so the two curves are the same quantity.
+
+    Their `functionValue` with the sign flipped and divided by the row
+    count, exactly as the learn loss is -- which is what makes the
+    detector's comparison meaningful.
+    """
+    var n = test.n_rows
+    var blocks = (n + MSE_BLOCK_SIZE - 1) // MSE_BLOCK_SIZE
+    if objective == OBJECTIVE_MULTICLASS:
+        blocks = multilogit_blocks(n)
+        launch_multilogit_value_and_der_search(
+            ctx, num_classes, n, test.targets, test.weights, False,
+            test.cursor, n, test.cindex, False,
+            test.fv_part, True, test.stats, n, test.mag_dummy, False,
+        )
+    elif objective == OBJECTIVE_MULTICLASS_OVA:
+        blocks = multilogit_blocks(n)
+        launch_one_vs_all_value_and_der[True](
+            ctx, num_classes, n, test.targets, test.weights, False,
+            test.cursor, n, test.cindex, False,
+            test.fv_part, True, test.stats, n, test.mag_dummy, False,
+        )
+    else:
+        launch_approximate[False](
+            ctx, objective, test.targets, test.weights, Int32(n),
+            test.cursor, Int32(0), alpha, logloss_border,
+            test.stats, test.fv_part, Int32(1),
+            test.mag_dummy, Int32(0), blocks,
+        )
+    ctx.enqueue_function[deterministic_sum_lanes_kernel[1]](
+        test.fv_part.unsafe_ptr(), Int32(blocks), test.fv.unsafe_ptr(),
+        grid_dim=1, block_dim=256,
+    )
+    ctx.enqueue_copy(dst_ptr=test.h_fv.unsafe_ptr(), src_buf=test.fv)
+    ctx.synchronize()
+    return -Float64(test.h_fv.unsafe_ptr().unsafe_load(0)) / Float64(n)
+
+
+def _test_loss_enqueue(
+    ctx: DeviceContext,
+    mut test: TestArm,
+    objective: Int,
+    num_classes: Int,
+    alpha: Float32,
+    logloss_border: Float32,
+    approx_dim: Int,
+    slot: Int,
+) raises:
+    """lane/apple-fast-sym-feat (`GBDT_EVAL_FUSED`, FAST + Apple only):
+    `_test_loss`'s launches with the folded sum left on the device in
+    `test.fv[slot]`; no readback, no drain. `_test_loss_flush` reads the
+    slots back. Same kernels, same fold, so the same loss values."""
+    var n = test.n_rows
+    var blocks = (n + MSE_BLOCK_SIZE - 1) // MSE_BLOCK_SIZE
+    if objective == OBJECTIVE_MULTICLASS:
+        blocks = multilogit_blocks(n)
+        launch_multilogit_value_and_der_search(
+            ctx, num_classes, n, test.targets, test.weights, False,
+            test.cursor, n, test.cindex, False,
+            test.fv_part, True, test.stats, n, test.mag_dummy, False,
+        )
+    elif objective == OBJECTIVE_MULTICLASS_OVA:
+        blocks = multilogit_blocks(n)
+        launch_one_vs_all_value_and_der[True](
+            ctx, num_classes, n, test.targets, test.weights, False,
+            test.cursor, n, test.cindex, False,
+            test.fv_part, True, test.stats, n, test.mag_dummy, False,
+        )
+    else:
+        launch_approximate[False](
+            ctx, objective, test.targets, test.weights, Int32(n),
+            test.cursor, Int32(0), alpha, logloss_border,
+            test.stats, test.fv_part, Int32(1),
+            test.mag_dummy, Int32(0), blocks,
+        )
+    ctx.enqueue_function[deterministic_sum_lanes_kernel[1]](
+        test.fv_part.unsafe_ptr(), Int32(blocks),
+        test.fv.unsafe_ptr() + slot,
+        grid_dim=1, block_dim=256,
+    )
+
+
+def _test_loss_div_kernel(
+    fv: MutPointer[Float32, MutAnyOrigin],
+    pending_in: Int32,
+    n_in: Int32,
+    losses: MutPointer[UInt64, MutAnyOrigin],
+):
+    """One thread a pending slot: `-double(fv[j]) / double(n)` in
+    soft-float64 (`checks/soft_f64.mojo`: negation flips the sign bit, the
+    divide is correctly rounded), the bits of the host expression it
+    replaces, written as double bit patterns."""
+    var j = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if j < Int(pending_in):
+        losses.unsafe_store(
+            j,
+            sf64_div(
+                sf64_neg(sf64_from_f32(fv.unsafe_load(j))),
+                sf64_from_int(Int(n_in)),
+            ),
+        )
+
+
+def _test_loss_flush(
+    ctx: DeviceContext,
+    mut test: TestArm,
+    mut test_losses: List[Float64],
+    mut detector: OverfittingDetector,
+    pending: Int,
+) raises:
+    """lane/apple-fast-sym-feat (`GBDT_EVAL_FUSED`): ONE readback and ONE
+    drain for the last `pending` deferred held-out losses (their
+    placeholders are the tail of `test_losses`), then the detector sees
+    them in iteration order, exactly as it would have one per tree. Only
+    used when the detector cannot stop the fit (`is_active()` False), so
+    no stop is ever decided late."""
+    if pending <= 0:
+        return
+    # the losses divided on the device (`_test_loss_div_kernel`), one bulk
+    # copy into their placeholders; the host only feeds the detector
+    var n = test.n_rows
+    var base = len(test_losses) - pending
+    var d_losses = ctx.enqueue_create_buffer[DType.uint64](pending)
+    var h_losses = ctx.enqueue_create_host_buffer[DType.uint64](pending)
+    ctx.enqueue_function[_test_loss_div_kernel](
+        test.fv.unsafe_ptr(), Int32(pending), Int32(n),
+        d_losses.unsafe_ptr(),
+        grid_dim=(pending + 63) // 64, block_dim=64,
+    )
+    ctx.enqueue_copy(dst_ptr=h_losses.unsafe_ptr(), src_buf=d_losses)
+    ctx.synchronize()
+    memcpy(
+        dest=(test_losses.unsafe_ptr() + base).bitcast[UInt64](),
+        src=h_losses.unsafe_ptr(),
+        count=pending,
+    )
+    _ = d_losses^  # past the drain
+    _ = h_losses^
+    # driver-loop: over the pending iterations (one held-out loss each)
+    for j in range(pending):
+        detector.add_error(test_losses[base + j])
+
+
+@fieldwise_init
+struct FitResult(Movable):
+    """What a fit reports beyond the model itself.
+
+    `fit` returns only `learn_losses`, which is what its nine existing
+    call sites expect; `fit_with_test` returns this.
+    """
+
+    var learn_losses: List[Float64]
+    #: empty when there is no held-out set
+    var test_losses: List[Float64]
+    #: the index of the lowest TEST loss, or of the lowest learn loss when
+    #: there is no test set. Their `TLearnProgress`'s best-iteration
+    #: bookkeeping, kept in the detector here because it is the only
+    #: object that already knows when a new best arrived.
+    var best_iteration: Int
+    #: True when the detector fired before `n_estimators` was reached
+    var stopped_early: Bool
+
+
+@fieldwise_init
+struct TTwoLevelTensorFitResult(Movable):
+    """One-tree opt-in fit result with complete tensor model metadata."""
+
+    var model: TAdditiveModel
+    var borders: List[List[Float32]]
+    var fold_counts: List[Int]
+    var one_hot: List[Bool]
+    var registry: TTensorCtrRegistry
+    var leaf_sizes: List[Int]
+
+
+def two_level_weighted_leaf_value_host(
+    y: List[Float32], sample_weight: List[Float32],
+    row_order: HostBuffer[DType.uint32], begin: Int, size: Int,
+    learning_rate: Float32, l2_leaf_reg: Float32,
+) raises -> Float32:
+    """Estimate one validated partition; zero-mass occupied leaves return zero.
+
+    A host reference only (lane cpu3-gbdt-a): the fit estimates its leaves
+    on the device (`two_level_leaf_values_kernel`, a fixed lane fold); this
+    sequential form stays for `checks/tree_ctr_slice_check.mojo`'s
+    zero-mass statements."""
+    var total = Float32(0.0)
+    var total_weight = Float32(0.0)
+    for i in range(size):
+        var row = Int(row_order.unsafe_ptr().unsafe_load(begin + i))
+        var weight = Float32(1.0) if len(sample_weight) == 0 else sample_weight[row]
+        total = fma(weight, y[row], total)  # the default build's fused op (lane/pinned-mul-contract-free)
+        total_weight += weight
+    return (
+        learning_rate * total / (total_weight + l2_leaf_reg)
+        if total_weight > Float32(0.0) else Float32(0.0)
+    )
+
+
+def fit_two_level_feature_freq_tree(
+    ctx: DeviceContext,
+    initial: TStagedTensorCandidate,
+    x_colmajor: List[Float32],
+    y: List[Float32],
+    sample_weight: List[Float32],
+    base_quantized_cindex: List[UInt32],
+    base_columns: List[List[UInt32]],
+    base_fold_counts: List[Int],
+    base_one_hot: List[Bool],
+    base_borders: List[List[Float32]],
+    n_rows: Int,
+    n_raw_features: Int,
+    grid: TBinarizationOptions,
+    learning_rate: Float32 = Float32(0.03),
+    l2_leaf_reg: Float32 = Float32(3.0),
+    random_seed: UInt64 = UInt64(0),
+) raises -> TTwoLevelTensorFitResult:
+    """Fit the supported two-level, one-tree RMSE tensor arm.
+
+    This entry is intentionally separate from ordinary `fit_with_test` so
+    its fixed depth, single target, and one-tree contract are
+    impossible to select accidentally.
+    """
+    if n_rows < 1 or len(y) != n_rows:
+        raise Error("two-level tensor fit target shape mismatch")
+    if len(sample_weight) != 0 and len(sample_weight) != n_rows:
+        raise Error("two-level tensor fit weight shape mismatch")
+    if len(x_colmajor) != n_rows * n_raw_features:
+        raise Error("two-level tensor fit raw shape mismatch")
+    if len(base_one_hot) != 0 and len(base_one_hot) != n_raw_features:
+        raise Error("two-level tensor fit one-hot shape mismatch")
+    # lane cpu3-gbdt-a: the stat planes, the weight checks and the two
+    # magnitudes on the device (`two_level_prep_kernel`, then the fixed
+    # lane fold); the host reads back four scalars (two sums, two flag
+    # counts), never the rows. The inputs are uploaded once.
+    var rows = ctx.enqueue_create_buffer[DType.uint32](n_rows)
+    var stats = ctx.enqueue_create_buffer[DType.float32](2 * n_rows)
+    var d_y = ctx.enqueue_create_buffer[DType.float32](n_rows)
+    ctx.enqueue_copy(dst_buf=d_y, src_ptr=y.unsafe_ptr())
+    var has_w = len(sample_weight) != 0
+    var d_w = ctx.enqueue_create_buffer[DType.float32](
+        n_rows if has_w else 1
+    )
+    if has_w:
+        ctx.enqueue_copy(dst_buf=d_w, src_ptr=sample_weight.unsafe_ptr())
+    var prep_part = ctx.enqueue_create_buffer[DType.float32](
+        TL_GRID * TL_PREP_LANES
+    )
+    ctx.enqueue_function[two_level_prep_kernel](
+        d_y.unsafe_ptr(), d_w.unsafe_ptr(), Int32(1) if has_w else Int32(0),
+        Int32(n_rows), rows.unsafe_ptr(), stats.unsafe_ptr(),
+        prep_part.unsafe_ptr(),
+        grid_dim=(TL_GRID, 1, 1), block_dim=(TL_BLOCK, 1, 1),
+    )
+    var prep_sums = ctx.enqueue_create_buffer[DType.float32](TL_PREP_LANES)
+    ctx.enqueue_function[deterministic_sum_lanes_kernel[TL_PREP_LANES]](
+        prep_part.unsafe_ptr(), Int32(TL_GRID), prep_sums.unsafe_ptr(),
+        grid_dim=1, block_dim=256,
+    )
+    var h_prep = ctx.enqueue_create_host_buffer[DType.float32](TL_PREP_LANES)
+    ctx.enqueue_copy(dst_buf=h_prep, src_buf=prep_sums)
+    ctx.synchronize()
+    var weight_mag = h_prep[0]
+    var grad_mag = h_prep[1]
+    if h_prep[2] != Float32(0.0):
+        raise Error("two-level tensor fit weight is invalid")
+    if h_prep[3] != Float32(0.0):
+        raise Error("two-level tensor fit weighted target is not finite")
+    _ = h_prep^
+    _ = prep_part^
+    _ = prep_sums^
+    _ = d_y^
+    _ = d_w^
+    if not isfinite(weight_mag) or not isfinite(grad_mag):
+        raise Error("two-level tensor fit weighted statistics overflow")
+    if not (weight_mag > Float32(0.0)):
+        raise Error("two-level tensor fit weights sum to zero")
+    var trace = IdentityTrace.disabled()
+    var times = StageTimes()
+    times.enabled = False
+    var tree = run_sequential_two_level_feature_freq_tree(
+        ctx, initial, x_colmajor, base_quantized_cindex,
+        base_columns, base_fold_counts, base_one_hot,
+        n_rows, n_raw_features, 2, grid, rows, stats,
+        weight_mag, grad_mag, SCORE_FUNCTION_COSINE, False,
+        l2_leaf_reg, Float32(0.0), random_seed, True,
+        n_raw_features, base_borders, trace, times, "tensor_fit",
+    )
+    # lane cpu3-gbdt-a: the leaves on the device over the final row order
+    # (`two_level_leaf_partials_kernel`, `two_level_leaf_values_kernel`);
+    # the leaf table is the tree's launch arguments (two words a leaf) and
+    # only the leaf values come back, once, for the model.
+    var n_leaves = len(tree.leaf_sizes)
+    var h_tab = ctx.enqueue_create_host_buffer[DType.uint32](2 * n_leaves)
+    for leaf in range(n_leaves):  # small-loop(n_leaves: the depth-two tree's four leaves): launch table of offsets and sizes
+        h_tab.unsafe_ptr().unsafe_store(2 * leaf, UInt32(tree.leaf_offsets[leaf]))
+        h_tab.unsafe_ptr().unsafe_store(2 * leaf + 1, UInt32(tree.leaf_sizes[leaf]))
+    var d_tab = ctx.enqueue_create_buffer[DType.uint32](2 * n_leaves)
+    ctx.enqueue_copy(dst_buf=d_tab, src_ptr=h_tab.unsafe_ptr())
+    var leaf_part = ctx.enqueue_create_buffer[DType.float32](
+        n_leaves * TL_GRID * 2
+    )
+    ctx.enqueue_function[two_level_leaf_partials_kernel](
+        rows.unsafe_ptr(), stats.unsafe_ptr(), Int32(n_rows),
+        d_tab.unsafe_ptr(), leaf_part.unsafe_ptr(),
+        # where the split schedule left the stat planes: in place beside
+        # the row ids under the index-only schedule, moved with them under
+        # the permuting reorder (`two_level_leaf_partials_kernel`)
+        Int32(1) if SYM_RIDX_SPLITS_2031 else Int32(0),
+        grid_dim=(TL_GRID, n_leaves, 1), block_dim=(TL_BLOCK, 1, 1),
+    )
+    var d_leaves = ctx.enqueue_create_buffer[DType.float32](n_leaves)
+    ctx.enqueue_function[two_level_leaf_values_kernel](
+        leaf_part.unsafe_ptr(), learning_rate, l2_leaf_reg,
+        d_leaves.unsafe_ptr(),
+        grid_dim=(n_leaves, 1, 1), block_dim=(TL_GRID, 1, 1),
+    )
+    var h_leaves = ctx.enqueue_create_host_buffer[DType.float32](n_leaves)
+    ctx.enqueue_copy(dst_buf=h_leaves, src_buf=d_leaves)
+    ctx.synchronize()
+    # past the drain [[mojo-buffer-freed-at-last-use]]: every buffer a
+    # queued launch or copy read is held to here
+    _ = h_tab^
+    _ = d_tab^
+    _ = leaf_part^
+    _ = d_leaves^
+    _ = rows^
+    _ = stats^
+    var structure = TObliviousTreeStructure()
+    structure.splits = tree.splits.copy()
+    var weak = TObliviousTreeModel(structure^)
+    weak.dim = 1
+    weak.leaf_values = List[Float32](length=n_leaves, fill=Float32(0.0))
+    memcpy(
+        dest=weak.leaf_values.unsafe_ptr(), src=h_leaves.unsafe_ptr(),
+        count=n_leaves,
+    )
+    _ = h_leaves^
+    var model = TAdditiveModel()
+    model.add_weak_model(weak^)
+    var output_one_hot = base_one_hot.copy()
+    while len(output_one_hot) < len(tree.stable_fold_counts):
+        output_one_hot.append(False)
+    return TTwoLevelTensorFitResult(
+        model^, tree.stable_borders.copy(), tree.stable_fold_counts.copy(),
+        output_one_hot^, tree.registry.copy(), tree.leaf_sizes.copy(),
+    )
+
+
+
+def _tree_tag(iteration: Int) -> String:
+    """`treeNNN` prefix for identity-trace tags, zero-padded to sort in
+    fit order."""
+    var s = String(iteration)
+    while s.byte_length() < 3:
+        s = String("0") + s
+    return String("tree") + s
+
+
+struct TEstimationWorkspace(Movable):
+    """The leaf-estimation stage's per-shape buffers, owned by the FIT.
+
+    ================= DEVIATION 1890 =================
+    CatBoost does not allocate the estimator's gathers per tree and
+    neither should this: their `TCudaManager` hands every estimator
+    buffer out of the per-device memory pool (`cuda_lib/memory_pool.h`),
+    so tree 2's `TDocParallelLeavesEstimator` reuses tree 1's device
+    memory. This implementation called `enqueue_create_buffer` inside
+    `_estimate_and_apply` -- THREE fresh `n_rows`-sized buffers (target,
+    weights, `approx_dim * n_rows` of cursor), the two partition-offset
+    buffers plus their host staging, and the estimate's device/host pair,
+    for EVERY estimation task, and Logloss runs one task per permutation
+    per tree. Same repair as `TTreeWorkspace`'s (its DEVIATION BLOCK is
+    the precedent, POOL OF ONE and all): the fit holds the list across
+    trees, keyed by the dataset shape, and a shape change rebuilds it.
+
+    `n_leaves_cap` is a CAPACITY, not an exact key: a non-symmetric tree
+    that stopped early has fewer leaves, and every consumer walks exactly
+    `n_leaves` entries (grid y, `bin_count` loops), so a wider buffer is
+    bit-inert. Growing reallocates; shrinking reuses.
+
+    THE LIFETIME RULE RIDES ALONG [[mojo-buffer-freed-at-last-use]]: the
+    workspace OWNS these buffers across trees, so nothing in
+    `_estimate_and_apply` dies under a queued copy any more -- the
+    staging halves (`h_po`/`h_ps`/`h_est`) are rewritten by the NEXT call
+    only after this call's tail drain, which is what makes the reuse
+    race-free (see DEVIATION 1891 at that drain).
+    ==================================================
+    """
+
+    var n_rows_key: Int
+    var approx_dim_key: Int
+    #: the gathered target's plane count: 1, or the target dimension for
+    #: MultiRMSE, whose target is dim-major planes like the cursor
+    var target_planes_key: Int
+    var n_leaves_cap: Int
+    var g_target: DeviceBuffer[DType.float32]
+    var g_weights: DeviceBuffer[DType.float32]
+    var g_cursor: DeviceBuffer[DType.float32]
+    var d_p_off: DeviceBuffer[DType.uint32]
+    var d_p_sz: DeviceBuffer[DType.uint32]
+    var h_po: HostBuffer[DType.uint32]
+    var h_ps: HostBuffer[DType.uint32]
+    var d_est: DeviceBuffer[DType.float32]
+    var h_est: HostBuffer[DType.float32]
+    #: DEVIATION 3041: the oracle's own device buffers, under their own
+    #: exact keys (`pointwise_oracle.OracleScratchPool`)
+    var oracle_scratch: OracleScratchPool
+    #: the batched path's (`_estimate_prepare`) oracle buffers, carved from
+    #: the fit's arena and kept for the fit, one entry per exact key (a tree
+    #: that stops early has fewer leaves); empty on every workspace the
+    #: one-call path builds
+    var arena_scratch: List[OracleDeviceScratch]
+    var arena_host: List[OracleHostScratch]
+    #: lane fix-g1-gbdt (`IDN_GBDT_MC_ONE_STEP_DEVICE`): the MultiClass
+    #: one-step's device stashes, kept for the fit like the buffers above.
+    #: `mc_grad` holds `n_leaves * approx_dim` reduced der floats, `mc_hess`
+    #: the `k (k + 1) / 2` reduced Hessian columns per leaf
+    #: (`k = approx_dim + 1`), `mc_not_pd` one fallback flag per leaf and
+    #: `h_mc_not_pd` its host copy. One element each on the arena workspace,
+    #: which never takes this path (`mc_hess_len` / `mc_grad_len` gate it).
+    var mc_grad: DeviceBuffer[DType.float32]
+    var mc_hess: DeviceBuffer[DType.float32]
+    var mc_not_pd: DeviceBuffer[DType.uint32]
+    var h_mc_not_pd: HostBuffer[DType.uint32]
+    var mc_grad_len: Int
+    var mc_hess_len: Int
+    #: lane fix-g1-gbdt (`IDN_GBDT_SYM_EST_DEFER_DRAIN`): at most one
+    #: estimation task whose tail drain was deferred to the next tree's
+    #: search drain (`finish_deferred_estimation` settles it). Empty
+    #: otherwise.
+    var pending: List[PendingEstimationTail]
+    #: lane cpu4-gbdt: the device leaf walk's state (`device_walker.mojo`)
+    #: for up to `n_leaves_cap` leaves, kept for the fit like the buffers
+    #: above, and a one-word device count (DEVIATION 74's fallback flags)
+    #: with its host word
+    var walk: WalkBuffers
+    var d_count: DeviceBuffer[DType.uint32]
+    var h_count: HostBuffer[DType.uint32]
+    #: lane gbdt-host-loops-12: the multi-dimensional device walk's state
+    #: (`device_walker.MultiWalkBuffers`) for up to `n_leaves_cap` leaves of
+    #: up to `approx_dim + 1` components (MultiClass's pinned plane)
+    var mwalk: MultiWalkBuffers
+    #: lane/apple-fast-sym-est: the FAST + Apple estimation task's buffers
+    #: (`apple_fast_est.AppleEstScratch`), pool of one; empty in every
+    #: build without one of its defines
+    var apple_est: List[AppleEstScratch]
+
+    def __init__(
+        out self,
+        ctx: DeviceContext,
+        mut arena: BufferArena,
+        n_rows: Int,
+        n_leaves: Int,
+    ) raises:
+        """The same buffers at `approx_dim` 1, carved from `arena`
+        (`gbdt/gpu_util/arena.mojo`) for the batched path."""
+        self.n_rows_key = n_rows
+        self.approx_dim_key = 1
+        self.target_planes_key = 1
+        self.n_leaves_cap = n_leaves
+        self.g_target = arena.device[DType.float32](ctx, n_rows)
+        self.g_weights = arena.device[DType.float32](ctx, n_rows)
+        self.g_cursor = arena.device[DType.float32](ctx, n_rows)
+        self.d_p_off = arena.device[DType.uint32](ctx, n_leaves)
+        self.d_p_sz = arena.device[DType.uint32](ctx, n_leaves)
+        self.h_po = arena.host_buffer[DType.uint32](ctx, n_leaves)
+        self.h_ps = arena.host_buffer[DType.uint32](ctx, n_leaves)
+        self.d_est = arena.device[DType.float32](ctx, n_leaves)
+        self.h_est = arena.host_buffer[DType.float32](ctx, n_leaves)
+        self.oracle_scratch = OracleScratchPool()
+        self.arena_scratch = List[OracleDeviceScratch]()
+        self.arena_host = List[OracleHostScratch]()
+        self.mc_grad = arena.device[DType.float32](ctx, 1)
+        self.mc_hess = arena.device[DType.float32](ctx, 1)
+        self.mc_not_pd = arena.device[DType.uint32](ctx, 1)
+        self.h_mc_not_pd = arena.host_buffer[DType.uint32](ctx, 1)
+        self.mc_grad_len = 0
+        self.mc_hess_len = 0
+        self.pending = List[PendingEstimationTail]()
+        self.walk = WalkBuffers(ctx, arena, n_leaves)
+        self.d_count = arena.device[DType.uint32](ctx, 1)
+        self.h_count = arena.host_buffer[DType.uint32](ctx, 1)
+        # the batched path is single-dimensional: a one-leaf placeholder
+        # (`device_multi_walk_supported` refuses any task it cannot hold)
+        self.mwalk = MultiWalkBuffers(ctx, 1, 1)
+        self.apple_est = List[AppleEstScratch]()
+
+    def __init__(
+        out self,
+        ctx: DeviceContext,
+        n_rows: Int,
+        approx_dim: Int,
+        n_leaves: Int,
+        target_planes: Int = 1,
+    ) raises:
+        self.n_rows_key = n_rows
+        self.approx_dim_key = approx_dim
+        self.target_planes_key = target_planes
+        self.n_leaves_cap = n_leaves
+        self.g_target = ctx.enqueue_create_buffer[DType.float32](
+            target_planes * n_rows
+        )
+        self.g_weights = ctx.enqueue_create_buffer[DType.float32](n_rows)
+        self.g_cursor = ctx.enqueue_create_buffer[DType.float32](
+            approx_dim * n_rows
+        )
+        self.d_p_off = ctx.enqueue_create_buffer[DType.uint32](n_leaves)
+        self.d_p_sz = ctx.enqueue_create_buffer[DType.uint32](n_leaves)
+        self.h_po = ctx.enqueue_create_host_buffer[DType.uint32](n_leaves)
+        self.h_ps = ctx.enqueue_create_host_buffer[DType.uint32](n_leaves)
+        self.d_est = ctx.enqueue_create_buffer[DType.float32](
+            n_leaves * approx_dim
+        )
+        self.h_est = ctx.enqueue_create_host_buffer[DType.float32](
+            n_leaves * approx_dim
+        )
+        self.oracle_scratch = OracleScratchPool()
+        self.arena_scratch = List[OracleDeviceScratch]()
+        self.arena_host = List[OracleHostScratch]()
+        # lane fix-g1-gbdt: sized only where the MultiClass one-step can run
+        # (approx_dim > 1); one element otherwise
+        var mc_grad_len = 0
+        var mc_hess_len = 0
+        comptime if IDN_GBDT_MC_ONE_STEP_DEVICE:
+            if approx_dim > 1:
+                var mc_k = approx_dim + 1
+                mc_grad_len = n_leaves * approx_dim
+                mc_hess_len = n_leaves * ((mc_k * (mc_k + 1)) // 2)
+        var mc_flag_len = 1
+        if mc_hess_len > 0 and n_leaves > 1:
+            mc_flag_len = n_leaves
+        self.mc_grad = ctx.enqueue_create_buffer[DType.float32](
+            mc_grad_len if mc_grad_len > 0 else 1
+        )
+        self.mc_hess = ctx.enqueue_create_buffer[DType.float32](
+            mc_hess_len if mc_hess_len > 0 else 1
+        )
+        self.mc_not_pd = ctx.enqueue_create_buffer[DType.uint32](mc_flag_len)
+        self.h_mc_not_pd = ctx.enqueue_create_host_buffer[DType.uint32](
+            mc_flag_len
+        )
+        self.mc_grad_len = mc_grad_len
+        self.mc_hess_len = mc_hess_len
+        self.pending = List[PendingEstimationTail]()
+        self.walk = WalkBuffers(ctx, n_leaves)
+        self.d_count = ctx.enqueue_create_buffer[DType.uint32](1)
+        self.h_count = ctx.enqueue_create_host_buffer[DType.uint32](1)
+        # a two-class MultiClass oracle is `approx_dim == 1` with two
+        # components, so the walk is sized at `approx_dim + 1` always (leaf
+        # sized; a one-leaf placeholder where no tree has leaves)
+        self.mwalk = MultiWalkBuffers(ctx, n_leaves, approx_dim + 1)
+        self.apple_est = List[AppleEstScratch]()
+
+
+struct PendingEstimationTail(Movable):
+    """lane fix-g1-gbdt (`IDN_GBDT_SYM_EST_DEFER_DRAIN`): what a one-step
+    device estimation task (F5's `newton_one_step_kernel` or the MultiClass
+    `multiclass_one_step_kernel`) must keep alive past the drain it no longer
+    takes itself: the oracle (its buffers are operands of queued launches and
+    copies, the step-33 race class) and the weighted fit's host mask (the
+    source of a queued copy). The leaf values sit in the workspace's `h_est`
+    (and the MultiClass fallback flags in `h_mc_not_pd`) once the queue
+    drains."""
+
+    var oracle: BinOptimizedOracle
+    var h_mask: HostBuffer[DType.float32]
+    #: how many floats of `h_est` are the task's leaf values
+    var n_values: Int
+    var n_leaves: Int
+    #: True on the MultiClass path: DEVIATION 74's counter reads the flags
+    var count_not_pd: Bool
+    var leaf_tag: String
+
+    def __init__(
+        out self,
+        var oracle: BinOptimizedOracle,
+        var h_mask: HostBuffer[DType.float32],
+        n_values: Int,
+        n_leaves: Int,
+        count_not_pd: Bool,
+        leaf_tag: String,
+    ):
+        self.oracle = oracle^
+        self.h_mask = h_mask^
+        self.n_values = n_values
+        self.n_leaves = n_leaves
+        self.count_not_pd = count_not_pd
+        self.leaf_tag = leaf_tag.copy()
+
+
+def _append_deferred_oblivious_tree(
+    mut model: TAdditiveModel,
+    splits: List[TBinarySplit],
+    leaf_values: List[Float32],
+    approx_dim: Int,
+    learning_rate: Float32,
+) raises:
+    """lane fix-g1-gbdt (`IDN_GBDT_SYM_EST_DEFER_DRAIN`): the boosting
+    loop's oblivious `AddWeakModel` for a tree whose leaf values arrived
+    through `finish_deferred_estimation`; the same statements as the loop's
+    own append (DEVIATION 256's host rescale included)."""
+    var structure = TObliviousTreeStructure()
+    # driver-loop: over the tree splits (depth)
+    for i in range(len(splits)):
+        structure.splits.append(splits[i])
+    var weak = TObliviousTreeModel(structure^)
+    weak.dim = approx_dim
+    # driver-loop: over the leaf values (leaves x approx_dim)
+    for i in range(len(leaf_values)):
+        weak.leaf_values.append(leaf_values[i] * learning_rate)
+    model.add_weak_model(weak^)
+
+
+def _settle_deferred_tree(
+    ctx: DeviceContext,
+    mut est_ws: List[TEstimationWorkspace],
+    mut model: TAdditiveModel,
+    mut deferred_splits: List[TBinarySplit],
+    mut has_deferred_tree: Bool,
+    approx_dim: Int,
+    learning_rate: Float32,
+    mut not_pd_total: Int,
+    mut trace: IdentityTrace,
+    mut stage_times: StageTimes,
+) raises:
+    """lane fix-g1-gbdt: settle the pending tree (if any) and append it."""
+    if not has_deferred_tree:
+        return
+    var prev_values = List[Float32]()
+    if not finish_deferred_estimation(
+        ctx, est_ws, prev_values, not_pd_total, trace, stage_times
+    ):
+        raise Error(
+            "IDN_GBDT_SYM_EST_DEFER_DRAIN: a tree was deferred but its"
+            " estimation task is not pending"
+        )
+    if len(prev_values) != (1 << len(deferred_splits)) * approx_dim:
+        raise Error(
+            "the deferred estimator returned " + String(len(prev_values))
+            + " leaf values for a depth-" + String(len(deferred_splits))
+            + " tree x " + String(approx_dim) + " dims"
+        )
+    _append_deferred_oblivious_tree(
+        model, deferred_splits, prev_values, approx_dim, learning_rate
+    )
+    deferred_splits.clear()
+    has_deferred_tree = False
+
+
+def finish_deferred_estimation(
+    ctx: DeviceContext,
+    mut est_ws: List[TEstimationWorkspace],
+    mut leaf_values: List[Float32],
+    mut not_pd_total: Int,
+    mut trace: IdentityTrace,
+    mut stage_times: StageTimes,
+) raises -> Bool:
+    """lane fix-g1-gbdt (`IDN_GBDT_SYM_EST_DEFER_DRAIN`): settle the
+    estimation task whose tail drain was deferred, and hand back its leaf
+    values. Returns False (and touches nothing) when none is pending.
+
+    The caller calls this right after the NEXT tree's search returned, so
+    that search's drain already ran every queued op of the task (one
+    in-order queue); the `synchronize` here finds the queue idle and only
+    makes the host reads below independent of which drain kind the search
+    took. Then the values, DEVIATION 74's counter and the trace record the
+    task's own tail would have produced, and the oracle and mask die past
+    the drain."""
+    if len(est_ws) == 0 or len(est_ws[0].pending) == 0:
+        return False
+    ctx.synchronize()
+    var tail = est_ws[0].pending.pop()
+    if tail.count_not_pd:
+        # the per-leaf fallback flags counted on the device (one word)
+        not_pd_total += Int(est_ws[0].h_count.unsafe_ptr().unsafe_load(0))
+    # one bulk copy of the read-back leaf values (no element loop)
+    leaf_values.clear()
+    if tail.n_values > 0:
+        leaf_values.resize(unsafe_uninit_length=tail.n_values)
+        memcpy(
+            dest=leaf_values.unsafe_ptr(),
+            src=est_ws[0].h_est.unsafe_ptr(),
+            count=tail.n_values,
+        )
+    merge_stage_times(stage_times, tail.oracle.times)
+    trace.record_list_f32(tail.leaf_tag, leaf_values)
+    _ = tail^  # past the drain (step-33 race class, device side)
+    return True
+
+
+def _estimate_and_apply(
+    ctx: DeviceContext,
+    n_rows: Int,
+    approx_dim: Int,
+    n_leaves: Int,
+    sizes: List[Int],
+    leaf_offsets: List[Int],
+    mut row_index: DeviceBuffer[DType.uint32],
+    mut targets: DeviceBuffer[DType.float32],
+    mut weights: DeviceBuffer[DType.float32],
+    has_weights: Bool,
+    mut cursor: DeviceBuffer[DType.float32],
+    objective: Int,
+    alpha: Float32,
+    estimator_alpha: Float32,
+    logloss_border: Float32,
+    l2_leaf_reg: Float32,
+    est_sm: Int,
+    leaf_estimation_method: Int,
+    num_classes: Int,
+    iters: Int,
+    learning_rate: Float32,
+    mut leaf_values: List[Float32],
+    mut not_pd_total: Int,
+    mut trace: IdentityTrace,
+    mut stage_times: StageTimes,
+    leaf_tag: String,
+    # DEVIATION 1890: the fit-owned estimation workspace (pool of one)
+    mut est_ws: List[TEstimationWorkspace],
+    # the QueryRMSE grouping and scratch (handle views onto the fit's own
+    # buffers); None for every pointwise and multiclass loss
+    var query: Optional[QuerywiseTargetBuffers] = None,
+    # the PairLogit pairs and scratch (handle views); None otherwise
+    var pairs: Optional[PairwiseTargetBuffers] = None,
+    # the YetiRank task table and scratch (handle views); None otherwise
+    var yeti: Optional[YetiRankTargetBuffers] = None,
+    # the seed of this task's YetiRank evaluation stream (one draw of the
+    # fit's YetiRank stream per tree); read only with `yeti`
+    yeti_seed: UInt64 = UInt64(0),
+    # lane fix-g1-gbdt (`IDN_GBDT_SYM_EST_DEFER_DRAIN`): when a one-step
+    # device path runs, skip its tail drain and leave the task pending in
+    # `est_ws[0].pending` (`leaf_values` comes back EMPTY; the caller gets
+    # them from `finish_deferred_estimation` after its next drain). Every
+    # other path ignores it and drains as before.
+    defer_tail: Bool = False,
+    # TOMBSTONE: ANONLIB_SYM_DERIV_FUSED (DROPPED-noise) deleted 2026-10-09 on lane/owed-deletions-D1 (the
+    # `tail_drain` argument); code recoverable at b639a2bd2. Restore: git apply experiments/removed/ANONLIB_SYM_DERIV_FUSED.patch.
+    # TOMBSTONE: ANONLIB_EST_SHRINK_FUSED (DROPPED-inconclusive) deleted 2026-10-09 on lane/owed-deletions-D1 (the
+    # `derivs_hook` argument); code recoverable at b639a2bd2. Restore: git apply experiments/removed/ANONLIB_EST_SHRINK_FUSED.patch.
+) raises:
+    """One estimation task: their `TDocParallelLeavesEstimator::Estimate`
+    plus the `AppendModels` that follows it, for ONE (dataset, cursor).
+    `row_index`, `leaf_offsets` and `sizes` are the partition -- rows
+    grouped by leaf. Which partition depends on which permutation this task
+    is for: the one the tree was grown on inherits the searcher's, and
+    every other one gets `partition_from_bins`. Nothing else in here
+    differs between permutations, which is why this is one function called
+    `permutation_count` times rather than two paths.
+
+    `leaf_values` is OVERWRITTEN with the estimate, and the caller keeps
+    only the estimation permutation's -- that is the ensemble their `Run()`
+    exports (`doc_parallel_boosting.h:526-528`).
+    """
+    var not_pd_blocks = 0
+    # lane fix-g1-gbdt: a deferred task must be settled first (its staging
+    # and oracle scratch are what this task is about to reuse)
+    if len(est_ws) > 0 and len(est_ws[0].pending) > 0:
+        raise Error(
+            "_estimate_and_apply: the previous task's deferred tail was never"
+            " settled (finish_deferred_estimation); the call order broke"
+        )
+    # their `weak->NeedEstimation()` arm (`doc_parallel_boosting.h:
+    # 371-385`): the searcher's leaf values are DISCARDED, the
+    # estimator recomputes them at the cursor, and only then does
+    # the rescaled model touch the cursor. `row_index` left the
+    # searcher bin-sorted, so target/weights/cursor gather straight
+    # into the oracle's order (their factory sorts; we inherit).
+    #
+    # DEVIATION 1890: the buffers come from the fit's pool of one, not
+    # from per-tree `enqueue_create_buffer` (see `TEstimationWorkspace`'s
+    # block). Reuse is safe because every consumer of the previous task's
+    # contents drained at that task's tail (DEVIATION 1891), and the
+    # gathers below overwrite every cell this task reads.
+    stage_times.begin(ctx)
+    # MultiRMSE's target is `approx_dim` dim-major planes (their
+    # `targets + idx + dim * targetAlignSize`, `multilogit.cu:514`); every
+    # other loss carries one target per row
+    var target_planes = 1
+    if objective == OBJECTIVE_MULTIRMSE:
+        target_planes = approx_dim
+    if (
+        len(est_ws) == 0
+        or est_ws[0].n_rows_key != n_rows
+        or est_ws[0].approx_dim_key != approx_dim
+        or est_ws[0].target_planes_key != target_planes
+        or est_ws[0].n_leaves_cap < n_leaves
+    ):
+        est_ws.clear()
+        est_ws.append(
+            TEstimationWorkspace(
+                ctx, n_rows, approx_dim, n_leaves, target_planes
+            )
+        )
+    # lane/apple-fast-sym-est: the FAST + Apple task (`apple_fast_est.mojo`)
+    # for a single-dim pointwise Newton / Gradient walk; every other build
+    # and every other task takes the path below unchanged
+    comptime if EST_APPLE_ANY:
+        if apple_est_handles(
+            objective, leaf_estimation_method, approx_dim, iters,
+            query.__bool__() or pairs.__bool__() or yeti.__bool__(),
+        ):
+            var a_sm = est_sm
+            if a_sm < 0:
+                a_sm = ctx.get_attribute(DeviceAttribute.MULTIPROCESSOR_COUNT)
+            apple_est_ensure(ctx, est_ws[0].apple_est, n_rows, n_leaves, a_sm)
+            var a_s = est_ws[0].apple_est[0].handles()
+            var a_gt = est_ws[0].g_target.copy()
+            var a_gw = est_ws[0].g_weights.copy()
+            var a_gc = est_ws[0].g_cursor.copy()
+            var a_po = est_ws[0].d_p_off.copy()
+            var a_ps = est_ws[0].d_p_sz.copy()
+            var a_hpo = est_ws[0].h_po.copy()
+            var a_hps = est_ws[0].h_ps.copy()
+            stage_times.end(ctx, "est.stage_in")
+            apple_fast_estimate_and_apply(
+                ctx, n_rows, n_leaves, sizes, leaf_offsets,
+                row_index, targets, weights, has_weights, cursor,
+                objective, alpha, logloss_border, l2_leaf_reg, a_sm,
+                leaf_estimation_method, iters, learning_rate,
+                leaf_values, trace, stage_times, leaf_tag,
+                a_gt, a_gw, a_gc, a_po, a_ps, a_hpo, a_hps, a_s,
+            )
+            return
+    # DEVIATION 3041: the oracle's device buffers from the fit's pool (keyed
+    # exactly; see `OracleScratchPool`), taken as handle views BEFORE the
+    # workspace refs below are borrowed
+    var oracle_ws = Optional[OracleDeviceScratch]()
+    comptime if ORACLE_SCRATCH_POOLED:
+        var pair_blocks = 0
+        if pairs.__bool__():
+            pair_blocks = pairs.value().blocks()
+        oracle_ws = est_ws[0].oracle_scratch.take(
+            ctx, n_rows, n_leaves, objective, num_classes, est_sm, pair_blocks,
+        )
+    ref g_target = est_ws[0].g_target
+    ref g_weights = est_ws[0].g_weights
+    ref g_cursor = est_ws[0].g_cursor
+    ref d_p_off = est_ws[0].d_p_off
+    ref d_p_sz = est_ws[0].d_p_sz
+    ref h_po = est_ws[0].h_po
+    ref h_ps = est_ws[0].h_ps
+    ref d_est = est_ws[0].d_est
+    ref h_est = est_ws[0].h_est
+    if target_planes > 1:
+        # MultiRMSE: EVERY target plane into bin order, as the cursor below
+        launch_gather_planes_with_mask_f32(
+            ctx, g_target, targets, row_index, n_rows,
+            UInt32(0xFFFFFFFF), target_planes, n_rows,
+        )
+    else:
+        launch_gather_with_mask_f32(
+            ctx, g_target, targets, row_index, n_rows,
+            UInt32(0xFFFFFFFF),
+        )
+    if has_weights:
+        launch_gather_with_mask_f32(
+            ctx, g_weights, weights, row_index, n_rows,
+            UInt32(0xFFFFFFFF),
+        )
+    # EVERY PLANE. The oracle owns a COPY of the cursor that it
+    # shifts (`AddBinModelValues` inside `MoveTo`), so this cannot
+    # be a gather-on-read view; for MultiClass that copy is
+    # `numClasses - 1` planes wide.
+    launch_gather_planes_with_mask_f32(
+        ctx, g_cursor, cursor, row_index, n_rows,
+        UInt32(0xFFFFFFFF), approx_dim, n_rows,
+    )
+    # ================= DEVIATION 1891 =================
+    # A `ctx.synchronize()` stood here and it settled NOTHING a later op
+    # needs: every enqueue above it (the pool's creates on a rebuild, the
+    # three gathers) is stream-ordered before every device op below, and
+    # writing a host buffer straight after `enqueue_create_host_buffer`
+    # is this repo's settled practice (`TTreeWorkspace.__init__`'s
+    # constant fills, `make_bin_optimized_oracle`'s `h_leaves`). The host
+    # writes below reuse `h_po`/`h_ps` across tasks, and THAT hazard is
+    # held to the tail drain: the previous task's `enqueue_copy` of these
+    # buffers became a RUN at its own tail `ctx.synchronize()`, which
+    # returned before this call began. Removed 2026-08-26; one full
+    # device drain per estimation task, and Logloss at 10 walker
+    # iterations ran ~34 full-n_rows passes between drains 1 and 2, so
+    # the drain was pure serialization. Bit-inert: a drain reorders
+    # nothing on one stream.
+    # ==================================================
+    # THE DEVICE'S OWN OFFSETS: the final partitions sit in memory
+    # in bit-reversed leaf order, so a prefix sum of the sizes is
+    # the WRONG segmentation (see run_tree_layout's tail).
+    for i in range(n_leaves):
+        h_po.unsafe_ptr().unsafe_store(
+            i, UInt32(leaf_offsets[i])
+        )
+        h_ps.unsafe_ptr().unsafe_store(i, UInt32(sizes[i]))
+    ctx.enqueue_copy(dst_buf=d_p_off, src_ptr=h_po.unsafe_ptr())
+    ctx.enqueue_copy(dst_buf=d_p_sz, src_ptr=h_ps.unsafe_ptr())
+    # THE BUFFERS MUST OUTLIVE THE COPY -- and now they structurally do.
+    # When `h_po`/`h_ps` were locals, their last use was the two
+    # `enqueue_copy`s above, so Mojo could free them there -- and the very
+    # next host allocation was `h_leaves` inside
+    # `make_bin_optimized_oracle`, SAME POOL, SAME DTYPE, SAME LENGTH,
+    # filled `[i] = i` immediately. That was DEVIATION 134's pointwise
+    # half (measured: 8 of 12 splits reproduced, first divergence at tree
+    # 8), [[mojo-buffer-freed-at-last-use]], same defect as DEVIATION
+    # 125a, and it was held to a mid-function sync. DEVIATION 1890 closes
+    # it at the OWNERSHIP level instead: the workspace owns the staging
+    # across trees, so no copy in this function ever outlives its source.
+
+    # The oracle receives HANDLE COPIES (`DeviceBuffer.copy()` copies the
+    # handle, not the bytes -- see the `cursors` note in `fit_with_test`),
+    # so the workspace keeps the memory alive across trees while the
+    # oracle's handles die with it at this task's tail drain.
+    if query.__bool__():
+        # `InversePermutation(Indices, InverseIndices)`
+        # (`permutation_der_calcer.h:176-183`): `row_index` is this tree's
+        # bin order, position -> row, so the inverse maps each row to the
+        # position the oracle's gathered cursor holds it at.
+        launch_inverse_permutation(ctx, row_index, query.value().inverse, n_rows)
+    if pairs.__bool__():
+        # the same inverse bin order, for the pairwise der calcer
+        launch_inverse_permutation(ctx, row_index, pairs.value().inverse, n_rows)
+    if yeti.__bool__():
+        # the same inverse bin order, for the YetiRank der calcer
+        launch_inverse_permutation(ctx, row_index, yeti.value().query.inverse, n_rows)
+    stage_times.end(ctx, "est.stage_in")
+    stage_times.begin(ctx)
+    # lane/apple-fast-sym-iter, SYM_BUF_ARENA: the oracle's five host
+    # staging buffers from the workspace's `arena_host` (pool of one, keyed
+    # as `OracleHostScratch.matches`) instead of five allocations per task.
+    # Single-dimensional pointwise oracles only; the key mismatch on any
+    # other shape makes `make_bin_optimized_oracle` allocate as main does.
+    var sym_host_ws = Optional[OracleHostScratch]()
+    comptime if SYM_BUF_ARENA:
+        if (
+            approx_dim == 1
+            and not query.__bool__()
+            and not pairs.__bool__()
+            and not yeti.__bool__()
+            and sym_objective_is_pointwise(objective)
+        ):
+            var sym_fv_blocks = (n_rows + MSE_BLOCK_SIZE - 1) // MSE_BLOCK_SIZE
+            if len(est_ws[0].arena_host) == 0 or not est_ws[0].arena_host[
+                0
+            ].matches(n_leaves, 1, 1, sym_fv_blocks):
+                est_ws[0].arena_host.clear()
+                est_ws[0].arena_host.append(
+                    OracleHostScratch(
+                        n_leaves, 1, 1, sym_fv_blocks,
+                        ctx.enqueue_create_host_buffer[DType.uint32](n_leaves),
+                        ctx.enqueue_create_host_buffer[DType.float32](n_leaves),
+                        ctx.enqueue_create_host_buffer[DType.float32](
+                            sym_fv_blocks
+                        ),
+                        ctx.enqueue_create_host_buffer[DType.float32](
+                            2 * n_leaves
+                        ),
+                        ctx.enqueue_create_host_buffer[DType.float32](n_leaves),
+                        ctx.enqueue_create_host_buffer[DType.float32](
+                            2 * n_leaves
+                        ),
+                    )
+                )
+            sym_host_ws = Optional(est_ws[0].arena_host[0].handles())
+    var oracle = make_bin_optimized_oracle(
+        ctx, n_rows, n_leaves, sizes,
+        g_target.copy(), g_weights.copy(), g_cursor.copy(),
+        d_p_off.copy(), d_p_sz.copy(),
+        has_weights,
+        objective,
+        alpha,
+        estimator_alpha,
+        logloss_border,
+        Float64(l2_leaf_reg),
+        est_sm,
+        leaf_estimation_method,
+        num_classes,
+        query^,
+        pairs^,
+        yeti^,
+        yeti_seed,
+        oracle_ws^,
+        host_scratch=sym_host_ws^,
+    )
+    stage_times.end(ctx, "est.make_oracle")
+    # `TDocParallelLeavesEstimator::Estimate`
+    # (`doc_parallel_leaves_estimator.cpp:9-16`): Exact REPLACES
+    # the walker, it does not configure it.
+    #
+    #     if (LeavesEstimationMethod == Exact) {
+    #         point = derCalcer->EstimateExact();
+    #     } else {
+    #         TNewtonLikeWalker walker(*derCalcer, iterations,
+    #                                  backtrackingType);
+    #         point = walker.Estimate(startPoint);
+    #     }
+    # DEVIATION 74's counter: how many leaves took their silent
+    # gradient fallback because Cholesky found the Hessian not
+    # positive definite. Accumulated across the whole fit and
+    # reported once, because the number that matters is whether
+    # it is ever nonzero.
+    # lane cpu4-gbdt: THE WALK ON THE DEVICE. Every single-dimensional walk
+    # (pointwise losses, QueryRMSE, PairLogit, YetiRank; Newton or Gradient;
+    # any iteration count; weighted or not) runs `device_walker.mojo`: the
+    # walker's state and statements in kernels, one accept word read per
+    # line-search evaluation, MakeZeroAverage on the device, and the leaves
+    # handed to the cursor add without a host round trip. It replaces both
+    # the host walker on this route and lane fam2-gbdt F5's one-step arm
+    # (`IDN_EST_ONE_STEP_DEVICE`, whose weighted fit filled its keep mask on
+    # the host): the one-step walk is the same statements as
+    # `newton_one_step_kernel`, so the same bits.
+    if leaf_estimation_method != LEAF_ESTIMATION_EXACT and approx_dim == 1 and device_walk_supported(
+        oracle, BACKTRACKING_ANY_IMPROVEMENT, n_leaves, est_ws[0].walk.cap
+    ):
+        oracle.times.enabled = stage_times.enabled
+        var walk = est_ws[0].walk.handles()
+        device_walk_estimate(ctx, oracle, walk, iters)
+        stage_times.begin(ctx)
+        var est_buf = walk.result()
+        if objective == OBJECTIVE_PAIR_LOGIT or objective == OBJECTIVE_YETI_RANK:
+            # `LeavesEstimationConfig.MakeZeroAverage`
+            # (`doc_parallel_leaves_estimator.cpp:25-37`, `NeedZeroAverage`)
+            enqueue_zero_average(ctx, walk, est_buf, n_leaves)
+        enqueue_copy_values(ctx, est_buf, n_leaves, d_est)
+        var walk_gx = 2 * oracle.sm_count
+        if walk_gx < 1:
+            walk_gx = 1
+        ctx.enqueue_function[add_model_value_kernel](
+            oracle.d_p_off.unsafe_ptr(),
+            oracle.d_p_sz.unsafe_ptr(),
+            row_index.unsafe_ptr(),
+            d_est.unsafe_ptr(),
+            learning_rate,
+            cursor.unsafe_ptr(),
+            Int32(1), Int32(n_rows),
+            grid_dim=(walk_gx, n_leaves, 1),
+            block_dim=(256, 1, 1),
+        )
+        # the fitted leaves for the host model (item 3 of lane cpu4-gbdt,
+        # the device-resident model, is not done: the boosting loop still
+        # keeps its ensemble on the host)
+        ctx.enqueue_copy(dst_ptr=h_est.unsafe_ptr(), src_buf=d_est)
+        comptime if IDN_GBDT_SYM_EST_DEFER_DRAIN:
+            if defer_tail:
+                # lane fix-g1-gbdt: no drain here; the next tree's search
+                # drain settles this task (`finish_deferred_estimation`)
+                stage_times.end(ctx, "est.tail_apply")
+                leaf_values.clear()
+                var walk_mask = ctx.enqueue_create_host_buffer[DType.float32](1)
+                est_ws[0].pending.append(
+                    PendingEstimationTail(
+                        oracle^, walk_mask^, n_leaves, n_leaves, False, leaf_tag
+                    )
+                )
+                return
+        # the task's one settle point (DEVIATION 1891's holds)
+        ctx.synchronize()
+        # one bulk copy of the read-back leaf values (no element loop)
+        leaf_values.clear()
+        if n_leaves > 0:
+            leaf_values.resize(unsafe_uninit_length=n_leaves)
+            memcpy(
+                dest=leaf_values.unsafe_ptr(),
+                src=h_est.unsafe_ptr(),
+                count=n_leaves,
+            )
+        merge_stage_times(stage_times, oracle.times)
+        trace.record_list_f32(leaf_tag, leaf_values)
+        stage_times.end(ctx, "est.tail_apply")
+        _ = walk^
+        _ = oracle^  # past the drain (step-33 race class, device side)
+        return
+    # lane fix-g1-gbdt (`IDN_GBDT_MC_ONE_STEP_DEVICE`): the one-step
+    # MultiClass Newton estimation (blocked Hessian) finishes on the device:
+    # the evaluation and every Hessian row are enqueued and stashed, one
+    # kernel solves each leaf's system in soft-float64, the cursor add reads
+    # its output and the task drains ONCE (the host walker drained after the
+    # gradient, after the Hessian rows and at the tail). Same bits as the
+    # host walker; the host column is untouched.
+    var mc_one_step_device = False
+    comptime if IDN_GBDT_MC_ONE_STEP_DEVICE:
+        var mc_k = oracle.single_bin_dim
+        mc_one_step_device = (
+            iters == 1
+            and leaf_estimation_method == LEAF_ESTIMATION_NEWTON
+            and objective == OBJECTIVE_MULTICLASS
+            and oracle.objective == OBJECTIVE_MULTICLASS
+            and mc_k >= 2
+            and mc_k <= MC_ONE_STEP_MAX_CLASSES
+            and oracle.cursor_dim == approx_dim
+            and mc_k == approx_dim + 1
+            and oracle.hessian_block_size() == mc_k
+            and oracle.bin_count == n_leaves
+            # a weighted fit needs the constructor's per-leaf weight sums
+            # already on the host (not the deferred-weights oracle)
+            and not oracle.h_weight_stats.__bool__()
+            and len(oracle.weights_cpu) == n_leaves
+            and est_ws[0].mc_grad_len >= n_leaves * approx_dim
+            and est_ws[0].mc_hess_len >= n_leaves * ((mc_k * (mc_k + 1)) // 2)
+        )
+    if mc_one_step_device:
+        oracle.times.enabled = stage_times.enabled
+        if has_weights:
+            # weighted fit: `Regularize`'s per-leaf decision (1.0 keep, 0.0
+            # zero) at each leaf's first slot of `d_est`, formed on the
+            # device from the constructor's weight fold, still in
+            # `d_part_stats` (lane cpu4-gbdt; the host filled it from
+            # `weights_cpu`)
+            ctx.enqueue_function[weight_keep_mask_strided_kernel](
+                oracle.d_part_stats.unsafe_ptr(),
+                bitcast[DType.uint64](oracle.min_leaf_weight),
+                Int32(n_leaves),
+                Int32(approx_dim),
+                d_est.unsafe_ptr(),
+                grid_dim=((n_leaves + 255) // 256, 1, 1),
+                block_dim=(256, 1, 1),
+            )
+        # the walker's own first call, `MoveTo(start)` at the zero point in
+        # the walker's gauge (`SingleBinDim()` components per leaf)
+        var mc_start = List[Float32](
+            length=n_leaves * oracle.single_bin_dim, fill=Float32(0.0)
+        )
+        oracle.move_to(mc_start)
+        # handle copies (the workspace keeps the memory for the fit)
+        var mc_grad = est_ws[0].mc_grad.copy()
+        var mc_hess = est_ws[0].mc_hess.copy()
+        var mc_not_pd = est_ws[0].mc_not_pd.copy()
+        oracle.enqueue_multiclass_one_step_inputs(mc_grad, mc_hess)
+        stage_times.begin(ctx)
+        # the deferred tail's keep-alive slot (the mask is formed on the
+        # device above)
+        var h_mc_mask = ctx.enqueue_create_host_buffer[DType.float32](1)
+        ctx.enqueue_function[multiclass_one_step_kernel](
+            mc_grad.unsafe_ptr(),
+            mc_hess.unsafe_ptr(),
+            oracle.d_p_sz.unsafe_ptr(),
+            bitcast[DType.uint64](oracle.lambda_reg),
+            bitcast[DType.uint64](oracle.min_leaf_weight),
+            Int32(n_leaves),
+            Int32(approx_dim),
+            d_est.unsafe_ptr(),
+            mc_not_pd.unsafe_ptr(),
+            Int32(1) if has_weights else Int32(0),
+            grid_dim=((n_leaves + 63) // 64, 1, 1),
+            block_dim=(64, 1, 1),
+        )
+        var mc_gx = 2 * oracle.sm_count
+        if mc_gx < 1:
+            mc_gx = 1
+        ctx.enqueue_function[add_model_value_kernel](
+            oracle.d_p_off.unsafe_ptr(),
+            oracle.d_p_sz.unsafe_ptr(),
+            row_index.unsafe_ptr(),
+            d_est.unsafe_ptr(),
+            learning_rate,
+            cursor.unsafe_ptr(),
+            Int32(approx_dim), Int32(n_rows),
+            grid_dim=(mc_gx, n_leaves, approx_dim),
+            block_dim=(256, 1, 1),
+        )
+        ctx.enqueue_copy(dst_ptr=h_est.unsafe_ptr(), src_buf=d_est)
+        # DEVIATION 74's counter: the per-leaf fallback flags counted on the
+        # device, one word home
+        ctx.enqueue_function[count_nonzero_u32_kernel](
+            mc_not_pd.unsafe_ptr(),
+            Int32(n_leaves),
+            est_ws[0].d_count.unsafe_ptr(),
+            grid_dim=(1, 1, 1),
+            block_dim=(WALK_FOLD_BLOCK, 1, 1),
+        )
+        ctx.enqueue_copy(
+            dst_ptr=est_ws[0].h_count.unsafe_ptr(), src_buf=est_ws[0].d_count
+        )
+        comptime if IDN_GBDT_SYM_EST_DEFER_DRAIN:
+            if defer_tail:
+                # lane fix-g1-gbdt: no drain here; the next tree's search
+                # drain settles this task (`finish_deferred_estimation`).
+                # The stash handles are views of workspace memory.
+                stage_times.end(ctx, "est.tail_apply")
+                leaf_values.clear()
+                _ = mc_grad^
+                _ = mc_hess^
+                _ = mc_not_pd^
+                est_ws[0].pending.append(
+                    PendingEstimationTail(
+                        oracle^, h_mc_mask^, n_leaves * approx_dim, n_leaves,
+                        True, leaf_tag,
+                    )
+                )
+                return
+        # the task's one settle point (DEVIATION 1891's holds, as the
+        # ordinary tail below)
+        ctx.synchronize()
+        # DEVIATION 74's counter, counted on the device
+        not_pd_blocks += Int(est_ws[0].h_count.unsafe_ptr().unsafe_load(0))
+        not_pd_total += not_pd_blocks
+        # one bulk copy of the read-back leaf values (no element loop)
+        leaf_values.clear()
+        if n_leaves * approx_dim > 0:
+            leaf_values.resize(unsafe_uninit_length=n_leaves * approx_dim)
+            memcpy(
+                dest=leaf_values.unsafe_ptr(),
+                src=h_est.unsafe_ptr(),
+                count=n_leaves * approx_dim,
+            )
+        merge_stage_times(stage_times, oracle.times)
+        trace.record_list_f32(leaf_tag, leaf_values)
+        stage_times.end(ctx, "est.tail_apply")
+        _ = h_mc_mask^  # past the drain (step-33 race class)
+        _ = mc_grad^
+        _ = mc_hess^
+        _ = mc_not_pd^
+        _ = oracle^  # past the drain (step-33 race class, device side)
+        return
+    # lane gbdt-host-loops-12: THE MULTI-DIMENSIONAL WALK ON THE DEVICE.
+    # Every multiclass-family walk the one-step kernel above does not take
+    # (MultiClass above `MC_ONE_STEP_MAX_CLASSES` or at more than one
+    # iteration, or under Gradient, or with deferred weights, or in FAST;
+    # MultiClassOneVsAll; MultiRMSE) runs `device_walker.
+    # device_multi_walk_estimate`: the walker's state and statements in
+    # kernels, one accept word per line-search evaluation, the leaves handed
+    # to the cursor add without a host round trip. It replaces
+    # `descent_helpers.newton_like_walker_estimate`, the host walk, on every
+    # GPU route; the oracle's multi-dimensional host readbacks are deleted.
+    if leaf_estimation_method != LEAF_ESTIMATION_EXACT and (
+        oracle.single_bin_dim > 1 or oracle.cursor_dim > 1
+    ):
+        if not device_multi_walk_supported(oracle, n_leaves, est_ws[0].mwalk):
+            raise Error(
+                "_estimate_and_apply: no device walk for objective "
+                + String(objective) + " with " + String(oracle.single_bin_dim)
+                + " leaf components over " + String(n_leaves) + " leaves"
+            )
+        oracle.times.enabled = stage_times.enabled
+        var mwalk = est_ws[0].mwalk.handles()
+        device_multi_walk_estimate(ctx, oracle, mwalk, iters)
+        stage_times.begin(ctx)
+        var mw_len = n_leaves * approx_dim
+        enqueue_copy_values(ctx, mwalk.d_res, mw_len, d_est)
+        var mw_gx = 2 * oracle.sm_count
+        if mw_gx < 1:
+            mw_gx = 1
+        ctx.enqueue_function[add_model_value_kernel](
+            oracle.d_p_off.unsafe_ptr(),
+            oracle.d_p_sz.unsafe_ptr(),
+            row_index.unsafe_ptr(),
+            d_est.unsafe_ptr(),
+            learning_rate,
+            cursor.unsafe_ptr(),
+            Int32(approx_dim), Int32(n_rows),
+            grid_dim=(mw_gx, n_leaves, approx_dim),
+            block_dim=(256, 1, 1),
+        )
+        ctx.enqueue_copy(dst_ptr=h_est.unsafe_ptr(), src_buf=d_est)
+        # the task's one settle point (DEVIATION 1891's holds)
+        ctx.synchronize()
+        # DEVIATION 74's counter, counted on the device
+        not_pd_blocks += device_multi_walk_not_pd(mwalk)
+        not_pd_total += not_pd_blocks
+        # one bulk copy of the read-back leaf values (no element loop)
+        leaf_values.clear()
+        if mw_len > 0:
+            leaf_values.resize(unsafe_uninit_length=mw_len)
+            memcpy(
+                dest=leaf_values.unsafe_ptr(),
+                src=h_est.unsafe_ptr(),
+                count=mw_len,
+            )
+        merge_stage_times(stage_times, oracle.times)
+        trace.record_list_f32(leaf_tag, leaf_values)
+        stage_times.end(ctx, "est.tail_apply")
+        _ = mwalk^
+        _ = oracle^  # past the drain (step-33 race class, device side)
+        return
+    if leaf_estimation_method != LEAF_ESTIMATION_EXACT:
+        # every single-dimensional walk is `device_walk_estimate`'s above and
+        # every multi-dimensional one `device_multi_walk_estimate`'s: no GPU
+        # fit walks on the host
+        raise Error(
+            "_estimate_and_apply: a walk reached no device walker (objective "
+            + String(objective) + ", " + String(n_leaves) + " leaves)"
+        )
+    var estimated = oracle.estimate_exact()
+    trace.record_list_f32(leaf_tag, estimated)
+    not_pd_total += not_pd_blocks
+    # `LeavesEstimationConfig.MakeZeroAverage`
+    # (`doc_parallel_leaves_estimator.cpp:25-37`), on for PairLogit through
+    # `NeedZeroAverage` (`train_template.h:29-40`; the other three losses it
+    # names are not implemented). After the walker and before
+    # `UpdateLeaves`, every leaf moves by minus the unweighted mean of the
+    # estimate over all `BinCount()` leaves, empty ones included, summed in
+    # double in leaf order; `float += double` rounds once, as
+    # `Float32(Float64 + Float64)` does. A shift of every leaf moves every
+    # row by the same amount, so no pairwise loss or ranking metric sees it;
+    # the raw predictions do.
+    #
+    # lane cpu4-gbdt: PairLogit and YetiRank are single-dimensional and walk
+    # on the device, which applies the shift there (`enqueue_zero_average`);
+    # they never reach this host walk.
+    if objective == OBJECTIVE_PAIR_LOGIT or objective == OBJECTIVE_YETI_RANK:
+        raise Error(
+            "_estimate_and_apply: a ranking target reached the host walker"
+            " (the device walk restates MakeZeroAverage)"
+        )
+    leaf_values.clear()
+    # driver-loop: over the leaf values (leaves x approx_dim)
+    for i in range(len(estimated)):
+        leaf_values.append(estimated[i])
+
+    # `AppendModels` for this arm: the ESTIMATED leaves, rescaled,
+    # onto the real cursor through the same kernel the RMSE arm
+    # uses inside `run_tree_layout`.
+    # `estimated` arrives in the CURSOR's gauge -- the walker
+    # applied `MakeEstimationResult` on its way out
+    # (`descent_helpers.cpp:153`, `:204`) -- so it is
+    # `n_leaves * approx_dim` and is BIN-MAJOR, which is the layout
+    # `add_model_value_kernel`'s z axis reads.
+    var est_len = n_leaves * approx_dim
+    if len(estimated) != est_len:
+        raise Error(
+            "the estimator returned " + String(len(estimated))
+            + " leaf values for " + String(n_leaves) + " leaves x "
+            + String(approx_dim) + " dims"
+        )
+    stage_times.begin(ctx)
+    for i in range(est_len):
+        h_est.unsafe_ptr().unsafe_store(i, estimated[i])
+    ctx.enqueue_copy(dst_buf=d_est, src_ptr=h_est.unsafe_ptr())
+    # MACHINE-SIZED x (the kernel strides): the widest-leaf grid priced
+    # every leaf at the largest leaf's block count -- on a skewed depth-8
+    # tree, tens of millions of empty threads per launch. Same repair as
+    # DEVIATION 210b in `kernel_add_model_value.mojo`; the launch runs
+    # once per tree, so the fix here is the grid, not the kernel.
+    var amv_gx = 2 * oracle.sm_count
+    if amv_gx < 1:
+        amv_gx = 1
+    ctx.enqueue_function[add_model_value_kernel](
+        oracle.d_p_off.unsafe_ptr(),
+        oracle.d_p_sz.unsafe_ptr(),
+        row_index.unsafe_ptr(),
+        d_est.unsafe_ptr(),
+        learning_rate,
+        cursor.unsafe_ptr(),
+        Int32(approx_dim), Int32(n_rows),
+        grid_dim=(amv_gx, n_leaves, approx_dim),
+        block_dim=(256, 1, 1),
+    )
+    # THE ONE SETTLE POINT of the task (DEVIATION 1891). This drain is
+    # KEPT, and it now carries every hold the removed drains carried:
+    # (a) the workspace staging (`h_po`/`h_ps`/`h_est`) may be host-
+    #     rewritten by the NEXT task only because their copies became
+    #     runs here;
+    # (b) the oracle dies PAST it, pinned by the explicit discard below.
+    #     Its last implicit use is the launch above, and dying there
+    #     would free its exclusive buffers (`d_bins`, `d_shift`, the
+    #     Exact path's trailing `move_to` operands) under queued work --
+    #     the step-33 race class, device side.
+    ctx.synchronize()
+    stage_times.end(ctx, "est.tail_apply")
+    _ = oracle^  # past the drain (step-33 race class, device side)
+
+
+struct PendingEstimation(Movable):
+    """One estimation task of `_estimate_and_apply` as a RESUMABLE WALK.
+
+    lane cpu4-gbdt: the walk runs ON THE DEVICE (`device_walker.mojo`): the
+    walker's points, direction and value live in the fit's `WalkBuffers`
+    (handles here), and this struct keeps only the walker's loop counters
+    between two of its evaluations. Every line-search evaluation is enqueued
+    by `_estimate_prepare` or `estimate_advance` with its one-word accept
+    flag, and read by the next `estimate_advance` after the caller's drain;
+    so several tasks walk in lock step, one drain per round for all of them.
+    When the walk finishes its estimate is copied into the task workspace's
+    `d_est` (`device_done`), which `_estimate_complete` (or the Ordered
+    fit's device arm) applies on the device.
+    """
+
+    var oracle: BinOptimizedOracle
+    var n_rows: Int
+    var n_leaves: Int
+    var iterations: Int
+    #: 1: a line-search evaluation is in flight; 2: the walk is finished;
+    #: 3: the walk's first `iterations` evaluations are in flight at the
+    #: device's step (GBDT_WALK_DEV_STEP), the control word coming home
+    var phase: Int
+    var iteration: Int
+    var updated: Bool
+    var step: Float64
+    #: handles onto the task workspace's walk state and `d_est`
+    var walk: WalkBuffers
+    var d_est: DeviceBuffer[DType.float32]
+    #: the leaves are in `d_est` (always, once `phase == 2`)
+    var device_done: Bool
+
+    def __init__(
+        out self,
+        var oracle: BinOptimizedOracle,
+        n_rows: Int,
+        n_leaves: Int,
+        iterations: Int,
+        var walk: WalkBuffers,
+        var d_est: DeviceBuffer[DType.float32],
+    ):
+        self.oracle = oracle^
+        self.n_rows = n_rows
+        self.n_leaves = n_leaves
+        self.iterations = iterations
+        self.phase = 1
+        self.iteration = 0
+        self.updated = False
+        self.step = 1.0
+        self.walk = walk^
+        self.d_est = d_est^
+        self.device_done = False
+
+
+def _walk_finish(mut p: PendingEstimation) raises:
+    """The walk's return, `MakeEstimationResult(cur_point)` (the identity
+    here), copied into the task's `d_est` on the device."""
+    var ctx = p.oracle.ctx
+    var est = p.walk.result()
+    var dst = p.d_est.copy()
+    enqueue_copy_values(ctx, est, p.n_leaves, dst)
+    p.phase = 2
+    p.device_done = True
+
+
+def _walk_line_search_or_finish(mut p: PendingEstimation) raises -> Bool:
+    """The walker's inner `while` test: enqueue the next line-search
+    evaluation (True), or -- the inner loop ending with no accepted step,
+    which breaks the outer loop -- finish the walk (False)."""
+    if p.iteration < p.iterations or (
+        (not p.updated) and p.iteration < 100
+    ):
+        var ctx = p.oracle.ctx
+        device_walk_enqueue_line_search(ctx, p.oracle, p.walk, p.step)
+        p.phase = 1
+        return True
+    _walk_finish(p)
+    return False
+
+
+def _walk_outer_or_finish(mut p: PendingEstimation) raises -> Bool:
+    """The walker's outer `while iteration < iterations` test and a round's
+    start (`step = 1`), or finish the walk at the current point."""
+    if p.iteration < p.iterations:
+        p.step = 1.0
+        return _walk_line_search_or_finish(p)
+    _walk_finish(p)
+    return False
+
+
+def estimate_advance(mut p: PendingEstimation) raises -> Bool:
+    """Read the accept word of the line-search evaluation in flight (the
+    caller has drained since it was enqueued) and run the walk's counters
+    to its next evaluation: True when one is enqueued, False when the walk
+    has finished (the leaves are in `d_est`). The statements, and their
+    order, are `descent_helpers.newton_like_walker_estimate`'s with
+    `BACKTRACKING_ANY_IMPROVEMENT`, `_estimate_and_apply`'s choice; the
+    acceptance itself (and the new direction) ran on the device."""
+    if p.phase == 3:
+        # GBDT_WALK_DEV_STEP: the first `iterations` evaluations ran; the
+        # host walker's counters are where they would be after them
+        p.iteration = p.iterations
+        if device_walk_ctl_updated(p.walk):
+            p.updated = True
+            _walk_finish(p)
+            return False
+        p.updated = False
+        p.step = device_walk_ctl_step(p.walk)
+        return _walk_line_search_or_finish(p)
+    if p.phase != 1:
+        return False
+    if device_walk_flag(p.walk):
+        p.iteration += 1
+        p.updated = True
+        return _walk_outer_or_finish(p)
+    p.iteration += 1
+    p.step /= 2
+    return _walk_line_search_or_finish(p)
+
+
+def estimate_can_batch(
+    objective: Int, leaf_estimation_method: Int, iters: Int
+) -> Bool:
+    """Whether `_estimate_prepare`/`_estimate_complete` restate
+    `_estimate_and_apply` for this task: a single-dimensional pointwise loss
+    (no MultiClass family, no ranking target), the Newton or Gradient walker
+    at any iteration count -- a walk whose only drains are its evaluations'
+    readbacks (`estimate_advance`). Everything else keeps the one-call
+    path."""
+    if iters < 1:
+        return False
+    if not (
+        leaf_estimation_method == LEAF_ESTIMATION_NEWTON
+        or leaf_estimation_method == LEAF_ESTIMATION_GRADIENT
+    ):
+        return False
+    if (
+        objective == OBJECTIVE_MULTICLASS
+        or objective == OBJECTIVE_MULTICLASS_OVA
+        or objective == OBJECTIVE_MULTIRMSE
+        or objective == OBJECTIVE_PAIR_LOGIT
+        or objective == OBJECTIVE_YETI_RANK
+        or objective == OBJECTIVE_QUERY_RMSE
+    ):
+        return False
+    return True
+
+
+def estimate_workspace(
+    ctx: DeviceContext,
+    mut est_ws: List[TEstimationWorkspace],
+    mut arena: BufferArena,
+    n_rows: Int,
+    n_leaves: Int,
+) raises:
+    """The batched path's workspace for a task of `n_rows` and `n_leaves`
+    (`_estimate_prepare`'s key check), built from `arena` on a miss, so a
+    caller can stage the gathered target, weights and cursor into it
+    before `_estimate_prepare(staged=True)`."""
+    if (
+        len(est_ws) == 0
+        or est_ws[0].n_rows_key != n_rows
+        or est_ws[0].approx_dim_key != 1
+        or est_ws[0].n_leaves_cap < n_leaves
+    ):
+        est_ws.clear()
+        est_ws.append(TEstimationWorkspace(ctx, arena, n_rows, n_leaves))
+
+
+def _estimate_prepare(
+    ctx: DeviceContext,
+    n_rows: Int,
+    n_leaves: Int,
+    sizes: List[Int],
+    leaf_offsets: List[Int],
+    mut row_index: DeviceBuffer[DType.uint32],
+    mut targets: DeviceBuffer[DType.float32],
+    mut weights: DeviceBuffer[DType.float32],
+    has_weights: Bool,
+    mut cursor: DeviceBuffer[DType.float32],
+    objective: Int,
+    alpha: Float32,
+    estimator_alpha: Float32,
+    logloss_border: Float32,
+    l2_leaf_reg: Float32,
+    est_sm: Int,
+    leaf_estimation_method: Int,
+    mut est_ws: List[TEstimationWorkspace],
+    mut arena: BufferArena,
+    mut stage_times: StageTimes,
+    staged: Bool = False,
+    iterations: Int = 1,
+    one_step_device: Bool = False,
+    var natural_bins: Optional[DeviceBuffer[DType.uint32]] = None,
+    var bk_partials: Optional[DeviceBuffer[DType.float32]] = None,
+    leaves_cap: Int = 0,
+) raises -> PendingEstimation:
+    """`_estimate_and_apply` for an `estimate_can_batch` task (approx_dim 1,
+    no grouping), up to its walker's evaluation readback, WITHOUT the drain
+    that settles it: the same workspace and oracle-scratch pools, the same
+    gathers and partition uploads, the same oracle (its weight fold
+    deferred, `make_bin_optimized_oracle(defer_weights=True)`), the walker's
+    first `MoveTo` and its evaluation, enqueued in the same order. Several
+    tasks prepared back to back therefore run the same kernels on the same
+    inputs as the same tasks run one at a time, behind one drain instead of
+    three each.
+
+    `est_ws` must be THIS task's workspace list and no other in-flight
+    task's: the staging (`h_po`/`h_ps`/`h_est`) and the oracle scratch are
+    rewritten by a task that reuses it, and nothing here drains.
+
+    THE BUFFERS COME FROM `arena` (`gbdt/gpu_util/arena.mojo`): the
+    workspace, and the oracle's device and host scratch (DEVIATION 3041's
+    `OracleDeviceScratch` and its host twin), each kept in the task's
+    workspace for the fit under its exact key. A batch holds every task's
+    buffers at once, and on Metal every live allocation is bound to every
+    launch; carved from a few parents they cost what one buffer does. The
+    oracle reads the same cells either way: every cell it reads it writes
+    first (DEVIATION 3041's contract, which the identity lanes hold)."""
+    if not estimate_can_batch(objective, leaf_estimation_method, iterations):
+        raise Error("_estimate_prepare: this task needs _estimate_and_apply")
+    stage_times.begin(ctx)
+    if staged:
+        # the caller gathered straight into THIS workspace
+        # (`estimate_workspace`); a rebuild here would drop it
+        if len(est_ws) == 0 or est_ws[0].n_rows_key != n_rows:
+            raise Error("_estimate_prepare(staged=True) needs the staged workspace")
+    # ======== lane gbdt-categorical-oom: THE ARENA NEVER FREES ========
+    # Everything below is carved from `arena`, which only grows (a new
+    # parent is at least twice everything handed out so far) and is never
+    # reset for the fit. Two misses used to re-carve n_rows-sized memory:
+    #   (1) `estimate_workspace` rebuilt the workspace (g_target, g_weights,
+    #       g_cursor: 12 B a row) every time a tree had more leaves than the
+    #       capacity so far, dropping its scratch list with it;
+    #   (2) every new leaf count carved a WHOLE oracle scratch, row half
+    #       included (d_identity 4 + d_bins 4 + d_eval_stats 8 + d_multi_der
+    #       4 = 20 B a row).
+    # A non-symmetric (Depthwise/Lossguide) fit with CTR columns runs this
+    # once per permutation per tree (default 4 permutations), and its trees
+    # take many distinct leaf counts. PEAK BEFORE, per row:
+    #   perms x (20 x K + 12 x G) bytes, K distinct leaf counts and G
+    #   capacity growths per permutation, then up to 2x for the arena's
+    #   doubling parent: at 4 permutations and K ~ 100 that is ~8 KB a row,
+    #   tens of GB on a few million rows (the 48 GB L40S refused such a fit
+    #   with CUDA_ERROR_OUT_OF_MEMORY at warm-up; a 256 GB MI325X fit it).
+    # PEAK AFTER, per row: perms x (12 + 20) = 128 B at 4 permutations (x2
+    # doubling slack), plus per (permutation, leaf count) one bin half of
+    # O(leaves x SM chunks) floats, KiB to a few hundred KiB, independent
+    # of the row count. The two repairs:
+    #   (1) the caller passes `leaves_cap`, the policy's leaf bound, so the
+    #       workspace is built once at that capacity. `n_leaves_cap` is a
+    #       capacity (TEstimationWorkspace's DEVIATION 1890 note: every
+    #       consumer walks exactly `n_leaves` entries, a wider buffer is
+    #       bit-inert, which is also what a shrinking tree already used);
+    #   (2) a new leaf count carves only the bin half and shares the row
+    #       half of the first entry, as `OracleScratchPool` already does on
+    #       the one-call path (DEVIATION 3041: every row cell is written
+    #       before it is read inside the task).
+    # No rule reads a data shape: the capacity is the max_leaves option and
+    # the sharing is by key. Bits: unchanged on every column (same kernels,
+    # same launches, same sizes for every whole-buffer copy endpoint, same
+    # fold order); the host column has no arena and is untouched.
+    # NOT COMPILED -- NOT TESTED -- NOT MEASURED.
+    # ===================================================================
+    var ws_leaves = n_leaves
+    if leaves_cap > ws_leaves:
+        ws_leaves = leaves_cap
+    estimate_workspace(ctx, est_ws, arena, n_rows, ws_leaves)
+    var dims = _oracle_dims(objective, 0)
+    var fv_blocks = (n_rows + MSE_BLOCK_SIZE - 1) // MSE_BLOCK_SIZE
+    var sm = est_sm
+    if sm < 0:
+        sm = ctx.get_attribute(DeviceAttribute.MULTIPROCESSOR_COUNT)
+    var ds = -1
+    for i in range(len(est_ws[0].arena_scratch)):  # small-loop(arena_scratch: pooled scratch keys, a few shapes): cache lookup by shape only
+        if est_ws[0].arena_scratch[i].matches(
+            n_rows, n_leaves, dims[0], dims[1], fv_blocks, sm
+        ):
+            ds = i
+    var fresh_scratch = ds < 0
+    if ds < 0:
+        # lane gbdt-categorical-oom (2): share the row half of the first
+        # entry with the same row key; carve the whole scratch only when
+        # there is none (see the peak note above)
+        var share = -1
+        for i in range(len(est_ws[0].arena_scratch)):  # small-loop(arena_scratch: pooled scratch keys, one per leaf count): row-key lookup, no data
+            if share < 0 and est_ws[0].arena_scratch[i].row_matches(
+                n_rows, dims[1], fv_blocks
+            ):
+                share = i
+        if share >= 0:
+            est_ws[0].arena_scratch.append(
+                make_oracle_device_scratch_sharing_rows_in(
+                    ctx, arena, est_ws[0].arena_scratch[share], n_leaves,
+                    dims[0], sm,
+                )
+            )
+        else:
+            est_ws[0].arena_scratch.append(
+                make_oracle_device_scratch_in(
+                    ctx, arena, n_rows, n_leaves, dims[0], dims[1],
+                    fv_blocks, sm,
+                )
+            )
+        ds = len(est_ws[0].arena_scratch) - 1
+    var hsi = -1
+    for i in range(len(est_ws[0].arena_host)):  # small-loop(arena_host: pooled host scratch keys, a few shapes): cache lookup by shape only
+        if est_ws[0].arena_host[i].matches(
+            n_leaves, dims[0], dims[1], fv_blocks
+        ):
+            hsi = i
+    if hsi < 0:
+        est_ws[0].arena_host.append(
+            OracleHostScratch(
+                ctx, arena, n_leaves, dims[0], dims[1], fv_blocks
+            )
+        )
+        hsi = len(est_ws[0].arena_host) - 1
+    if fresh_scratch:
+        # the scratch's `d_leaves` is `[0, n_leaves)` for the fit, written
+        # ONCE here (the factory's own refill is skipped, `leaves_ready`);
+        # the staging is the scratch's own, never rewritten, so the upload
+        # reads the same values whenever it runs
+        ref h_leaves = est_ws[0].arena_host[hsi].h_leaves
+        for i in range(n_leaves):
+            h_leaves.unsafe_ptr().unsafe_store(i, UInt32(i))
+        ctx.enqueue_copy(
+            dst_buf=est_ws[0].arena_scratch[ds].d_leaves,
+            src_ptr=h_leaves.unsafe_ptr(),
+        )
+    var oracle_ws = Optional(est_ws[0].arena_scratch[ds].handles())
+    var oracle_hs = Optional(est_ws[0].arena_host[hsi].handles())
+    ref g_target = est_ws[0].g_target
+    ref g_weights = est_ws[0].g_weights
+    ref g_cursor = est_ws[0].g_cursor
+    ref d_p_off = est_ws[0].d_p_off
+    ref d_p_sz = est_ws[0].d_p_sz
+    ref h_po = est_ws[0].h_po
+    ref h_ps = est_ws[0].h_ps
+    # Lane S3 `CTR_SORTFREE_SUMS`: `natural_bins` given, the rows stay in
+    # ORIGINAL order: no gathers, the oracle reads the fit's target and
+    # weight planes directly and walks a copy of the cursor
+    var bin_keyed = False
+    comptime if CTR_SORTFREE_SUMS:
+        if natural_bins.__bool__():
+            if staged:
+                raise Error("_estimate_prepare: bin-keyed rows are never staged")
+            bin_keyed = True
+            enqueue_bk_copy_f32(ctx, g_cursor, cursor, n_rows)
+    if not staged and not bin_keyed:
+        launch_gather_with_mask_f32(
+            ctx, g_target, targets, row_index, n_rows,
+            UInt32(0xFFFFFFFF),
+        )
+        if has_weights:
+            launch_gather_with_mask_f32(
+                ctx, g_weights, weights, row_index, n_rows,
+                UInt32(0xFFFFFFFF),
+            )
+        launch_gather_planes_with_mask_f32(
+            ctx, g_cursor, cursor, row_index, n_rows,
+            UInt32(0xFFFFFFFF), 1, n_rows,
+        )
+    for i in range(n_leaves):
+        h_po.unsafe_ptr().unsafe_store(i, UInt32(leaf_offsets[i]))
+        h_ps.unsafe_ptr().unsafe_store(i, UInt32(sizes[i]))
+    ctx.enqueue_copy(dst_buf=d_p_off, src_ptr=h_po.unsafe_ptr())
+    ctx.enqueue_copy(dst_buf=d_p_sz, src_ptr=h_ps.unsafe_ptr())
+    stage_times.end(ctx, "est.stage_in")
+    stage_times.begin(ctx)
+    var o_target = g_target.copy()
+    var o_weights = g_weights.copy()
+    if bin_keyed:
+        o_target = targets.copy()
+        if has_weights:
+            o_weights = weights.copy()
+    var oracle = make_bin_optimized_oracle(
+        ctx, n_rows, n_leaves, sizes,
+        o_target^, o_weights^, g_cursor.copy(),
+        d_p_off.copy(), d_p_sz.copy(),
+        has_weights,
+        objective,
+        alpha,
+        estimator_alpha,
+        logloss_border,
+        Float64(l2_leaf_reg),
+        est_sm,
+        leaf_estimation_method,
+        0,
+        scratch=oracle_ws^,
+        defer_weights=True,
+        host_scratch=oracle_hs^,
+        leaves_ready=True,
+        weights_on_device=True,
+        natural_bins=natural_bins^,
+        bk_partials=bk_partials^,
+    )
+    stage_times.end(ctx, "est.make_oracle")
+    # `TNewtonLikeWalker::Estimate` (`descent_helpers.newton_like_walker_
+    # estimate`) ON THE DEVICE (lane cpu4-gbdt, `device_walker.mojo`): the
+    # start `MoveTo`, its evaluation and the first direction, ENQUEUED; a
+    # one-iteration walk also takes its full step and is finished (the
+    # leaves go to `d_est`, no readback, no walk drain, no upload). Any other
+    # walk enqueues its first line-search evaluation and its accept word,
+    # which `estimate_advance` reads after the caller's drain. The weighted
+    # regularizer reads the constructor's weight fold, still in
+    # `d_part_stats` here (stream order). `one_step_device` (lane ml-gbdt
+    # T4's `newton_one_step_kernel` arm) is subsumed: the device walk's one
+    # step is the same statements.
+    oracle.times.enabled = stage_times.enabled
+    if not device_walk_supported(
+        oracle, BACKTRACKING_ANY_IMPROVEMENT, n_leaves, est_ws[0].walk.cap
+    ):
+        raise Error("_estimate_prepare: the device walk does not cover this task")
+    var walk = est_ws[0].walk.handles()
+    var d_est = est_ws[0].d_est.copy()
+    var finished = device_walk_begin(ctx, oracle, walk, iterations)
+    var pending = PendingEstimation(
+        oracle^, n_rows, n_leaves, iterations, walk^, d_est^
+    )
+    if finished:
+        _walk_finish(pending)
+        return pending^
+    comptime if GBDT_WALK_DEV_STEP:
+        # the walk's first `iterations` evaluations, enqueued at the device's
+        # step (device_walker.mojo GBDT_WALK_DEV_STEP); the caller's next
+        # drain settles all of them (`estimate_advance`, phase 3)
+        device_walk_enqueue_speculative(
+            ctx, pending.oracle, pending.walk, iterations
+        )
+        pending.phase = 3
+        return pending^
+    _ = _walk_line_search_or_finish(pending)
+    return pending^
+
+
+def _estimate_complete(
+    ctx: DeviceContext,
+    mut pending: PendingEstimation,
+    mut row_index: DeviceBuffer[DType.uint32],
+    mut cursor: DeviceBuffer[DType.float32],
+    learning_rate: Float32,
+    mut leaf_values: List[Float32],
+    mut not_pd_total: Int,
+    mut trace: IdentityTrace,
+    mut stage_times: StageTimes,
+    leaf_tag: String,
+    mut est_ws: List[TEstimationWorkspace],
+    append_to_cursor: Bool = True,
+    var natural_bins: Optional[DeviceBuffer[DType.uint32]] = None,
+) raises:
+    """The rest of a `_estimate_prepare` task once its walk has finished
+    (`estimate_advance` returned False): the walker's trace record, then
+    `_estimate_and_apply`'s `AppendModels` onto `cursor` from the task's
+    `d_est`, ENQUEUED, and the leaves' copy into the workspace's `h_est`.
+
+    lane cpu4-gbdt: the leaves are on the device (`device_done`), so
+    `leaf_values` comes back EMPTY; the caller reads the task's leaves from
+    `est_ws[0].h_est` after its next drain (`walk_leaf_values`). The caller
+    drains before it reuses `est_ws` or lets `pending` die (the oracle's
+    buffers are read by the launch below)."""
+    if pending.phase != 2 or not pending.device_done:
+        raise Error("_estimate_complete before the walk finished")
+    ref oracle = pending.oracle
+    merge_stage_times(stage_times, oracle.times)
+    var n_leaves = pending.n_leaves
+    ref d_est = est_ws[0].d_est
+    trace.record_device(ctx, leaf_tag, d_est, n_leaves)
+    leaf_values.clear()
+    var bk_applied = False
+    comptime if CTR_SORTFREE_SUMS:
+        # Lane S3: the cursor is in original order and row r's leaf is
+        # `natural_bins[r]` (the same per-row statement, `bin_keyed_stats`)
+        if append_to_cursor and natural_bins.__bool__():
+            var nb = natural_bins.value().copy()
+            enqueue_bin_keyed_apply(
+                ctx, nb, d_est, learning_rate, cursor, pending.n_rows
+            )
+            bk_applied = True
+    if append_to_cursor and not bk_applied:
+        var amv_gx = 2 * oracle.sm_count
+        if amv_gx < 1:
+            amv_gx = 1
+        ctx.enqueue_function[add_model_value_kernel](
+            oracle.d_p_off.unsafe_ptr(),
+            oracle.d_p_sz.unsafe_ptr(),
+            row_index.unsafe_ptr(),
+            d_est.unsafe_ptr(),
+            learning_rate,
+            cursor.unsafe_ptr(),
+            Int32(1), Int32(pending.n_rows),
+            grid_dim=(amv_gx, n_leaves, 1),
+            block_dim=(256, 1, 1),
+        )
+    ctx.enqueue_copy(dst_ptr=est_ws[0].h_est.unsafe_ptr(), src_buf=d_est)
+
+
+def walk_leaf_values(
+    mut est_ws: List[TEstimationWorkspace], n_leaves: Int
+) -> List[Float32]:
+    """A finished device walk's leaves, from the `h_est` copy
+    `_estimate_complete` enqueued, after the caller's drain: the host model's
+    download (the boosting loop keeps its ensemble on the host; lane
+    cpu4-gbdt's device-resident model item is not done)."""
+    var out = List[Float32](length=n_leaves, fill=Float32(0.0))
+    memcpy(
+        dest=out.unsafe_ptr(),
+        src=est_ws[0].h_est.unsafe_ptr(),
+        count=n_leaves,
+    )
+    return out^
+
+
+
+def _launch_querywise_pointwise_target(
+    ctx: DeviceContext,
+    objective: Int,
+    second_order: Bool,
+    mut query: Optional[QuerywiseTargetBuffers],
+    mut pairs: Optional[PairwiseTargetBuffers],
+    mut yeti: Optional[YetiRankTargetBuffers],
+    mut cursor: DeviceBuffer[DType.float32],
+    yeti_seed: UInt64,
+    mut stats: DeviceBuffer[DType.float32],
+    mut value_partials: DeviceBuffer[DType.float32],
+    mut magnitude_partials: DeviceBuffer[DType.float32],
+    compute_magnitudes: Bool,
+) raises:
+    # FAIRNESS FIX (2026-10-13 audit): the doc-parallel searcher's
+    # ComputeWeakTarget calls GradientAtZero for Cosine/L2 and NewtonAtZero
+    # for Newton scores (CatBoost 1.2.10, oblivious_tree_doc_parallel_
+    # structure_searcher.cpp:179-185). Querywise StochasticDer, used by the
+    # OTHER searcher, reverses that flag. Do not dispatch through it here.
+    # The two planes are [weight-or-Hessian, weighted gradient], in original
+    # document order. Query/explicit-pair state stays fit-owned and is also
+    # passed to the grouped leaf estimator after the structure is grown.
+    if objective == OBJECTIVE_QUERY_RMSE and query.__bool__():
+        # QueryRMSE's Hessian equals its row weight in either score mode.
+        launch_query_rmse_with[False](
+            ctx, query.value(), cursor, False, stats, value_partials, True,
+            magnitude_partials, compute_magnitudes,
+        )
+    elif objective == OBJECTIVE_PAIR_LOGIT and pairs.__bool__():
+        if second_order:
+            launch_pair_logit_with[False, True](
+                ctx, pairs.value(), cursor, False, stats, value_partials,
+                True, magnitude_partials, compute_magnitudes,
+            )
+        else:
+            launch_pair_logit_with[False, False](
+                ctx, pairs.value(), cursor, False, stats, value_partials,
+                True, magnitude_partials, compute_magnitudes,
+            )
+    elif objective == OBJECTIVE_YETI_RANK and yeti.__bool__():
+        # YetiRank GradientAt delegates to NewtonAt. Its sampled pair
+        # weights occupy plane zero for every score function; one seed is
+        # consumed for this derivative call, not once per plane.
+        launch_yeti_rank_with[False](
+            ctx, yeti.value(), cursor, False, yeti_seed, stats,
+            value_partials, True, magnitude_partials, compute_magnitudes,
+        )
+    else:
+        raise Error("the pointwise querywise target is missing its grouped state")
+
+
+def fit_with_test(
+    mut model: TAdditiveModel,
+    ctx: DeviceContext,
+    n_rows: Int,
+    fold_counts: List[Int],
+    max_depth: Int,
+    mut cindex: DeviceBuffer[DType.uint32],
+    mut targets: DeviceBuffer[DType.float32],
+    mut weights: DeviceBuffer[DType.float32],
+    has_weights: Bool,
+    n_estimators: Int,
+    mut trace: IdentityTrace,
+    learning_rate: Float32 = Float32(0.03),
+    l2_leaf_reg: Float32 = Float32(3.0),
+    use_subtraction: Bool = True,
+    bootstrap_bayesian: Bool = False,
+    bagging_temperature: Float32 = Float32(1.0),
+    bootstrap_type: Int = -1,
+    bootstrap_param: Float32 = Float32(1.0),
+    random_seed: UInt64 = UInt64(0),
+    one_hot: List[Bool] = List[Bool](),
+    score_function: Int = SCORE_FUNCTION_COSINE,
+    objective: Int = OBJECTIVE_RMSE,
+    num_classes: Int = 0,
+    logloss_border: Float32 = Float32(0.5),
+    leaf_estimation_iterations: Int = 1,
+    leaf_estimation_method: Int = LEAF_ESTIMATION_NEWTON,
+    alpha: Float32 = Float32(0.0),
+    estimator_alpha: Float32 = Float32(0.5),
+    boost_from_average: Bool = False,
+    # THE HELD-OUT ARM IS OPTIONAL AND EVERY EXISTING CALLER IS
+    # UNCHANGED. `fit` has nine call sites across checks, benches and
+    # `train`, one of which belongs to another session, so these are
+    # additive with defaults rather than a new required argument.
+    var test: Optional[TestArm] = None,
+    # THE OTHER PERMUTATIONS' COMPRESSED INDICES, in permutation order and
+    # INCLUDING the estimation one, which must be `cindex` itself. Empty
+    # means one permutation, which is what every caller but `train` passes
+    # and what CatBoost itself uses without a CTR-bearing categorical
+    # feature (`cuda/train_lib/train.cpp:99-108`).
+    var perm_cindexes: List[DeviceBuffer[DType.uint32]] = List[
+        DeviceBuffer[DType.uint32]
+    ](),
+    est_permutation: Int = -1,
+    # `TObliviousTreeLearnerOptions::RandomStrength`
+    # (`oblivious_tree_options.cpp:17`). **THEIR DEFAULT IS 1.0 AND THIS
+    # ONE IS 0.0**; see `CatBoostOptions.random_strength` for why the
+    # default did not move with the implementation.
+    #
+    # It reaches BOTH searchers and does something on only one of them:
+    # the doc-parallel arm's noise survives into the gain
+    # (`kernel/pointwise_scores.cu:396-402`), the greedy arm's cancels
+    # against its own before-calcer (`compute_scores.cu:84-134`). That is
+    # CatBoost's behaviour, not a gap here.
+    random_strength: Float32 = Float32(0.0),
+    # WHICH STRUCTURE SEARCHER GROWS THE TREE. False is
+    # `TGreedySubsetsSearcher`, which is what this repository has always
+    # run and what CatBoost runs for MULTICLASS symmetric trees. True is
+    # `TDocParallelObliviousTreeSearcher`, which is what CatBoost runs for
+    # SINGLE-TARGET symmetric trees at `boosting_type=Plain`
+    # -- the arm every matched benchmark pins CatBoost
+    # to.
+    #
+    # Additive with a default, like `test` above and for the same reason:
+    # `fit` has nine call sites and one belongs to another session.
+    #
+    # DEFAULT IS FALSE, and that is not timidity. The two searchers pick
+    # IDENTICAL splits (`pixi run check-pointwise-vs-greedy`), so this is
+    # not a correctness switch. The arm's old per-tree overheads are
+    # falling -- the host round trip in `split_stat_planes` became a
+    # device launch, DEVIATION 143 pools its per-tree construction --
+    # but the arm still trails the greedy searcher at the measured
+    # shapes, and flipping the default is a MEASUREMENT's job in a
+    # settled window: bit-identity plus a speed win, or it stays False.
+    use_pointwise_searcher: Bool = False,
+    od_type: Int = OD_NONE,
+    od_pvalue: Float64 = OD_DEFAULT_STOP_PVALUE,
+    od_wait: Int = OD_DEFAULT_WAIT_ITERATIONS,
+    # ============================ DEVIATION 259 ============================
+    # `grow_policy`, `max_leaves`, `min_data_in_leaf` -- their
+    # `TObliviousTreeLearnerOptions::{GrowPolicy, MaxLeaves, MinDataInLeaf}`
+    # (`oblivious_tree_options.cpp:23-25`). Additive with defaults, like
+    # every argument after `trace`, so the nine `fit` call sites and every
+    # oracle fixture run the code they ran before, to the bit.
+    #
+    # SymmetricTree (the default) is the loop this file has always been.
+    # Depthwise and Lossguide grow `TNonSymmetricTree` through
+    # `fit_non_symmetric_tree` -- ONE searcher for both, as theirs is one
+    # `TGreedySearchHelper` with `switch (Options.Policy)` -- and then take
+    # their `NeedEstimation` arm UNCONDITIONALLY: `ComputeBins` off the
+    # model (`doc_parallel_leaves_estimator.cpp:48`), the estimator, and
+    # `AddBinModelValues` for the apply. DEVIATION 64's RMSE shortcut is
+    # the GREEDY OBLIVIOUS arm's (its leaf is applied inside
+    # `run_tree_layout`); this arm has no such in-searcher apply and runs
+    # the estimator exactly as the pointwise arm does, so for RMSE the
+    # numbers are the same Newton step from zero by DEVIATION 64's own
+    # derivation.
+    #
+    # THE MODEL IS A `TNonSymmetricTree` PER WEAK MODEL. Their trainer
+    # returns `TAdditiveModel<TNonSymmetricTree>` for these policies
+    # (`train.cpp:436-455`); here the same `model` carries them in
+    # `non_symmetric_models`, and `predict` / the held-out apply / the
+    # model text dispatch on the shape.
+    #
+    # `max_leaves` is READ ONLY UNDER LOSSGUIDE (`catboost_options.cpp:
+    # 993-1001` pins every other policy to `1 << depth`, which is what the
+    # -1 resolves to); `min_data_in_leaf` is `MinLeafSize`, live under the
+    # non-symmetric policies only (`greedy_search_helper.cpp:685` guards
+    # the size test with `Policy != SymmetricTree`). The CALLER refuses
+    # the pairs CatBoost refuses; this function takes resolved numbers.
+    # =======================================================================
+    grow_policy: Int = GROW_SYMMETRIC,
+    max_leaves: Int = -1,
+    min_data_in_leaf: Int = 1,
+    min_split_gain: Float64 = -1,
+    min_child_hessian: Float64 = -1.0,
+    feature_fraction: Float64 = 1.0,
+    # the pool's grouping as query sizes in row order, read by
+    # `objective=OBJECTIVE_QUERY_RMSE` only (`gbdt/train.mojo::train` resolves
+    # it, `TWithoutQueriesGrouping` included)
+    group_sizes: List[UInt32] = List[UInt32](),
+    # the PairLogit pairs in the device order, winner row, loser row and
+    # weight per pair (`gbdt/train.mojo::train` generates or checks them);
+    # read by `objective=OBJECTIVE_PAIR_LOGIT` only
+    pair_winners: List[UInt32] = List[UInt32](),
+    pair_losers: List[UInt32] = List[UInt32](),
+    pair_weights: List[Float32] = List[Float32](),
+) raises -> FitResult:
+    """Their `Fit` (`doc_parallel_boosting.h:302`), one permutation.
+
+    `objective` selects the loss and `alpha` is the one float its kernel
+    takes; `leaf_estimation_method` and `leaf_estimation_iterations` come
+    from `set_leaves_estimation_default`, which is where CatBoost decides
+    them per loss (`catboost_options.cpp:273-360`). THE CALLER RESOLVES
+    THEM -- this function does not re-derive a default, because a default
+    derived in two places drifts in one of them.
+
+    Every loss but one runs their `NeedEstimation` arm
+    (`doc_parallel_boosting.h:371-385`): structure only from the searcher,
+    then `TDocParallelLeavesEstimator` -- oracle over the bin-sorted rows,
+    the walker, then the rescaled model applied to the cursor.
+
+    DEVIATION 64: RMSE AT NEWTON-1 SKIPS THE ESTIMATOR. Their
+    `NeedEstimation()` is `LeavesEstimationMethod != Simple`
+    (`greedy_subsets_searcher.h:67-69`), which is TRUE for RMSE, so theirs
+    runs the estimator and overwrites the searcher's leaf. This implementation does
+    not, because for RMSE alone the two answers are the same number:
+    the searcher writes `stats / (w + L2Reg)`
+    (`greedy_search_helper.cpp:646-647`) and one Newton step from zero
+    writes `Gradient / (Hessian + 1e-20)` with `Hessian = w + L2Reg`,
+    since `TRmseTarget::Der2` returns `1.0f` and the kernel stores
+    `weight * Der2` -- they agree to every representable digit. The skip
+    is conditioned on BOTH the objective AND `Newton` at ONE iteration,
+    so a caller who asks RMSE for Gradient leaves, or for more than one
+    iteration, gets the estimator like everyone else.
+
+    UNDER BOOTSTRAP THE ESTIMATOR SEES THE PLAIN WEIGHTS: their
+    `AddEstimationTask` takes `learnTarget`, not the bootstrapped weak
+    target (`doc_parallel_boosting.h:377-383`) -- sampling shapes the
+    STRUCTURE only.
+
+    `learning_rate` is their `Config.LearningRate`, whose default is **0.03**
+    (`boosting_options.cpp:10`). It stood at 0.3 here, a tenfold larger step
+    than stock CatBoost, which is a different model for every caller that did
+    not pass one. See `CatBoostOptions.learning_rate` for the data-dependent
+    retune (`options_helper.cpp:269-288`) that is deliberately not implemented.
+
+    Returns the loss per row after each iteration: their `functionValue`
+    (`pointwise_targets.cu:271`, `:363` for the cross-entropy arm) with the
+    sign flipped and divided by the row count, because everything
+    downstream of theirs maximizes and a caller here wants a number that
+    falls. It is computed IN THE SAME LAUNCH as the gradients, as theirs
+    is, and folded from per-block partials in one fixed order; the host
+    loop this replaced cost about 5 ms/tree at 800k rows.
+
+    The loss is returned rather than printed because the thing worth
+    asserting is that it DECREASES, and an assertion needs the numbers.
+    """
+    # `GetDim()` (`multiclass_targets.h:129-133`): `numClasses - 1` for
+    # MultiClass, 1 for everything else. The cursor carries this many
+    # planes and the stats carry one more -- their `statCount` is
+    # `1 + point.GetColumnCount()` (`pointwise_target_impl.h:186`).
+    check_feature_fraction(feature_fraction)
+    if feature_fraction < 1:
+        for fi in range(len(one_hot)):  # small-loop(one_hot: one flag per feature): a parameter check that only raises
+            if one_hot[fi]:
+                raise Error("feature_fraction<1 supports numeric features only")
+    var approx_dim = 1
+    if objective == OBJECTIVE_MULTICLASS:
+        if num_classes < 2:
+            raise Error(
+                "MultiClass needs num_classes >= 2, got "
+                + String(num_classes)
+            )
+        approx_dim = num_classes - 1
+    elif objective == OBJECTIVE_MULTICLASS_OVA:
+        # `GetDim()` is `NumClasses` -- no pinned class
+        if num_classes < 2:
+            raise Error(
+                "MultiClassOneVsAll needs num_classes >= 2, got "
+                + String(num_classes)
+            )
+        approx_dim = num_classes
+    elif objective == OBJECTIVE_MULTIRMSE:
+        # `GetDim()` is `NumClasses`, which MultiRMSE sets to the target
+        # dimension (`multiclass_targets.h:155-156`); `num_classes` carries
+        # that dimension here, and `targets` holds that many dim-major
+        # planes of `n_rows`. Their `CB_ENSURE(NumClasses > 1, "Only one
+        # class found, can't learn multiclass objective")` (`:167`).
+        if num_classes < 2:
+            raise Error(
+                "Only one class found, can't learn multiclass objective"
+                " (MultiRMSE needs a target dimension >= 2, their"
+                " multiclass_targets.h:167); got " + String(num_classes)
+            )
+        approx_dim = num_classes
+        if leaf_estimation_method == LEAF_ESTIMATION_EXACT:
+            raise Error(
+                "Exact leaves estimation is one-dimensional"
+                " (ComputeExactValue, permutation_der_calcer.h:98-110);"
+                " MultiRMSE does not reach it"
+            )
+        if use_pointwise_searcher:
+            # their MultiRMSE trainer is `TGpuTrainer<
+            # TMultiClassificationTargets>` through the GREEDY subsets
+            # searcher's template (`cuda/train_lib/multiclass.cpp:1-13`);
+            # the doc-parallel oblivious searcher is single-target
+            raise Error(
+                "use_pointwise_searcher is TDocParallelObliviousTreeSearcher,"
+                " a single-target searcher; MultiRMSE is trained by"
+                " TGreedySubsetsSearcher only (cuda/train_lib/multiclass.cpp:"
+                "1-13)"
+            )
+        if test.__bool__() and test.value().n_rows > 0:
+            raise Error(
+                "MultiRMSE with an eval set is not carried here: the held-out"
+                " arm's target is one value per row"
+            )
+    var stat_count = 1 + approx_dim
+
+    _ = child_hessian_threshold(min_child_hessian, grow_policy, score_function)
+    check_child_hessian_objective(min_child_hessian, objective)
+    if not isfinite(min_split_gain) or (min_split_gain < 0 and min_split_gain != -1):
+        raise Error("min_split_gain must be -1 (disabled) or finite nonnegative")
+    if min_split_gain >= 0 and grow_policy == GROW_SYMMETRIC:
+        raise Error("min_split_gain requires Depthwise or Lossguide")
+    # ---- the non-symmetric policies' own refusals (DEVIATION 259) ----
+    var non_symmetric = grow_policy != GROW_SYMMETRIC
+    if non_symmetric:
+        if grow_policy != GROW_DEPTHWISE and grow_policy != GROW_LOSSGUIDE:
+            raise Error(
+                "grow_policy " + String(grow_policy) + " is not"
+                " SymmetricTree, Depthwise or Lossguide; EGrowPolicy::Region"
+                " is unimplemented (structure_searcher_options.check)"
+            )
+        if use_pointwise_searcher:
+            # `TDocParallelObliviousTreeSearcher` grows OBLIVIOUS trees and
+            # nothing else: their non-symmetric trainers are
+            # `TGpuTrainer<TPointwiseTargetsImpl, TNonSymmetricTree>`
+            # through `train_template_pointwise_greedy_subsets_searcher.h`
+            # (`pointwise_non_symmetric.cpp:5`), never the doc-parallel
+            # oblivious searcher. Refused by name rather than silently
+            # growing a symmetric tree under a non-symmetric name.
+            raise Error(
+                "use_pointwise_searcher is TDocParallelObliviousTreeSearcher,"
+                " an OBLIVIOUS searcher; grow_policy="
+                + grow_policy_name(grow_policy)
+                + " is grown by TGreedySubsetsSearcher<TNonSymmetricTree>"
+                " only (pointwise_non_symmetric.cpp:5-29)"
+            )
+        if (
+            objective == OBJECTIVE_MULTICLASS
+            or objective == OBJECTIVE_MULTICLASS_OVA
+            or objective == OBJECTIVE_MULTIRMSE
+        ):
+            # MultiRMSE is registered beside them, the same way
+            # (`multiclass.cpp:13`).
+            #
+            # their GPU trainer registry has NO (MultiClass, Depthwise) or
+            # (MultiClass, Lossguide) entry -- `multiclass.cpp:5-14`
+            # registers the multiclass targets at the default grow policy
+            # only -- so `TGpuTrainerFactory::Has` fails with "optimization
+            # scheme is not supported for GPU learning" (`train.cpp:279`).
+            raise Error(
+                "Error: optimization scheme is not supported for GPU learning"
+                " Loss=MultiClass;OptimizationScheme="
+                + grow_policy_name(grow_policy)
+                + " (their TGpuTrainerFactory has no non-symmetric"
+                " multiclass trainer, multiclass.cpp:5-14, train.cpp:279)"
+            )
+    # `catboost_options.cpp:993-1001`: every policy but Lossguide pins
+    # MaxLeaves to `1 << MaxDepth`; -1 here is their IsDefault() arm
+    var ns_max_leaves = max_leaves
+    if grow_policy != GROW_LOSSGUIDE:
+        if max_leaves >= 0 and max_leaves != (1 << max_depth):
+            raise Error(
+                "max_leaves option works only with lossguide tree growing"
+                " (catboost_options.cpp:998); for "
+                + grow_policy_name(grow_policy)
+                + " it is 1 << depth == " + String(1 << max_depth)
+                + ", got " + String(max_leaves)
+            )
+        ns_max_leaves = 1 << max_depth
+    elif ns_max_leaves < 0:
+        # their constructed default, `MaxLeaves("max_leaves", 31)`
+        # (`oblivious_tree_options.cpp:24`), which only Lossguide keeps
+        ns_max_leaves = 31
+    if non_symmetric and ns_max_leaves < 2:
+        raise Error(
+            "max_leaves must be at least 2 under "
+            + grow_policy_name(grow_policy) + ", got "
+            + String(ns_max_leaves)
+        )
+    if non_symmetric and min_data_in_leaf < 0:
+        raise Error(
+            "min_data_in_leaf must be non-negative, got "
+            + String(min_data_in_leaf)
+        )
+
+    # their `cursor`: the running prediction for every row. With
+    # `boost_from_average` false, `cursors->StartingPoint` is unset and
+    # `CreateCursors` writes `TVector<float> start(sampleCount, 0.0)`
+    # (`doc_parallel_boosting.h:180-186`); with it TRUE (IMPLEMENTED
+    # 2026-08-22), `StartingPoint = NCB::CalcOptimumConstApprox(loss,
+    # target, weights)` (`:174-182`) and every cursor plane is written
+    # with `const float value = (*cursors->StartingPoint)[dim]` -- the
+    # double narrowed to float32 exactly once, here as there. The same
+    # value goes on the model as its bias
+    # (`modelToExport.SetBias(cursors->StartingPoint)`, `:434`).
+    var starting_approx = Float64(0.0)
+    if boost_from_average:
+        if objective == OBJECTIVE_MULTIRMSE:
+            # THEIR LIST HAS MultiRMSE (`catboost_options.cpp:705-709`) and
+            # their `CalcOptimumConstApprox` gives it a per-dimension start
+            # (`optimal_const_for_loss.h:230-239`); the model's bias here
+            # is ONE Float64 (`TAdditiveModel.bias`, the model text's one-
+            # token `bias` record), so the per-dimension `SetBias` is not
+            # carried and the option is refused by name
+            raise Error(
+                "boost_from_average with loss MultiRMSE is not carried here:"
+                " its StartingPoint is per-dimension"
+                " (optimal_const_for_loss.h:230-239) and this model's bias is"
+                " one value"
+            )
+        if approx_dim != 1:
+            raise Error(
+                "boost_from_average is one-dimensional here; their ENSURE"
+                " list has no MultiClass either"
+            )
+        # on the device: the targets and weights stay put, every row sum
+        # is a fixed-order grid fold (gbdt/metrics/optimal_const_device.mojo,
+        # cpu-gpu-cleanup t-gbdt; was a download and a host loop)
+        starting_approx = optimum_const_approx_device(
+            ctx, objective, targets, weights, has_weights, n_rows,
+            Float64(estimator_alpha),
+        )
+        # their `modelToExport.SetBias` (`:434`), set here so an early
+        # stop or a raise mid-fit cannot produce a seeded-cursor model
+        # that forgot to say so.
+        model.bias = starting_approx
+    var start_value = Float32(starting_approx)
+    var cursor = ctx.enqueue_create_buffer[DType.float32](
+        approx_dim * n_rows
+    )
+    # every plane, not only the first
+    enqueue_fill(ctx, cursor, start_value)
+
+    # ---- the permutations -------------------------------------------
+    #
+    # `cursors->Cursors.resize(PermutationsCount())`
+    # (`doc_parallel_boosting.h:141`), all written to the same starting
+    # value (`:180-186`). `cursor` above IS the estimation permutation's
+    # and keeps its own variable, so a one-permutation fit runs the code
+    # it ran before this block existed, to the bit.
+    var perm_count = len(perm_cindexes)
+    if perm_count == 0:
+        perm_count = 1
+    var est_p = est_permutation
+    if est_p == -1:
+        est_p = perm_count - 1
+    if est_p < 0 or est_p >= perm_count:
+        raise Error(
+            "est_permutation " + String(est_p) + " is outside the "
+            + String(perm_count) + " permutations given"
+        )
+    #: one cursor per permutation, in permutation order.
+    #: `cursors[est_p]` IS `cursor` -- `DeviceBuffer.copy()` copies the
+    #: handle, not the bytes, so the two names are the same memory and a
+    #: write through either is seen by both. That is what keeps the
+    #: one-permutation path identical: it allocates one cursor, memsets it
+    #: once, and every kernel below writes the same buffer it always did.
+    var cursors = List[DeviceBuffer[DType.float32]]()
+    for p in range(perm_count):
+        if p == est_p:
+            cursors.append(cursor.copy())
+        else:
+            var c = ctx.enqueue_create_buffer[DType.float32](
+                approx_dim * n_rows
+            )
+            # `cursors->Cursors[i]`, ALL written to the same starting
+            # value (`doc_parallel_boosting.h:180-186`)
+            enqueue_fill(ctx, c, start_value)
+            cursors.append(c^)
+
+    # their der/der2 buffers, in the two-plane layout the histogram kernels
+    # already read. See the DEVIATION BLOCK in `pointwise_targets.mojo`.
+    var stats = ctx.enqueue_create_buffer[DType.float32](stat_count * n_rows)
+
+    # growth permutes this, so it is reseeded to the identity every
+    # iteration exactly as their per-iteration dataset view is -- ON THE
+    # DEVICE, their `MakeSequence` (`fill.cu:47`). This used to upload a
+    # host-built identity, 3.2 MB of H2D per tree at 800k rows.
+    var row_index = ctx.enqueue_create_buffer[DType.uint32](n_rows)
+
+    # their `functionValue`: ONE float, accumulated by `pointwise_target_kernel`'s block
+    # reduce + atomicAdd (`pointwise_targets.cu:309-317`). This replaces a
+    # HOST loop over every row per iteration (~5 ms/tree at 800k), which
+    # the reference never does.
+    var fv = ctx.enqueue_create_buffer[DType.float32](1)
+    var h_fv = ctx.enqueue_create_host_buffer[DType.float32](1)
+    # per-block partials for `pointwise_target_kernel`'s reduces, folded in one fixed
+    # order by `deterministic_sum_lanes_kernel`: the float-atomic combine
+    # they use made same-seed fits differ in the last bits of
+    # `fixed_scale` (bootstrap_check caught it, 2026-08-21)
+    var mse_blocks = (n_rows + MSE_BLOCK_SIZE - 1) // MSE_BLOCK_SIZE
+    # MultiClass launches at `multilogit_blocks`, which is the same 256
+    # threads x 1 element shape today; sized from the max so the partials
+    # buffers stay right if either constant ever moves.
+    var part_blocks = mse_blocks
+    if multilogit_blocks(n_rows) > part_blocks:
+        part_blocks = multilogit_blocks(n_rows)
+    # PairLogit's value partials are per 256 PAIRS (`pair_logit.mojo`)
+    if objective == OBJECTIVE_PAIR_LOGIT and pair_blocks(len(pair_winners)) > part_blocks:
+        part_blocks = pair_blocks(len(pair_winners))
+    comptime if PAIRLOGIT_GROUP_FUSED:
+        # the group layout (`pair_logit_group.mojo`): one value partial and
+        # two magnitudes per GROUP
+        if objective == OBJECTIVE_PAIR_LOGIT and len(group_sizes) > part_blocks:
+            part_blocks = len(group_sizes)
+    var fv_part = ctx.enqueue_create_buffer[DType.float32](part_blocks)
+    var mag_part = ctx.enqueue_create_buffer[DType.float32](
+        2 * part_blocks
+    )
+
+    # ---- the QUERYWISE target (QueryRMSE) ----
+    # `TQuerywiseTargetsImpl` (`targets/querywise_targets_impl.h`) over the
+    # doc-parallel grouping (`gpu_data/samples_grouping_gpu.h`). This
+    # implementation carries it on either SymmetricTree searcher at one
+    # permutation with no held-out set; every other arm refuses it by name.
+    var is_querywise = objective == OBJECTIVE_QUERY_RMSE
+    var query_buffers = Optional[QuerywiseTargetBuffers]()
+    if is_querywise:
+        var has_test_rows = test.__bool__() and test.value().n_rows > 0
+        if non_symmetric or perm_count > 1 or has_test_rows:
+            raise Error(
+                "QueryRMSE is implemented for a SymmetricTree"
+                " searcher at one permutation with no eval set; this fit asked"
+                " for another arm"
+            )
+        query_buffers = Optional(
+            make_querywise_target_buffers(
+                ctx, group_sizes, n_rows, targets, weights, has_weights
+            )
+        )
+    # ---- the PAIRWISE-DERIVATIVE querywise target (PairLogit) ----
+    # `TQuerywiseTargetsImpl`'s `InitPairLogit` arm over the pairs
+    # (`gbdt/targets/kernel/pair_logit.mojo`), on the same arm as QueryRMSE.
+    # The caller already replaced `weights` with the per-row pair weights.
+    var is_pair_logit = objective == OBJECTIVE_PAIR_LOGIT
+    var pair_buffers = Optional[PairwiseTargetBuffers]()
+    var loss_norm = Float64(n_rows)
+    if is_pair_logit:
+        var has_test_rows = test.__bool__() and test.value().n_rows > 0
+        if non_symmetric or perm_count > 1 or has_test_rows:
+            raise Error(
+                "PairLogit is implemented for a SymmetricTree"
+                " searcher at one permutation with no eval set; this fit asked"
+                " for another arm"
+            )
+        comptime if PAIRLOGIT_GROUP_FUSED:
+            if len(pair_winners) == 0:
+                # generated pairs: the group layout, enumerated on the device
+                # from the grades, no pair list (`pair_logit_group.mojo`);
+                # `train` left the sample weights in `weights` for it
+                pair_buffers = Optional(
+                    make_pairwise_group_buffers(
+                        ctx, group_sizes, n_rows, targets, weights
+                    )
+                )
+            else:
+                pair_buffers = Optional(
+                    make_pairwise_target_buffers(
+                        ctx, pair_winners, pair_losers, pair_weights, n_rows
+                    )
+                )
+        else:
+            pair_buffers = Optional(
+                make_pairwise_target_buffers(
+                    ctx, pair_winners, pair_losers, pair_weights, n_rows
+                )
+            )
+        # `ComputeStats`' PairLogit weight (`querywise_targets_impl.h:98-101`)
+        loss_norm = pair_buffers.value().pairs_total_weight
+    # ---- the SAMPLED-PERMUTATION querywise target (YetiRank) ----
+    # `TQuerywiseTargetsImpl`'s `InitYetiRank` arm
+    # (`gbdt/targets/kernel/yeti_rank.mojo`), on the same arm as QueryRMSE,
+    # at the reference's loss defaults (permutations 10, decay 0.85,
+    # `loss_description.cpp:181-193`).
+    var is_yeti_rank = objective == OBJECTIVE_YETI_RANK
+    var yeti_buffers = Optional[YetiRankTargetBuffers]()
+    # ================= DEVIATION: the YetiRank draw stream =================
+    # The reference draws each derivative call's seed with
+    # `GetRandom().NextUniformL()` from the one `TGpuAwareRandom` the whole fit
+    # shares with the base iteration seed and the searcher's score seeds
+    # (`querywise_targets_impl.h:213-229`). This implementation already keeps
+    # those streams apart (DEVIATION 139), so YetiRank gets a stream of its
+    # own, `TRandom(random_seed ^ "YETIRANK")`: per tree, one draw for the
+    # search pass, then one that seeds the tree's estimation stream (one draw
+    # per evaluation, `pointwise_oracle.mojo`). The host fit
+    # (`gbdt/host/gbdt_oracle_losses.mojo`) draws in the same order. The GPU
+    # reference's bits cannot be reproduced; both columns here agree.
+    # ======================================================================
+    var yeti_rand = TRandom(random_seed ^ UInt64(0x5945544952414E4B))
+    if is_yeti_rank:
+        var has_test_rows = test.__bool__() and test.value().n_rows > 0
+        if non_symmetric or perm_count > 1 or has_test_rows:
+            raise Error(
+                "YetiRank is implemented for a SymmetricTree"
+                " searcher at one permutation with no eval set; this fit asked"
+                " for another arm"
+            )
+        yeti_buffers = Optional(
+            make_yeti_rank_target_buffers(
+                ctx, group_sizes, n_rows, targets, weights, has_weights,
+                10, Float32(0.85),
+            )
+        )
+    # The pointwise searcher here returns a structure, then the native
+    # grouped oracle estimates its leaves. CatBoost Simple instead retains
+    # the BOOTSTRAPPED search-stat leaves; routing it through the oracle
+    # would silently change the algorithm. Keep that new combination
+    # explicitly unavailable until those search leaves are carried through.
+    if use_pointwise_searcher and (is_querywise or is_pair_logit or is_yeti_rank):
+        if (
+            leaf_estimation_method != LEAF_ESTIMATION_NEWTON
+            and leaf_estimation_method != LEAF_ESTIMATION_GRADIENT
+        ):
+            raise Error(
+                "querywise use_pointwise_searcher requires Newton or Gradient"
+                " leaf estimation; Simple search-stat leaves and Exact are"
+                " not implemented on this arm"
+            )
+    if not (is_querywise or is_pair_logit or is_yeti_rank) and (
+        len(group_sizes) > 0 or len(pair_winners) > 0
+    ):
+        raise Error(
+            "fit_with_test: group_sizes and pairs are read by the QueryRMSE,"
+            " PairLogit and YetiRank objectives only, got objective "
+            + String(objective)
+        )
+
+    # THE FIXED-POINT BOUND, for every build whose histogram quantizes: the
+    # IDENTICAL flush, and the Apple column's `HIST_SMEM_SHARED2_I32`
+    # shared-memory accumulation, which quantizes at `fixed_scale` even
+    # under FAST (`hist_smem_mode_for` in `checks/kernel_matrix.mojo`).
+    # The scale must be bounded by `sum over all rows of abs(plane)`, and
+    # the two plane magnitudes are computed ON THE DEVICE by `pointwise_target_kernel`'s
+    # magnitude reduce -- the same block-reduce-plus-one-atomicAdd shape as
+    # its `functionValue` -- into TWO scalars read back below. This replaces
+    # a full-stats readback (6.4 MB at 800k rows) plus a `2 * n_rows` host
+    # loop per tree. A build that quantizes nothing (NVIDIA and 32-lane AMD
+    # FAST, whose hist_2 arm keeps CatBoost's warp-private float design)
+    # skips the launch flag, the copy and the sync at comptime. A 64-lane
+    # column's FAST build quantizes: its one-byte blocks route through the
+    # fused 8-bit fixed-point kernel (`greedy_one_byte_fixed_for`,
+    # DEVIATION 1906), so it needs the bound exactly as the Apple column
+    # does -- an unbounded scale here is the WHY THIS EXISTS failure below.
+    comptime _flush_fixed = deterministic_flush_for[
+        TARGET_COLUMN, PIN_DETERMINISM
+    ]()
+    comptime _one_byte_fixed = greedy_one_byte_fixed_for[
+        TARGET_COLUMN, HIST_BUILD_MODE == NUMERIC_IDENTICAL
+    ]()
+    comptime _needs_magnitudes = (
+        _flush_fixed or HIST2_SMEM_IS_I32 or _one_byte_fixed
+    )
+    var mags = ctx.enqueue_create_buffer[DType.float32](2)
+    var h_mags = ctx.enqueue_create_host_buffer[DType.float32](2)
+
+    # their `TGpuAwareRandom::GetGpuSeeds`: the per-thread RNG state of
+    # the whole fit, created once and advanced in place by every draw
+    # (`gbdt/gpu_util/kernel/bootstrap.mojo`). One dummy word when
+    # bootstrap is off.
+    # `bootstrap_type` is the real switch; `bootstrap_bayesian` predates
+    # it and stays as the shorthand every existing caller and check
+    # passes. `-1` means "take the bool", so no caller changes meaning.
+    var boot_kind = bootstrap_type
+    var boot_param = bootstrap_param
+    if boot_kind < 0:
+        boot_kind = (
+            BOOTSTRAP_KERNEL_BAYESIAN if bootstrap_bayesian else -1
+        )
+        boot_param = bagging_temperature
+    var bootstrap_on = boot_kind >= 0
+    # Querywise targets form full-query gradients before this row bootstrap.
+    # CatBoost's greedy searcher uses the same samples mapping and multiplies
+    # both planes in querywise_targets_impl.h::StochasticDer (162-188).
+
+    var boot_seeds: DeviceBuffer[DType.uint64]
+    if bootstrap_on:
+        boot_seeds = create_bootstrap_seeds(ctx, random_seed)
+    else:
+        boot_seeds = ctx.enqueue_create_buffer[DType.uint64](1)
+    var boot_mag_part = ctx.enqueue_create_buffer[DType.float32](
+        2 * bootstrap_grid_blocks(n_rows)
+    )
+
+    # ONE device query for the estimator's reduces: `get_attribute` costs
+    # 1.26 ms on this Metal device and their `SMCount()` is a cached static.
+    # their `weak->NeedEstimation()` (`greedy_subsets_searcher.h:67-69`)
+    # is `LeavesEstimationMethod != Simple`; DEVIATION 64 in the docstring
+    # is the one subtraction from it, and it is conditioned on the
+    # iteration count as well as on the objective.
+    var need_estimation = leaf_estimation_method != LEAF_ESTIMATION_SIMPLE
+    if (
+        objective == OBJECTIVE_RMSE
+        and leaf_estimation_method == LEAF_ESTIMATION_NEWTON
+        and leaf_estimation_iterations == 1
+    ):
+        need_estimation = False
+        # ...AND ONLY AT ONE PERMUTATION. DEVIATION 64 rests on the
+        # searcher's leaf being the same number a Newton step from zero
+        # gives, which it is -- for the rows the searcher partitioned. The
+        # other permutations partition the same tree differently, so their
+        # leaves are different numbers and there is nothing to reuse.
+        if perm_count > 1:
+            need_estimation = True
+    var est_sm = -1
+    # `use_pointwise_searcher` ALSO needs it, and that is DEVIATION 64
+    # meeting DEVIATION 104. Item 64 skips estimation for RMSE + Newton at
+    # one iteration and one permutation, because the GREEDY searcher's leaf
+    # already IS the Newton step. `TDocParallelObliviousTreeSearcher`
+    # returns the STRUCTURE ONLY -- theirs calls a separate
+    # `ReadAndEstimateLeaves` -- so the pointwise arm has no leaf to reuse
+    # and must run the estimator whatever item 64 says. Leaving `est_sm` at
+    # -1 hands the estimator's reduce an invalid block count.
+    # ...and the NON-SYMMETRIC arm too, for the same reason as the pointwise
+    # one: `fit_non_symmetric_tree` returns the searcher's own leaf values
+    # but never applies them, so the estimator runs on every tree whatever
+    # DEVIATION 64 says (the numbers coincide for RMSE by its derivation).
+    if need_estimation or use_pointwise_searcher or non_symmetric:
+        est_sm = ctx.get_attribute(DeviceAttribute.MULTIPROCESSOR_COUNT)
+    # the `random_strength` reduces are machine-sized like every strided
+    # grid of theirs, and neither of the two conditions above implies the
+    # option is set.
+    var noise_sm = est_sm
+    if random_strength != Float32(0.0) and noise_sm <= 0:
+        noise_sm = ctx.get_attribute(DeviceAttribute.MULTIPROCESSOR_COUNT)
+    # their `TGpuAwareRandom` for the fit, the one both searchers draw
+    # their per-level `GlobalSeed` from (`oblivious_tree_doc_parallel_
+    # structure_searcher.cpp:15`, `greedy_search_helper.h:15`). One draw
+    # per TREE here; see DEVIATION 139.
+    var noise_rand = TRandom(random_seed)
+
+    var losses = List[Float64]()
+    var test_losses = List[Float64]()
+    # `CreateOverfittingDetector(options, maxIsOptimal, hasTest)`
+    # (`overfitting_detector.cpp:205-207`). EVERY loss this implementation trains is
+    # MINIMIZED, so `maxIsOptimal` is False; a detector built without a
+    # test set is inert whatever was asked (`:122-124`).
+    var has_test = test.__bool__() and test.value().n_rows > 0
+    if has_test:
+        # their `CreateCursors` seeds the TEST cursor with the same
+        # `StartingPoint` (the CB_ENSURE at `:174-182` names
+        # TestDataProvider precisely because the seed reaches it)
+        ref t_arm = test.value()
+        # Device allocations are uninitialized. Without average boosting the
+        # starting point is zero, not the previous occupant of this buffer.
+        enqueue_fill(
+            ctx, t_arm.cursor,
+            start_value if boost_from_average else Float32(0.0),
+        )
+    var detector = make_overfitting_detector(
+        od_type, False, od_pvalue, od_wait, has_test
+    )
+    if od_type != OD_NONE and not has_test:
+        raise Error(
+            "od_type is set but there is no held-out set. Stopping on the"
+            " LEARN loss would stop on a curve that falls almost by"
+            " construction; their own detector is inert without a test"
+            " set (overfitting_detector.cpp:122-124) and this refuses"
+            " rather than silently never firing."
+        )
+    var stopped_early = False
+    # the SAME layout the searcher uses; the test rows were quantized
+    # against the same borders, so the same feature offsets apply
+    var layout_for_test = build_layout(fold_counts, one_hot)
+    var not_pd_blocks = 0
+    var not_pd_total = 0
+    # their `TVector<TResultModel>* result`, the ensemble being built
+
+    # THE POOL OF ONE, see `TTreeWorkspace`: the tree planes are the FIT's,
+
+    # not the tree's, so growing tree 2 allocates nothing.
+
+    var ws = List[TTreeWorkspace]()
+    # the pointwise arm's pool of one (DEVIATION 143), same span: the FIT's
+    var pw_pool = List[PointwiseTreeWorkspace]()
+    # the non-symmetric arm's per-leaf pool (`TDepthwiseWorkspace`), same
+    # span; `fit_non_symmetric_tree` re-keys it on the shape and reuses it
+    var dws = List[TDepthwiseWorkspace]()
+    # the ESTIMATOR's pool (DEVIATION 1890), same span: every
+    # `_estimate_and_apply` task of every permutation of every tree reuses
+    # one set of gather/staging buffers, keyed by (n_rows, approx_dim) with
+    # a leaf-count capacity
+    var est_ws = List[TEstimationWorkspace]()
+    # lane/apple-fast-sym-iter: the pointwise symmetric arm's pool of one
+    # (`SymIterPool`); inert (empty) under every build without the defines.
+    # TOMBSTONE: ANONLIB_SYM_DERIV_FUSED (DROPPED-noise) deleted 2026-10-09 on lane/owed-deletions-D1 (the
+    # prefetch carry); code recoverable at b639a2bd2. Restore: git apply experiments/removed/ANONLIB_SYM_DERIV_FUSED.patch.
+    var sym_pool = List[SymIterPool]()
+    # DEVIATION 2551: the non-symmetric estimator's device partition, the
+    # FIT's pool of one (empty and never touched on the default side)
+    var leaf_parts = List[DeviceLeafPartitioner]()
+    # CTR_PERM_BATCH: one partitioner and one estimation workspace per
+    # permutation (every task's buffers live at once), and the arena the
+    # batched path carves them from. Empty when the arm is compiled out.
+    var perm_leaf_parts = List[DeviceLeafPartitioner]()
+    # Lane S3 CTR_SORTFREE_SUMS: per permutation, the leaf row counts (device
+    # and host) and the bin-keyed fold's scratch, kept for the fit
+    var bk_counts = List[DeviceBuffer[DType.int32]]()
+    var bk_h_counts = List[HostBuffer[DType.int32]]()
+    var bk_parts = List[DeviceBuffer[DType.float32]]()
+    var bk_cap_rows = -1
+    var bk_cap_leaves = -1
+    var perm_est_ws = List[List[TEstimationWorkspace]]()
+    var perm_arena = BufferArena()
+    # FAST Depthwise and Lossguide fits otherwise download and counting-sort
+    # every row, then upload the same stable row order once per
+    # tree/permutation. The existing device partitioner produces identical
+    # integer partitions and is already the IDENTICAL default. Symmetric
+    # routing is unchanged (its learn permutation keeps the searcher's own
+    # partition).
+    # (cpu-gpu-cleanup t-gbdt: the host-partition A/B define is gone;
+    # `partition_from_bins` itself now partitions on the device, so the
+    # flag only picks the fit's pooled partitioner over a per-call one.)
+    var device_leaf_partition = DEVICE_LEAF_PARTITION or (
+        HIST_BUILD_MODE == NUMERIC_FAST
+        and (grow_policy == GROW_DEPTHWISE or grow_policy == GROW_LOSSGUIDE)
+    )
+
+    # `secondDerAsWeights = IsSecondOrderScoreFunction(scoreFunction)`.
+    # BOTH their searchers key the stat planes' content on it -- the greedy
+    # arm through `ComputeTarget` -> `StochasticDer`
+    # (`greedy_search_helper.cpp:286-296`), the doc-parallel arm through
+    # `NewtonAtZero` vs `GradientAtZero`
+    # (`oblivious_tree_doc_parallel_structure_searcher.cpp:195-207`) -- and
+    # both arms here read the ONE stats buffer the launch below fills, so
+    # this is the one place the flag applies.
+    var second_order = is_second_order_score_function(score_function)
+    if second_order and (
+        objective == OBJECTIVE_MULTICLASS
+        or objective == OBJECTIVE_MULTICLASS_OVA
+        or objective == OBJECTIVE_MULTIRMSE
+    ):
+        # their `CB_ENSURE(!secondDerAsWeights, ...)`
+        # (`multiclass_targets.cpp:27`), raised at fit entry rather than
+        # inside the first tree's der launch -- same first observable
+        # effect, no half-grown tree.
+        raise Error(
+            "MultiClass loss doesn't support second derivatives in tree"
+            " structure search currently (their CB_ENSURE,"
+            " `multiclass_targets.cpp:27`)"
+        )
+
+    # one stage clock per fit -- env read ONCE (ANONLIB_STAGE_TIMES=1);
+    # the identity trace arrives from the caller so border records and
+    # tree records share one seq space.
+    var stage_times = StageTimes()
+
+    # Independent portable stream; does not consume bootstrap/noise RNG draws.
+    var feature_random = Optional[TRandom]()
+    var feature_projection = Optional[FeatureProjectionWorkspace]()
+    if feature_fraction < 1:
+        feature_random = TRandom(random_seed ^ UInt64(0x4645415455524553))
+        feature_projection = FeatureProjectionWorkspace(ctx,n_rows,layout_for_test)
+    # DEVIATION 2552: host stamps over the boosting loop, the sites the
+    # DEVIATION 2510 tables left unstamped (ANONLIB_STAGE_TIMES=1 only,
+    # `stop_host`, NO drain added). Queued device work is charged to the
+    # stage that next drains, so read a row as "host time until this
+    # stage's own drain returned". Disjoint stages; `other` is the rest.
+    var loop_times = HostStageTimes()
+    var t_loop = loop_times.start()
+    # lane fix-g1-gbdt (`IDN_GBDT_SYM_EST_DEFER_DRAIN`): the structure of the
+    # tree whose estimation tail is still queued (settled after the next
+    # tree's search, or after the loop)
+    var deferred_splits = List[TBinarySplit]()
+    var has_deferred_tree = False
+    # TOMBSTONE: ANONLIB_EST_SHRINK_FUSED (DROPPED-inconclusive) deleted 2026-10-09 on lane/owed-deletions-D1 (the
+    # fused next-tree derivative pass); code recoverable at b639a2bd2. Restore: git apply experiments/removed/ANONLIB_EST_SHRINK_FUSED.patch.
+    for iteration in range(n_estimators):
+        var t_grad = loop_times.start()
+        # ---- which permutation the STRUCTURE is searched on ----------
+        #
+        # `TRandom rand(iteration + BaseIterationSeed); rand.Advance(10);`
+        # (`doc_parallel_boosting.h:343-345`) and the draw (`:349-351`):
+        #
+        #     learnPermutationCount = estimationPermutation
+        #                             ? permutationCount - 1 : 1
+        #     learnPermutationId = learnPermutationCount > 1
+        #         ? rand.NextUniformL() % (learnPermutationCount - 1) : 0
+        #
+        # **THE MODULUS IS `learnPermutationCount - 1`, NOT
+        # `learnPermutationCount`**, so at their default of four
+        # permutations the structure comes from permutation 0 or 1 and
+        # permutation 2 is never searched on. That reads like an
+        # off-by-one in the reference and it is kept rather than
+        # corrected, because a fit that searched on a permutation the reference
+        # never searches on would not be answering the same question. It is
+        # the same expression in their feature-parallel
+        # learner (`dynamic_boosting.h:286-289`), which is evidence it is
+        # deliberate or at least old.
+        var learn_perm_count = perm_count - 1 if est_p != 0 else 1
+        var learn_p = est_p
+        if learn_perm_count > 1:
+            var rnd = TRandom(UInt64(iteration) + random_seed)
+            rnd.advance(10)
+            learn_p = Int(
+                rnd.next_uniform_l() % UInt64(learn_perm_count - 1)
+            )
+        # the learn permutation's (index, cursor) pair, as HANDLES onto the
+        # real buffers -- `copy()` on a `DeviceBuffer` copies the handle,
+        # so the searcher writes the permutation's own cursor.
+        var lc = (
+            cindex.copy() if learn_p == est_p
+            else perm_cindexes[learn_p].copy()
+        )
+        var tree_folds = List[Int]()
+        var tree_layout = Optional[CompressedIndexLayout]()
+        var tree_cindex = lc.copy()
+        if feature_fraction < 1:
+            tree_folds = sample_tree_folds(
+                fold_counts, feature_fraction, feature_random.value(),
+            )
+            tree_layout = build_layout(tree_folds, one_hot)
+            tree_cindex = feature_projection.value().project(
+                ctx, lc, layout_for_test, tree_layout.value(),
+            )
+            # Projection drains prior tree readers before it rewrites staging.
+            # Refresh metadata while retaining compatible large arenas. The
+            # depthwise pool already refreshes bin-feature tables each tree and
+            # checks its capacities itself; pointwise caching stays conservative.
+            var reused_workspace = False
+            if len(ws) > 0:
+                reused_workspace = ws[0].refresh_sampled_layout(
+                    ctx, tree_layout.value(),
+                )
+                if not reused_workspace:
+                    ws.clear()
+            trace.record_scalar_f32(
+                _tree_tag(iteration) + ".feature_workspace_reused",
+                Float32(1) if reused_workspace else Float32(0),
+            )
+            pw_pool.clear()
+            if trace.enabled:
+                var selected_ids = List[Int32]()
+                for f in range(len(tree_folds)):
+                    if tree_folds[f] > 0:
+                        selected_ids.append(Int32(f))
+                trace.record_list_i32(
+                    _tree_tag(iteration) + ".sampled_features", selected_ids,
+                )
+        var lcur = cursors[learn_p].copy()
+        # `TTargetAtPointTrait::Create(learnTarget, cursor)` (`:353`).
+        # The gradients are taken AT THE CURRENT PREDICTIONS, which is the
+        # whole of what makes this boosting.
+        # their `functionValue` is accumulated in the SAME launch as the
+        # gradients, so the value this iteration reads is the loss of the
+        # cursor as it stands -- i.e. after the PREVIOUS tree.
+        var mags_in_mse = _needs_magnitudes and not bootstrap_on
+        # under bootstrap the magnitudes must bound the BOOTSTRAPPED
+        # planes (a Bayesian weight reaches ~46 at the tail), so the
+        # bootstrap kernel computes them AFTER its multiply instead
+        if objective == OBJECTIVE_MULTICLASS:
+            # `TMultiClassificationTargets::StochasticDer`
+            # (`multiclass_targets.cpp:22-45`): column 0 the weights,
+            # columns 1.. the ders, one per FREE class.
+            # TOMBSTONE: ANONLIB_MC_CLASS_BATCH_DERIV (DROPPED-noise) deleted 2026-10-09 on lane/owed-deletions-D1
+            # (the register-softmax arm here); code recoverable at b639a2bd2.
+            # Restore: git apply experiments/removed/ANONLIB_MC_CLASS_BATCH_DERIV.patch.
+            launch_multilogit_value_and_der_search(
+                ctx, num_classes, n_rows, targets, weights, has_weights,
+                lcur, n_rows, row_index, False,
+                fv_part, True,
+                stats, n_rows,
+                mag_part, mags_in_mse,
+            )
+        elif objective == OBJECTIVE_MULTICLASS_OVA:
+            # the same `StochasticDer`, its `MultiClassOneVsAll` arm
+            # (`:46-49`), where `statCount` keeps the full
+            # `1 + NumClasses` because there is no pinned class to drop.
+            launch_one_vs_all_value_and_der[True](
+                ctx, num_classes, n_rows, targets, weights, has_weights,
+                lcur, n_rows, row_index, False,
+                fv_part, True,
+                stats, n_rows,
+                mag_part, mags_in_mse,
+            )
+        elif objective == OBJECTIVE_MULTIRMSE:
+            # the same `StochasticDer`, its `MultiRMSE` arm (`:61-68`):
+            # column 0 the weights, columns 1.. `diff * weight` per target
+            # dimension, the target read as `num_classes` dim-major planes
+            launch_multi_rmse_value_and_der[True](
+                ctx, num_classes, n_rows, targets, n_rows,
+                weights, has_weights,
+                lcur, n_rows, row_index, False,
+                fv_part, True,
+                stats, n_rows,
+                mag_part, mags_in_mse,
+            )
+        elif use_pointwise_searcher and (is_querywise or is_pair_logit or is_yeti_rank):
+            # Complete grouped derivatives before bootstrap. The existing
+            # pointwise noise reduction below intentionally sees these
+            # unbootstrapped planes, as CatBoost ComputeWeakTarget does.
+            var search_yeti_seed = UInt64(0)
+            if is_yeti_rank:
+                search_yeti_seed = yeti_rand.next_uniform_l()
+            _launch_querywise_pointwise_target(
+                ctx, objective, second_order, query_buffers, pair_buffers,
+                yeti_buffers, lcur, search_yeti_seed, stats, fv_part,
+                mag_part, mags_in_mse,
+            )
+        elif is_querywise:
+            # `TQuerywiseTargetsImpl::StochasticDer`
+            # (`querywise_targets_impl.h:161-181`): whichever of `GradientAt`
+            # and `NewtonAt` the score function picks, plane 0 is the row
+            # weight for QueryRMSE and plane 1 is `weight * direction`, the
+            # point read in row order (no indices).
+            launch_query_rmse_with[False](
+                ctx, query_buffers.value(), lcur, False,
+                stats, fv_part, True, mag_part, mags_in_mse,
+            )
+        elif is_pair_logit:
+            # the search planes of `pair_logit.mojo`, whose weight plane
+            # follows `secondDerAsWeights`' meaning (the DEVIATION block there)
+            if second_order:
+                launch_pair_logit_with[False, True](
+                    ctx, pair_buffers.value(), lcur, False,
+                    stats, fv_part, True, mag_part, mags_in_mse,
+                )
+            else:
+                launch_pair_logit_with[False, False](
+                    ctx, pair_buffers.value(), lcur, False,
+                    stats, fv_part, True, mag_part, mags_in_mse,
+                )
+        elif is_yeti_rank:
+            # `GradientAt` calls `NewtonAt` for YetiRank
+            # (`querywise_targets_impl.h:131-134`), so both score arms read the
+            # pair weights in plane 0; the call's seed is this tree's first
+            # draw of the YetiRank stream (the DEVIATION at `yeti_rand`)
+            launch_yeti_rank_with[False](
+                ctx, yeti_buffers.value(), lcur, False,
+                yeti_rand.next_uniform_l(),
+                stats, fv_part, True, mag_part, mags_in_mse,
+            )
+        elif second_order:
+            # `secondDerAsWeights=true`: plane 0 becomes `weight * der2`
+            # (`pointwise_target_impl.h:193-201`); plane 1 stays
+            # `weight * der`. Runtime flag to comptime arm, the same shape
+            # as the objective dispatch one call down.
+            launch_approximate[False, True](
+                ctx, objective, targets, weights, Int32(n_rows), lcur,
+                Int32(1) if has_weights else Int32(0),
+                alpha, logloss_border,
+                stats, fv_part, Int32(1),
+                mag_part, Int32(1) if mags_in_mse else Int32(0),
+                mse_blocks,
+            )
+        else:
+            launch_approximate[False](
+                ctx, objective, targets, weights, Int32(n_rows), lcur,
+                Int32(1) if has_weights else Int32(0),
+                alpha, logloss_border,
+                stats, fv_part, Int32(1),
+                mag_part, Int32(1) if mags_in_mse else Int32(0),
+                mse_blocks,
+            )
+        var fv_blocks = mse_blocks
+        if objective == OBJECTIVE_MULTICLASS:
+            fv_blocks = multilogit_blocks(n_rows)
+        var mag_blocks = fv_blocks
+        if is_pair_logit:
+            fv_blocks = pair_buffers.value().blocks()
+            comptime if PAIRLOGIT_GROUP_FUSED:
+                # the group layout's magnitudes are per group too
+                if pair_buffers.value().n_pairs < 0:
+                    mag_blocks = fv_blocks
+        comptime if YETI_TASK_FUSED:
+            # lane af-sym-multi: the fused task kernel writes one magnitude
+            # pair per TASK (its launcher's guard, `n_tasks <= row_blocks`);
+            # the value partials stay one per row block (all 0.0)
+            if is_yeti_rank and yeti_buffers.value().n_tasks <= mse_blocks:
+                mag_blocks = yeti_buffers.value().n_tasks
+        ctx.enqueue_function[deterministic_sum_lanes_kernel[1]](
+            fv_part.unsafe_ptr(), Int32(fv_blocks), fv.unsafe_ptr(),
+            grid_dim=1, block_dim=256,
+        )
+        if mags_in_mse:
+            ctx.enqueue_function[deterministic_sum_lanes_kernel[2]](
+                mag_part.unsafe_ptr(), Int32(mag_blocks),
+                mags.unsafe_ptr(),
+                grid_dim=1, block_dim=256,
+            )
+        # ================ THE `random_strength` MAGNITUDE ==============
+        # `auto mult = CalcScoreModelLengthMult(objectCount,
+        #                                       iteration * step);`
+        # (`doc_parallel_boosting.h:358-359`), where `step` is the learning
+        # rate. It is handed to `CreateStructureSearcher(mult, ...)` and
+        # from there either multiplies the greedy searcher's option
+        # (`greedy_subsets_searcher.h:73-76`) or becomes the doc-parallel
+        # searcher's `ModelLengthMultiplier` (`oblivious_tree_doc_parallel_
+        # structure_searcher.h:25,31`).
+        var noise_mult = Float64(0.0)
+        if random_strength != Float32(0.0):
+            noise_mult = calc_score_model_length_mult(
+                Float64(n_rows), Float64(iteration) * Float64(learning_rate)
+            )
+        var tree_seed = noise_rand.next_uniform_l()
+
+        # `ComputeWeakTarget` computes the doc-parallel arm's std dev
+        # BETWEEN the gradient and the bootstrap
+        # (`oblivious_tree_doc_parallel_structure_searcher.cpp:200-218`),
+        # so it is taken from the UNBOOTSTRAPPED planes. The greedy arm's
+        # is taken from the bootstrapped ones instead
+        # (`greedy_search_helper.cpp:381-385`) and is computed inside
+        # `run_tree_layout`. That ordering difference is CatBoost's, and it
+        # is a second reason the two arms' noise magnitudes differ; see
+        # `gbdt/methods/random_score_helper.mojo` for the first two.
+        var pointwise_score_std_dev = Float32(0.0)
+        if use_pointwise_searcher and random_strength != Float32(0.0):
+            pointwise_score_std_dev = Float32(
+                compute_score_std_dev(
+                    ctx,
+                    noise_mult,
+                    Float64(random_strength),
+                    stats,
+                    n_rows,
+                    n_rows,
+                    noise_sm if noise_sm > 0 else 1,
+                )
+            )
+
+        if bootstrap_on:
+            # their `BootstrapAndFilter`: one draw per row multiplies
+            # BOTH planes. Bayesian never zeroes a weight, so their
+            # filter branch cannot fire for it; Bernoulli and Poisson do
+            # zero weights and this implementation still does not filter, which is
+            # DEVIATION 69 in `bootstrap.mojo` -- same model, more rows
+            # streamed than theirs.
+            var compute_mags = False
+
+            @parameter
+            if _needs_magnitudes:
+                compute_mags = True
+            launch_bootstrap(
+                ctx, boot_kind, boot_seeds, stats, n_rows, boot_param,
+                boot_mag_part, compute_mags, stat_count,
+            )
+            if compute_mags:
+                ctx.enqueue_function[deterministic_sum_lanes_kernel[2]](
+                    boot_mag_part.unsafe_ptr(),
+                    Int32(bootstrap_grid_blocks(n_rows)),
+                    mags.unsafe_ptr(),
+                    grid_dim=1, block_dim=256,
+                )
+        # stream-ordered behind the kernel; READ after `run_tree_layout`,
+        # whose first drain settles it, so it costs no synchronize here.
+        ctx.enqueue_copy(dst_ptr=h_fv.unsafe_ptr(), src_buf=fv)
+
+        # growth reorders rows in place, so the index restarts each tree.
+        # their `MakeSequence` (`fill.cu:47`), device-side.
+        launch_make_sequence(ctx, UInt32(0), row_index, n_rows)
+
+        # `sum over all rows of abs(...)`, per plane, which is what
+        # `choose_scale` is specified against. Plane 0 is the WEIGHT plane
+        # and plane 1 is `der`, laid out `stats[s * n_rows + i]` by
+        # `pointwise_target_kernel`, which is their `StatsToAggregate` column order
+        # (`pointwise_target_impl.h:188-192`). Plane 0 is the sample weight
+        # under Cosine/L2 and `weight * der2` under NewtonCosine/NewtonL2
+        # (`second_order` above); the two coincide for RMSE, whose Der2 is
+        # 1.0. Either way the kernel's magnitudes bound the plane AS
+        # STORED; see `pointwise_targets.mojo`.
+        #
+        # ===================== WHY THIS EXISTS =====================
+        # This call passed `0.0, 0.0` for both. Zero is not "unknown", it is
+        # the input for which the scale derivation returns its LARGEST value,
+        # 2^28 - 1 -- so `Int32(val * scale)` overflowed on any histogram
+        # cell holding more than about eight rows' worth of weight.
+        #
+        # It was invisible for as long as no replicated kernel reached the
+        # Int32 flush on this path: the half-byte kernel took the plain store
+        # on both branches, and `boosting_check` is 16 half-byte features and
+        # nothing else. The moment `launch_histograms_for_blocks` began
+        # launching half-byte with `groups * replicas`, the top two levels of
+        # every tree started scoring a wrapped-around histogram. The tree
+        # still learns, because the leaf VALUES come from
+        # `compute_partition_stats` and never touch the accumulator; only the
+        # SPLITS go bad. That is exactly a model that stays monotone, still
+        # beats the mean, and is several times worse than it should be.
+        #
+        # The `HIST_SMEM_SHARED2_I32` matrix row widened who depends on this:
+        # the Apple column's hist_2 kernels quantize IN SHARED MEMORY at
+        # `fixed_scale` even under `NUMERIC_FAST`, so an unbounded scale now
+        # breaks the shipped Apple build, not just the IDENTICAL opt-in.
+        # `_needs_magnitudes` above is that union.
+        #
+        # CONTRACT AUDIT, 2026-08-19, updated for the device reduction.
+        # Every caller of `choose_scale` on the tree path against
+        # `checks/fixed_point.mojo`'s stated precondition, "sum over all
+        # rows of abs(value) for the plane being accumulated":
+        #
+        #   this file                      sum of |stats| reduced ON DEVICE
+        #                                  by `pointwise_target_kernel` from the exact
+        #                                  planes it wrote, both planes, per
+        #                                  iteration -- SOUND
+        #   checks/level_check.mojo     abs-accumulates a signed generator
+        #                                  at :210-218 and :344-352 -- SOUND
+        #   checks/level_bench.mojo     same, three sites -- SOUND
+        #   probe_main.check_fixed_point   sums |rows| directly -- SOUND
+        #
+        # The permutation growth applies to the stats plane does not move the
+        # bound: a gather is a bijection on rows, so the sum of magnitudes is
+        # invariant, and the sibling subtraction cannot exceed the parent's
+        # bound either. The three reserved headroom bits cover the rest,
+        # including the one place the bound is not exact: the device reduce
+        # accumulates in Float32 through block sums and a float atomic, so
+        # the total can round DOWN by a few parts in 1e6 relative -- a scale
+        # at most that much too large. `SCALE_HEADROOM_BITS = 3` is a factor
+        # of eight against it, five orders of magnitude of slack.
+        #
+        # THE TIER IS A BUILD DEFINE (checks/numerics.mojo:9-16) AND AN IDENTICAL GBDT BUILD SHIPS -- the
+        # runtime `determinism` option is validated but wired to nothing,
+        # and a comment here used to claim it pinned the integer flush,
+        # which was false (caught 2026-08-21 in a review of why the
+        # nondeterministic mirror was not the default: it already was).
+        # This block still governs the shipped APPLE configuration because
+        # Metal's threadgroup atomics are integer-only, so the hist_2
+        # shared stage quantizes at `fixed_scale` even under FAST
+        # (`HIST2_SMEM_IS_I32`), and `_needs_magnitudes` is that union.
+        # ===========================================================
+        # DEVIATION 95: the scale is derived on the device inside
+        # `run_tree_layout` from the magnitudes buffer, so the per-tree
+        # drain that used to read two floats back is gone -- the tree's
+        # own drain is now the loop's only one.
+        loop_times.stop_host("iter_gradients_enqueue", t_grad)
+        var mags_opt = Optional[DeviceBuffer[DType.float32]]()
+
+        @parameter
+        if _needs_magnitudes:
+            mags_opt = Optional(mags.copy())
+
+        # `optimizer.Fit(...)` then `Estimate` then `Rescale` then
+        # `AppendModels`, all four inside `run_tree_layout`, in their order.
+        var splits = List[TBinarySplit]()
+        var leaf_values = List[Float32]()
+        var leaf_offsets = List[Int]()
+        var sizes = List[Int]()
+        # the non-symmetric arm's tree, empty on the oblivious arms
+        var ns_trees = List[TNonSymmetricTree]()
+        # lane/apple-fast-sym-iter, per-tree state (constant False / a
+        # handle onto `row_index` under every build without the defines):
+        # `sym_rows`: the estimator's row order. (`sym_fuse` / `sym_fv_now`
+        # and `sym_leaf_device`: the deleted ANONLIB_SYM_DERIV_FUSED and
+        # ANONLIB_SYM_LEAF_FROM_STATS, 2026-10-09.)
+        var sym_rows = row_index.copy()
+
+        if non_symmetric:
+            # ---- CatBoost's NON-SYMMETRIC learner (DEVIATION 259) -------
+            # `TGreedyTreeLikeStructureSearcher<TNonSymmetricTree>::FitImpl`
+            # through the merged Depthwise/Lossguide driver, then their
+            # estimation loop over every permutation, exactly as the
+            # pointwise arm below: the searcher's partition is NOT reused,
+            # the bins are recomputed from the MODEL on each permutation's
+            # compressed index (`task.Model->ComputeBins(*task.DataSet,
+            # &bins)`, `doc_parallel_leaves_estimator.cpp:48`), grouped by
+            # `partition_from_bins`, estimated, and applied. That is also
+            # what re-indexes the leaves: the searcher hands back values
+            # in LEAF-ID order and the model's bins are VISIT order
+            # (`model_builder.mojo`), and the estimator writes the values
+            # in the model's own bin order, which is the order the apply
+            # kernels read.
+            var opts = TTreeStructureSearcherOptions()
+            opts.policy = grow_policy
+            opts.max_depth = max_depth
+            opts.max_leaves = ns_max_leaves
+            opts.l2_reg = l2_leaf_reg
+            opts.score_function = score_function
+            opts.min_leaf_size = Float64(min_data_in_leaf)
+            opts.min_split_gain = min_split_gain
+            opts.min_child_hessian = min_child_hessian
+            # `options.RandomStrength *= randomStrengthMult`
+            # (`greedy_subsets_searcher.h:76`), the same multiply the
+            # greedy oblivious arm receives below
+            opts.random_strength = Float32(
+                noise_mult * Float64(random_strength)
+            )
+            # THE FIXED-POINT MAGNITUDES, read back like the pointwise arm's
+            # scale: the non-symmetric driver derives `choose_scale` on the
+            # host from the two plane magnitudes (DEVIATION 95's device
+            # derivation is wired to `run_tree_layout` only). One drain per
+            # tree to read two floats, under the builds that quantize;
+            # PRICED, same bill as the pointwise arm, and the same fix
+            # applies when someone measures it.
+            var wmag = Float32(0.0)
+            var gmag = Float32(0.0)
+            var t_mags = loop_times.start()
+            # lane/fam-gbdt (IDN_NS_SCALE_DEVICE): the driver derives the
+            # scale on the device from `mags` (as `run_tree_layout` does,
+            # DEVIATION 95), so this per-tree drain is not taken.
+            var ns_mags_opt = Optional[DeviceBuffer[DType.float32]]()
+
+            @parameter
+            if _needs_magnitudes and IDN_NS_SCALE_DEVICE:
+                ns_mags_opt = Optional(mags.copy())
+
+            @parameter
+            if _needs_magnitudes and not IDN_NS_SCALE_DEVICE:
+                var hm = ctx.enqueue_create_host_buffer[DType.float32](2)
+                ctx.enqueue_copy(dst_buf=hm, src_buf=mags)
+                ctx.synchronize()
+                wmag = hm[0]
+                gmag = hm[1]
+                _ = hm^  # past the drain
+            loop_times.stop_host("iter_mags_drain", t_mags)
+            # ====================== DEVIATION 260 ======================
+            # THE hist_2 ACCUMULATION MODE IS THE KERNEL MATRIX'S
+            # `HIST2_SMEM_MODE` ROW, the same one the oblivious
+            # `run_tree_layout` defaults to: shared-Int32 on Apple and under
+            # IDENTICAL, CatBoost's warp-private float on NVIDIA/AMD FAST.
+            # The lane's own gates (`check-depthwise`, `check-lossguide`,
+            # the E2 growth cards) drive `fit_non_symmetric_tree` at mode 0
+            # (warp-private float), so this is the first caller to run the
+            # non-symmetric driver on the Int32 arms, and it is recorded
+            # because the first measurement said the arm was BROKEN here
+            # and that reading was wrong. One Depthwise tree, 20,000 rows
+            # x 24 features, three runs each, 2026-08-23 on this M4:
+            #
+            #   borders   mode 0 (loss)        HIST2_SMEM_MODE, before 261
+            #   15        38.508 deterministic 38.508 deterministic
+            #   64        38.323 deterministic 41.898 deterministic
+            #   128       38.299 deterministic 43.30 / 43.30 / 43.32
+            #
+            # The divergence began at depth 4 and was a HOST RACE in the
+            # non-symmetric driver (DEVIATION 261, one staging pair reused
+            # for three id lists per level) that the float arms happened to
+            # land on the right side of; after 261 the two modes agree BIT
+            # FOR BIT on this fixture (0x8cedc2e5a5fc1ae5 at depth 6, 128
+            # borders, FAST; IDENTICAL deterministic at 38.299009), exactly
+            # as the oblivious driver's two modes do. `checks/
+            # grow_policy_check.mojo` claim 7 is the run-to-run control at
+            # this shape. The matrix row stands; an inline mode 0 here would
+            # have been a vendor/arm fork hiding a race.
+            # ============================================================
+            var t_search = loop_times.start()
+            var tree = fit_non_symmetric_tree[HIST2_SMEM_MODE](
+                ctx, n_rows, tree_folds if feature_fraction < 1 else fold_counts, opts,
+                tree_cindex, stats, row_index,
+                wmag, gmag,
+                ws, dws, trace,
+                one_hot=one_hot,
+                approx_dim=approx_dim,
+                multiclass_optimization=objective == OBJECTIVE_MULTICLASS,
+                random_seed=tree_seed,
+                tag_prefix=_tree_tag(iteration) + ".",
+                mags_dev=ns_mags_opt^,
+            )
+            loop_times.stop_host("iter_tree_search", t_search)
+            var n_bins = tree.bin_count()
+            # T26 V1: only a same-version host/device supported contract.
+            # NOT COMPILED — NOT TESTED — IDENTITY NOT VERIFIED — QUALITY NOT VERIFIED — NOT MEASURED.
+            var t26_done = False
+            comptime if T26:
+                if (objective == OBJECTIVE_RMSE and not has_weights and perm_count == 1
+                    and approx_dim == 1 and leaf_estimation_method == LEAF_ESTIMATION_NEWTON
+                    and leaf_estimation_iterations == 1):
+                    var direct_bins = ctx.enqueue_create_buffer[DType.uint32](n_rows)
+                    compute_non_symmetric_bins_for_model(
+                        ctx, layout_for_test, tree.model_structure, lc, n_rows, direct_bins,
+                    )
+                    leaf_values = t26_estimate_apply(
+                        ctx, direct_bins, targets, cursors[0], n_rows, n_bins,
+                        l2_leaf_reg, learning_rate,
+                    )
+                    t26_done = True
+                    _ = direct_bins^
+            if device_leaf_partition and not t26_done:
+                # DEVIATION 2551: the pool of one, keyed on the row count,
+                # with a leaf capacity of the policy's own bound
+                if (
+                    len(leaf_parts) == 0
+                    or leaf_parts[0].n_rows_cap != n_rows
+                    or leaf_parts[0].n_leaves_cap < n_bins
+                ):
+                    leaf_parts.clear()
+                    leaf_parts.append(
+                        DeviceLeafPartitioner(
+                            ctx,
+                            n_rows,
+                            ns_max_leaves if ns_max_leaves > n_bins else n_bins,
+                        )
+                    )
+            var perm_batched = False
+            comptime if CTR_PERM_BATCH:
+                if (
+                    not t26_done and perm_count > 1
+                    and device_leaf_partition
+                    and approx_dim == 1
+                    and estimate_can_batch(
+                        objective, leaf_estimation_method,
+                        leaf_estimation_iterations,
+                    )
+                ):
+                    perm_batched = True
+                    var cap = ns_max_leaves if ns_max_leaves > n_bins else n_bins
+                    if (
+                        len(perm_leaf_parts) != perm_count
+                        or perm_leaf_parts[0].n_rows_cap != n_rows
+                        or perm_leaf_parts[0].n_leaves_cap < n_bins
+                    ):
+                        perm_leaf_parts.clear()
+                        for _ in range(perm_count):
+                            perm_leaf_parts.append(
+                                DeviceLeafPartitioner(ctx, n_rows, cap)
+                            )
+                    while len(perm_est_ws) < perm_count:
+                        perm_est_ws.append(List[TEstimationWorkspace]())
+                    # bins for the model and the partition of every
+                    # permutation, enqueued back to back
+                    var t_bins_b = loop_times.start()
+                    # T18: only the learning permutation shares search row IDs.
+                    # A folded-back Lossguide leaf remains refused by final_ready.
+                    # NOT COMPILED — NOT TESTED — IDENTITY NOT VERIFIED — QUALITY NOT VERIFIED — NOT MEASURED.
+                    var inherit_learn = T18 and len(dws) == 1
+                    if inherit_learn:
+                        inherit_learn = dws[0].final_ready and len(dws[0].final_sizes) == n_bins
+                    # Lane S3 `ANONLIB_TREES_CTR_SORTFREE_SUMS` (IDENTICAL,
+                    # default off). NOT COMPILED — NOT TESTED — IDENTITY NOT
+                    # VERIFIED — QUALITY NOT VERIFIED — NOT MEASURED.
+                    # Every permutation keeps its rows in ORIGINAL order: the
+                    # model walk's per-row leaf ids (`lp.bins`), exact integer
+                    # leaf counts (`enqueue_bin_keyed_counts`) behind the same
+                    # ONE drain, and the oracle's per-leaf sums keyed by leaf id
+                    # in a fixed float order (`bin_keyed_stats.mojo`): no radix
+                    # sort, no gathers into leaf order, no partition scatter.
+                    # COST: a stable radix sort of n (leaf, row) pairs plus
+                    # three gathers per permutation per tree become one
+                    # broadcast scan per (stat, 256-leaf group) per evaluation.
+                    # BITS CHANGE (float fold order; NVIDIA = AMD; no host
+                    # column: the CPU binding refuses CTR columns outside
+                    # SymmetricTree). T18's inherited learn partition is not
+                    # used under this switch (every permutation is sort-free).
+                    var sortfree = False
+                    comptime if CTR_SORTFREE_SUMS:
+                        sortfree = True
+                        inherit_learn = False
+                        var bk_cap = ns_max_leaves if ns_max_leaves > n_bins else n_bins
+                        if (
+                            len(bk_counts) != perm_count
+                            or bk_cap_rows != n_rows
+                            or bk_cap_leaves < n_bins
+                        ):
+                            bk_counts.clear()
+                            bk_h_counts.clear()
+                            bk_parts.clear()
+                            for _ in range(perm_count):  # small-loop(perm_count: learn permutations, a handful): pooled scratch per permutation
+                                bk_counts.append(ctx.enqueue_create_buffer[DType.int32](bk_cap))
+                                bk_h_counts.append(ctx.enqueue_create_host_buffer[DType.int32](bk_cap))
+                                bk_parts.append(
+                                    ctx.enqueue_create_buffer[DType.float32](
+                                        bk_partials_len(bk_cap, 2, n_rows)
+                                    )
+                                )
+                            bk_cap_rows = n_rows
+                            bk_cap_leaves = bk_cap
+                    # TOMBSTONE: ANONLIB_IDN_CTR_PERM_GRID (noise) deleted 2026-10-11 by d092b6e2d; code recoverable at d092b6e2d^.
+                    # Restore: git apply experiments/removed/ANONLIB_IDN_CTR_PERM_GRID.patch
+                    for p in range(perm_count):
+                        if inherit_learn and p == learn_p:
+                            continue
+                        ref lp = perm_leaf_parts[p]
+                        if p == learn_p:
+                            compute_non_symmetric_bins_for_model(
+                                ctx, layout_for_test, tree.model_structure,
+                                lc, n_rows, lp.bins,
+                            )
+                        else:
+                            compute_non_symmetric_bins_for_model(
+                                ctx, layout_for_test, tree.model_structure,
+                                perm_cindexes[p], n_rows, lp.bins,
+                            )
+                        if sortfree:
+                            enqueue_bin_keyed_counts(
+                                ctx, n_bins, n_rows, lp.bins, bk_counts[p]
+                            )
+                            ctx.enqueue_copy(
+                                dst_buf=bk_h_counts[p], src_buf=bk_counts[p]
+                            )
+                        else:
+                            lp.partition_enqueue(ctx, n_rows, n_bins)
+                    loop_times.stop_host("iter_bins_for_model", t_bins_b)
+                    var t_part_b = loop_times.start()
+                    # ONE drain settles every permutation's leaf bounds
+                    ctx.synchronize()
+                    var parts = List[LeafPartition]()
+                    for p in range(perm_count):
+                        if sortfree:
+                            # sizes from the exact counts; offsets their
+                            # running sum (the oracle's `d_p_sz` is the
+                            # unweighted leaf weight); the row index is
+                            # never read on this arm
+                            var bk_sizes = List[Int]()
+                            var bk_offsets = List[Int]()
+                            var bk_running = 0
+                            for leaf in range(n_bins):  # small-loop(n_bins: the tree's leaves): counts readback to sizes
+                                var c = Int(bk_h_counts[p].unsafe_ptr().unsafe_load(leaf))
+                                bk_offsets.append(bk_running)
+                                bk_sizes.append(c)
+                                bk_running += c
+                            if bk_running != n_rows:
+                                raise Error(
+                                    "CTR_SORTFREE_SUMS: leaf counts sum to "
+                                    + String(bk_running) + " for "
+                                    + String(n_rows) + " rows"
+                                )
+                            parts.append(LeafPartition(
+                                perm_leaf_parts[p].vals.copy(),
+                                bk_offsets^, bk_sizes^,
+                            ))
+                            continue
+                        if inherit_learn and p == learn_p:
+                            parts.append(LeafPartition(
+                                row_index.copy(), dws[0].final_offsets.copy(),
+                                dws[0].final_sizes.copy(),
+                            ))
+                            continue
+                        parts.append(
+                            perm_leaf_parts[p].partition_collect(
+                                ctx, n_rows, n_bins
+                            )
+                        )
+                    loop_times.stop_host("iter_partition", t_part_b)
+                    var t_est_b = loop_times.start()
+                    # the walks: prepared back to back, advanced in lock
+                    # step behind one drain per round, completed in order
+                    var pend = List[PendingEstimation]()
+                    for p in range(perm_count):
+                        var nb_opt = Optional[DeviceBuffer[DType.uint32]]()
+                        var bkp_opt = Optional[DeviceBuffer[DType.float32]]()
+                        if sortfree:
+                            nb_opt = Optional(perm_leaf_parts[p].bins.copy())
+                            bkp_opt = Optional(bk_parts[p].copy())
+                        pend.append(
+                            _estimate_prepare(
+                                ctx, n_rows, n_bins,
+                                parts[p].sizes, parts[p].offsets,
+                                parts[p].row_index, targets, weights,
+                                has_weights, cursors[p],
+                                objective, alpha, estimator_alpha,
+                                logloss_border, l2_leaf_reg, est_sm,
+                                leaf_estimation_method,
+                                perm_est_ws[p], perm_arena, stage_times,
+                                iterations=leaf_estimation_iterations,
+                                natural_bins=nb_opt^,
+                                bk_partials=bkp_opt^,
+                                # lane gbdt-categorical-oom (1): the policy's
+                                # leaf bound, the same capacity the
+                                # partitioners above take
+                                leaves_cap=cap,
+                            )
+                        )
+                    var walking = True
+                    while walking:
+                        ctx.synchronize()
+                        walking = False
+                        for p in range(perm_count):  # small-loop(perm_count: learn permutations, a handful): walker orchestration per permutation task
+                            if pend[p].phase != 2:
+                                if estimate_advance(pend[p]):
+                                    walking = True
+                    for p in range(perm_count):  # small-loop(perm_count: learn permutations, a handful): one completion launch set per permutation task
+                        var pv_b = List[Float32]()
+                        var nbc_opt = Optional[DeviceBuffer[DType.uint32]]()
+                        if sortfree:
+                            nbc_opt = Optional(perm_leaf_parts[p].bins.copy())
+                        _estimate_complete(
+                            ctx, pend[p], parts[p].row_index, cursors[p],
+                            learning_rate, pv_b, not_pd_total, trace,
+                            stage_times,
+                            _tree_tag(iteration) + ".perm" + String(p)
+                            + ".leaves.estimated",
+                            perm_est_ws[p],
+                            natural_bins=nbc_opt^,
+                        )
+                    # the batch's closing drain: one per tree
+                    ctx.synchronize()
+                    # the estimation permutation's leaves for the host model
+                    # (one memcpy of the `h_est` copy the completion queued)
+                    leaf_values = walk_leaf_values(perm_est_ws[est_p], n_bins)
+                    _ = parts^  # past the drain (step-33 race class)
+                    _ = pend^  # past the drain (step-33 race class)
+                    loop_times.stop_host("iter_estimate_apply", t_est_b)
+            for p in range(0 if (perm_batched or t26_done) else perm_count):
+                var pv = List[Float32]()
+                var t_bins = loop_times.start()
+                var part: LeafPartition
+                # NS_INHERIT_PARTITION (trees-apple3): the permutation the
+                # tree was grown on inherits the searcher's partition
+                var inherit = False
+                comptime if NS_INHERIT_PARTITION:
+                    inherit = (
+                        (perm_count == 1 or T18)
+                        and p == learn_p
+                        and len(dws) == 1
+                        and dws[0].final_ready
+                        and len(dws[0].final_sizes) == n_bins
+                    )
+                if inherit:
+                    part = LeafPartition(
+                        row_index.copy(),
+                        dws[0].final_offsets.copy(),
+                        dws[0].final_sizes.copy(),
+                    )
+                    loop_times.stop_host("iter_bins_for_model", t_bins)
+                elif device_leaf_partition:
+                    ref lp = leaf_parts[0]
+                    if p == learn_p:
+                        compute_non_symmetric_bins_for_model(
+                            ctx, layout_for_test, tree.model_structure, lc,
+                            n_rows, lp.bins,
+                        )
+                    else:
+                        compute_non_symmetric_bins_for_model(
+                            ctx, layout_for_test, tree.model_structure,
+                            perm_cindexes[p], n_rows, lp.bins,
+                        )
+                    loop_times.stop_host("iter_bins_for_model", t_bins)
+                    var t_part = loop_times.start()
+                    part = lp.partition(ctx, n_rows, n_bins)
+                    loop_times.stop_host("iter_partition", t_part)
+                else:
+                    var d_bins = ctx.enqueue_create_buffer[DType.uint32](
+                        n_rows
+                    )
+                    if p == learn_p:
+                        compute_non_symmetric_bins_for_model(
+                            ctx, layout_for_test, tree.model_structure, lc,
+                            n_rows, d_bins,
+                        )
+                    else:
+                        compute_non_symmetric_bins_for_model(
+                            ctx, layout_for_test, tree.model_structure,
+                            perm_cindexes[p], n_rows, d_bins,
+                        )
+                    loop_times.stop_host("iter_bins_for_model", t_bins)
+                    var t_part = loop_times.start()
+                    part = partition_from_bins(ctx, d_bins, n_rows, n_bins)
+                    loop_times.stop_host("iter_partition", t_part)
+                var t_est = loop_times.start()
+                _estimate_and_apply(
+                    ctx, n_rows, approx_dim, len(part.sizes),
+                    part.sizes, part.offsets,
+                    part.row_index, targets, weights, has_weights,
+                    cursors[p],
+                    objective, alpha, estimator_alpha, logloss_border,
+                    l2_leaf_reg, est_sm, leaf_estimation_method,
+                    num_classes, leaf_estimation_iterations,
+                    learning_rate,
+                    pv, not_pd_total,
+                    trace, stage_times,
+                    _tree_tag(iteration) + ".perm" + String(p)
+                    + ".leaves.estimated",
+                    est_ws,
+                )
+                loop_times.stop_host("iter_estimate_apply", t_est)
+                if p == est_p:
+                    leaf_values.clear()
+                    # driver-loop: over the leaf values (leaves x approx_dim)
+                    for i in range(len(pv)):
+                        leaf_values.append(pv[i])
+            # their `UpdateLeaves(std::move(point))` (`doc_parallel_leaves_
+            # estimator.cpp:39`), then `Rescale(step)` folded in as the
+            # oblivious arm folds it (DEVIATION 256 applies unchanged)
+            if len(leaf_values) != n_bins * approx_dim:
+                raise Error(
+                    "the estimator returned " + String(len(leaf_values))
+                    + " values for a non-symmetric tree of " + String(n_bins)
+                    + " bins x " + String(approx_dim)
+                )
+            tree.leaf_values.clear()
+            # driver-loop: over the leaf values (leaves x approx_dim)
+            for i in range(len(leaf_values)):
+                tree.leaf_values.append(leaf_values[i] * learning_rate)
+            tree.dim = approx_dim
+            ns_trees.append(tree^)
+        elif use_pointwise_searcher:
+            # ---- CatBoost's SINGLE-TARGET symmetric learner -----------
+            # `TDocParallelObliviousTreeSearcher::FitImpl` returns the
+            # STRUCTURE only (DEVIATION 104). The partition it grew is not
+            # reused: the leaves are re-derived from the structure through
+            # `compute_bins_for_model` + `partition_from_bins`, which is
+            # the SAME path the non-estimation permutations below already
+            # take. That is deliberate -- it means the pointwise arm shares
+            # every line of leaf estimation with the greedy arm, so a
+            # difference between the two arms can only come from the
+            # structure.
+            # ===================== THE FIXED-POINT SCALE ==============
+            # The 8-bit accumulator holds Int32 fixed point (DEVIATION 93,
+            # Metal has no threadgroup float atomics), so it needs the same
+            # scale the greedy path derives: `choose_scale` over the LARGER
+            # of the two planes' sums of magnitudes.
+            #
+            # This passed a hardcoded 1.0 and the symptom is the one
+            # DEVIATION 95's block warns about in as many words -- "the tree
+            # still learns, because the leaf VALUES come from
+            # `compute_partition_stats` and never touch the accumulator;
+            # only the SPLITS go bad". It reproduced CatBoost 48/48 at 15
+            # and 100 borders and 7/48 at 254, because 254 borders is the
+            # only fixture that reaches the 8-bit kernel at all.
+            #
+            # PRICED: this drains once per tree to read two floats, which
+            # the greedy path stopped doing in DEVIATION 95 by deriving the
+            # scale on the device. It cannot do the same yet because
+            # `compute_hist2` takes `fixed_scale` as a HOST scalar
+            # (`pointwise_kernels.mojo:1318`); making it a device pointer is
+            # the fix and is not attempted here.
+            # lane/apple-fast-sym-iter: the pool of one for this arm's
+            # per-tree buffers.
+            comptime if SYM_ITER_ANY:
+                sym_pool_get(
+                    ctx, sym_pool, n_rows, max_depth,
+                    noise_sm if noise_sm > 0 else 1,
+                )
+            var scale = Float32(1.0)
+            @parameter
+            if _needs_magnitudes:
+                var sym_scale_ready = False
+                comptime if SYM_BUF_ARENA:
+                    # the fit's `h_mags` instead of a host buffer per tree
+                    if not sym_scale_ready:
+                        ctx.enqueue_copy(dst_buf=h_mags, src_buf=mags)
+                        ctx.synchronize()
+                        scale = sym_scale_from_mags(h_mags, n_rows)
+                        sym_scale_ready = True
+                if not sym_scale_ready:
+                    var hm = ctx.enqueue_create_host_buffer[DType.float32](2)
+                    ctx.enqueue_copy(dst_buf=hm, src_buf=mags)
+                    ctx.synchronize()
+                    _ = boot_mag_part^  # past the drain (step-33 race class, device side)
+                    _ = mags^  # past the drain (step-33 race class, device side)
+                    var m0 = Float64(hm[0])
+                    if m0 < 0.0:
+                        m0 = -m0
+                    var m1 = Float64(hm[1])
+                    if m1 < 0.0:
+                        m1 = -m1
+                    scale = Float32(
+                        choose_scale(m1 if m1 > m0 else m0, n_rows)
+                    )
+
+            var planes: Tuple[
+                DeviceBuffer[DType.float32], DeviceBuffer[DType.float32]
+            ]
+            comptime if SYM_BUF_ARENA:
+                # the pool's two planes instead of two n_rows buffers per tree
+                planes = sym_split_planes(ctx, stats, n_rows, sym_pool[0])
+            else:
+                planes = split_stat_planes(ctx, stats, n_rows)
+            # lane/sym-quality: the gradient plane onto the tree's grid, as
+            # the greedy arm's `run_tree_layout` does (`enqueue_snap_plane`);
+            # only where the scale above is a real one
+            @parameter
+            if _needs_magnitudes:
+                var g_plane = planes[1].copy()
+                enqueue_snap_plane(ctx, g_plane, n_rows, scale)
+            splits = fit_oblivious_tree_structure_traced(
+                ctx,
+                tree_layout.value().copy() if feature_fraction < 1 else layout_for_test.copy(),
+                n_rows, max_depth, tree_cindex,
+                planes[0], planes[1],
+                est_sm if est_sm > 0 else 1,
+                scale,
+                score_function,
+                pw_pool,
+                trace, stage_times, _tree_tag(iteration),
+                l2_leaf_reg,
+                score_std_dev=pointwise_score_std_dev,
+                seed=tree_seed,
+                one_hot=one_hot,
+            )
+            # TOMBSTONE: ANONLIB_SYM_REUSE_PARTITION (DROPPED-noise) deleted 2026-10-09 on lane/owed-deletions-D1 (a
+            # full-depth tree's final subsets as the partition); code recoverable at b639a2bd2.
+            # Restore: git apply experiments/removed/ANONLIB_SYM_REUSE_PARTITION.patch.
+            var sym_pooled_partition = False
+            comptime if SYM_BUF_ARENA:
+                # the pool's partitioner: the bins land in its `bins`,
+                # one drain (the bounds readback), no allocation and no
+                # keep-alive drain
+                sym_pooled_partition = True
+                sym_compute_bins_pooled(
+                    ctx, layout_for_test, splits, len(splits), lc,
+                    n_rows, sym_pool[0],
+                )
+                var sym_part = sym_pool[0].parts.partition(
+                    ctx, n_rows, 1 << len(splits)
+                )
+                sizes = sym_part.sizes.copy()
+                leaf_offsets = sym_part.offsets.copy()
+                row_index = sym_part.row_index.copy()
+            if not sym_pooled_partition:
+                var d_bins = ctx.enqueue_create_buffer[DType.uint32](n_rows)
+                compute_bins_for_model(
+                    ctx, layout_for_test, splits, len(splits), lc, n_rows,
+                    d_bins,
+                )
+                var part = partition_from_bins(
+                    ctx, d_bins, n_rows, 1 << len(splits)
+                )
+                sizes = part.sizes.copy()
+                leaf_offsets = part.offsets.copy()
+                row_index = part.row_index.copy()
+            sym_rows = row_index.copy()
+            # TOMBSTONE: ANONLIB_SYM_LEAF_FROM_STATS (DROPPED-noise) deleted 2026-10-09 on lane/owed-deletions-D1 (one
+            # Newton step from the searcher's statistics); code recoverable at b639a2bd2.
+            # Restore: git apply experiments/removed/ANONLIB_SYM_LEAF_FROM_STATS.patch.
+            if not need_estimation:
+                # the greedy arm estimates and applies INSIDE
+                # `run_tree_layout` when the method is Simple; this arm has
+                # to do it explicitly, through the same estimator.
+                _estimate_and_apply(
+                    ctx, n_rows, approx_dim, len(sizes), sizes,
+                    leaf_offsets, sym_rows, targets, weights, has_weights,
+                    lcur, objective, alpha, estimator_alpha,
+                    logloss_border, l2_leaf_reg, est_sm,
+                    leaf_estimation_method, num_classes,
+                    leaf_estimation_iterations, learning_rate,
+                    leaf_values, not_pd_total,
+                    trace, stage_times,
+                    _tree_tag(iteration) + ".leaves.estimated",
+                    est_ws,
+                )
+        else:
+            var t_sym = loop_times.start()
+            sizes = run_tree_layout_traced(
+                ctx, n_rows, tree_folds if feature_fraction < 1 else fold_counts, max_depth,
+                tree_cindex, stats, row_index, lcur,
+                Float32(0.0), Float32(0.0),
+                splits, leaf_values, leaf_offsets, ws,
+                trace, stage_times, _tree_tag(iteration),
+                need_estimation,
+                use_subtraction, not need_estimation,
+                learning_rate, l2_leaf_reg,
+                one_hot=one_hot,
+                score_function=score_function,
+                approx_dim=approx_dim,
+                mags_dev=mags_opt^,
+                # `MultiLogitOptimization` is set ONLY for MultiClass
+                # (`multiclass_targets.cpp:32-35`); OneVsAll has no pinned
+                # class, so its histogram carries every plane and the
+                # score needs no extra leaf contribution.
+                multiclass_optimization=objective
+                == OBJECTIVE_MULTICLASS,
+                # `options.RandomStrength *= randomStrengthMult`
+                # (`greedy_subsets_searcher.h:76`). The multiply happens
+                # HERE, in the boosting loop, exactly as their
+                # `CreateStructureSearcher` does it -- the searcher
+                # receives one number and never sees `mult`.
+                random_strength=Float32(
+                    noise_mult * Float64(random_strength)
+                ),
+                random_seed=tree_seed,
+            )
+            loop_times.stop_host("iter_tree_search", t_sym)
+
+        # lane fix-g1-gbdt (`IDN_GBDT_SYM_EST_DEFER_DRAIN`): the search
+        # above drained the queue, so the previous tree's deferred
+        # estimation is complete; take its values and append its model
+        # before this tree's estimation reuses the staging.
+        comptime if IDN_GBDT_SYM_EST_DEFER_DRAIN:
+            _settle_deferred_tree(
+                ctx, est_ws, model, deferred_splits, has_deferred_tree,
+                approx_dim, learning_rate, not_pd_total, trace, stage_times,
+            )
+        var t_sym_est = loop_times.start()
+        if need_estimation and not non_symmetric:
+            # ---- their estimation loop (`doc_parallel_boosting.h:
+            # 371-385`): ONE TASK PER PERMUTATION, each on its own dataset
+            # and its own cursor, all estimating the SAME structure.
+            #
+            #     for (permutation = 0; permutation < permutationCount; ++permutation) {
+            #         estimator.AddEstimationTask(*(learnTarget[permutation]),
+            #                                     dataSet.GetDataSetForPermutation(permutation),
+            #                                     (*learnCursors)[permutation],
+            #                                     &iterationModels[permutation]);
+            #     }
+            #
+            # The permutation the tree was GROWN on inherits the searcher's
+            # partition; the others compute their own, because a row's leaf
+            # depends on that permutation's CTR columns and the searcher
+            # never looked at them.
+            var sym_defer_est = False
+            comptime if IDN_GBDT_SYM_EST_DEFER_DRAIN:
+                sym_defer_est = perm_count == 1 and not has_test
+            for p in range(perm_count):
+                var pv = List[Float32]()
+                if p == learn_p:
+                    var q_est = Optional[QuerywiseTargetBuffers]()
+                    if is_querywise:
+                        q_est = Optional(query_buffers.value().handles())
+                    var p_est = Optional[PairwiseTargetBuffers]()
+                    if is_pair_logit:
+                        p_est = Optional(pair_buffers.value().handles())
+                    var y_est = Optional[YetiRankTargetBuffers]()
+                    var y_seed = UInt64(0)
+                    if is_yeti_rank:
+                        y_est = Optional(yeti_buffers.value().handles())
+                        # this tree's second draw: the estimation stream's seed
+                        y_seed = yeti_rand.next_uniform_l()
+                    _estimate_and_apply(
+                        ctx, n_rows, approx_dim, len(sizes), sizes,
+                        leaf_offsets,
+                        sym_rows, targets, weights, has_weights,
+                        cursors[p],
+                        objective, alpha, estimator_alpha, logloss_border,
+                        l2_leaf_reg, est_sm, leaf_estimation_method,
+                        num_classes, leaf_estimation_iterations,
+                        learning_rate,
+                        pv, not_pd_total,
+                        trace, stage_times,
+                        _tree_tag(iteration) + ".perm" + String(p)
+                        + ".leaves.estimated",
+                        est_ws,
+                        q_est^,
+                        p_est^,
+                        y_est^,
+                        y_seed,
+                        # lane fix-g1-gbdt: one task per tree and no eval
+                        # set, so nothing below needs the values this tree
+                        defer_tail=sym_defer_est,
+                    )
+                else:
+                    var d_bins = ctx.enqueue_create_buffer[DType.uint32](
+                        n_rows
+                    )
+                    # DEPTH IS `len(splits)`, NOT `max_depth`: a tree that
+                    # stopped growing early has fewer splits, and
+                    # `len(sizes)` is `1 << len(splits)` either way.
+                    compute_bins_for_model(
+                        ctx, layout_for_test, splits, len(splits),
+                        perm_cindexes[p], n_rows, d_bins,
+                    )
+                    var part = partition_from_bins(
+                        ctx, d_bins, n_rows, len(sizes)
+                    )
+                    _estimate_and_apply(
+                        ctx, n_rows, approx_dim, len(part.sizes),
+                        part.sizes, part.offsets,
+                        part.row_index, targets, weights, has_weights,
+                        cursors[p],
+                        objective, alpha, estimator_alpha, logloss_border,
+                        l2_leaf_reg, est_sm, leaf_estimation_method,
+                        num_classes, leaf_estimation_iterations,
+                        learning_rate,
+                        pv, not_pd_total,
+                        trace, stage_times,
+                        _tree_tag(iteration) + ".perm" + String(p)
+                        + ".leaves.estimated",
+                        est_ws,
+                    )
+                # the EXPORTED ensemble is the estimation permutation's
+                # (`doc_parallel_boosting.h:526-528`); the others exist to
+                # carry their own cursors forward and their weak models are
+                # never read, so they are not accumulated.
+                if p == est_p:
+                    leaf_values.clear()
+                    # driver-loop: over the leaf values (leaves x approx_dim)
+                    for i in range(len(pv)):
+                        leaf_values.append(pv[i])
+        # TOMBSTONE: ANONLIB_SYM_DERIV_FUSED and ANONLIB_SYM_LEAF_FROM_STATS (both DROPPED-noise) deleted 2026-10-09 on lane/owed-deletions-D1 (the
+        # tree's fused tail: the next gradient pass and the stats-leaf readback); code recoverable at b639a2bd2.
+        # Restore: git apply experiments/removed/ANONLIB_SYM_DERIV_FUSED.patch / ANONLIB_SYM_LEAF_FROM_STATS.patch.
+        loop_times.stop_host("iter_symmetric_estimate", t_sym_est)
+        _ = len(sizes)
+
+        var t_append = loop_times.start()
+        # their `result[i].AddWeakModel(iterationModels[i])` (`:398`).
+        # `Rescale(step)` is folded into `add_model_value_kernel`, so the
+        # stored values are UNSCALED and the rate is applied on the way out.
+        if non_symmetric:
+            # the `TAdditiveModel<TNonSymmetricTree>` instantiation; the
+            # rate was folded into the tree's values above
+            model.add_non_symmetric_model(ns_trees.pop())
+        else:
+            # lane fix-g1-gbdt (`IDN_GBDT_SYM_EST_DEFER_DRAIN`): a tree whose
+            # estimation tail is still queued is appended by
+            # `_settle_deferred_tree` once its values are home
+            var deferred_now = False
+            comptime if IDN_GBDT_SYM_EST_DEFER_DRAIN:
+                if len(est_ws) > 0 and len(est_ws[0].pending) > 0:
+                    deferred_now = True
+                    deferred_splits = splits.copy()
+                    has_deferred_tree = True
+            if not deferred_now:
+                var structure = TObliviousTreeStructure()
+                # driver-loop: over the tree splits (depth)
+                for i in range(len(splits)):
+                    structure.splits.append(splits[i])
+                var weak = TObliviousTreeModel(structure^)
+                # their `Dim` / `OutputDim()` (`oblivious_model.h:130-133`): the
+                # number of approxes a leaf carries. `MakeEstimationResult` already
+                # projected the walker's `numClasses`-wide point down to this, so
+                # a MultiClass leaf holds `numClasses - 1` values and the model's
+                # dimension matches the CURSOR's, not the walker's.
+                weak.dim = approx_dim
+                # DEVIATION 256, justified UNPINNED: IDENTITY_PATHS row 9 names
+                # the LEAF RESCALE, and this multiply is it -- the device half
+                # was already closed as the cursor-update fma
+                # (`add_model_value_kernel`, `39a0d88`), and what remains is one
+                # correctly-rounded HOST Float32 multiply with no chain to
+                # contract and no device flush policy in play, so its bits are
+                # the same on every host.
+                # driver-loop: over the leaf values (leaves x approx_dim)
+                for i in range(len(leaf_values)):
+                    weak.leaf_values.append(leaf_values[i] * learning_rate)
+                model.add_weak_model(weak^)
+        loop_times.stop_host("iter_model_append", t_append)
+
+        # ---- their `AppendModels(..., learnCursors, testCursor)` -----
+        # (`doc_parallel_boosting.h:391-396`): the SAME weak model goes on
+        # to the held-out cursor. One tree at a time, through the
+        # ROW-WISE apply, because the partition-wise one only knows rows
+        # the tree was grown on.
+        comptime if GBDT_EVAL_FUSED:
+            # lane/apple-fast-sym-feat: with a detector that cannot stop
+            # the fit, the held-out loss stays on the device and is read
+            # back once per `_EVAL_FV_SLOTS` trees (and after the loop).
+            # The packed apply rewrites `h_vals` each tree without a drain
+            # of its own: the previous tree's upload has completed because
+            # this iteration's leaf values were read back to the host
+            # (a drain) before this tree could be appended to the model.
+            if has_test and not detector.is_active():
+                _apply_last_tree_to_test(
+                    ctx, model, layout_for_test, test.value(), approx_dim,
+                    learning_rate,
+                )
+                var slot = len(test_losses) % _EVAL_FV_SLOTS
+                _test_loss_enqueue(
+                    ctx, test.value(), objective, num_classes, alpha,
+                    logloss_border, approx_dim, slot,
+                )
+                test_losses.append(Float64(0.0))
+                if slot == _EVAL_FV_SLOTS - 1:
+                    _test_loss_flush(
+                        ctx, test.value(), test_losses, detector,
+                        _EVAL_FV_SLOTS,
+                    )
+            elif has_test:
+                _apply_last_tree_to_test(
+                    ctx, model, layout_for_test, test.value(), approx_dim,
+                    learning_rate,
+                )
+                var t_loss = _test_loss(
+                    ctx, test.value(), objective, num_classes, alpha,
+                    logloss_border, approx_dim,
+                )
+                test_losses.append(t_loss)
+                # `DetectOverfitting(testError, detector, ...)`
+                # (`overfitting_detector.h:25-34`)
+                detector.add_error(t_loss)
+                if detector.is_need_stop():
+                    stopped_early = True
+                    break
+        else:
+            if has_test:
+                _apply_last_tree_to_test(
+                    ctx, model, layout_for_test, test.value(), approx_dim,
+                    learning_rate,
+                )
+                var t_loss = _test_loss(
+                    ctx, test.value(), objective, num_classes, alpha,
+                    logloss_border, approx_dim,
+                )
+                test_losses.append(t_loss)
+                # `DetectOverfitting(testError, detector, ...)`
+                # (`overfitting_detector.h:25-34`)
+                detector.add_error(t_loss)
+                if detector.is_need_stop():
+                    stopped_early = True
+                    break
+
+        # the device `functionValue` read alongside this iteration's
+        # gradients: the loss AFTER THE PREVIOUS TREE (their accumulation
+        # is `-w * (val - relev)^2`, `pointwise_targets.cu:311`, so the
+        # positive loss is its negation). Iteration 0's value is the
+        # baseline and is not a tree's loss, so it is dropped, and the
+        # LAST tree's loss comes from one extra gradient pass below.
+        if len(losses) < n_estimators:
+            var v = Float64(h_fv.unsafe_ptr().unsafe_load(0))
+            # `size()` counts either shape (the non-symmetric ensemble's
+            # trees are in `non_symmetric_models`)
+            var trees_so_far = model.size()
+            if has_deferred_tree:
+                # lane fix-g1-gbdt: this tree's model is appended later
+                trees_so_far += 1
+            if trees_so_far > 1:
+                losses.append(-v / loss_norm)
+
+    # lane fix-g1-gbdt (`IDN_GBDT_SYM_EST_DEFER_DRAIN`): the last tree's
+    # deferred estimation
+    comptime if IDN_GBDT_SYM_EST_DEFER_DRAIN:
+        _settle_deferred_tree(
+            ctx, est_ws, model, deferred_splits, has_deferred_tree,
+            approx_dim, learning_rate, not_pd_total, trace, stage_times,
+        )
+    comptime if GBDT_EVAL_FUSED:
+        if has_test and not detector.is_active():
+            _test_loss_flush(
+                ctx, test.value(), test_losses, detector,
+                len(test_losses) % _EVAL_FV_SLOTS,
+            )
+    loop_times.stop_host("fit_total", t_loop)
+    loop_times.report()
+
+    # the final tree's loss: one more `functionValue` pass over the settled
+    # cursor, through the SAME per-block-partials + fixed-order fold as the
+    # loop's pass -- this launch still handed the 1-float `fv` where the
+    # kernel now stores per-block partials, which under-read the loss by
+    # ~n_blocks and wrote past the buffer (caught by the predict repro:
+    # replay 36.52 vs a claimed 8.91 final loss, ratio ~= the block count).
+    var final_blocks = mse_blocks
+    if objective == OBJECTIVE_MULTIRMSE:
+        final_blocks = multilogit_blocks(n_rows)
+        launch_multi_rmse_value_and_der[True](
+            ctx, num_classes, n_rows, targets, n_rows,
+            weights, has_weights,
+            cursor, n_rows, row_index, False,
+            fv_part, True,
+            stats, n_rows,
+            mag_part, False,
+        )
+    elif objective == OBJECTIVE_MULTICLASS_OVA:
+        final_blocks = multilogit_blocks(n_rows)
+        launch_one_vs_all_value_and_der[True](
+            ctx, num_classes, n_rows, targets, weights, has_weights,
+            cursor, n_rows, row_index, False,
+            fv_part, True,
+            stats, n_rows,
+            mag_part, False,
+        )
+    elif objective == OBJECTIVE_MULTICLASS:
+        final_blocks = multilogit_blocks(n_rows)
+        launch_multilogit_value_and_der_search(
+            ctx, num_classes, n_rows, targets, weights, has_weights,
+            cursor, n_rows, row_index, False,
+            fv_part, True,
+            stats, n_rows,
+            mag_part, False,
+        )
+    elif is_querywise:
+        launch_query_rmse_with[False](
+            ctx, query_buffers.value(), cursor, False,
+            stats, fv_part, True, mag_part, False,
+        )
+    elif is_pair_logit:
+        final_blocks = pair_buffers.value().blocks()
+        launch_pair_logit_with[False, False](
+            ctx, pair_buffers.value(), cursor, False,
+            stats, fv_part, True, mag_part, False,
+        )
+    elif is_yeti_rank:
+        # YetiRank has no function value (`FillBuffer(FunctionValue, 0)`,
+        # `kernel.h:421-423`): the final learn loss is 0 and no draw is taken
+        launch_yeti_rank_zero_value(ctx, fv_part, mse_blocks)
+    else:
+        launch_approximate[False](
+            ctx, objective, targets, weights, Int32(n_rows), cursor,
+            Int32(1) if has_weights else Int32(0),
+            alpha, logloss_border,
+            stats, fv_part, Int32(1),
+            mag_part, Int32(0),
+            mse_blocks,
+        )
+    ctx.enqueue_function[deterministic_sum_lanes_kernel[1]](
+        fv_part.unsafe_ptr(), Int32(final_blocks), fv.unsafe_ptr(),
+        grid_dim=1, block_dim=256,
+    )
+    # ================= DEVIATION 2002, LEG 2 =================
+    # THE POISONED FINAL-LOSS WORD, the whole-fit backstop across every
+    # grow policy this loop drives. The 134 loaded window measured fits
+    # returning with `mse -0.0` because a dead Metal context silently
+    # stopped delivering readbacks: `h_fv` kept its stale +0.0 and
+    # `-0.0 / n` became the reported train loss. The host plants a
+    # poison BIT PATTERN in the word before the copy is enqueued; on a
+    # live device the drain overwrites it with the accumulated
+    # `functionValue`, and the exact poison bits surviving means the
+    # loss was NEVER DELIVERED -- so the fit raises rather than record
+    # a loss it never computed. Bit-compared, not value-compared, so a
+    # legitimate loss of ANY value (including a constant-target fit's
+    # exact -0.0) passes: only non-delivery fails, which cannot happen
+    # on a live in-order queue with the synchronize below.
+    # `-D ANONLIB_2002_SABOTAGE=1` (REQUIRED-RED, see
+    # `core/device_liveness.mojo`) compiles the copy out to fake
+    # exactly that signature.
+    # =========================================================
+    h_fv.unsafe_ptr().bitcast[UInt32]().unsafe_store(
+        0, DEAD_DEVICE_POISON
+    )
+    comptime if not SAB_2002_DEAD_DEVICE:
+        ctx.enqueue_copy(dst_ptr=h_fv.unsafe_ptr(), src_buf=fv)
+    ctx.synchronize()
+    _ = fv_part^  # past the drain (step-33 race class, device side)
+    _ = fv^  # past the drain (step-33 race class, device side)
+    if (
+        h_fv.unsafe_ptr().bitcast[UInt32]().unsafe_load(0)
+        == DEAD_DEVICE_POISON
+    ):
+        raise Error(
+            "DEVIATION 2002: refusing to return this fit -- the final"
+            " train loss was never delivered (the host-side poison"
+            " survived the drain). This is the dead/saturated-device"
+            " signature (Metal context death under load): fits in this"
+            " state return empty models and a stale mse of -0.0 with no"
+            " error, so the fit raises instead. The process's GPU"
+            " context is not trustworthy; restart the process on a"
+            " quieter box."
+            + (
+                " [SABOTAGE ARM -D ANONLIB_2002_SABOTAGE=1 IS ARMED:"
+                " this failure is the REQUIRED-RED verdict.]"
+                if SAB_2002_DEAD_DEVICE else ""
+            )
+        )
+    losses.append(
+        -Float64(h_fv.unsafe_ptr().unsafe_load(0)) / loss_norm
+    )
+    # DEVIATION 74, MEASURED RATHER THAN ARGUED. A nonzero count means
+    # some leaf's Hessian was not positive definite, Cholesky stopped, and
+    # that leaf took a gradient step instead of a Newton one -- silently,
+    # because their `CB_ENSURE(info >= 0)` passes on exactly that. Printed
+    # rather than raised, because the behaviour is THEIRS and the point is
+    # to know whether it happens at all.
+    if not_pd_total != 0:
+        print(
+            "  [deviation 74] Cholesky found a non-positive-definite"
+            " Hessian in", not_pd_total,
+            "leaf-blocks over this fit; those leaves took their gradient"
+            " fallback, as CatBoost's own dposv does",
+        )
+
+    stage_times.report(
+        grow_policy_name(grow_policy) + " fit (doc-parallel boosting)"
+    )
+
+    return FitResult(
+        losses^, test_losses^, detector.best_iteration, stopped_early
+    )
+
+
+def model_approx_dim(model: TAdditiveModel) raises -> Int:
+    """`OutputDim()` of the ensemble (`oblivious_model.h:130-133`).
+
+    Every weak model in one ensemble has the same `Dim`; disagreement is a
+    corrupted model rather than a case to handle, so it raises. An empty
+    ensemble is one-dimensional, which is what a zero-tree predict returns.
+    """
+    if model.size() == 0:
+        return 1
+    if not model.is_oblivious():
+        # `TNonSymmetricTree::OutputDim()` (`non_symmetric_tree.h:179-182`),
+        # the same one-dim-per-ensemble rule
+        var nd = model.non_symmetric_models[0].dim
+        for t in range(1, model.size()):
+            if model.non_symmetric_models[t].dim != nd:
+                raise Error(
+                    "non-symmetric tree " + String(t) + " has dim "
+                    + String(model.non_symmetric_models[t].dim)
+                    + " but tree 0 has " + String(nd)
+                )
+        if nd < 1:
+            raise Error("model dim is " + String(nd))
+        return nd
+    var d = model.weak_models[0].dim
+    for t in range(1, model.size()):
+        if model.weak_models[t].dim != d:
+            raise Error(
+                "tree " + String(t) + " has dim "
+                + String(model.weak_models[t].dim)
+                + " but tree 0 has " + String(d)
+            )
+    if d < 1:
+        raise Error("model dim is " + String(d))
+    return d
+
+
+def predict(
+    model: TAdditiveModel,
+    ctx: DeviceContext,
+    n_rows: Int,
+    fold_counts: List[Int],
+    mut cindex: DeviceBuffer[DType.uint32],
+    mut cursor: DeviceBuffer[DType.float32],
+    one_hot: List[Bool] = List[Bool](),
+) raises:
+    """Apply a stored ensemble by EVALUATING every tree.
+
+    Their `TAdditiveModel` prediction: sum over weak models. The learning
+    rate is already in the stored leaf values (`Rescale(step)`), so nothing
+    here reapplies it.
+
+    This is the path that works on rows the model was never grown on, which
+    the partition-based `add_model_value_kernel` cannot do. On the learn set
+    the two must agree exactly, and `boosting_check` asserts that.
+
+    THE ENSEMBLE IS PACKED ONCE. This used to create eight buffers, fill
+    them and `ctx.synchronize()` PER TREE, which at ~191 us per drain plus
+    the allocations made the host loop cost as much as the kernels: our
+    artifact, not theirs -- their evaluator holds the whole model resident
+    and their `AddObliviousTreeImpl` launches back to back on one stream.
+    Now the per-level split records of every tree and every tree's leaf
+    values go up in five copies total, the launches are enqueued back to
+    back exactly as their stream takes them, and the ONE drain at the end
+    is what makes `cursor` readable."""
+    var layout = build_layout(fold_counts, one_hot)
+    var approx_dim = model_approx_dim(model)
+
+    # the model's bias IS the cursor's starting value
+    # (`modelToExport.SetBias(cursors->StartingPoint)`,
+    # `doc_parallel_boosting.h:434`): a fit under `boost_from_average`
+    # grew every tree against a cursor seeded there, so an apply that
+    # started at zero would return the residual, not the target.
+    enqueue_fill(ctx, cursor, Float32(model.bias))
+
+    if not model.is_oblivious():
+        # THE NON-SYMMETRIC SHAPE (DEVIATION 259): their
+        # `TAddModelDocParallel<TNonSymmetricTree>`, one tree at a time --
+        # bins off the model, `AddBinModelValues` onto the cursor
+        # (`add_non_symmetric_tree_doc_parallel.cpp:182-206`). Each tree
+        # drains once (its bins buffer is per tree); that is a fixed
+        # per-tree cost on a path that runs once per predict, stated
+        # rather than hidden, and the packed-once form the oblivious arm
+        # below takes is the fix if anyone measures a need.
+        # lane/fam-gbdt (IDN_NS_PREDICT_PACKED): the ensemble packed once,
+        # the same kernels back to back, one drain
+        # lane/trees-predict-ideas: ANONLIB_GBDT_NS_PREDICT_BITVEC takes
+        # the packed staging in every numeric mode (its apply lives there)
+        comptime if IDN_NS_PREDICT_PACKED or GBDT_NS_BITVEC:
+            add_non_symmetric_trees_packed(
+                ctx, layout, model.non_symmetric_models, cindex, n_rows,
+                cursor,
+            )
+        else:
+            for t in range(model.size()):
+                add_non_symmetric_tree_to_cursor(
+                    ctx, layout, model.non_symmetric_models[t], cindex,
+                    n_rows, cursor,
+                )
+            ctx.synchronize()
+        return
+
+    # pack every tree's per-level records and leaf values, flat.
+    # `total_leaves` counts VALUES, so it carries the approx dimension.
+    var total_levels = 0
+    var total_leaves = 0
+    for t in range(model.size()):  # small-loop(model: one entry per tree): sums tree depths to size the apply buffers
+        total_levels += model.weak_models[t].structure.get_depth()
+        total_leaves += (
+            (1 << model.weak_models[t].structure.get_depth()) * approx_dim
+        )
+    if model.size() == 0:
+        ctx.synchronize()
+        return
+
+    # Constant trees have one leaf and no split records. Keep a valid
+    # placeholder origin for the kernel's unused split pointers when the
+    # entire ensemble is constant. Positive-depth packing stays unchanged.
+    var split_capacity = max(total_levels, 1)
+    var d_off = ctx.enqueue_create_buffer[DType.uint32](split_capacity)
+    var d_shift = ctx.enqueue_create_buffer[DType.uint32](split_capacity)
+    var d_mask = ctx.enqueue_create_buffer[DType.uint32](split_capacity)
+    var d_bin = ctx.enqueue_create_buffer[DType.uint32](split_capacity)
+    var d_eq = ctx.enqueue_create_buffer[DType.uint8](split_capacity)
+    var d_vals = ctx.enqueue_create_buffer[DType.float32](total_leaves)
+    var h_off = ctx.enqueue_create_host_buffer[DType.uint32](split_capacity)
+    var h_shift = ctx.enqueue_create_host_buffer[DType.uint32](split_capacity)
+    var h_mask = ctx.enqueue_create_host_buffer[DType.uint32](split_capacity)
+    var h_bin = ctx.enqueue_create_host_buffer[DType.uint32](split_capacity)
+    var h_eq = ctx.enqueue_create_host_buffer[DType.uint8](split_capacity)
+    var h_vals = ctx.enqueue_create_host_buffer[DType.float32](total_leaves)
+    if total_levels == 0:
+        h_off.unsafe_ptr().unsafe_store(0, UInt32(0))
+        h_shift.unsafe_ptr().unsafe_store(0, UInt32(0))
+        h_mask.unsafe_ptr().unsafe_store(0, UInt32(0))
+        h_bin.unsafe_ptr().unsafe_store(0, UInt32(0))
+        h_eq.unsafe_ptr().unsafe_store(0, UInt8(0))
+
+    var lvl = 0
+    var leaf = 0
+    # driver-loop: over the trees of the model
+    for t in range(model.size()):
+        ref weak = model.weak_models[t]
+        var depth = weak.structure.get_depth()
+        # driver-loop: over the tree depth (split records)
+        for level in range(depth):
+            ref cf = layout.features[
+                Int(weak.structure.splits[level].feature_id)
+            ]
+            h_off.unsafe_ptr().unsafe_store(
+                lvl, cf.offset * UInt32(n_rows)
+            )
+            h_shift.unsafe_ptr().unsafe_store(lvl, cf.shift)
+            h_mask.unsafe_ptr().unsafe_store(lvl, cf.mask)
+            h_bin.unsafe_ptr().unsafe_store(
+                lvl, UInt32(Int(weak.structure.splits[level].bin_idx))
+            )
+            # THE PREDICATE COMES OFF THE MODEL, and the layout only
+            # confirms it. Their `TAddModelDocParallel::AddTask` switches
+            # on `split.SplitType` and asserts the dataset agrees --
+            # `if (split.SplitType == EBinSplitType::TakeBin)
+            #  CB_ENSURE(dataSet.IsOneHot(split.FeatureId)); else
+            #  CB_ENSURE(!dataSet.IsOneHot(...))`
+            # (`add_oblivious_tree_model_doc_parallel.cpp:139-144`). This
+            # used to read the layout alone, which is fine while the layout
+            # that grew the tree is still in hand and not fine for a model
+            # read back from a file: the file, not the caller's fold
+            # counts, has to say what the predicate is.
+            var take_bin = (
+                Int(weak.structure.splits[level].split_type)
+                == BIN_SPLIT_TAKE_BIN
+            )
+            if take_bin != cf.one_hot_feature:
+                raise Error(
+                    "tree " + String(t) + " level " + String(level)
+                    + " is a "
+                    + String("TakeBin" if take_bin else "TakeGreater")
+                    + " split on feature "
+                    + String(Int(weak.structure.splits[level].feature_id))
+                    + ", which the layout says is "
+                    + String("one-hot" if cf.one_hot_feature else "ordered")
+                )
+            h_eq.unsafe_ptr().unsafe_store(
+                lvl, UInt8(1) if take_bin else UInt8(0)
+            )
+            lvl += 1
+        var n_values = (1 << depth) * approx_dim
+        # driver-loop: over the tree's leaf values (leaves x approx_dim)
+        for i in range(n_values):
+            var v = Float32(0.0)
+            if i < len(weak.leaf_values):
+                v = weak.leaf_values[i]
+            h_vals.unsafe_ptr().unsafe_store(leaf + i, v)
+        leaf += n_values
+    ctx.enqueue_copy(dst_buf=d_off, src_ptr=h_off.unsafe_ptr())
+    ctx.enqueue_copy(dst_buf=d_shift, src_ptr=h_shift.unsafe_ptr())
+    ctx.enqueue_copy(dst_buf=d_mask, src_ptr=h_mask.unsafe_ptr())
+    ctx.enqueue_copy(dst_buf=d_bin, src_ptr=h_bin.unsafe_ptr())
+    ctx.enqueue_copy(dst_buf=d_eq, src_ptr=h_eq.unsafe_ptr())
+    ctx.enqueue_copy(dst_buf=d_vals, src_ptr=h_vals.unsafe_ptr())
+
+    # `AddObliviousTreeImpl` per tree, back to back on one stream, their
+    # own launch shape (`add_model_value.cu`); no drain between trees.
+    var wide = (n_rows + 255) // 256
+    if wide > 1024:
+        wide = 1024
+    # lane/fam2-gbdt F3 / F4: the same per-row ordered adds in fewer
+    # launches (`gbdt/models/kernel/add_bin_values.mojo`)
+    var grouped = False
+    comptime if IDN_PREDICT_FOUR or IDN_APPLY_WIDE:
+        var tree_depths = List[Int](capacity=model.size())
+        for t in range(model.size()):  # small-loop(model: one entry per tree): collects tree depths for the apply dispatch
+            tree_depths.append(model.weak_models[t].structure.get_depth())
+        comptime if IDN_APPLY_WIDE:
+            var uniform = uniform_positive_depth(tree_depths)
+            if uniform > 0:
+                launch_oblivious_apply_wide(
+                    ctx, cindex, d_off, d_shift, d_mask, d_bin, d_eq, d_vals,
+                    uniform, model.size(), n_rows, cursor, approx_dim,
+                )
+                grouped = True
+        comptime if IDN_PREDICT_FOUR:
+            if not grouped:
+                launch_oblivious_apply_four(
+                    ctx, cindex, d_off, d_shift, d_mask, d_bin, d_eq, d_vals,
+                    tree_depths, n_rows, cursor, approx_dim,
+                )
+                grouped = True
+    if not grouped:
+        lvl = 0
+        leaf = 0
+        for t in range(model.size()):
+            ref weak = model.weak_models[t]
+            var depth = weak.structure.get_depth()
+            # With depth zero the existing kernel's level loop is empty and
+            # leaf remains zero: apply the constant, including inside a mixed
+            # ensemble. Use offset zero for unused pointers to avoid a trailing
+            # constant forming a one-past-end split pointer.
+            var split_offset = lvl if depth > 0 else 0
+            ctx.enqueue_function[compute_bins_and_add_kernel](
+                cindex.unsafe_ptr(),
+                d_off.unsafe_ptr() + split_offset,
+                d_shift.unsafe_ptr() + split_offset,
+                d_mask.unsafe_ptr() + split_offset,
+                d_bin.unsafe_ptr() + split_offset,
+                d_eq.unsafe_ptr() + split_offset,
+                Int32(depth),
+                d_vals.unsafe_ptr() + leaf,
+                Int32(n_rows),
+                cursor.unsafe_ptr(),
+                Int32(approx_dim),
+                Int32(n_rows),
+                grid_dim=(wide, approx_dim, 1),
+                block_dim=(256, 1, 1),
+            )
+            lvl += depth
+            leaf += (1 << depth) * approx_dim
+    ctx.synchronize()
+    _ = d_vals^  # past the drain (step-33 race class, device side)
+    _ = d_eq^  # past the drain (step-33 race class, device side)
+    _ = d_bin^  # past the drain (step-33 race class, device side)
+    _ = d_mask^  # past the drain (step-33 race class, device side)
+    _ = d_shift^  # past the drain (step-33 race class, device side)
+    _ = d_off^  # past the drain (step-33 race class, device side)
+    # past the drain: the six pack buffers' last uses were their
+    # enqueues, which freed them under queued copies -- and THIS is the
+    # AUC path, so the step-33 race class here corrupts the metric even
+    # when the fit was clean
+    _ = h_off^
+    _ = h_shift^
+    _ = h_mask^
+    _ = h_bin^
+    _ = h_eq^
+    _ = h_vals^
+
+def fit(
+    mut model: TAdditiveModel,
+    ctx: DeviceContext,
+    n_rows: Int,
+    fold_counts: List[Int],
+    max_depth: Int,
+    mut cindex: DeviceBuffer[DType.uint32],
+    mut targets: DeviceBuffer[DType.float32],
+    mut weights: DeviceBuffer[DType.float32],
+    has_weights: Bool,
+    n_estimators: Int,
+    learning_rate: Float32 = Float32(0.03),
+    l2_leaf_reg: Float32 = Float32(3.0),
+    use_subtraction: Bool = True,
+    bootstrap_bayesian: Bool = False,
+    bagging_temperature: Float32 = Float32(1.0),
+    bootstrap_type: Int = -1,
+    bootstrap_param: Float32 = Float32(1.0),
+    random_seed: UInt64 = UInt64(0),
+    one_hot: List[Bool] = List[Bool](),
+    score_function: Int = SCORE_FUNCTION_COSINE,
+    objective: Int = OBJECTIVE_RMSE,
+    num_classes: Int = 0,
+    logloss_border: Float32 = Float32(0.5),
+    leaf_estimation_iterations: Int = 1,
+    leaf_estimation_method: Int = LEAF_ESTIMATION_NEWTON,
+    alpha: Float32 = Float32(0.0),
+    estimator_alpha: Float32 = Float32(0.5),
+    # forwarded; see `fit_with_test` for what it selects and why the
+    # default is False
+    use_pointwise_searcher: Bool = False,
+    # forwarded; `oblivious_tree_options.cpp:17`
+    random_strength: Float32 = Float32(0.0),
+    # forwarded; resolved by the caller (see `fit_with_test`'s docstring
+    # on this parameter)
+    boost_from_average: Bool = False,
+    feature_fraction: Float64 = 1.0,
+) raises -> List[Float64]:
+    """`fit_with_test` with no held-out set and no detector.
+
+    THIS WRAPPER EXISTS SO NINE CALL SITES DID NOT HAVE TO CHANGE when the
+    test arm landed -- checks, benches, and another session's interleaved
+    harness. Its signature and return are exactly what they were.
+    """
+    var trace = IdentityTrace()
+    var r = fit_with_test(
+        feature_fraction=feature_fraction,
+        model=model,
+        ctx=ctx,
+        trace=trace,
+        n_rows=n_rows,
+        fold_counts=fold_counts,
+        max_depth=max_depth,
+        cindex=cindex,
+        targets=targets,
+        weights=weights,
+        has_weights=has_weights,
+        n_estimators=n_estimators,
+        learning_rate=learning_rate,
+        l2_leaf_reg=l2_leaf_reg,
+        use_subtraction=use_subtraction,
+        bootstrap_bayesian=bootstrap_bayesian,
+        bagging_temperature=bagging_temperature,
+        bootstrap_type=bootstrap_type,
+        bootstrap_param=bootstrap_param,
+        random_seed=random_seed,
+        one_hot=one_hot,
+        score_function=score_function,
+        objective=objective,
+        num_classes=num_classes,
+        logloss_border=logloss_border,
+        leaf_estimation_iterations=leaf_estimation_iterations,
+        leaf_estimation_method=leaf_estimation_method,
+        alpha=alpha,
+        estimator_alpha=estimator_alpha,
+        use_pointwise_searcher=use_pointwise_searcher,
+        random_strength=random_strength,
+        boost_from_average=boost_from_average,
+    )
+    var out = r.learn_losses.copy()
+    return out^

@@ -1,0 +1,50 @@
+# x_linear: the linear expansion lane
+
+SGDClassifier, SGDRegressor, Perceptron, PassiveAggressiveClassifier,
+PassiveAggressiveRegressor, SGDOneClassSVM, PoissonRegressor, GammaRegressor,
+TweedieRegressor, HuberRegressor, BayesianRidge, ARDRegression, Lars,
+LassoLars, QuantileRegressor, RidgeClassifier, RidgeCV, LassoCV,
+ElasticNetCV, LogisticRegressionCV and IsotonicRegression
+(`python/anonlib/_expansion_linear.py`). Each module's header names its
+scikit-learn reference and every difference from it; `NOT_IMPLEMENTED.tsv`
+lists what is refused or replaced.
+
+## One source, two columns
+
+Every fit is one plain function over pointers (`dispatch.mojo::fit_dispatch`).
+The CPU host binding (`bindings/_anonlib_x_linear_host.mojo`) calls it
+directly; the GPU binding (`bindings/_anonlib_x_linear.mojo`) calls the same
+function from a one-thread kernel (`device.mojo`). Scoring
+(`dispatch.mojo::decision_one`) runs one device thread per (row, output).
+IDENTICAL is bought by the sequence of operations alone; the parallel fit
+schedules are the speed work that follows.
+
+## The seams (IDENTITY_PATHS rows 100-109)
+
+| DEVIATION | seam | move |
+|---|---|---|
+| 5000 | every reduction (`ops.dot`, `row_dot`, the Gram and X'y folds) | PIN: j ascending, one `identical_mul_add` per term |
+| 5001 | every operand and result | PIN: `ftz` (a subnormal is its signed zero) |
+| 5002 | Cholesky (`ops.cholesky`, `chol_solve`) | PIN: column j ascending, inner sums k ascending, products rounded alone |
+| 5003 | the symmetric eigensolver (`ops.jacobi_eig`, BayesianRidge) | REPLACE their SVD: cyclic Jacobi, p then q ascending, Rutishauser's rotation |
+| 5004 | the SGD epoch order (`ops.perm_at`, `perm_key`) | REPLACE numpy's MT19937 shuffle: a fresh keyed permutation each epoch (4-round Feistel on splitmix64's mix, cycle-walked into [0, n), key = mix(seed + 1000003 c + (epoch + 1) golden)), a thread a row on the device; `ops.shuffle` (Fisher-Yates) remains only as the seam fixture |
+| 5005 | every argmax/argmin (LARS's feature, the class argmax, the CV choices) | PIN: the lowest index wins an exact tie |
+| 5006 | isotonic out-of-bounds 'nan' | PIN: the constant word 0x7FC00000, never a computed NaN (Clause B) |
+| 5007 | a score (`decision_one`) | PIN: the fold of x.w first, the intercept added last |
+| 5008 | exp and log in the fits (`ops.fexp`, `flog`) | PIN: the portable spellings of checks/numerics.mojo |
+| 5009 | the CV alpha grid (`cd.alpha_grid_value`) | PIN: alpha_max * exp(frac * log eps) |
+
+## Algorithm differences that are not seams
+
+| DEVIATION | where | what |
+|---|---|---|
+| 5010 | `lars.mojo`, Lars (method lar) | When an active coefficient crosses zero, scikit-learn's lar method flips its `sign_active` entry and adds no feature on the next step. LAR keeps every active correlation's sign (only the coefficient changes sign), so the flip breaks the equiangular step and the path diverges: their own float64 Lars ends at train R2 -25 where least squares gives 0.93 on a 60 x 5 problem with every feature active, and at R2 below -1e20 on the bench board's Istella block. Ours lets the coefficient cross (plain LAR, Efron et al. 2004). LassoLars keeps the drop. Fits with no crossing are bit for bit unchanged. Check: `python -m anonlib.tests.test_x_linear_sanity lars-crossing`. |
+
+Check: `tools/with_identical_mode.sh pixi run mojo run -I . x_linear/checks/seams_check.mojo`
+(oracle `x_linear/checks/seams_oracle.mojo`; each seam's fixture must separate
+its pinned spelling from the unpinned one first). Sabotage arms:
+`x_linear/checks/sabotage/seam_50NN_*.patch`, listed in
+`tools/identity_lanes/linear.checks` and run by
+`tools/algos_lane_check.sh <lanes> --pass 2`. Card:
+`$ANONLIB_XLINEAR_CARD`, compared across boxes with
+`tools/identity_trace_diff.py`.

@@ -1,0 +1,1273 @@
+# Build the wheel and publish it to TestPyPI or PyPI through a Trusted
+# Publisher. No API token exists anywhere in this repository and none should.
+#
+# REWRITTEN 2026-08-20. This file was a verbatim copy of mojotrees' and could
+# never have run here: it globbed `python/dist/mojotrees-*.whl`, called
+# `packaging/macos/build_release_wheel.sh` before that script existed, and ran
+# on `[self-hosted, macos, arm64, metal]` while this repository has zero
+# registered runners. Its header also stated "The environments exist", which
+# was true of mojotrees and false here -- `testpypi` and `pypi` were created
+# on 2026-08-20 and were absent until then, which alone would have made every
+# OIDC claim unacceptable.
+#
+# WHERE IT RUNS, AND WHY IT IS NOT A HOSTED RUNNER.
+#
+# This built on `macos-15` for exactly one release and that release was
+# BROKEN. GitHub's hosted macOS runner compiles the host half of the extension
+# and silently emits no Metal shader code at all -- `mojo build` exits 0. Same
+# commit, two machines:
+#
+#                              local (M4)     hosted runner
+#     __TEXT/__const            692,543 B          49,039 B
+#     AIR / metallib markers           98                 0
+#
+# TestPyPI 0.1.0a2 was that wheel. It passed every gate, published, installed
+# cleanly from the index, and died on the first fit with "Failed to create
+# Metal function". packaging/macos/check_gpu_embedded.py now refuses such a
+# build, but refusing is not producing: a release needs a machine with a real
+# Apple GPU.
+#
+# So the build job runs on a SELF-HOSTED, EPHEMERAL runner labelled
+# `real-gpu`. Ephemeral means it accepts one job and exits, so nothing is left
+# listening on anyone's laptop; start it deliberately before dispatching a
+# release: `tools/release_runner.sh` registers exactly one such runner on the
+# M4, runs one job in the foreground, and removes the registration. The
+# step-by-step release procedure is docs/PYPI_RELEASE.md. That is a real cost
+# -- a release now depends on someone's machine being awake -- and it is the
+# cost of shipping a wheel that works.
+#
+# ONE WHEEL, NOT ONE PER INTERPRETER. The extension links no libpython, so
+# the wheel carries the `py3` tag (python/setup.py) and one artifact serves
+# python 3.10 through 3.14; the job below verifies that claim by installing
+# and running it under each of the five. An earlier sibling workflow,
+# release-macos.yml, built a cp310..cp314 matrix against a per-interpreter
+# pixi environment that this repository does not have; it was never runnable
+# (every action pinned to a placeholder, publish hard-disabled) and was the
+# second Trusted Publisher identity where an index can trust only one
+# workflow file, so it was deleted 2026-08-23 and this file is the only
+# release workflow.
+#
+# BECAUSE IT HAS A GPU, THIS WORKFLOW VERIFIES THAT THE WHEEL COMPUTES.
+# verify_wheel.sh runs with no flag, so every interpreter installs the wheel
+# into a clean venv and runs real fits. The hosted-runner version of this file
+# could only check that it imported.
+#
+# TRIGGERING. workflow_dispatch only. There is deliberately no `push` and no
+# `pull_request`: a pull request must never reach a job holding
+# `id-token: write`.
+
+# GPU projects come from python/anonlib/gpu_plugins.py. Ordinary installs
+# retain both vendor names as aggregates and install all native payloads.
+# Publish native payloads FIRST, vendor aggregates SECOND, the core LAST.
+# The aggregate/core jobs also check their exact dependencies on the index,
+# including when the release uploads each project in a separate dispatch.
+# The NVIDIA PTX dependency is a regular payload and publishes before NVIDIA.
+# Every project uses its own Trusted Publisher environment: pypi[-<profile>]
+# and testpypi[-<profile>]. New architecture environments/publishers must be
+# provisioned externally before the first upload; this workflow does not
+# assert they already exist.
+name: Release provenance
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Where to publish. Build only unless changed.
+        required: true
+        default: none
+        type: choice
+        options:
+          - none
+          - testpypi
+          - pypi
+      alpha_candidate_tag:
+        description: Optional alpha-api-* release asset tag; selects prebuilt alpha exposure instead of Apple build.
+        required: false
+        default: ''
+        type: string
+      alpha_manifest_sha256:
+        description: SHA256 of the root-prepared alpha-manifest.json; required with alpha_candidate_tag.
+        required: false
+        default: ''
+        type: string
+      validation_profile:
+        description: Light installed smoke for prepared alpha API artifacts (default), or explicit full native build/certification.
+        required: true
+        default: light
+        type: choice
+        options:
+          - full
+          - light
+          - verifier-patch
+          - python-patch
+          - preverified
+
+      light_platform:
+        description: Explicit platform batch for light publication; each wheel needs its own successful installed smoke.
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - macos
+          - linux
+      artifact_source_commit:
+        description: Optional frozen artifact source SHA when only publisher automation changed after the build.
+        required: false
+        default: ''
+        type: string
+
+# Deny by default. Every job adds back exactly what it needs, so a step that
+# starts wanting a token has to say so in a diff.
+permissions: {}
+
+# One release at a time. Two concurrent runs could publish two different
+# wheels under one version.
+concurrency:
+  group: release-provenance
+  cancel-in-progress: false
+
+jobs:
+  validate_inputs:
+    name: Select the release path
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Require a prepared candidate for light publication
+        env:
+          VALIDATION_PROFILE: ${{ inputs.validation_profile }}
+          CANDIDATE_TAG: ${{ inputs.alpha_candidate_tag }}
+        run: |
+          if [ "$VALIDATION_PROFILE" != full ] && [ -z "$CANDIDATE_TAG" ]; then
+            echo '::error::Light releases need alpha_candidate_tag and its manifest SHA. Select full only when a fresh native build/certification is intended.'
+            exit 2
+          fi
+
+  cpu_certification:
+    name: Full CPU reference certification
+    needs: validate_inputs
+    if: inputs.publish != 'none' && inputs.validation_profile == 'full'
+    uses: ./.github/workflows/cpu-identity-gate.yml
+    with:
+      confirm: RUN-HEAVY
+    permissions:
+      contents: read
+
+  build:
+    name: Build and verify the wheel
+    needs: validate_inputs
+    if: inputs.alpha_candidate_tag == '' && inputs.validation_profile == 'full'
+    # Self-hosted and ephemeral. See the header: a hosted runner produces a
+    # wheel with no GPU kernels in it.
+    runs-on: [self-hosted, macos, arm64, metal, real-gpu]
+    # The release Mac has a slow uplink: the 0.6.0 candidate passed its
+    # gates but hit upload-artifact's five-minute chunk-progress timeout.
+    timeout-minutes: 90
+    env:
+      ANONLIB_PACKAGE_BYTE_LM: '1'
+      # Four builds of one compiler worker: four compiler threads, inside the
+      # Apple release budget of five cores, about 5 GB (2026-09-21). From the
+      # 0.8.13 cold build's measured per-extension times this is about 15
+      # minutes; 2 x 2 would be about 25 and one at a time was 44
+      # (packaging/macos/build_release_wheel.sh has the measurement).
+      ANONLIB_BUILD_JOBS: '4'
+      ANONLIB_COMPILE_JOBS: '1'
+      ANONLIB_CPU_THREADS: '1'
+      OMP_NUM_THREADS: '1'
+      OPENBLAS_NUM_THREADS: '1'
+      MKL_NUM_THREADS: '1'
+      NUMEXPR_NUM_THREADS: '1'
+      VECLIB_MAXIMUM_THREADS: '1'
+      ACTIONS_ARTIFACT_UPLOAD_CONCURRENCY: '1'
+      ACTIONS_ARTIFACT_UPLOAD_TIMEOUT_MS: '1200000'
+    permissions:
+      contents: read
+    outputs:
+      wheel_name: ${{ steps.digest.outputs.wheel_name }}
+      wheel_sha256: ${{ steps.digest.outputs.wheel_sha256 }}
+      # Every wheel this release publishes, as `sha256  filename` lines, which
+      # is `shasum -c` format on purpose. The macOS wheel is always the first
+      # line; a Linux wheel staged on the runner adds a second. The publish
+      # job checks the artifact against THIS, not against a count.
+      wheel_manifest: ${{ steps.digest.outputs.wheel_manifest }}
+      # The split Linux plugins staged with the core, as a JSON list of
+      # plugin names ("amd", "nvidia"); [] for a combined wheel or none.
+      linux_plugins: ${{ steps.linux.outputs.plugins || '[]' }}
+      linux_payloads: ${{ steps.linux.outputs.payloads || '[]' }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          # A build job has no business holding a token that can write to
+          # this repository, and a self-hosted runner keeps the checkout's
+          # git credentials on a disk somebody else may use.
+          persist-credentials: false
+          # NOT fetch-tags: true. With a tag ref (`gh workflow run --ref
+          # v0.1.0`) and an annotated tag, actions/checkout fails with
+          # "Cannot fetch both <sha> and refs/tags/v0.1.0 to
+          # refs/tags/v0.1.0" (run 32639387919, 2026-08-23). The dispatched
+          # ref is fetched as refs/tags/<tag> anyway, which is all the
+          # Version agreement step needs.
+
+      # Refuse early on the wrong machine: the whole point of the label set is
+      # a native Apple silicon Mac with a real GPU, and a 60 minute build on
+      # anything else is a wasted hour and a wheel that has to be thrown away.
+      - name: Runner facts
+        run: |
+          test "$(uname -s)" = Darwin || { echo "::error::not macOS"; exit 1; }
+          test "$(uname -m)" = arm64  || { echo "::error::not arm64"; exit 1; }
+          test "$(sysctl -n sysctl.proc_translated 2>/dev/null || echo 0)" = 0 \
+            || { echo "::error::running under Rosetta"; exit 1; }
+          echo "chip:  $(sysctl -n machdep.cpu.brand_string)"
+          echo "macOS: $(sw_vers -productVersion)"
+          xcodebuild -version 2>/dev/null || echo "xcodebuild: absent"
+
+      # The version is stated in two files on purpose (python/pyproject.toml
+      # says so) and a release where they disagree ships a wheel whose
+      # filename and `__version__` differ. If HEAD is already tagged, the tag
+      # must be that version; tagging after publishing is also allowed, which
+      # is why an untagged HEAD is not an error here.
+      - name: Version and citation date agreement
+        run: |
+          python3 packaging/wheel_ci.py versions .
+          v_toml=$(sed -n 's/^version = "\(.*\)"$/\1/p' python/pyproject.toml | head -1)
+          v_py=$(sed -n 's/^__version__ = "\(.*\)"$/\1/p' python/anonlib/_version.py | head -1)
+          echo "pyproject.toml: $v_toml"
+          echo "_version.py:    $v_py"
+          test -n "$v_toml" && test "$v_toml" = "$v_py" || {
+            echo "::error::python/pyproject.toml and python/anonlib/_version.py disagree"
+            exit 1
+          }
+          if tag=$(git describe --exact-match --tags HEAD 2>/dev/null); then
+            echo "tag:            $tag"
+            test "$tag" = "v$v_toml" || {
+              echo "::error::HEAD is tagged $tag but the version is $v_toml"; exit 1; }
+          else
+            echo "tag:            (none at HEAD)"
+          fi
+
+      # NOT setup-pixi. This runner is a developer machine that already has
+      # pixi, and the action refuses with "Destination file path
+      # /Users/<user>/.pixi/bin/pixi already exists" rather than using it.
+      # The self-hosted runner is the one place pixi is guaranteed present,
+      # so the step verifies rather than installs -- and fails loudly if the
+      # version predates the lock file, which is the actual requirement.
+      - name: Use the machine's pixi
+        run: |
+          export PATH="$HOME/.pixi/bin:$PATH"
+          echo "$HOME/.pixi/bin" >> "$GITHUB_PATH"
+          command -v pixi || { echo "::error::pixi not on this runner"; exit 1; }
+          pixi --version
+          have=$(pixi --version | awk '{print $2}')
+          need=0.76.2
+          [ "$(printf '%s\n%s\n' "$need" "$have" | sort -V | head -1)" = "$need" ] || {
+            echo "::error::pixi $have predates the lock file (need >= $need)"
+            exit 1
+          }
+
+      # NOT setup-python, for the same reason as pixi above: on a self-hosted
+      # Mac the action writes its toolcache to /Users/runner, the hosted
+      # runner's home, and fails with "mkdir: /Users/runner: Permission
+      # denied" (first dispatch, run 32638952057, 2026-08-23). The runner
+      # machine carries the five interpreters (Homebrew python@3.10 through
+      # python@3.14); this step verifies each is on PATH and fails loudly if
+      # one is missing, because verify_wheel.sh would otherwise SKIP it and
+      # the "No interpreter may be skipped" step below would fail later with
+      # a less useful message.
+      - name: Use the machine's python 3.10 through 3.14
+        run: |
+          export PATH="/opt/homebrew/bin:$PATH"
+          echo "/opt/homebrew/bin" >> "$GITHUB_PATH"
+          missing=0
+          for v in 3.10 3.11 3.12 3.13 3.14; do
+            if command -v "python$v" >/dev/null 2>&1; then
+              echo "python$v: $(command -v "python$v") ($("python$v" --version 2>&1))"
+            else
+              echo "::error::python$v is not on this runner (brew install python@$v)"
+              missing=1
+            fi
+          done
+          exit $missing
+
+      # Builds at --target-cpu apple-m1 --target-accelerator metal:1, stages
+      # the MAX runtime dylibs, re-signs, checks the binary's minos against
+      # the wheel tag, and runs the ISA disassembly. Each of those refuses to
+      # continue rather than warning.
+      # build_release_wheel.sh builds all ten binaries (five extensions, two
+      # numeric modes), gates them, packs the wheel and then RUNS
+      # verify_wheel.sh itself: every interpreter installs the wheel into a
+      # clean venv and runs actual fits on every estimator family in both
+      # modes. NO --no-gpu; this runner has a real Apple GPU. The output is
+      # kept so the next step can refuse a SKIP, which is what a missing
+      # interpreter looks like and what "No interpreter may be skipped"
+      # exists to catch.
+      # THE LOCAL COMPILE CACHE (tools/bincache.py, "a LOCAL directory
+      # cache"). It lives in the runner user's home, outside the ephemeral
+      # checkout, so a rerun of a failed release and the next release reuse
+      # every binding whose inputs did not change. The key includes this
+      # checkout's path, the import closure, every script the build runs,
+      # pixi.lock, the Mojo and Xcode toolchains, the mode and the build
+      # environment. A cached binding is verified byte for byte against its
+      # archive before it is placed, then goes through every gate below
+      # exactly like a fresh one; any cache fault builds from source. The
+      # provenance lines are printed after the build so the log says which
+      # bindings were compiled and which were reused, with their sha256.
+      - name: Build the wheel, then install and RUN it on every claimed interpreter
+        run: |
+          set -o pipefail
+          export ANONLIB_BINCACHE_DIR="$HOME/.anonlib-bincache/macos-release"
+          export ANONLIB_BINCACHE_OUT="${RUNNER_TEMP:-/tmp}/bincache"
+          ./packaging/macos/build_release_wheel.sh 2>&1 | tee build.log
+          echo "== compile cache: $(grep -c $'\thit\t' "$ANONLIB_BINCACHE_OUT/provenance.tsv" || true) reused, $(grep -vc $'\thit\t' "$ANONLIB_BINCACHE_OUT/provenance.tsv" || true) compiled"
+          cat "$ANONLIB_BINCACHE_OUT/provenance.tsv" || true
+
+      - name: No interpreter may be skipped, in either numeric mode
+        run: |
+          grep -q '^SKIP' build.log && {
+            echo "::error::an interpreter the package claims was not tested"
+            exit 1
+          }
+          for v in 3.10 3.11 3.12 3.13 3.14; do
+            for mode in fast identical; do
+              grep -q "^PASS python$v \[$mode\]" build.log || {
+                echo "::error::python$v [$mode] is claimed but did not pass"; exit 1; }
+            done
+          done
+          grep -q '^all 5 interpreters passed' build.log
+          rm -f build.log
+
+      - name: Qualify installed UMAP fit, transform and held-out quality
+        run: |
+          set -eu
+          set -- python/dist/anonlib-*.whl
+          test "$#" -eq 1
+          test -f "$1"
+          wheel="$1"
+          set --
+          if [ -n "${ANONLIB_QUALIFICATION_WHEELHOUSE:-}" ]; then
+            set -- --wheelhouse "$ANONLIB_QUALIFICATION_WHEELHOUSE"
+          fi
+          version=$(sed -n 's/^__version__ = "\(.*\)"$/\1/p' python/anonlib/_version.py)
+          python3 tools/qualify_umap_wheel.py "$wheel" "$@" \
+            --source-root "$GITHUB_WORKSPACE" --expected-version "$version" \
+            --output "$RUNNER_TEMP/umap-qualification-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+
+      - name: Retain installed UMAP qualification
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: umap-wheel-qualification
+          path: ${{ runner.temp }}/umap-qualification-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: ignore
+          retention-days: 30
+
+      - name: Qualify the installed verifier and portable CPU models
+        run: |
+          set -eu
+          set -- python/dist/anonlib-*.whl
+          test "$#" -eq 1
+          wheel="$1"
+          set --
+          if [ -n "${ANONLIB_QUALIFICATION_WHEELHOUSE:-}" ]; then
+            set -- --wheelhouse "$ANONLIB_QUALIFICATION_WHEELHOUSE"
+          fi
+          python3 tools/qualify_verifier_wheel.py "$wheel" "$@" \
+            --expected-source-commit "$GITHUB_SHA" \
+            --output "$RUNNER_TEMP/verifier-qualification-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+
+      - name: Retain installed verifier qualification
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: verifier-wheel-qualification
+          path: ${{ runner.temp }}/verifier-qualification-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: ignore
+          retention-days: 30
+
+      # THE LINUX WHEEL IS NOT BUILT HERE AND CANNOT BE. It is compiled on a
+      # rented CUDA box and a rented HIP box (`packaging/linux/leg.sh`),
+      # packed on the Mac by `packaging/linux/pack_wheel.py`, and retagged by
+      # `auditwheel` in docker (`packaging/linux/audit.sh`). All of that
+      # happens BEFORE a release is dispatched, and none of it can happen
+      # inside this job.
+      #
+      # So it is handed over on the runner's own disk, OUTSIDE the workspace,
+      # at $ANONLIB_LINUX_WHEEL_DIR (default ~/.anonlib-linux-wheel). A
+      # checkout cannot write there and this workflow never puts anything
+      # there; staging it is a deliberate act by whoever ran the audit.
+      #
+      # Stage exactly the core, both vendor aggregates, and every released
+      # native architecture payload. Combined/partial Linux releases are not
+      # accepted by the full workflow. Alpha dispatches can publish one
+      # project after its exact dependency versions reach the index.
+      # Every staged wheel is admitted only if ALL of these hold, and each is
+      # an exit:
+      #   * a `<wheel>.sha256` sidecar sits beside it and matches, so a
+      #     half-copied or swapped file is caught here and not on PyPI
+      #   * its version equals the version this job just built
+      #   * its tag is a manylinux tag; `linux_x86_64` is what pack_wheel.py
+      #     writes on purpose for the combined wheel and PyPI refuses it, so
+      #     seeing it here means the audit step never ran
+      #   * `twine check` passes on it (the Metadata check step below)
+      # a split set additionally passes tools/wheel_api_audit.py split_audit
+      # (each plugin holds only its own vendor's sets, the pins are exact both
+      # ways, one version, one tag, no member in two wheels), and ONLY IF a
+      # qualification/ directory was staged beside it:
+      #   * qualification/{hip,cuda}/ under that same staging directory
+      #     retains 24 installed jobs per vendor plus build-provenance.json
+      #     from each build; BOTH runs installed this exact final wheel SHA
+      #     (for a split set: the set digest of every staged wheel,
+      #     tools/check_linux_release_qualification.py --profile release-split)
+      #   * current native source inventory, both vendor binary sets, and
+      #     retained UMAP/OrderedRMSE IDENTICAL comparisons all pass
+      # Separate HIP-only/CUDA-only candidate qualifications cannot admit a
+      # subsequently assembled or auditwheel-modified final release wheel.
+      # If the directory is absent or empty, this is a macOS-only release and
+      # the step says so and moves on. That is not a failure; it is what
+      # every release before 0.3.0 was.
+      - name: Admit a pre-built, pre-audited Linux wheel (or split set), if one is staged
+        id: linux
+        run: |
+          set -euo pipefail
+          DIR="${ANONLIB_LINUX_WHEEL_DIR:-$HOME/.anonlib-linux-wheel}"
+          if [ ! -d "$DIR" ] || [ -z "$(ls -A "$DIR"/*.whl 2>/dev/null || true)" ]; then
+            echo "no Linux wheel staged at $DIR; this is a macOS-only release"
+            echo "staged=none" >> "$GITHUB_OUTPUT"
+            echo "plugins=[]" >> "$GITHUB_OUTPUT"
+            echo "payloads=[]" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          v_toml=$(sed -n 's/^version = "\(.*\)"$/\1/p' python/pyproject.toml | head -1)
+          python3 tools/gpu_release_projects.py "$DIR" --version "$v_toml" --require-complete --github-output
+          staged=""
+          for WHL in "$DIR"/*.whl; do
+            base=$(basename "$WHL")
+            test -f "$WHL.sha256" || { echo "::error::$base has no .sha256 sidecar"; exit 1; }
+            want=$(cut -d' ' -f1 < "$WHL.sha256" | tr -d '[:space:]')
+            got=$(shasum -a 256 "$WHL" | cut -d' ' -f1)
+            test "$want" = "$got" || { echo "::error::$base digest $got, sidecar says $want"; exit 1; }
+            case "$base" in
+              *-manylinux_*_x86_64.whl) ;;
+              *) echo "::error::$base carries no manylinux tag; packaging/linux/audit.sh has not run on it"; exit 1 ;;
+            esac
+            staged="$staged $base"
+          done
+          CORE=$(ls -1 "$DIR"/anonlib-"$v_toml"-*.whl)
+          split=1
+          python3 - "$DIR" <<'PY'
+          import pathlib, sys
+          sys.path.insert(0, 'tools')
+          from wheel_api_audit import split_audit
+          report = split_audit(sorted(pathlib.Path(sys.argv[1]).glob('*.whl')))
+          for problem in report['problems']:
+              print('::error::' + problem)
+          sys.exit(1 if report['problems'] else 0)
+          PY
+          # The Mac build stages generated Python harness copies in its
+          # package directory. Admit Linux against this exact committed
+          # source, without counting those build products as native inputs.
+          source_dir=$(mktemp -d "$RUNNER_TEMP/linux-admission-source.XXXXXX")
+          trap 'rm -rf "$source_dir"' EXIT
+          git archive HEAD -- . ':!bench/results' | tar -x -C "$source_dir"
+          # Corpus operands are tracked but export-ignored. Restore only the
+          # qualification cases from the same commit, never the working tree.
+          python3 - "$source_dir" <<'PY'
+          import pathlib, subprocess, sys
+          root = pathlib.Path(sys.argv[1])
+          sys.path.insert(0, str(root / 'tools'))
+          from verify_linux_surface_qualification import CORPUS_CASES
+          for case in CORPUS_CASES:
+              prefix = 'mamba/corpus/' + case
+              names = subprocess.check_output(['git', 'ls-tree', '-rz', '--name-only', 'HEAD', '--', prefix])
+              for name in names.decode().split('\0'):
+                  if not name:
+                      continue
+                  target = root / name
+                  target.parent.mkdir(parents=True, exist_ok=True)
+                  target.write_bytes(subprocess.check_output(['git', 'show', 'HEAD:' + name]))
+          PY
+          # A release is verified by the CPU column and the Apple pass
+          # (2026-09-19). NVIDIA and AMD qualification is checked when someone
+          # staged it and is not required when nobody did.
+          if [ -d "$DIR/qualification" ]; then
+            if [ "$split" = 1 ]; then
+              # shellcheck disable=SC2046
+              python3 "$source_dir/tools/check_linux_release_qualification.py" $(ls -1 "$DIR"/*.whl) \
+                --qualification-root "$DIR/qualification" \
+                --source-root "$source_dir" --profile release-split
+            else
+              python3 "$source_dir/tools/check_linux_release_qualification.py" "$CORE" \
+                --qualification-root "$DIR/qualification" \
+                --source-root "$source_dir" --profile release-linux3
+            fi
+          else
+            echo "::warning::no NVIDIA/AMD qualification staged for$staged; admitting it on the CPU column and the Apple pass"
+          fi
+          for base in $staged; do
+            cp "$DIR/$base" python/dist/
+            echo "admitted $base ($(shasum -a 256 "$DIR/$base" | cut -d' ' -f1))"
+          done
+          echo "staged=$(echo $staged)" >> "$GITHUB_OUTPUT"
+
+      # ==================================================================
+      # THE TWO GATES THAT WERE MISSING WHEN 0.3.0 AND 0.3.2 SHIPPED.
+      # Both run on the ARTIFACT that is about to be uploaded, not on a
+      # build directory on a box that no longer exists.
+      # ==================================================================
+
+      # 1. THE LINUX ISA BASELINE, ON THE WHEEL.
+      #
+      # `packaging/linux/isa_baseline_linux.py` exists because 0.3.0's Linux
+      # wheel carried unconditional AVX-512 and died with SIGILL inside
+      # `cluster::estimator::kmeans_fit` on every host without it. It is
+      # invoked in exactly ONE place: `packaging/linux/build_sets.sh`, on the
+      # rented box, against the set directory. Nothing between that box and
+      # PyPI looks again -- not pack_wheel.py, not audit.sh, not the
+      # admission step above, which checks the digest, the version, the
+      # manylinux tag and twine and never opens a single .so. A set that
+      # skipped its leg's gate, or was fetched from a leg that predates the
+      # gate, walks straight through. So the gate runs HERE, on the bytes
+      # that ship.
+      #
+      # In docker because the disassembler must be GNU objdump on x86-64
+      # ELF; `audit.sh` already runs this image on this machine.
+      - name: The staged Linux wheel meets the x86-64-v3 baseline
+        if: steps.linux.outputs.staged != 'none'
+        env:
+          STAGED: ${{ steps.linux.outputs.staged }}
+        run: |
+          set -euo pipefail
+          rm -rf "${RUNNER_TEMP:-/tmp}/isa" && mkdir -p "${RUNNER_TEMP:-/tmp}/isa"
+          # A split set is a partition of the combined wheel: every wheel is
+          # extracted into the one tree, so the same gate reads the same bytes.
+          for base in $STAGED; do
+            python3 -c 'import zipfile,sys; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])' \
+              "python/dist/$base" "${RUNNER_TEMP:-/tmp}/isa"
+          done
+          docker run --rm --cpus 1 --platform linux/amd64 \
+            -v "${RUNNER_TEMP:-/tmp}/isa:/w:ro" \
+            -v "$PWD/packaging/linux:/g:ro" \
+            "${ANONLIB_AUDIT_IMAGE:-quay.io/pypa/manylinux_2_28_x86_64}" \
+            python3 /g/isa_baseline_linux.py /w/anonlib
+
+      # 2. NOTHING SHIPS THAT NOTHING IMPORTS.
+      #
+      # `anonlib/torch_ops.py`, 49,809 bytes, was in the 0.2.x and 0.3.x
+      # wheels having never been imported, compiled or executed by anything
+      # (CHANGELOG.md, Removed, 2026-08-31). `packages = ["anonlib"]`
+      # sweeps the directory, so no gate could have seen it. This walks the
+      # import graph of the package as it sits in the wheel.
+      - name: Nothing ships in the wheel that nothing imports
+        run: |
+          set -euo pipefail
+          WHL=$(ls python/dist/anonlib-*-macosx_*.whl)
+          rm -rf "${RUNNER_TEMP:-/tmp}/inv" && mkdir -p "${RUNNER_TEMP:-/tmp}/inv"
+          python3 -c 'import zipfile,sys; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])' \
+            "$WHL" "${RUNNER_TEMP:-/tmp}/inv"
+          python3 packaging/wheel_ci.py inventory \
+            "${RUNNER_TEMP:-/tmp}/inv/anonlib" \
+            "${RUNNER_TEMP:-/tmp}/inv/anonlib_diagnostics.py"
+          python3 packaging/wheel_ci.py versions .
+      - name: Metadata check
+        run: pixi run -e pkg twine check python/dist/*.whl
+
+      - name: Verify qualified UMAP artifact before recording upload digests
+        run: |
+          set -euo pipefail
+          set -- python/dist/anonlib-*-macosx_*.whl
+          test "$#" -eq 1
+          test -f "$1"
+          version=$(sed -n 's/^__version__ = "\(.*\)"$/\1/p' python/anonlib/_version.py)
+          python3 tools/verify_umap_qualification.py "$1" \
+            --results "$RUNNER_TEMP/umap-qualification-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT/results.json" \
+            --source-root "$GITHUB_WORKSPACE" --expected-version "$version"
+
+      # The digests are recorded so the artifacts that get published can be
+      # matched against the ones that were built, by anyone, later.
+      - name: Digest
+        id: digest
+        run: |
+          set -euo pipefail
+          WHEEL=$(ls python/dist/anonlib-*-macosx_*.whl)
+          echo "wheel_name=$(basename "$WHEEL")" >> "$GITHUB_OUTPUT"
+          echo "wheel_sha256=$(shasum -a 256 "$WHEEL" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          # macOS first, then anything else, so the manifest's order is fixed.
+          ( cd python/dist && shasum -a 256 anonlib-*-macosx_*.whl
+            { ls -1 anonlib-*.whl anonlib_*.whl 2>/dev/null | grep -v -- '-macosx_' || true; } | while read -r w; do
+              shasum -a 256 "$w"; done ) > manifest.txt
+          cat manifest.txt
+          {
+            echo "wheel_manifest<<MANIFEST_EOF"
+            cat manifest.txt
+            echo "MANIFEST_EOF"
+          } >> "$GITHUB_OUTPUT"
+          rm -f manifest.txt
+
+      - name: Upload the wheels
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: anonlib-wheel
+          path: python/dist/*.whl
+          if-no-files-found: error
+
+      - name: Say plainly what was not verified
+        run: |
+          {
+            echo "### ${{ steps.digest.outputs.wheel_name }}"
+            echo ""
+            echo "\`${{ steps.digest.outputs.wheel_sha256 }}\`"
+            echo ""
+            echo "Verified on a real Apple GPU: portable-baseline build, ISA"
+            echo "disassembly, minos/tag agreement, GPU kernels embedded, twine"
+            echo "metadata, and real fits on every claimed interpreter."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  publish:
+    name: Publish to ${{ inputs.publish }}
+    # AFTER the plugins (the split core requires both): only when every plugin
+    # upload succeeded, or the build staged no plugin at all.
+    needs: [build, cpu_certification, publish_payloads, publish_plugins]
+    if: >-
+      always() && !cancelled() &&
+      inputs.publish != 'none' && inputs.alpha_candidate_tag == '' && inputs.validation_profile == 'full' &&
+      needs.build.result == 'success' && needs.cpu_certification.result == 'success' &&
+      (needs.publish_payloads.result == 'success' ||
+       (needs.publish_payloads.result == 'skipped' && needs.build.outputs.linux_payloads == '[]')) &&
+      (needs.publish_plugins.result == 'success' ||
+       (needs.publish_plugins.result == 'skipped' && needs.build.outputs.linux_plugins == '[]'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # The environment name is what the Trusted Publisher on PyPI and TestPyPI
+    # was configured against, and it is also where a required reviewer can be
+    # attached. Both `testpypi` and `pypi` exist on this repository as of
+    # 2026-08-20; they did not before, and a publisher whose environment does
+    # not exist rejects every claim.
+    environment:
+      name: ${{ inputs.publish }}
+      url: ${{ inputs.publish == 'pypi' && 'https://pypi.org/p/anonlib' || 'https://test.pypi.org/project/anonlib/' }}
+    permissions:
+      # THE ONLY JOB IN THIS FILE WITH THIS PERMISSION. It mints the OIDC
+      # token the Trusted Publisher checks; there is no API token anywhere.
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Download the wheel that was built
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: anonlib-wheel
+          path: dist
+
+      # The two values from the build job arrive as environment variables
+      # rather than as `${{ }}` inside the script. They are a hash and a
+      # filename this workflow computed itself, but a job that holds an OIDC
+      # token should not have expression results spliced into a shell at all.
+      # A RELEASE MAY CARRY MORE THAN ONE WHEEL. Until 0.3.0 it was macOS
+      # alone and this step asserted `count = 1`; a Linux wheel made that
+      # assertion the thing standing between a correct artifact and PyPI.
+      # It is replaced by a STRONGER check, not a looser one: the build job
+      # emits a `sha256  filename` manifest of everything it is publishing,
+      # and both directions are checked here.
+      #   * every file named in the manifest is present and hashes to the
+      #     recorded value (`sha256sum -c`, which fails on either)
+      #   * the number of .whl files in dist equals the number of manifest
+      #     lines, so an EXTRA wheel that nobody built cannot ride along
+      #   * the macOS wheel is still checked by name and digest separately,
+      #     because that pair is what the build job's summary published and
+      #     what a reader outside this repository can verify against
+      - name: What is about to be published
+        env:
+          EXPECTED_WHEEL: ${{ needs.build.outputs.wheel_name }}
+          EXPECTED_SHA256: ${{ needs.build.outputs.wheel_sha256 }}
+          EXPECTED_MANIFEST: ${{ needs.build.outputs.wheel_manifest }}
+        run: |
+          set -euo pipefail
+          ls -la dist
+          printf '%s\n' "$EXPECTED_MANIFEST" | sed '/^$/d' > manifest.txt
+          echo "the build job published these:"; cat manifest.txt
+          lines=$(wc -l < manifest.txt | tr -d ' ')
+          test "$lines" -ge 1 || { echo "::error::the build job named no wheels"; exit 1; }
+          count=$(find dist -type f -name '*.whl' | wc -l | tr -d ' ')
+          test "$count" = "$lines" || {
+            echo "::error::artifact holds $count wheels, the build job named $lines"; exit 1; }
+          ( cd dist && sha256sum -c ../manifest.txt ) || {
+            echo "::error::an artifact is missing or does not match its recorded digest"; exit 1; }
+          test -f "dist/$EXPECTED_WHEEL" || {
+            echo "::error::the macOS wheel $EXPECTED_WHEEL is not in the artifact"; exit 1; }
+          echo "expected macOS digest: $EXPECTED_SHA256"
+          test "$(sha256sum "dist/$EXPECTED_WHEEL" | cut -d' ' -f1)" = "$EXPECTED_SHA256" || {
+            echo "::error::the macOS wheel does not match the digest the build job recorded"
+            exit 1
+          }
+          rm -f manifest.txt
+
+      - name: Reject platform math in final wheel bytes
+        run: |
+          python3 -m venv "$RUNNER_TEMP/math-audit"
+          "$RUNNER_TEMP/math-audit/bin/pip" install --disable-pip-version-check --only-binary=:all: lief==1.0.0
+          "$RUNNER_TEMP/math-audit/bin/python" packaging/portable_math/wheel.py --audit-only dist/*.whl
+
+      # THIS JOB UPLOADS THE `anonlib` PROJECT ONLY: the macOS wheel and the
+      # Linux core (or the combined wheel). A split plugin belongs to its own
+      # project and is uploaded by `publish_plugins`, BEFORE this job.
+      - name: Keep only the anonlib project's wheels
+        run: |
+          set -euo pipefail
+          mkdir -p upload
+          mv dist/anonlib-*.whl upload/
+          ls -la upload
+
+      - name: The split core publishes last, after both plugins are on the index
+        env:
+          TARGET: ${{ inputs.publish }}
+        run: python3 tools/wheel_api_audit.py --plugins-on-index "$TARGET" upload/*.whl
+
+      - name: Publish
+        uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.13.0
+        with:
+          repository-url: ${{ inputs.publish == 'pypi' && 'https://upload.pypi.org/legacy/' || 'https://test.pypi.org/legacy/' }}
+          packages-dir: upload/
+          print-hash: true
+          # A filename collision means this exact version was already
+          # uploaded. Skipping it quietly is how two different artifacts end
+          # up believed to be the same one.
+          skip-existing: false
+
+  publish_payloads:
+    name: Publish anonlib-${{ matrix.plugin }} to ${{ inputs.publish }}
+    # FIRST: vendor aggregates and core wait for native payload uploads.
+    needs: [build, cpu_certification]
+    if: inputs.publish != 'none' && needs.build.outputs.linux_payloads != '[]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      # one plugin failing never cancels the other vendor's
+      fail-fast: false
+      matrix:
+        plugin: ${{ fromJSON(needs.build.outputs.linux_payloads) }}
+    # ONE ENVIRONMENT PER PROJECT (see the header; PyPI requires distinct
+    # configurations for pending publishers): the Trusted Publisher of
+    # anonlib-nvidia is configured against `pypi-nvidia` (`testpypi-nvidia`
+    # on TestPyPI), that of anonlib-amd against `pypi-amd` (`testpypi-amd`).
+    environment:
+      name: ${{ inputs.publish }}-${{ matrix.plugin }}
+      url: ${{ inputs.publish == 'pypi' && format('https://pypi.org/p/anonlib-{0}', matrix.plugin) || format('https://test.pypi.org/project/anonlib-{0}/', matrix.plugin) }}
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Download the wheels that were built
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: anonlib-wheel
+          path: dist
+      - name: This plugin's wheel, exactly as the build job recorded it
+        env:
+          EXPECTED_MANIFEST: ${{ needs.build.outputs.wheel_manifest }}
+          PLUGIN: ${{ matrix.plugin }}
+        run: |
+          set -euo pipefail
+          python3 tools/gpu_release_projects.py dist
+          WHEEL_PREFIX=$(python3 tools/gpu_release_projects.py --wheel-prefix "$PLUGIN")
+          printf '%s\n' "$EXPECTED_MANIFEST" | sed '/^$/d' | grep -E "  ${WHEEL_PREFIX}-[^ ]+\.whl$" > manifest.txt
+          test "$(wc -l < manifest.txt | tr -d ' ')" = 1 || {
+            echo "::error::the build job recorded no single ${WHEEL_PREFIX} wheel"; exit 1; }
+          mkdir -p upload
+          mv dist/"${WHEEL_PREFIX}"-*.whl upload/
+          test "$(find upload -name '*.whl' | wc -l | tr -d ' ')" = 1 || {
+            echo "::error::the artifact holds other than one ${WHEEL_PREFIX} wheel"; exit 1; }
+          ( cd upload && sha256sum -c ../manifest.txt ) || {
+            echo "::error::${WHEEL_PREFIX} does not match the digest the build job recorded"; exit 1; }
+          rm -f manifest.txt
+      - name: Reject platform math in final wheel bytes
+        run: |
+          python3 -m venv "$RUNNER_TEMP/math-audit"
+          "$RUNNER_TEMP/math-audit/bin/pip" install --disable-pip-version-check --only-binary=:all: lief==1.0.0
+          "$RUNNER_TEMP/math-audit/bin/python" packaging/portable_math/wheel.py --audit-only upload/*.whl
+      - name: Publish
+        uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.13.0
+        with:
+          repository-url: ${{ inputs.publish == 'pypi' && 'https://upload.pypi.org/legacy/' || 'https://test.pypi.org/legacy/' }}
+          packages-dir: upload/
+          print-hash: true
+          skip-existing: false
+
+  publish_plugins:
+    name: Publish anonlib-${{ matrix.plugin }} to ${{ inputs.publish }}
+    # SECOND: native payload uploads finish before vendor aggregates.
+    needs: [build, cpu_certification, publish_payloads]
+    if: >-
+      always() && !cancelled() && inputs.publish != 'none' &&
+      needs.build.result == 'success' && needs.cpu_certification.result == 'success' &&
+      needs.build.outputs.linux_plugins != '[]' &&
+      (needs.publish_payloads.result == 'success' ||
+       (needs.publish_payloads.result == 'skipped' && needs.build.outputs.linux_payloads == '[]'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      # one plugin failing never cancels the other vendor's
+      fail-fast: false
+      matrix:
+        plugin: ${{ fromJSON(needs.build.outputs.linux_plugins) }}
+    # ONE ENVIRONMENT PER PROJECT (see the header; PyPI requires distinct
+    # configurations for pending publishers): the Trusted Publisher of
+    # anonlib-nvidia is configured against `pypi-nvidia` (`testpypi-nvidia`
+    # on TestPyPI), that of anonlib-amd against `pypi-amd` (`testpypi-amd`).
+    environment:
+      name: ${{ inputs.publish }}-${{ matrix.plugin }}
+      url: ${{ inputs.publish == 'pypi' && format('https://pypi.org/p/anonlib-{0}', matrix.plugin) || format('https://test.pypi.org/project/anonlib-{0}/', matrix.plugin) }}
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Download the wheels that were built
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: anonlib-wheel
+          path: dist
+      - name: This plugin's wheel, exactly as the build job recorded it
+        env:
+          EXPECTED_MANIFEST: ${{ needs.build.outputs.wheel_manifest }}
+          PLUGIN: ${{ matrix.plugin }}
+        run: |
+          set -euo pipefail
+          python3 tools/gpu_release_projects.py dist
+          WHEEL_PREFIX=$(python3 tools/gpu_release_projects.py --wheel-prefix "$PLUGIN")
+          printf '%s\n' "$EXPECTED_MANIFEST" | sed '/^$/d' | grep -E "  ${WHEEL_PREFIX}-[^ ]+\.whl$" > manifest.txt
+          test "$(wc -l < manifest.txt | tr -d ' ')" = 1 || {
+            echo "::error::the build job recorded no single ${WHEEL_PREFIX} wheel"; exit 1; }
+          mkdir -p upload
+          mv dist/"${WHEEL_PREFIX}"-*.whl upload/
+          test "$(find upload -name '*.whl' | wc -l | tr -d ' ')" = 1 || {
+            echo "::error::the artifact holds other than one ${WHEEL_PREFIX} wheel"; exit 1; }
+          ( cd upload && sha256sum -c ../manifest.txt ) || {
+            echo "::error::${WHEEL_PREFIX} does not match the digest the build job recorded"; exit 1; }
+          rm -f manifest.txt
+      - name: Reject platform math in final wheel bytes
+        run: |
+          python3 -m venv "$RUNNER_TEMP/math-audit"
+          "$RUNNER_TEMP/math-audit/bin/pip" install --disable-pip-version-check --only-binary=:all: lief==1.0.0
+          "$RUNNER_TEMP/math-audit/bin/python" packaging/portable_math/wheel.py --audit-only upload/*.whl
+      - name: Require exact architecture payload versions on the target index
+        env:
+          TARGET: ${{ inputs.publish }}
+        run: python3 tools/wheel_api_audit.py --plugins-on-index "$TARGET" upload/*.whl
+      - name: Publish
+        uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.13.0
+        with:
+          repository-url: ${{ inputs.publish == 'pypi' && 'https://upload.pypi.org/legacy/' || 'https://test.pypi.org/legacy/' }}
+          packages-dir: upload/
+          print-hash: true
+          skip-existing: false
+
+  alpha_stage:
+    name: Admit explicitly alpha API artifacts
+    needs: validate_inputs
+    outputs:
+      linux_qualification: ${{ steps.linux_qualification.outputs.required }}
+      # Which PyPI projects this candidate carries: `core` is true when a
+      # anonlib-*.whl (macOS, the combined Linux wheel or the split core)
+      # is in it; `plugins` is the JSON list of split plugins ("amd", "nvidia").
+      core: ${{ steps.projects.outputs.core }}
+      plugins: ${{ steps.projects.outputs.plugins }}
+      payloads: ${{ steps.projects.outputs.payloads }}
+    if: inputs.alpha_candidate_tag != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    env:
+      OMP_NUM_THREADS: '2'
+      OPENBLAS_NUM_THREADS: '2'
+      MKL_NUM_THREADS: '2'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Download root-prepared candidate assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_TAG: ${{ inputs.alpha_candidate_tag }}
+        run: |
+          set -euo pipefail
+          [[ "$CANDIDATE_TAG" =~ ^alpha-api-[A-Za-z0-9._-]+$ ]] || exit 2
+          mkdir dist
+          gh release download "$CANDIDATE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern '*.whl' --pattern alpha-manifest.json --dir dist
+      - name: Read SHA-pinned optional combined Linux qualification contract
+        id: linux_qualification
+        env:
+          EXPECTED_MANIFEST_SHA: ${{ inputs.alpha_manifest_sha256 }}
+        run: |
+          python3 - <<'PYQUAL'
+          import hashlib, json, os
+          from pathlib import Path
+          with Path('dist/alpha-manifest.json').open('rb') as stream:
+              raw = stream.read(2 * 1024**2 + 1)
+          if len(raw) > 2 * 1024**2 or hashlib.sha256(raw).hexdigest() != os.environ['EXPECTED_MANIFEST_SHA']:
+              raise SystemExit('Manifest hash/bound mismatch before qualification download')
+          contract = json.loads(raw).get('linux_qualification')
+          if contract is not None and (not isinstance(contract, dict) or contract.get('file') != 'linux-qualification.tar.gz'):
+              raise SystemExit('Unsupported qualification asset name')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write('required=' + ('true' if contract is not None else 'false') + '\n')
+          PYQUAL
+      - name: Download bounded installed smoke receipts
+        if: inputs.validation_profile == 'light'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_TAG: ${{ inputs.alpha_candidate_tag }}
+        run: |
+          gh release download "$CANDIDATE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern 'light-smoke-*.json' --dir dist
+      - name: Download complete installed Linux evidence when declared
+        if: steps.linux_qualification.outputs.required == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_TAG: ${{ inputs.alpha_candidate_tag }}
+        run: |
+          set -euo pipefail
+          mkdir qualification
+          gh release download "$CANDIDATE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern linux-qualification.tar.gz --dir qualification
+      - name: Check exact alpha artifact bytes without GPU execution
+        if: inputs.validation_profile != 'verifier-patch' && inputs.validation_profile != 'python-patch'
+        env:
+          EXPECTED_MANIFEST_SHA: ${{ inputs.alpha_manifest_sha256 }}
+          VALIDATION_PROFILE: ${{ inputs.validation_profile }}
+          ARTIFACT_SOURCE_COMMIT: ${{ inputs.artifact_source_commit }}
+        run: |
+          set -euo pipefail
+          cpus=$(python3 -c 'import os; print(",".join(map(str, sorted(os.sched_getaffinity(0))[:2])))')
+          qualification_args=()
+          if [ "${VALIDATION_PROFILE:-}" = preverified ]; then
+            test -n "$ARTIFACT_SOURCE_COMMIT"
+            qualification_args+=(--preverified-source "$ARTIFACT_SOURCE_COMMIT")
+          fi
+          if [ -f qualification/linux-qualification.tar.gz ]; then
+            qualification_args=(--qualification-archive qualification/linux-qualification.tar.gz --source-root "$GITHUB_WORKSPACE")
+          fi
+          timeout 600 taskset -c "$cpus" python3 packaging/verify_alpha_artifacts.py \
+            dist --manifest-sha256 "$EXPECTED_MANIFEST_SHA" "${qualification_args[@]}" > alpha-admission.json
+          cat alpha-admission.json
+      - name: Admit exact Python/verifier changes against published PyPI wheel bytes
+        if: inputs.validation_profile == 'verifier-patch' || inputs.validation_profile == 'python-patch'
+        env:
+          EXPECTED_MANIFEST_SHA: ${{ inputs.alpha_manifest_sha256 }}
+          ARTIFACT_SOURCE_COMMIT: ${{ inputs.artifact_source_commit }}
+        run: |
+          python3 packaging/verifier_patch.py dist ${{ inputs.validation_profile == 'python-patch' && '--allow-label-inverse-fix' || '' }} --cache "$RUNNER_TEMP/verifier-base" \
+            --source-commit "${ARTIFACT_SOURCE_COMMIT:-$GITHUB_SHA}" \
+            --manifest-sha256 "$EXPECTED_MANIFEST_SHA" | tee alpha-admission.json
+      - name: Admit the exact prepared wheels under the light release policy
+        if: inputs.validation_profile == 'light'
+        env:
+          ARTIFACT_SOURCE_COMMIT: ${{ inputs.artifact_source_commit }}
+          LIGHT_PLATFORM: ${{ inputs.light_platform }}
+        run: python3 tools/check_light_release.py dist --source-commit "${ARTIFACT_SOURCE_COMMIT:-$GITHUB_SHA}" --platform "$LIGHT_PLATFORM"
+      - name: Which PyPI projects the candidate carries
+        id: projects
+        run: |
+          python3 tools/gpu_release_projects.py dist --github-output
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: anonlib-alpha-wheel
+          path: |
+            dist/*.whl
+            dist/alpha-manifest.json
+            dist/light-smoke-*.json
+          if-no-files-found: error
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: steps.linux_qualification.outputs.required == 'true'
+        with:
+          name: anonlib-alpha-linux-qualification
+          path: qualification/linux-qualification.tar.gz
+          if-no-files-found: error
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: anonlib-alpha-admission
+          path: alpha-admission.json
+          if-no-files-found: error
+
+  publish_alpha:
+    name: Publish alpha API artifacts to ${{ inputs.publish }}
+    # AFTER the candidate's plugins, if it carries any (the split core
+    # requires both); a failed plugin upload holds the core.
+    needs: [alpha_stage, cpu_certification, publish_alpha_payloads, publish_alpha_plugins]
+    if: >-
+      always() && !cancelled() && inputs.publish != 'none' && inputs.alpha_candidate_tag != '' &&
+      needs.alpha_stage.result == 'success' && needs.alpha_stage.outputs.core == 'true' &&
+      (needs.publish_alpha_payloads.result == 'success' ||
+       (needs.publish_alpha_payloads.result == 'skipped' && needs.alpha_stage.outputs.payloads == '[]')) &&
+      (needs.publish_alpha_plugins.result == 'success' ||
+       (needs.publish_alpha_plugins.result == 'skipped' && needs.alpha_stage.outputs.plugins == '[]')) &&
+      ((inputs.validation_profile != 'full' && needs.cpu_certification.result == 'skipped') ||
+       (inputs.validation_profile == 'full' && needs.cpu_certification.result == 'success'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment:
+      name: ${{ inputs.publish }}
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: anonlib-alpha-wheel
+          path: dist
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        if: needs.alpha_stage.outputs.linux_qualification == 'true'
+        with:
+          name: anonlib-alpha-linux-qualification
+          path: qualification
+      - name: Recheck exact alpha bytes immediately before publishing
+        env:
+          EXPECTED_MANIFEST_SHA: ${{ inputs.alpha_manifest_sha256 }}
+          VALIDATION_PROFILE: ${{ inputs.validation_profile }}
+          ARTIFACT_SOURCE_COMMIT: ${{ inputs.artifact_source_commit }}
+          LIGHT_PLATFORM: ${{ inputs.light_platform }}
+        run: |
+          set -euo pipefail
+          cpus=$(python3 -c 'import os; print(",".join(map(str, sorted(os.sched_getaffinity(0))[:2])))')
+          qualification_args=()
+          if [ "${VALIDATION_PROFILE:-}" = preverified ]; then
+            test -n "$ARTIFACT_SOURCE_COMMIT"
+            qualification_args+=(--preverified-source "$ARTIFACT_SOURCE_COMMIT")
+          fi
+          if [ -f qualification/linux-qualification.tar.gz ]; then
+            qualification_args=(--qualification-archive qualification/linux-qualification.tar.gz --source-root "$GITHUB_WORKSPACE")
+          fi
+          if [ "$VALIDATION_PROFILE" = verifier-patch ] || [ "$VALIDATION_PROFILE" = python-patch ]; then
+            python3 packaging/verifier_patch.py dist ${{ inputs.validation_profile == 'python-patch' && '--allow-label-inverse-fix' || '' }} --cache "$RUNNER_TEMP/verifier-base" \
+              --source-commit "${ARTIFACT_SOURCE_COMMIT:-$GITHUB_SHA}" \
+              --manifest-sha256 "$EXPECTED_MANIFEST_SHA"
+          else
+            timeout 600 taskset -c "$cpus" python3 packaging/verify_alpha_artifacts.py \
+              dist --manifest-sha256 "$EXPECTED_MANIFEST_SHA" "${qualification_args[@]}"
+          fi
+          if [ "$VALIDATION_PROFILE" = light ]; then
+            python3 tools/check_light_release.py dist --source-commit "${ARTIFACT_SOURCE_COMMIT:-$GITHUB_SHA}" --platform "$LIGHT_PLATFORM"
+          fi
+          rm dist/alpha-manifest.json
+          rm -f dist/light-smoke-*.json
+      - name: Reject platform math in final wheel bytes
+        run: |
+          python3 -m venv "$RUNNER_TEMP/math-audit"
+          "$RUNNER_TEMP/math-audit/bin/pip" install --disable-pip-version-check --only-binary=:all: lief==1.0.0
+          "$RUNNER_TEMP/math-audit/bin/python" packaging/portable_math/wheel.py --audit-only dist/*.whl
+
+      # The anonlib project's wheels only; a split plugin in the same
+      # candidate was uploaded by publish_alpha_plugins, BEFORE this job.
+      - name: Keep only the anonlib project's wheels
+        run: |
+          set -euo pipefail
+          mkdir -p upload
+          mv dist/anonlib-*.whl upload/
+          ls -la upload
+
+      - name: The split core publishes last, after both plugins are on the index
+        env:
+          TARGET: ${{ inputs.publish }}
+        run: python3 tools/wheel_api_audit.py --plugins-on-index "$TARGET" upload/*.whl
+
+      - name: Publish exact alpha API wheel bytes with their scoped admission
+        uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e
+        with:
+          repository-url: ${{ inputs.publish == 'pypi' && 'https://upload.pypi.org/legacy/' || 'https://test.pypi.org/legacy/' }}
+          packages-dir: upload/
+          print-hash: true
+          skip-existing: false
+
+  publish_alpha_payloads:
+    name: Publish alpha anonlib-${{ matrix.plugin }} to ${{ inputs.publish }}
+    # FIRST: vendor aggregates and core wait for native payload uploads.
+    needs: [alpha_stage, cpu_certification]
+    if: >-
+      always() && !cancelled() && inputs.publish != 'none' && inputs.alpha_candidate_tag != '' &&
+      needs.alpha_stage.result == 'success' && needs.alpha_stage.outputs.payloads != '[]' &&
+      ((inputs.validation_profile != 'full' && needs.cpu_certification.result == 'skipped') ||
+       (inputs.validation_profile == 'full' && needs.cpu_certification.result == 'success'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        plugin: ${{ fromJSON(needs.alpha_stage.outputs.payloads) }}
+    # One environment per registry profile; architecture publishers must be
+    # provisioned before first release, independently of the vendor names.
+    environment:
+      name: ${{ inputs.publish }}-${{ matrix.plugin }}
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: anonlib-alpha-wheel
+          path: dist
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        if: needs.alpha_stage.outputs.linux_qualification == 'true'
+        with:
+          name: anonlib-alpha-linux-qualification
+          path: qualification
+      - name: Recheck exact alpha bytes immediately before publishing
+        env:
+          EXPECTED_MANIFEST_SHA: ${{ inputs.alpha_manifest_sha256 }}
+          VALIDATION_PROFILE: ${{ inputs.validation_profile }}
+          ARTIFACT_SOURCE_COMMIT: ${{ inputs.artifact_source_commit }}
+          LIGHT_PLATFORM: ${{ inputs.light_platform }}
+        run: |
+          set -euo pipefail
+          cpus=$(python3 -c 'import os; print(",".join(map(str, sorted(os.sched_getaffinity(0))[:2])))')
+          qualification_args=()
+          if [ "${VALIDATION_PROFILE:-}" = preverified ]; then
+            test -n "$ARTIFACT_SOURCE_COMMIT"
+            qualification_args+=(--preverified-source "$ARTIFACT_SOURCE_COMMIT")
+          fi
+          if [ -f qualification/linux-qualification.tar.gz ]; then
+            qualification_args=(--qualification-archive qualification/linux-qualification.tar.gz --source-root "$GITHUB_WORKSPACE")
+          fi
+          if [ "$VALIDATION_PROFILE" = verifier-patch ] || [ "$VALIDATION_PROFILE" = python-patch ]; then
+            python3 packaging/verifier_patch.py dist ${{ inputs.validation_profile == 'python-patch' && '--allow-label-inverse-fix' || '' }} --cache "$RUNNER_TEMP/verifier-base" \
+              --source-commit "${ARTIFACT_SOURCE_COMMIT:-$GITHUB_SHA}" \
+              --manifest-sha256 "$EXPECTED_MANIFEST_SHA"
+          else
+            timeout 600 taskset -c "$cpus" python3 packaging/verify_alpha_artifacts.py \
+              dist --manifest-sha256 "$EXPECTED_MANIFEST_SHA" "${qualification_args[@]}"
+          fi
+          if [ "$VALIDATION_PROFILE" = light ]; then
+            python3 tools/check_light_release.py dist --source-commit "${ARTIFACT_SOURCE_COMMIT:-$GITHUB_SHA}" --platform "$LIGHT_PLATFORM"
+          fi
+          rm dist/alpha-manifest.json
+          rm -f dist/light-smoke-*.json
+      - name: Keep only this plugin's wheel
+        env:
+          PLUGIN: ${{ matrix.plugin }}
+        run: |
+          set -euo pipefail
+          python3 tools/gpu_release_projects.py dist
+          WHEEL_PREFIX=$(python3 tools/gpu_release_projects.py --wheel-prefix "$PLUGIN")
+          mkdir -p upload
+          mv dist/"${WHEEL_PREFIX}"-*.whl upload/
+          test "$(find upload -name '*.whl' | wc -l | tr -d ' ')" = 1 || {
+            echo "::error::the candidate holds other than one ${WHEEL_PREFIX} wheel"; exit 1; }
+      - name: Reject platform math in final wheel bytes
+        run: |
+          python3 -m venv "$RUNNER_TEMP/math-audit"
+          "$RUNNER_TEMP/math-audit/bin/pip" install --disable-pip-version-check --only-binary=:all: lief==1.0.0
+          "$RUNNER_TEMP/math-audit/bin/python" packaging/portable_math/wheel.py --audit-only upload/*.whl
+      - name: Publish exact alpha plugin wheel bytes with their scoped admission
+        uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e
+        with:
+          repository-url: ${{ inputs.publish == 'pypi' && 'https://upload.pypi.org/legacy/' || 'https://test.pypi.org/legacy/' }}
+          packages-dir: upload/
+          print-hash: true
+          skip-existing: false
+  publish_alpha_plugins:
+    name: Publish alpha anonlib-${{ matrix.plugin }} to ${{ inputs.publish }}
+    # Native vendor packages publish before the core. Architecture sets stay
+    # together in each vendor wheel; the PTX dependency has already published.
+    needs: [alpha_stage, cpu_certification, publish_alpha_payloads]
+    if: >-
+      always() && !cancelled() && inputs.publish != 'none' && inputs.alpha_candidate_tag != '' &&
+      needs.alpha_stage.result == 'success' && needs.alpha_stage.outputs.plugins != '[]' &&
+      (needs.publish_alpha_payloads.result == 'success' ||
+       (needs.publish_alpha_payloads.result == 'skipped' && needs.alpha_stage.outputs.payloads == '[]')) &&
+      ((inputs.validation_profile != 'full' && needs.cpu_certification.result == 'skipped') ||
+       (inputs.validation_profile == 'full' && needs.cpu_certification.result == 'success'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        plugin: ${{ fromJSON(needs.alpha_stage.outputs.plugins) }}
+    # One environment per registry profile; architecture publishers must be
+    # provisioned before first release, independently of the vendor names.
+    environment:
+      name: ${{ inputs.publish }}-${{ matrix.plugin }}
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: anonlib-alpha-wheel
+          path: dist
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        if: needs.alpha_stage.outputs.linux_qualification == 'true'
+        with:
+          name: anonlib-alpha-linux-qualification
+          path: qualification
+      - name: Recheck exact alpha bytes immediately before publishing
+        env:
+          EXPECTED_MANIFEST_SHA: ${{ inputs.alpha_manifest_sha256 }}
+          VALIDATION_PROFILE: ${{ inputs.validation_profile }}
+          ARTIFACT_SOURCE_COMMIT: ${{ inputs.artifact_source_commit }}
+          LIGHT_PLATFORM: ${{ inputs.light_platform }}
+        run: |
+          set -euo pipefail
+          cpus=$(python3 -c 'import os; print(",".join(map(str, sorted(os.sched_getaffinity(0))[:2])))')
+          qualification_args=()
+          if [ "${VALIDATION_PROFILE:-}" = preverified ]; then
+            test -n "$ARTIFACT_SOURCE_COMMIT"
+            qualification_args+=(--preverified-source "$ARTIFACT_SOURCE_COMMIT")
+          fi
+          if [ -f qualification/linux-qualification.tar.gz ]; then
+            qualification_args=(--qualification-archive qualification/linux-qualification.tar.gz --source-root "$GITHUB_WORKSPACE")
+          fi
+          if [ "$VALIDATION_PROFILE" = verifier-patch ] || [ "$VALIDATION_PROFILE" = python-patch ]; then
+            python3 packaging/verifier_patch.py dist ${{ inputs.validation_profile == 'python-patch' && '--allow-label-inverse-fix' || '' }} --cache "$RUNNER_TEMP/verifier-base" \
+              --source-commit "${ARTIFACT_SOURCE_COMMIT:-$GITHUB_SHA}" \
+              --manifest-sha256 "$EXPECTED_MANIFEST_SHA"
+          else
+            timeout 600 taskset -c "$cpus" python3 packaging/verify_alpha_artifacts.py \
+              dist --manifest-sha256 "$EXPECTED_MANIFEST_SHA" "${qualification_args[@]}"
+          fi
+          if [ "$VALIDATION_PROFILE" = light ]; then
+            python3 tools/check_light_release.py dist --source-commit "${ARTIFACT_SOURCE_COMMIT:-$GITHUB_SHA}" --platform "$LIGHT_PLATFORM"
+          fi
+          rm dist/alpha-manifest.json
+          rm -f dist/light-smoke-*.json
+      - name: Keep only this plugin's wheel
+        env:
+          PLUGIN: ${{ matrix.plugin }}
+        run: |
+          set -euo pipefail
+          python3 tools/gpu_release_projects.py dist
+          WHEEL_PREFIX=$(python3 tools/gpu_release_projects.py --wheel-prefix "$PLUGIN")
+          mkdir -p upload
+          mv dist/"${WHEEL_PREFIX}"-*.whl upload/
+          test "$(find upload -name '*.whl' | wc -l | tr -d ' ')" = 1 || {
+            echo "::error::the candidate holds other than one ${WHEEL_PREFIX} wheel"; exit 1; }
+      - name: Reject platform math in final wheel bytes
+        run: |
+          python3 -m venv "$RUNNER_TEMP/math-audit"
+          "$RUNNER_TEMP/math-audit/bin/pip" install --disable-pip-version-check --only-binary=:all: lief==1.0.0
+          "$RUNNER_TEMP/math-audit/bin/python" packaging/portable_math/wheel.py --audit-only upload/*.whl
+      - name: Require exact architecture payload versions on the target index
+        env:
+          TARGET: ${{ inputs.publish }}
+        run: python3 tools/wheel_api_audit.py --plugins-on-index "$TARGET" upload/*.whl
+      - name: Publish exact alpha plugin wheel bytes with their scoped admission
+        uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e
+        with:
+          repository-url: ${{ inputs.publish == 'pypi' && 'https://upload.pypi.org/legacy/' || 'https://test.pypi.org/legacy/' }}
+          packages-dir: upload/
+          print-hash: true
+          skip-existing: false

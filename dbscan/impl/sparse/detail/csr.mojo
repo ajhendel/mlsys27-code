@@ -1,0 +1,539 @@
+"""Weakly connected components by label propagation.
+
+Reference: `raft/sparse/detail/csr.cuh::weak_cc_label_device` and
+`weak_cc_init_all_kernel` (RAFT `661a3b8`).
+
+This is the step that turns DBSCAN's neighbor graph into clusters, and it is
+the only part of DBSCAN that is not distance arithmetic.
+
+THE `filter_op` IS THE WHOLE OF DBSCAN'S SEMANTICS
+--------------------------------------------------
+`weak_cc` is a general primitive; DBSCAN passes it a lambda that returns
+whether a vertex is a CORE point (`cuml/cpp/src/dbscan/runner.cuh:384-386`,
+the `filter_op` lambda passed to `weak_cc_batched`). That
+one predicate is what makes this DBSCAN rather than plain connected
+components:
+
+- a core point may PROPAGATE its label to its neighbors,
+- a border point may RECEIVE a label but never pass one on,
+- so two clusters touching a common border point stay separate,
+
+which is the single most commonly got-wrong part of DBSCAN. The reference kernel
+encodes it as `ci_allow_prop` and `cj_allow_prop`, and both guards are
+matched exactly.
+
+Initialization matches the reference too: a core point starts labelled `i + 1` and a
+non-core point starts at `MAX_LABEL`, so the min-propagation naturally leaves
+untouched non-core points at `MAX_LABEL` and those are the noise.
+
+DETERMINISM
+-----------
+The propagation uses `atomicMin`, so the ORDER of updates varies run to run,
+but the fixed point does not: a minimum over a set is the same whatever order
+it is taken in. This is one of the rare places in these implements where an
+atomic costs nothing in reproducibility, the same situation as the k-means
+assignment argmin and unlike CatBoost's float histogram flush.
+
+**THAT ARGUMENT HAS A PRECONDITION AND IT IS THE ITERATION CAP**
+(IDENTITY_PATHS row 25, DEVIATION 507). "The fixed point does not vary" is
+a statement about the FIXED POINT, and the loop below only reaches it if it
+is allowed to run until `changed` stays zero. `max_iterations` truncates
+it, and a truncated propagation is a SNAPSHOT of a race: whichever labels
+happened to have propagated by the last pass on this machine. THE CAP IS
+THIS IMPLEMENTATION'S, NOT cuML's: the sentence that stood here, "cuML's default
+200, `dbscan.mojo:141`", was false -- the reference's loop is `do { } while
+(host_m)` with no cap (`weak_cc_batched`'s docstring below says so), and
+`dbscan_fit_impl`'s 200 is a number this implementation chose. Measured 2026-08-23
+(DEVIATION 519, `tools/e2u_matrix_fit.py`): a 1,000-point chain needs 731
+passes, and at the 200 cap FAST returned seven clusters for one. The
+caller-facing surface (`dbscan/estimator.mojo`, `anonlib.DBSCAN`) now
+defaults to the fixed point, capped at `n_samples + 1` as a bound; an
+explicit cap is still honoured, and the reference's silent truncation is what
+an explicit binding cap still does under FAST.
+
+Under `NUMERIC_IDENTICAL` this function RAISES instead. A cap that binds is
+the one case where DBSCAN's labels are not a function of its input, so the
+mode that promises they are may not hand one back. Under `FAST` the
+reference behaviour is unchanged, cap and all.
+"""
+from experiments.classical_identical_ideas.graph_controls import C33_FROZEN_CHUNKS, C33_CHUNK
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 the authors. Part of anonlib, DOI-WITHHELD
+
+
+from checks.numerics import (
+    GLOBAL_NUMERIC_MODE,
+    NUMERIC_IDENTICAL,
+    PIN_DETERMINISM,
+    numeric_mode_name,
+)
+from std.atomic import Atomic
+from std.gpu import block_dim, block_idx, thread_idx
+from max.gpu.host import DeviceBuffer, DeviceContext, HostBuffer
+from std.sys.compile import is_defined
+from std.sys.info import has_apple_gpu_accelerator
+
+
+comptime WEAK_CC_TPB = 256
+comptime WEAK_CC_FAST_BATCH = 4
+"""Label passes per flag readback under `ANONLIB_DBSCAN_FAST_CC_BATCH=1`."""
+
+
+def weak_cc_fast_batch_on() -> Bool:
+    comptime if not (
+        GLOBAL_NUMERIC_MODE != NUMERIC_IDENTICAL and has_apple_gpu_accelerator()
+        and is_defined["ANONLIB_DBSCAN_FAST_CC_BATCH"]()
+    ):
+        return False
+    else:
+        return True
+comptime MAX_LABEL = Int32(2147483647)
+
+
+#: fam2-cluster (2026-10-04), IDENTICAL, every column: the convergence flag
+#: stays on the device. `weak_cc_batched` enqueues `IDN_DBSCAN_CC_CHUNK`
+#: label passes between two reads of the flag cells instead of draining the
+#: queue after every pass. Cell 0 of the gate buffer is 1; pass `r`
+#: (1-based inside the chunk) runs only when cell `r - 1` is nonzero and
+#: writes cell `r` when it changes a label, so every pass enqueued after the
+#: pass that found no change returns at its first load. The labels are the
+#: same fixed point and the pass count is the same count (the first zero
+#: cell is the pass that found nothing to do). `merge_labels` takes the same
+#: form on the same buffer.
+#: `-D ANONLIB_IDN_DBSCAN_CC_GATED_OFF=1` restores one drain per pass.
+comptime IDN_DBSCAN_CC_GATED = C33_FROZEN_CHUNKS or (
+    GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL
+    and not (
+        # I14 measured gated+shortcut chunk16 versus ungated below; default retained.
+        is_defined["ANONLIB_IDN_DBSCAN_CC_GATED_OFF"]()
+        or is_defined["ANONLIB_IDN_ALL_OFF"]()
+    )
+)
+
+#: Passes per flag read under `IDN_DBSCAN_CC_GATED`. CANDIDATE ARMS (default
+#: 8): `-D ANONLIB_IDN_DBSCAN_CC_CHUNK4=1`, `..._CHUNK16=1`, `..._CHUNK32=1`.
+# I14 sourcecbcc8dcd33 (2026-10-06), weak_cc_batched component on disconnected
+# 17-vertex cliques, rows100000/131071, two logical convergence passes:
+# gated+shortcut chunk16 versus ungated baseline, NOT chunk16 versus default8.
+# NVIDIA1.841165->4.569126ms (2.482x LOSS),5.566404->2.284453ms
+# (0.410x WIN); AMD1.321677->1.554933ms (1.176x LOSS),
+# 1.658742->1.623151ms (0.979x near-neutral). MIXED: retain gated/default8.
+# One same-process warmup/score; graph convergence component only, no full
+# DBSCAN/HDBSCAN or arbitrary-topology speed claim; accepted identity reused.
+# Evidence: overnight-ab-20261006/{amd,nvidia} normalized I14 receipts.
+comptime IDN_DBSCAN_CC_CHUNK = C33_CHUNK if C33_FROZEN_CHUNKS else (
+    # NEVER RUN — PENDING MEASUREMENT
+    4 if is_defined["ANONLIB_IDN_DBSCAN_CC_CHUNK4"]()
+    else (
+        # Chunk16 bundle measured above; isolated chunk-width comparison pending.
+        16 if is_defined["ANONLIB_IDN_DBSCAN_CC_CHUNK16"]()
+        # NEVER RUN — PENDING MEASUREMENT
+        else (32 if is_defined["ANONLIB_IDN_DBSCAN_CC_CHUNK32"]() else 8)
+    )
+)
+
+#: CANDIDATE ARMS (default 1, the one-thread-per-row walk): under
+#: `IDN_DBSCAN_CC_GATED` each row of the edge pass is shared by `S` threads,
+#: thread `t` of a row walking its edges `start + t, start + t + S, ...`.
+#: A row of several thousand neighbours is otherwise one thread's serial
+#: walk. Every thread pushes the row's label as it read it and mins its own
+#: pulled minimum into the row's label, so a pass makes the same kind of
+#: moves and the fixed point is the same labels; only the pass count can
+#: differ. `-D ANONLIB_IDN_DBSCAN_CC_SPLIT4=1`, `..._SPLIT8=1`,
+#: `..._SPLIT16=1`.
+comptime IDN_DBSCAN_CC_SPLIT = (
+    # NEVER RUN — PENDING MEASUREMENT
+    4 if is_defined["ANONLIB_IDN_DBSCAN_CC_SPLIT4"]()
+    else (
+        # NEVER RUN — PENDING MEASUREMENT
+        8 if is_defined["ANONLIB_IDN_DBSCAN_CC_SPLIT8"]()
+        # NEVER RUN — PENDING MEASUREMENT
+        else (16 if is_defined["ANONLIB_IDN_DBSCAN_CC_SPLIT16"]() else 1)
+    )
+)
+
+#: Cells the caller's flag buffers (device and host) must hold: the chunk's
+#: gate cells under `IDN_DBSCAN_CC_GATED`, the one `changed` cell otherwise.
+comptime DBSCAN_CC_FLAG_CELLS = (
+    IDN_DBSCAN_CC_CHUNK + 1 if IDN_DBSCAN_CC_GATED else 1
+)
+
+#: fam2-cluster (2026-10-04), IDENTICAL, every column: a pointer-jumping
+#: pass after each label pass. A core vertex's label `L` names core vertex
+#: `L - 1` of its own component, so `labels[v] = min(labels[v],
+#: labels[labels[v] - 1])` moves a label any number of hops in one pass
+#: where the edge pass moves it one: a chain of 1,000 points needed 731
+#: edge passes (DEVIATION 519). Every value it writes is a label of the same
+#: component and no smaller than the component minimum, so the fixed point
+#: of the edge pass (the thing returned) is the same labels; the loop still
+#: ends only on an edge pass that changes nothing, and the jump runs only
+#: after an edge pass that did change something, so an edge pass always
+#: follows it. Needs `IDN_DBSCAN_CC_GATED`. The returned pass count (edge
+#: passes) gets smaller. `-D ANONLIB_IDN_DBSCAN_CC_SHORTCUT_OFF=1` removes
+#: the jump.
+comptime IDN_DBSCAN_CC_SHORTCUT = (
+    IDN_DBSCAN_CC_GATED
+    and not (
+        is_defined["ANONLIB_IDN_DBSCAN_CC_SHORTCUT_OFF"]()
+        or is_defined["ANONLIB_IDN_ALL_OFF"]()
+    )
+)
+
+
+def weak_cc_init_kernel(
+    labels: MutPointer[Int32, MutAnyOrigin],
+    core: MutPointer[UInt8, MutAnyOrigin],
+    n_in: Int32,
+):
+    """`weak_cc_init_all_kernel`, copied.
+
+        if (filter_op(tid)) labels[tid] = tid + 1;
+        else                labels[tid] = MAX_LABEL;
+    """
+    var tid = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if tid < Int(n_in):
+        if core.unsafe_load(tid) != 0:
+            labels.unsafe_store(tid, Int32(tid + 1))
+        else:
+            labels.unsafe_store(tid, MAX_LABEL)
+
+
+def weak_cc_label_kernel(
+    labels: MutPointer[Int32, MutAnyOrigin],
+    row_ind: MutPointer[Int32, MutAnyOrigin],
+    col_ind: MutPointer[Int32, MutAnyOrigin],
+    core: MutPointer[UInt8, MutAnyOrigin],
+    changed: MutPointer[Int32, MutAnyOrigin],
+    start_vertex_id_in: Int32,
+    batch_size_in: Int32,
+    n_in: Int32,
+):
+    """`weak_cc_label_device`, copied including both propagation guards.
+
+    One thread per vertex OF THE BATCH. `tid` indexes the batch's CSR rows and
+    `global_id = tid + start_vertex_id` indexes `labels` and the core mask,
+    which is theirs (`csr.cuh:61-63`) and is what makes the CSR a
+    `batch_size x N` slice rather than an `N x N` graph. The first version of
+    this implementation used `tid` for both and only worked because it was handed one
+    global CSR.
+
+    Each pass pushes a smaller label to every neighbor it may propagate to,
+    and pulls the smallest neighbor label it may accept. `changed` is their
+    `*m`, and the host repeats until it stays zero.
+
+    The asymmetry between the two arms is theirs and is load-bearing:
+    pushing requires `ci_allow_prop` (the SOURCE must be core) while pulling
+    requires `cj_allow_prop` (the NEIGHBOR must be core). A border point can
+    therefore end up labelled by a core neighbor and still never join two
+    clusters together.
+
+    `end` comes from `row_ind[tid + 1]` rather than their
+    `get_stop_idx(tid, batch_size, nnz, row_ind)`. That is the extra element
+    their own TODO one line above asks for (`csr.cuh:72`, "add one element to
+    row_ind and avoid get_stop_idx"), and the scan in
+    `adjgraph/algo.mojo` writes it.
+    """
+    var n = Int(n_in)
+    var batch_size = Int(batch_size_in)
+    var start_vertex_id = Int(start_vertex_id_in)
+    var tid = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    var global_id = tid + start_vertex_id
+    if tid >= batch_size or global_id >= n:
+        return
+
+    var start = Int(row_ind.unsafe_load(tid))
+    var end = Int(row_ind.unsafe_load(tid + 1))
+
+    var ci = labels.unsafe_load(global_id)
+    var ci_mod = False
+    var ci_allow_prop = core.unsafe_load(global_id) != 0
+
+    for j in range(start, end):
+        var j_ind = Int(col_ind.unsafe_load(j))
+        var cj = labels.unsafe_load(j_ind)
+        var cj_allow_prop = core.unsafe_load(j_ind) != 0
+        if ci < cj and ci_allow_prop:
+            _ = Atomic.min(labels.unsafe_offset(j_ind), ci)
+            if cj_allow_prop:
+                changed.unsafe_store(0, Int32(1))
+        elif ci > cj and cj_allow_prop:
+            ci = cj
+            ci_mod = True
+
+    if ci_mod:
+        _ = Atomic.min(labels.unsafe_offset(global_id), ci)
+        if ci_allow_prop:
+            changed.unsafe_store(0, Int32(1))
+
+
+def weak_cc_label_gated_kernel(
+    labels: MutPointer[Int32, MutAnyOrigin],
+    row_ind: MutPointer[Int32, MutAnyOrigin],
+    col_ind: MutPointer[Int32, MutAnyOrigin],
+    core: MutPointer[UInt8, MutAnyOrigin],
+    gate: MutPointer[Int32, MutAnyOrigin],
+    pass_in: Int32,
+    start_vertex_id_in: Int32,
+    batch_size_in: Int32,
+    n_in: Int32,
+):
+    """`weak_cc_label_kernel` behind a device flag (`IDN_DBSCAN_CC_GATED`).
+
+    The body is that kernel's, statement for statement. Two differences: it
+    returns at once when `gate[pass - 1]` is zero (the previous pass of the
+    chunk changed nothing, so the fixed point is already in `labels`), and
+    its `changed` cell is `gate[pass]`. No thread writes `gate[pass - 1]`
+    during this launch, so every thread of the launch takes the same branch.
+    """
+    var p = Int(pass_in)
+    if gate.unsafe_load(p - 1) == Int32(0):
+        return
+    var n = Int(n_in)
+    var batch_size = Int(batch_size_in)
+    var start_vertex_id = Int(start_vertex_id_in)
+    # `IDN_DBSCAN_CC_SPLIT` threads share a row (1 by default: `tid` is the
+    # row and `lane` is 0, the reference walk).
+    var gtid = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    var tid = gtid // IDN_DBSCAN_CC_SPLIT
+    var lane = gtid % IDN_DBSCAN_CC_SPLIT
+    var global_id = tid + start_vertex_id
+    if tid >= batch_size or global_id >= n:
+        return
+
+    var start = Int(row_ind.unsafe_load(tid))
+    var end = Int(row_ind.unsafe_load(tid + 1))
+
+    var ci = labels.unsafe_load(global_id)
+    var ci_mod = False
+    var ci_allow_prop = core.unsafe_load(global_id) != 0
+
+    var j = start + lane
+    while j < end:
+        var j_ind = Int(col_ind.unsafe_load(j))
+        j += IDN_DBSCAN_CC_SPLIT
+        var cj = labels.unsafe_load(j_ind)
+        var cj_allow_prop = core.unsafe_load(j_ind) != 0
+        if ci < cj and ci_allow_prop:
+            _ = Atomic.min(labels.unsafe_offset(j_ind), ci)
+            if cj_allow_prop:
+                gate.unsafe_store(p, Int32(1))
+        elif ci > cj and cj_allow_prop:
+            ci = cj
+            ci_mod = True
+
+    if ci_mod:
+        _ = Atomic.min(labels.unsafe_offset(global_id), ci)
+        if ci_allow_prop:
+            gate.unsafe_store(p, Int32(1))
+
+
+def weak_cc_shortcut_gated_kernel(
+    labels: MutPointer[Int32, MutAnyOrigin],
+    core: MutPointer[UInt8, MutAnyOrigin],
+    gate: MutPointer[Int32, MutAnyOrigin],
+    pass_in: Int32,
+    n_in: Int32,
+):
+    """The pointer jump of `IDN_DBSCAN_CC_SHORTCUT`, one thread per vertex.
+
+    Runs only when `gate[pass]` is nonzero, that is when the edge pass just
+    before it changed a label. Core vertices only: a border vertex never
+    passes a label on, and its own label is settled by the last edge pass.
+    A core label is never `MAX_LABEL` (it starts at `v + 1` and only
+    decreases) and always names a core vertex, so the second load is in
+    range.
+    """
+    if gate.unsafe_load(Int(pass_in)) == Int32(0):
+        return
+    var tid = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if tid < Int(n_in):
+        if core.unsafe_load(tid) != 0:
+            var l = labels.unsafe_load(tid)
+            if l != MAX_LABEL:
+                var up = labels.unsafe_load(Int(l) - 1)
+                if up < l:
+                    _ = Atomic.min(labels.unsafe_offset(tid), up)
+
+
+# TOMBSTONE: ANONLIB_IDN_DBSCAN_CC_HOOK (DROPPED-noise) deleted 2026-10-10 by lane/postmerge-act-7; code recoverable at ca8ea1f8d.
+# Tried: D5, comptime IDN_DBSCAN_CC_HOOK, _cc_find / _cc_union, weak_cc_hook_kernel, weak_cc_compress_kernel,
+# weak_cc_border_kernel and _weak_cc_hook (weak_cc by union-find hook and compress, 4 launches + 1 drain per batch).
+# Restore: git apply experiments/removed/ANONLIB_IDN_DBSCAN_CC_HOOK.patch; record in docs/TOMBSTONES.md.
+
+
+def weak_cc_batched(
+    ctx: DeviceContext,
+    mut labels: DeviceBuffer[DType.int32],
+    mut row_ind: DeviceBuffer[DType.int32],
+    mut col_ind: DeviceBuffer[DType.int32],
+    mut core: DeviceBuffer[DType.uint8],
+    mut d_changed: DeviceBuffer[DType.int32],
+    mut h_changed: HostBuffer[DType.int32],
+    n_rows: Int,
+    start_vertex_id: Int,
+    batch_size: Int,
+    max_iterations: Int,
+) raises -> Int:
+    """`weak_cc_batched` (`csr.cuh:133`), copied, returning the pass count.
+
+    **THE INITIALIZATION IS INSIDE, AND OVER ALL `N`, NOT OVER THE BATCH.**
+    Theirs calls `weak_cc_init_all_kernel` on every fit of every batch
+    (`csr.cuh:149`), so each batch starts from a fresh labelling of the whole
+    dataset and the caller merges the results afterwards. Reusing the
+    previous batch's labels as the initial value and skipping the merge is
+    the exact bug their comment at `runner.cuh:392-395` names, cuML issue
+    #3094.
+
+    The convergence flag comes back to the host every pass, which is theirs
+    too: `raft::update_host(&host_m, state->m, 1, stream)` inside their
+    `do { } while (host_m)`.
+    """
+    ctx.enqueue_function[weak_cc_init_kernel](
+        labels.unsafe_ptr(),
+        core.unsafe_ptr(),
+        Int32(n_rows),
+        grid_dim=((n_rows + WEAK_CC_TPB - 1) // WEAK_CC_TPB, 1, 1),
+        block_dim=(WEAK_CC_TPB, 1, 1),
+    )
+    var passes = 0
+    var converged = False
+    # TOMBSTONE: ANONLIB_IDN_DBSCAN_CC_HOOK (DROPPED-noise) deleted 2026-10-10 by lane/postmerge-act-7; code recoverable at ca8ea1f8d.
+    # Tried: D5, the batch fixed point by lock-free hook / compress / border (_weak_cc_hook) before the label passes.
+    # Restore: git apply experiments/removed/ANONLIB_IDN_DBSCAN_CC_HOOK.patch; record in docs/TOMBSTONES.md.
+    comptime if IDN_DBSCAN_CC_GATED:
+        # The caller's flag buffers hold `DBSCAN_CC_FLAG_CELLS` cells. One
+        # upload, `runs` gated passes and one download per chunk; the host
+        # reads the cells in order and the first zero cell is the pass that
+        # found nothing to change, exactly the pass the per-pass loop stops
+        # on, so `passes` is that loop's count.
+        var git = 0
+        while git < max_iterations and not converged:
+            var gruns = IDN_DBSCAN_CC_CHUNK
+            if gruns > max_iterations - git:
+                gruns = max_iterations - git
+            h_changed.unsafe_ptr().unsafe_store(0, Int32(1))
+            for c in range(1, DBSCAN_CC_FLAG_CELLS):
+                h_changed.unsafe_ptr().unsafe_store(c, Int32(0))
+            ctx.enqueue_copy(dst_buf=d_changed, src_ptr=h_changed.unsafe_ptr())
+            for r in range(1, gruns + 1):
+                ctx.enqueue_function[weak_cc_label_gated_kernel](
+                    labels.unsafe_ptr(),
+                    row_ind.unsafe_ptr(),
+                    col_ind.unsafe_ptr(),
+                    core.unsafe_ptr(),
+                    d_changed.unsafe_ptr(),
+                    Int32(r),
+                    Int32(start_vertex_id),
+                    Int32(batch_size),
+                    Int32(n_rows),
+                    grid_dim=(
+                        (batch_size * IDN_DBSCAN_CC_SPLIT + WEAK_CC_TPB - 1)
+                        // WEAK_CC_TPB,
+                        1,
+                        1,
+                    ),
+                    block_dim=(WEAK_CC_TPB, 1, 1),
+                )
+                comptime if IDN_DBSCAN_CC_SHORTCUT:
+                    ctx.enqueue_function[weak_cc_shortcut_gated_kernel](
+                        labels.unsafe_ptr(),
+                        core.unsafe_ptr(),
+                        d_changed.unsafe_ptr(),
+                        Int32(r),
+                        Int32(n_rows),
+                        grid_dim=((n_rows + WEAK_CC_TPB - 1) // WEAK_CC_TPB, 1, 1),
+                        block_dim=(WEAK_CC_TPB, 1, 1),
+                    )
+            ctx.enqueue_copy(dst_ptr=h_changed.unsafe_ptr(), src_buf=d_changed)
+            ctx.synchronize()
+            for r2 in range(1, gruns + 1):  # small-loop(gruns: at most IDN_DBSCAN_CC_CHUNK per-pass flags): reads the chunk's convergence words, no data
+                passes += 1
+                git += 1
+                if h_changed.unsafe_ptr().unsafe_load(r2) == Int32(0):
+                    converged = True
+                    break
+    else:
+        passes = _weak_cc_passes_per_sync(
+            ctx, labels, row_ind, col_ind, core, d_changed, h_changed,
+            n_rows, start_vertex_id, batch_size, max_iterations,
+        )
+        converged = passes >= 0
+        if not converged:
+            passes = max_iterations
+    comptime if PIN_DETERMINISM:
+        # DEVIATION 507. See DETERMINISM in the module docstring: the
+        # order-independence of `atomicMin` is a property of the FIXED
+        # POINT, and a run that stopped at the cap never reached one.
+        if not converged:
+            raise Error(
+                "weak_cc_batched: label propagation did not converge in "
+                + String(max_iterations)
+                + " passes. Under "
+                + numeric_mode_name()
+                + " a truncated propagation"
+                " is refused rather than returned: its labels are a"
+                " snapshot of the atomic order on THIS machine, not a"
+                " function of the graph. Raise max_iterations."
+            )
+    return passes
+
+
+def _weak_cc_passes_per_sync(
+    ctx: DeviceContext,
+    mut labels: DeviceBuffer[DType.int32],
+    mut row_ind: DeviceBuffer[DType.int32],
+    mut col_ind: DeviceBuffer[DType.int32],
+    mut core: DeviceBuffer[DType.uint8],
+    mut d_changed: DeviceBuffer[DType.int32],
+    mut h_changed: HostBuffer[DType.int32],
+    n_rows: Int,
+    start_vertex_id: Int,
+    batch_size: Int,
+    max_iterations: Int,
+) raises -> Int:
+    """The per-pass readback loop `weak_cc_batched` had before
+    `IDN_DBSCAN_CC_GATED`, unchanged. Returns the pass count, or -1 when
+    the cap was reached without a pass that changed nothing."""
+    var passes = 0
+    var converged = False
+    # ANONLIB_DBSCAN_FAST_CC_BATCH=1 (lane/apple-fast-core, 2026-10-02,
+    # FAST + Apple only, default off): `WEAK_CC_FAST_BATCH` label passes
+    # are enqueued between two readbacks of the flag instead of one. Cause:
+    # the loop below drains the queue (`ctx.synchronize()`) after EVERY
+    # pass to read `changed`, so a propagation of P passes pays P host
+    # round trips; the fixed point is the same set of labels (a minimum
+    # over the same graph), reached with at most `WEAK_CC_FAST_BATCH - 1`
+    # extra no-op passes after it, and `passes` counts those too.
+    var per_sync = 1
+    if weak_cc_fast_batch_on():
+        per_sync = WEAK_CC_FAST_BATCH
+    var it = 0
+    while it < max_iterations:
+        var runs = per_sync
+        if runs > max_iterations - it:
+            runs = max_iterations - it
+        h_changed.unsafe_ptr().unsafe_store(0, Int32(0))
+        ctx.enqueue_copy(dst_buf=d_changed, src_ptr=h_changed.unsafe_ptr())
+        for _r in range(runs):
+            ctx.enqueue_function[weak_cc_label_kernel](
+                labels.unsafe_ptr(),
+                row_ind.unsafe_ptr(),
+                col_ind.unsafe_ptr(),
+                core.unsafe_ptr(),
+                d_changed.unsafe_ptr(),
+                Int32(start_vertex_id),
+                Int32(batch_size),
+                Int32(n_rows),
+                grid_dim=((batch_size + WEAK_CC_TPB - 1) // WEAK_CC_TPB, 1, 1),
+                block_dim=(WEAK_CC_TPB, 1, 1),
+            )
+        ctx.enqueue_copy(dst_ptr=h_changed.unsafe_ptr(), src_buf=d_changed)
+        ctx.synchronize()
+        passes += runs
+        it += runs
+        if h_changed.unsafe_ptr().unsafe_load(0) == Int32(0):
+            converged = True
+            break
+    if not converged:
+        return -1
+    return passes

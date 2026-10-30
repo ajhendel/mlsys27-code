@@ -1,0 +1,2632 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 the authors. Part of anonlib, DOI-WITHHELD
+"""Support vector classification and regression on the GPU. Reference:
+cuML's SVC and SVR.
+
+PRIVATE MODULE. `SVC` and `SVR` are named exactly as scikit-learn names
+them; both are re-exported from `anonlib/__init__.py`.
+
+`SVR` LANDED 2026-09-01 AND THIS HEADER USED TO SAY IT COULD NOT. It read
+"THERE IS NO `SVR` IN THIS MODULE, AND THAT IS NOT AN OVERSIGHT ... an
+`SVR` class here would have nothing to call", which was true while
+`svmType != C_SVC` raised. It stopped being true at `fea6becc`
+(2026-08-31), when the six rung-2 pieces were gated 44 of 44 and the
+refusal came out of `SmoSolver.solve`; what was missing after that was
+only the Python path, and the path is `svr_fit_host` / `svr_predict_host`
+in `svm/estimator.mojo`, `svr_fit` / `svr_predict` in
+`bindings/_anonlib_svm.mojo`, and the class below.
+
+WHAT THE TWO CLASSES SHARE, AND WHAT THEY DO NOT. One `SmoSolver`, one
+kernel-matrix path, one set of refusals in
+`svm/impl/svm_parameter.mojo::check_rung1_scope`. They differ in the
+gradient initialization (`SvrInit` writes `f = +-epsilon - y` and a `+-1`
+label vector), the domain size (`n_train = 2 * n_rows`) and how the
+coefficients are combined (`CombineCoefs` folds the two alpha halves), and
+in nothing else. On this surface that shows up as one extra parameter,
+`epsilon`, and three absences: no `classes_`, no `decision_function` and no
+`predict_proba`.
+
+THE LANE'S STANDING: `svm/`'s CLASSIFIER carries a THREE-VENDOR IDENTICAL
+card. THE REGRESSOR DOES NOT, and `SVR`'s own docstring says so rather than
+inheriting the sentence below. Round
+11 of the E3 judge (2026-08-23, commit `144aa5b`) records it in
+`archive/evidence/E3_RESULTS.md`: the IDENTICAL card bit-identical on Apple M4 <-> NVIDIA
+H100 and Apple M4 <-> AMD MI325X, 32 stages. Two thirds of that is
+re-checkable from this repository and was re-checked: the NVIDIA leg's
+`svm.identical.card` and the AMD leg's agree on every recorded line
+(`bench/results/e1/2026-08-23_165142-anonlib-e2-nv/lanes/` and
+`.../2026-08-23_172650-anonlib-e2-amd/lanes/`), while their FAST cards
+differ, as the round says. The Apple leg the judge diffed against is NOT
+committed here, so the Apple half of the sentence rests on the judge's
+record rather than on a file anyone can re-diff today.
+
+That property belongs to `ANONLIB_NUMERIC_MODE=identical`. The FAST
+build, which is the default, makes no cross-vendor claim at all.
+"""
+
+import array
+import importlib.machinery
+import importlib.util
+import os
+import sys
+
+from . import _portable_math as math
+import numbers
+
+from . import _backend
+from . import _serialize
+from ._array import Array
+from ._buffer import addr, addr_ro, all_finite, as_f32_c, as_f32_dense_c, as_f64_c, empty, zeros
+from ._sample_weight import check_sample_weight
+from ._labels import argmax_rows, classes_from_member, classes_member, decode_labels, encode_labels, sorted_classes, threshold_codes
+from ._mode import NumericModeMixin, available_if, is_fitted as _is_fitted
+from ._scale_gamma import scale_gamma, scale_gamma_x
+from .linear_model import (
+    _accuracy_host,
+    _check_saved_by,
+    _labels_1d,
+    _r2_sums,
+    _restore_mode,
+    _round_f32,
+    _saved_mode,
+    _shape_of,
+)
+
+#: `SVC.save`'s format tag (the kde svc host lane, 2026-09-14).
+_SVC_FORMAT = "anonlib-svc-1"
+#: `SVR.save`'s format tag (lane/inference-svm, 2026-09-15).
+_SVR_FORMAT = "anonlib-svr-1"
+
+# cuML's `KernelType` values (kernel_params.hpp). Only two are implemented.
+_KERNEL_LINEAR = 0
+_KERNEL_POLYNOMIAL = 1
+_KERNEL_RBF = 2
+_KERNEL_TANH = 3
+_KERNEL_PRECOMPUTED = 4
+
+_KERNELS = {"linear": _KERNEL_LINEAR, "rbf": _KERNEL_RBF}
+
+# SVC also carries POLYNOMIAL (lane/cpu-training-small-gaps, 2026-09-15): the
+# identical linear Gram, then kernel_methods' polynomial_epilogue_kernel
+# (DEVIATION 1663). SVR keeps _KERNELS and refuses 'poly' by name.
+_SVC_KERNELS = dict(_KERNELS, poly=_KERNEL_POLYNOMIAL, sigmoid=_KERNEL_TANH,
+                    precomputed=_KERNEL_PRECOMPUTED)
+
+#: DEVIATION 1663's cap, kernel_methods/impl/distance/kernel_matrices.mojo::KM_MAX_DEGREE
+#: and svm/impl/svm_parameter.mojo::SVM_MAX_POLY_DEGREE.
+_MAX_POLY_DEGREE = 32
+
+# The names cuML accepts that this implementation does not, and the reason each is
+# refused. Refused BY NAME rather than silently downgraded to 'rbf'.
+_REFUSED_KERNELS = {
+    "poly": (
+        "POLYNOMIAL is not implemented in rung 1; it is one identical_pow away "
+        "(svm/NOT_IMPLEMENTED.tsv spells the kernel out) and was left unimplemented "
+        "rather than written without a gate"
+    ),
+    "polynomial": (
+        "POLYNOMIAL is not implemented in rung 1 (svm/NOT_IMPLEMENTED.tsv); cuML spells "
+        "this kernel 'poly'"
+    ),
+    "sigmoid": (
+        "TANH is not implemented for SVR: SVC carries it (kernel_methods' "
+        "identical_tanh epilogue), but the SVR binding takes no coef0 yet "
+        "(svm/NOT_IMPLEMENTED.tsv)"
+    ),
+    "tanh": (
+        "TANH is not implemented in rung 1 (svm/NOT_IMPLEMENTED.tsv); cuML spells this "
+        "kernel 'sigmoid'"
+    ),
+    "precomputed": (
+        "PRECOMPUTED is not implemented: kernelcache.cuh's "
+        "extractColumnsForPrecomputed and svc_impl.cuh's precomputed "
+        "predict arm are both unimplemented (svm/NOT_IMPLEMENTED.tsv)"
+    ),
+}
+
+# SVC's refusals: the shared table less 'poly', which SVC implements.
+_SVC_REFUSED_KERNELS = {k: v for k, v in _REFUSED_KERNELS.items() if k not in ("poly", "sigmoid", "precomputed")}
+_SVC_REFUSED_KERNELS["tanh"] = (
+    "cuML and scikit-learn spell this kernel 'sigmoid', which SVC implements"
+)
+_SVC_REFUSED_KERNELS["polynomial"] = (
+    "cuML and scikit-learn spell this kernel 'poly', which SVC implements"
+)
+
+# SVR carries the same kernels (2026-09-27): its bindings take degree and
+# coef0 as optional trailing params, so every linear / rbf call is unchanged.
+_SVR_KERNELS = _SVC_KERNELS
+_SVR_REFUSED_KERNELS = dict(_SVC_REFUSED_KERNELS)
+_SVR_REFUSED_KERNELS["polynomial"] = (
+    "cuML and scikit-learn spell this kernel 'poly', which SVR implements"
+)
+_SVR_REFUSED_KERNELS["tanh"] = (
+    "cuML and scikit-learn spell this kernel 'sigmoid', which SVR implements"
+)
+
+_EXT_NAME = "_anonlib_svm"
+_PKG = __name__.rsplit(".", 1)[0]
+
+
+def _extension(mode=None):
+    """The `_anonlib_svm` extension for `mode` (the process default when
+    None), through `_backend.binding`: the one choke point that refuses an
+    identical-only lane by name under a lower tier, loads the set the tier
+    and vendor axes name, and cross-checks the binary's compiled tier.
+
+    This carried a private loader until DEVIATION 2490 (2026-09-10), written
+    when `_backend._MODULES` did not list this extension. It does now, and
+    the private path was how a stale FAST `_anonlib_svm.so` on disk kept
+    ANSWERING after the lane went identical only: the macOS release smoke
+    caught it the day the rule landed. Nothing loads a binding by path any
+    more.
+    """
+    return _backend.binding(_EXT_NAME, mode)
+
+
+def _as_labels(y):
+    """`y` as a 1-D float32 Array plus the two distinct labels in cuML's
+    order (sorted ascending), as a Python LIST under the package-wide
+    ORDER RULE (`_labels.sorted_classes`, DEVIATION 2340). Raises the
+    binary-only refusal HERE, before any device work, because that is the
+    most common way to reach this class by mistake."""
+    labels, shape = _labels_1d(y)
+    if labels is None:
+        raise ValueError(
+            f"anonlib SVC: y must be 1-D, got {len(shape)}-D shape {shape}"
+        )
+    # A NaN label gets the DEVIATION 636 refusal: the encoder refuses a NaN
+    # label itself (`_labels.py` rule 4, "NaN label"), and that refusal is
+    # translated here, so the message a caller reads does not depend on
+    # which check ran (lane cpu2-l10-linear: no Python scan over the labels).
+    # lane py-shared: the native encoder (`sorted_classes` is its definition)
+    try:
+        classes, codes_arr = encode_labels(labels)
+    except ValueError as exc:
+        if "NaN label" not in str(exc):
+            raise
+        raise ValueError(
+            "anonlib SVC: y contains a non-finite value (DEVIATION 636: a "
+            "NaN or inf cannot be fitted; a computed NaN carries a "
+            "vendor-specific payload and cannot sit in a hashed stage)"
+        ) from None
+    if len(classes) < 2:
+        raise ValueError(
+            f"anonlib SVC: y has {len(classes)} class; at least two are needed"
+        )
+    if len(classes) > 2:
+        # One-vs-one over the binary solver (`SVC._fit_ovo`): the caller
+        # forms each pair's rows and 0.0 / 1.0 labels from these int32 codes.
+        return None, classes, codes_arr
+    if not all(isinstance(c, numbers.Real) for c in classes):  # glue: type check over the k class labels
+        # String (or other non-numeric) labels: the solver sees each row's
+        # dense code, 0.0 or 1.0, so `classes_[1]` still maps to +1 and the
+        # label pair it reports back is (0.0, 1.0). Numeric labels keep the
+        # float32 path below, bit for bit. Found by the Sep 22 pip smoke:
+        # `SVC().fit(X, ["a", "b", ...])` raised "buffer format '<U1'"
+        # while LogisticRegression and LinearSVC took the same labels.
+        f = codes_arr.astype("<f4")             # exact: small ints
+        return f, classes, (0.0, 1.0)
+    f, _ = as_f32_c(y, ndim=1, name="y")
+    if not all_finite(f):
+        raise ValueError(
+            "anonlib SVC: y contains a non-finite value (DEVIATION 636: a "
+            "NaN or inf cannot be fitted; a computed NaN carries a "
+            "vendor-specific payload and cannot sit in a hashed stage)"
+        )
+    return f, classes, (classes[0], classes[1])
+
+
+def _c_rows(binding, C, n_rows, sample_weight, class_weight=None, y=None, who="SVC"):
+    """`InitPenalty`'s weighted arm: the per-row bounds `C * class_weight[y_i]
+    * sample_weight_i` (scikit-learn's libsvm `C_i`; cuML's `C_vec = C * w`
+    after its Python layer folds class_weight into sample_weight), formed in
+    binary64 in that order and rounded ONCE to float32, so every host hands
+    the solver the same bounds. None when nothing is weighted (the
+    unweighted arm, C at every row, bit for bit the old fit). A zero weight
+    pins that row's alpha at 0 (cuML keeps the row; libsvm drops it, and the
+    solution is the same).
+
+    The per-row products run in the binding (cgfin-c-svm: on the device on
+    a GPU install, `svm/impl/svc_rows.mojo::c_row`, soft binary64); here
+    only the checks and the per-class weights."""
+    if sample_weight is None and class_weight is None:
+        return None
+    sw = None
+    if sample_weight is not None:
+        # scikit-learn's checks and wording (shape, finite, >= 0, not all
+        # zero) through the base binding's reductions; read only, never written
+        sw = check_sample_weight(sample_weight, n_rows, dtype="<f8")
+    codes = cwa = None
+    n_classes = 0
+    if class_weight is not None:
+        labels, _shape = _labels_1d(y)
+        classes, codes = encode_labels(labels)
+        n_classes = len(classes)
+        if codes.shape[0] != n_rows:
+            raise ValueError(f"anonlib {who}: y has {codes.shape[0]} entries, X has {n_rows} rows")
+        if isinstance(class_weight, str):
+            if class_weight != "balanced":
+                raise ValueError(
+                    f"anonlib {who}: class_weight is a dict, 'balanced' or None, got {class_weight!r}"
+                )
+            from ._buffer import _native
+            cnt = zeros((len(classes),), "<i8")
+            _native("bincount_i64")(addr_ro(codes, name="class codes"), 2, codes.shape[0], len(classes),
+                                    addr(cnt, name="counts"), 0)
+            # n / (k * count) per class in the base binding (lane
+            # py-runtime-b; the same binary64 words as the Python quotient)
+            cwa = empty((len(classes),), "<f8")
+            if len(classes) and int(_native("class_ratio_f64")(addr_ro(cnt, name="counts"), len(classes), n_rows,
+                                                               0, addr(cwa, name="class_weight"))):
+                raise ZeroDivisionError("division by zero")
+        else:
+            cw = [1.0] * len(classes)
+            for key, value in dict(class_weight).items():  # glue: user class_weight dict entries
+                if key not in classes:
+                    raise ValueError(
+                        f"anonlib {who}: class_weight names the label {key!r}, "
+                        f"which is not in y's classes {classes!r}"
+                    )
+                cw[classes.index(key)] = float(value)
+            cwa = Array.from_list(cw, "<f8")
+    out = empty((n_rows,), "<f4")
+    if n_rows:
+        binding.svc_pair_epilogue(
+            0 if sw is None else addr_ro(sw, name="sample_weight"),
+            0 if cwa is None else addr_ro(codes, name="class codes"),
+            0 if cwa is None else addr_ro(cwa, name="class_weight"),
+            addr(out, name="C rows"),
+            [_GLUE_C_ROWS, n_rows, n_classes, float(C), 0])
+    return out
+
+
+def _i32(values):
+    """`values` (an int32 Array or a sequence of ints) as an int32 Array."""
+    if isinstance(values, Array):
+        return values
+    # lane py-runtime-b: array('i') converts the ints in C (no Python
+    # comprehension over the indices); integral floats take int() as before
+    try:
+        store = array.array("i", values)
+    except TypeError:
+        store = array.array("i", map(int, values))
+    return Array._owned(store, (len(store),), "<i4", "C")
+
+
+def _gather(binding, x, rows=None, cols=None):
+    """`x[rows][:, cols]`, an exact copy of float32 cells, gathered in the
+    binding (on the device on a GPU install; cgfin-c-svm). An absent index
+    list keeps that axis whole."""
+    n_rows, n_cols = x.shape
+    ra = None if rows is None else _i32(rows)
+    ca = None if cols is None else _i32(cols)
+    nor = n_rows if ra is None else ra.shape[0]
+    noc = n_cols if ca is None else ca.shape[0]
+    out = empty((nor, noc), "<f4")
+    if nor and noc:
+        binding.svc_pair_epilogue(
+            addr_ro(x, name="x"),
+            0 if ra is None else addr_ro(ra, name="row indices"),
+            0 if ca is None else addr_ro(ca, name="column indices"),
+            addr(out, name="gathered"),
+            [_GLUE_GATHER, n_rows, n_cols, nor, noc])
+    return out
+
+
+def _gather_i32(binding, values, rows):
+    """`values[rows]` for an int32 Array `values` and int32 row indices, the
+    binding's 4-byte gather (on the device on a GPU install)."""
+    m = values.shape[0]
+    ra = _i32(rows)
+    out = empty((ra.shape[0],), "<i4")
+    if ra.shape[0]:
+        binding.svc_pair_epilogue(
+            addr_ro(values, name="values"), addr_ro(ra, name="row indices"), 0,
+            addr(out, name="gathered"), [_GLUE_GATHER, m, 1, ra.shape[0], 1])
+    return out
+
+
+def _pair_select(binding, codes, ci, cj, c_rows=None):
+    """The rows of class ci or cj, in row order, selected in the binding (a
+    device compaction on a GPU install; cgfin-c-svm): their indices (int32
+    Array), their labels (float32, 1.0 for class cj, 0.0 for ci) and their
+    bounds cut from `c_rows` (None when unweighted)."""
+    n = codes.shape[0]
+    idx = empty((n,), "<i4")
+    lab = empty((n,), "<f4")
+    cout = None if c_rows is None else empty((n,), "<f4")
+    m = 0
+    if n:
+        m = int(binding.svc_pair_epilogue(
+            addr_ro(codes, name="class codes"),
+            0 if c_rows is None else addr_ro(c_rows, name="C * sample_weight"),
+            addr(lab, name="pair labels"),
+            addr(idx, name="pair rows"),
+            [_GLUE_SELECT, n, int(ci), int(cj), 0 if cout is None else addr(cout, name="pair bounds")]))
+    return idx[:m], lab[:m], (None if cout is None else cout[:m])
+
+
+def _precomputed_columns(binding, q, support):
+    """kernel='precomputed' at predict: `X[:, support_]`, the query's
+    cross-kernel columns at the support vectors, copied exactly (float32
+    bytes, no arithmetic). What the solver's decision reads as its kernel
+    tile."""
+    # `support` is the fitted int32 Array (a fit's own rows, or a load's,
+    # checked against n_features_in_ there: `_check_support_bounds`); q has
+    # n_features_in_ columns (`_query`), so every index is in range and no
+    # per-predict Python pass over it runs (lane cpu2-l10-linear)
+    return _gather(binding, q, None, _i32(support))
+
+
+def _check_support_bounds(support, n_cols, path):
+    """`load` (the explicit CPU-only load route): every precomputed support
+    index of a saved model must name one of its n_cols training columns.
+    An Array is checked by the native min and max; only a failing file is
+    walked, to name its first bad index (lane py-runtime-b)."""
+    if isinstance(support, Array):
+        if not support.size or (int(support.min()) >= 0 and int(support.max()) < n_cols):
+            return
+        support = support.tolist()
+    for s in support:                 # glue: load-time validation of a saved file
+        if not 0 <= int(s) < n_cols:
+            raise ValueError(
+                f"anonlib: {path!r} kernel='precomputed' support index {int(s)} is outside the "
+                f"model's {n_cols} columns")
+
+
+def _concat_f32(blocks):
+    """The float32 elements of every block, in order, as one flat Array
+    (byte copies; the saved pair arrays)."""
+    return _concat_words([as_f32_c(b, ndim=None, name="block")[0] for b in blocks], "<f4")  # glue: byte copies of the saved pair blocks
+
+
+def _concat_words(parts, dtype):
+    """The 4-byte elements of every C-order Array in `parts`, in order, as
+    one flat `dtype` Array (byte copies)."""
+    from ._bufcheck import memcopy
+    parts = [p._as_c() for p in parts]  # glue: byte copies of the saved pair blocks
+    out = empty((max(sum(p.size for p in parts), 0),), dtype)  # glue: byte copies of the saved pair blocks
+    at = addr(out, name="pairs") if out.size else 0
+    for p in parts:  # glue: byte copies of the saved pair blocks
+        if p.size:
+            memcopy(at, addr_ro(p, name="block"), 4 * p.size)
+            at += 4 * p.size
+    return out
+
+
+#: `svc_pair_epilogue` modes (svm/impl/svc_rows.mojo): the epilogues
+#: (lane/py-dn-svm, 2026-09-28) and the row glue (cgfin-c-svm, 2026-10-02)
+(_EPI_OVO, _EPI_OVR, _EPI_VOTES, _EPI_PROBA, _EPI_LOG_PROBA, _EPI_BINARY,
+ _GLUE_GATHER, _GLUE_SELECT, _GLUE_C_ROWS, _GLUE_FOLD, _GLUE_FOLD_FINISH) = range(11)
+
+
+def _native_perm_array(binding, n, seed):
+    """`_native_perm` into an int32 Array (the fold glue reads it at its
+    address)."""
+    out = empty((max(n, 1),), "<i4")
+    seed &= 0xFFFFFFFFFFFFFFFF
+    if n:
+        binding.svc_splitmix_perm(addr(out, name="shuffle"), n, seed & 0xFFFFFFFF, seed >> 32)
+    return out
+
+
+def _native_perm(binding, n, seed):
+    """`tests/_svm_reference.py::_splitmix_perm(n, seed)` in Mojo (`svc_splitmix_perm`): the same
+    integers, an int32 `array.array`."""
+    out = array.array("i", bytes(4 * n))
+    seed &= 0xFFFFFFFFFFFFFFFF
+    if n:
+        binding.svc_splitmix_perm(out.buffer_info()[0], n, seed & 0xFFFFFFFF, seed >> 32)
+    return out
+
+
+def _native_sigmoid_train(binding, dec, labels):
+    """`tests/_svm_reference.py::_sigmoid_train(dec, labels)` in Mojo (`svc_platt_train`): the same
+    binary64 operations in the same order, the same `(A, B)` bits."""
+    d = array.array("d", dec)
+    lab = array.array("d", labels)
+    if len(d) != len(lab):
+        raise ValueError("decision values and labels differ in length")
+    ab = array.array("d", [0.0, 0.0])
+    binding.svc_platt_train(d.buffer_info()[0] if len(d) else 0,
+                            lab.buffer_info()[0] if len(lab) else 0, ab.buffer_info()[0], len(d))
+    return ab[0], ab[1]
+
+
+# Maintainer notes (moved verbatim from the SVC docstring):
+# C-support vector classification, binary and one-vs-one multiclass,
+# backed by an SMO solver and GPU kernel matrices (`svm/`, DEVIATIONS 630-637;
+# `svm/README.md`), the scikit-learn surface.
+#
+# WHAT IS HONORED, WHAT IS REFUSED, AND WHY -- one line per parameter,
+# because a parameter that is accepted and ignored is a wrong answer
+# waiting for a caller (the house rule):
+#
+#     C               honored   the penalty. Must be finite and positive;
+#                               a non-finite C is refused by name
+#                               (DEVIATION 636)
+#     kernel          honored   'linear', 'rbf' and 'poly'. 'poly' is the
+#                               identical linear Gram then
+#                               `(gamma * K + coef0) ** degree` as
+#                               kernel_methods' DEVIATION 1663 epilogue
+#                               (one fused multiply-add, an ascending
+#                               repeated product). 'sigmoid' is the
+#                               linear Gram then tanh(gamma * K + coef0)
+#                               (kernel_methods' TANH epilogue,
+#                               identical_tanh). 'precomputed': X is the
+#                               n x n kernel matrix at fit (the solver's
+#                               tiles are exact copies of its cells,
+#                               cuML's extractColumnsForPrecomputed) and
+#                               the q x n cross-kernel against the
+#                               training rows at predict, whose support
+#                               columns the decision reads.
+#                               support_vectors_ then holds the kernel
+#                               matrix's support ROWS (scikit-learn's is
+#                               empty)
+#     gamma           honored   a finite float >= 0, or the string 'auto'
+#                               (= 1 / n_features, cuML's `_get_gamma`).
+#                               'scale' is resolved exactly, DEVIATION
+#                               870 below (theirs is the default)
+#     degree          honored   with kernel='poly': an integer in
+#                               [0, 32] (DEVIATION 1663). With any other
+#                               kernel only the default 3 is accepted,
+#                               since nothing would read it
+#     coef0           honored   with 'poly' and 'sigmoid': a finite float. With
+#                               any other kernel only the default 0.0
+#                               is accepted
+#     tol             honored   the stopping tolerance; must be finite and
+#                               positive (DEVIATION 636)
+#     cache_size      honored   ONLY as the prediction buffer, see
+#                               DEVIATION 871 below
+#     class_weight    honored   a dict {label: weight} or 'balanced'; it
+#                               multiplies each row's bound, C * cw[y_i] *
+#                               w_i (`_c_rows`)
+#     max_iter        honored   cuML's total inner-iteration cap; -1 (the
+#                               default) is no limit
+#     nochange_steps  honored   cuML's convergence rule, with
+#                               its n_small_diff counter
+#     verbose         refused   anything truthy. It selects LOG LINES
+#                               in the reference (CUML_LOG_DEBUG); this implementation
+#                               prints none, so accepting it would be
+#                               accepting-and-ignoring
+#     random_state    honored   with probability=True: the key of the
+#                               folds' SplitMix64 shuffle (None = 0);
+#                               refused otherwise, since nothing else
+#                               draws a random number
+#     decision_       honored   'ovo' (the default here, cuML's) or 'ovr'
+#       function_shape          (scikit-learn's): with more than two
+#                               classes, decision_function's pairwise
+#                               (n, K(K-1)/2) or voted (n, K) form. No
+#                               effect on two classes, as in scikit-learn
+#     break_ties      honored   with 'ovr' and more than two classes,
+#                               predict is the argmax of the 'ovr'
+#                               decision_function; refused with 'ovo'
+#                               (scikit-learn's ValueError)
+#     multiclass      honored   one-vs-one, libsvm's scheme: one binary
+#                               machine per class pair (i < j) on the
+#                               rows of those two classes, gamma resolved
+#                               on the whole X, the per-row bounds cut to
+#                               the pair's rows; prediction by vote, ties
+#                               to the lowest class (`_fit_ovo`)
+#     probability     honored   libsvm's Platt scaling: a seeded 5-fold
+#                               cross-validation of each class pair, the
+#                               folds' decision values from the binary
+#                               solver, then sigmoid_train and (more than
+#                               two classes) pairwise coupling in binary64
+#                               with the portable exp/log
+#                               (`_fit_probability`); predict_proba and
+#                               predict_log_proba. The same bits on every
+#                               column; not libsvm's bits (its fold
+#                               shuffle is C rand())
+#     output_type     refused   a cuML-internal array-type selector; this
+#                               package returns anonlib Arrays
+#     sample_weight   honored   in fit(): the weighted `InitPenalty` arm,
+#                               per-row bounds C * w formed in binary64 and
+#                               rounded once to float32 (`_c_rows`)
+#     sparse X        honored   densified exactly (`as_f32_dense_c`: the
+#                               implicit entries are zeros), so it takes
+#                               its dense twin's path and bits; cuML's
+#                               CSR solver arms are not implemented
+#
+# Non-finite cells of `X` are refused by name inside the Mojo entry
+# (DEVIATION 636), naming the flat index, rather than being fitted.
+#
+# DEVIATION 870: `gamma='scale'` IS RESOLVED EXACTLY, AND THE DEFAULT
+# HERE IS STILL 'auto' (theirs is 'scale'; the default is kept so every
+# recorded default fit keeps its bits). 'scale' is `1 / (n_features *
+# X.var())` as theirs, but the variance is the EXACT population variance
+# of the float32 cells, formed in integers, and the reciprocal is rounded
+# once to binary64 (`_scale_gamma.scale_gamma`). Their float32 `X.var()`
+# carries its reduction's fold shape in its last bits; this one has no
+# fold to differ, so every host reads the same gamma bits, and it differs
+# from theirs by at most that reduction's rounding.
+#
+# DEVIATION 871: `cache_size` IS HONORED ONLY AT PREDICT. In the reference it is
+# two things under one name: the training-time `raft::cache` LRU kernel
+# cache, and the ceiling on the prediction kernel-tile buffer
+# (`svm_base.pyx:554`, passed as `buffer_size` to `svcPredict`). The
+# prediction half is honored here, exactly, and it is a real knob: it
+# sets the prediction batch size, and `check_device_is_launch_invariant`
+# holds the answer fixed over it from 0.001 MiB to 200 MiB. The training
+# half is NOT implemented -- the solver always runs cuML's own
+# `n_cache_sets == 0` path -- so `cache_size` does not affect training
+# time here the way it does in the reference. It cannot affect training RESULTS
+# in the reference either (`svm/NOT_IMPLEMENTED.tsv` carries that determinism
+# statement), so nothing numeric hangs on it.
+#
+# DEVIATION 873: the fitted model crosses back to the host and is
+# uploaded again at every `predict` / `decision_function`, because the
+# binding retains no device pointer. `fit` therefore allocates
+# worst-case output buffers -- `n_samples` dual coefficients and
+# `n_samples x n_features` support-vector floats -- since `n_support` is
+# not known until the solve finishes. On a matrix that is mostly support
+# vectors that is a second copy of X.
+#
+# Attributes
+# ----------
+# classes_ : list (K,)
+#     The distinct labels, sorted ascending, as Python scalars under
+#     the package-wide order rule (`_labels.sorted_classes`, DEVIATION
+#     2340; it was an ndarray in `y`'s dtype). `predict` returns an
+#     int64 / float64 Array for int / float labels and a Python list
+#     otherwise. `classes_[1]` is the one the solver maps to +1
+#     (`getOvrlabels(..., idx=1)`), so it fixes the sign of the decision
+#     function.
+# support_ : Array (n_SV,) int32
+#     Indices of the support vectors in the training matrix.
+# support_vectors_ : Array (n_SV, n_features) float32
+# dual_coef_ : Array (1, n_SV) float32
+#     scikit-learn's 2-D layout of cuML's 1-D `dual_coefs`.
+# intercept_ : Array (1,) float32
+# n_support_ : int, or Array (K,) int32 for K > 2
+#     Two classes: cuML's scalar count (scikit-learn's is a per-class
+#     array; this one is not, and the difference is here rather than in
+#     a surprise). More: scikit-learn's per-class counts.
+# n_iter_ : int, or Array (K(K-1)/2,) int32 for K > 2
+#     Total inner SMO iterations, per pair for more than two classes.
+#
+# MULTICLASS LAYOUT (K > 2) is scikit-learn's, in its orientation (a
+# pair's decision positive toward its LOWER class): `support_` grouped
+# by class, ascending within a class; `dual_coef_` (K - 1, n_SV);
+# `intercept_` (K(K-1)/2,); `coef_` (K(K-1)/2, n_features) for 'linear'.
+# coef_ : Array (1, n_features) float32
+#     `dual_coef_ @ support_vectors_`, and only for `kernel='linear'`;
+#     raises AttributeError otherwise, as scikit-learn does.
+# n_features_in_ : int
+#
+def _check_proba(self):
+    """scikit-learn's `SVC._check_proba`: the AttributeError names why, and
+    `available_if` chains it under "has no attribute 'predict_proba'"."""
+    if not self.probability:
+        raise AttributeError("predict_proba is not available when probability=False")
+    return True
+
+
+class SVC(NumericModeMixin):
+    """C-support vector classification.
+
+    Follows scikit-learn's `SVC`, with cuML's `SVC` as the reference
+    implementation: an SMO solver with the kernel matrices computed on the
+    GPU. Two classes train one machine; more train one machine per class
+    pair (one-vs-one, libsvm's scheme) and predict by vote, ties going to
+    the lowest class. `X` is converted to float32 (sparse input is
+    densified), and non-finite values in `X` raise an error naming the
+    first bad cell. Supports the `'identical'` (default) and `'fast'`
+    numeric modes; `'fast'` is available on Apple GPUs only.
+
+    Defaults that differ from scikit-learn: `gamma='auto'` (scikit-learn
+    uses 'scale'); `cache_size` is the prediction buffer in MiB and does not
+    affect training. There is no `shrinking` parameter. Every parameter is
+    keyword-only. A parameter that would be ignored is refused rather than
+    accepted: `degree` with any kernel but 'poly', `coef0` with any kernel
+    but 'poly' or 'sigmoid', and a truthy `verbose` or any `output_type` all raise
+    `NotImplementedError`.
+
+    Parameters
+    ----------
+    C : float, default 1.0
+        Regularization penalty. Must be finite and positive.
+    kernel : {'linear', 'rbf', 'poly', 'sigmoid', 'precomputed'}, default 'rbf'
+        The kernel. 'poly' is `(gamma * <x, y> + coef0) ** degree`;
+        'sigmoid' is `tanh(gamma * <x, y> + coef0)`. With 'precomputed',
+        `X` is the n x n kernel matrix at fit and the q x n kernel against
+        the training rows at predict; `support_vectors_` then holds the
+        support rows of the kernel matrix (scikit-learn's is empty). Other
+        names, including 'polynomial' and 'tanh', raise.
+    degree : int, default 3
+        Degree of the 'poly' kernel, an integer in [0, 32]. Must stay 3
+        with any other kernel.
+    gamma : float, 'auto' or 'scale', default 'auto'
+        Kernel coefficient, a finite float >= 0. 'auto' is
+        `1 / n_features`; 'scale' is `1 / (n_features * X.var())`, computed
+        from the exact variance of the float32 data, so it can differ from
+        scikit-learn's float32 `X.var()` in the last bits.
+    coef0 : float, default 0.0
+        Independent term of the 'poly' and 'sigmoid' kernels, finite. Must
+        stay 0.0 with any other kernel.
+    tol : float, default 1e-3
+        Stopping tolerance. Must be finite and positive.
+    cache_size : float, default 1024.0
+        Size in MiB of the kernel tile buffer used at prediction, which
+        sets the prediction batch size; results do not depend on it. It
+        has no training-time kernel cache role here. Must be positive and
+        finite.
+    max_iter : int, default -1
+        Cap on the total inner SMO iterations (cuML's meaning); -1 means no
+        limit. 0 and values below -1 are refused.
+    nochange_steps : int, default 1000
+        Follows cuML's ``nochange_steps`` convergence rule. Must be >= 0.
+    verbose : bool, default False
+        Only False is accepted; this estimator prints no log lines.
+    output_type : None, default None
+        Only None is accepted; results are anonlib Arrays.
+    random_state : int or None, default None
+        With `probability=True`, the seed of the cross-validation fold
+        shuffle (None means 0); an int in [0, 2**64). Unused when
+        `probability` is False.
+    class_weight : dict, 'balanced' or None, default None
+        Per-class weights; row i's penalty becomes
+        `C * class_weight[y_i] * sample_weight_i`.
+    decision_function_shape : {'ovr', 'ovo'}, default 'ovr'
+        With more than two classes, `decision_function` returns the
+        voted (n, K) form ('ovr') or the pairwise (n, K(K-1)/2) form
+        ('ovo'). No effect with two classes.
+    probability : bool, default False
+        Fit Platt scaling (libsvm's method: a seeded 5-fold
+        cross-validation per class pair, then a sigmoid fit and, for more
+        than two classes, pairwise coupling) so that `predict_proba` and
+        `predict_log_proba` are available. The fold shuffle differs from
+        libsvm's, so the probabilities are not bit-equal to libsvm's.
+    break_ties : bool, default False
+        With `decision_function_shape='ovr'` and more than two classes,
+        predict the argmax of the 'ovr' decision function instead of the
+        vote. Must be False with 'ovo' (scikit-learn's rule).
+    numeric_mode : {'identical', 'fast'} or None, default None
+        Numeric mode for this estimator; None uses the process default.
+        ``'fast'`` is available on Apple GPUs only.
+
+    Attributes
+    ----------
+    classes_ : list of shape (K,)
+        The distinct labels, sorted ascending, as Python scalars.
+        `classes_[1]` is the positive class of the binary decision
+        function.
+    support_ : Array of shape (n_SV,), int32
+        Indices of the support vectors in the training data.
+    support_vectors_ : Array of shape (n_SV, n_features), float32
+        The support vectors.
+    dual_coef_ : Array of shape (1, n_SV) or (K - 1, n_SV), float32
+        Dual coefficients, in scikit-learn's layout.
+    intercept_ : Array of shape (1,) or (K(K-1)/2,), float32
+        Intercepts of the decision functions.
+    coef_ : Array of shape (1, n_features) or (K(K-1)/2, n_features), float32
+        Primal weights `dual_coef_ @ support_vectors_`, only for
+        `kernel='linear'`; raises `AttributeError` otherwise, as
+        scikit-learn does.
+    n_support_ : int, or Array of shape (K,), int32
+        Number of support vectors. With two classes this is a single count
+        (cuML's form; scikit-learn returns a per-class array); with more,
+        the per-class counts.
+    n_iter_ : int, or Array of shape (K(K-1)/2,), int32
+        Total inner SMO iterations, per class pair with more than two
+        classes.
+    probA_, probB_ : Array of shape (K(K-1)/2,), float64
+        Platt sigmoid parameters per class pair, when `probability=True`.
+    n_features_in_ : int
+        Number of features seen during `fit`.
+
+    Notes
+    -----
+    With more than two classes the fitted arrays follow scikit-learn's
+    layout and orientation: a pair's decision is positive toward its lower
+    class, `support_` is grouped by class (ascending within a class),
+    `dual_coef_` is (K - 1, n_SV) and `intercept_` is (K(K-1)/2,).
+
+    `predict` returns an int64 or float64 Array for integer or float
+    labels, and a Python list for other label types.
+
+    Examples
+    --------
+    >>> import numpy as np, anonlib
+    >>> rng = np.random.default_rng(0)
+    >>> X = rng.random((1000, 8), dtype=np.float32)
+    >>> y = (X[:, 0] + X[:, 1] > 1.0).astype(np.int64)
+    >>> model = anonlib.SVC(C=1.0, kernel="rbf").fit(X, y)
+    >>> labels = model.predict(X[:5])
+    """
+
+    #: scikit-learn's estimator kind: `cross_val_score` stratifies a
+    #: classifier's default folds, as scikit-learn's does.
+    _estimator_type = "classifier"
+
+    #: This family's binding, for `NumericModeMixin._bind` (the kde svc host
+    #: lane, 2026-09-14: `fit` and `_run` bind through `self._bind`, the same
+    #: `_backend.binding(_EXT_NAME, numeric_mode)` that `_extension` resolves,
+    #: so the host subclass in `_classical_host.py` answers the CPU binding by
+    #: overriding one method and the Python around it is this class's own).
+    _BINDING = _EXT_NAME
+
+    def __init__(
+        self,
+        *,
+        C=1.0,
+        kernel="rbf",
+        degree=3,
+        gamma="auto",
+        coef0=0.0,
+        tol=1e-3,
+        cache_size=1024.0,
+        max_iter=-1,
+        nochange_steps=1000,
+        verbose=False,
+        output_type=None,
+        random_state=None,
+        class_weight=None,
+        decision_function_shape="ovr",
+        probability=False,
+        break_ties=False,
+    ):
+        # Stored verbatim (scikit-learn's convention); `_validate_params`
+        # checks them when `fit` (or `load`) runs and keeps the checked
+        # values the solver reads as `_hp_<name>`.
+        self.C = C
+        self.kernel = kernel
+        self.degree = degree
+        self.gamma = gamma
+        self.coef0 = coef0
+        self.tol = tol
+        self.cache_size = cache_size
+        self.max_iter = max_iter
+        self.nochange_steps = nochange_steps
+        self.verbose = verbose
+        self.output_type = output_type
+        self.random_state = random_state
+        self.class_weight = class_weight
+        self.decision_function_shape = decision_function_shape
+        self.probability = probability
+        self.break_ties = break_ties
+
+    def __setstate__(self, state):
+        # A model pickled before the parameter checks moved to fit carries
+        # no `_hp_*` working values: derive them from its stored parameters.
+        self.__dict__.update(state)
+        if "_hp_C" not in state and _is_fitted(self):
+            self._validate_params()
+
+    def _validate_params(self):
+        """The constructor checks, run at the start of `fit` and in `load`."""
+        C = self.C
+        kernel = self.kernel
+        degree = self.degree
+        gamma = self.gamma
+        coef0 = self.coef0
+        tol = self.tol
+        cache_size = self.cache_size
+        max_iter = self.max_iter
+        nochange_steps = self.nochange_steps
+        verbose = self.verbose
+        output_type = self.output_type
+        random_state = self.random_state
+        class_weight = self.class_weight
+        decision_function_shape = self.decision_function_shape
+        probability = self.probability
+        break_ties = self.break_ties
+
+        if not isinstance(kernel, str):
+            raise ValueError("anonlib SVC: kernel is a name")
+        # The caller's own string object when it is already lower case, so
+        # `get_params` hands `clone` back the object it was given.
+        k = kernel if kernel == kernel.lower() else kernel.lower()
+        if k in _SVC_REFUSED_KERNELS:
+            raise NotImplementedError(
+                f"anonlib SVC: kernel={kernel!r} is refused; "
+                + _SVC_REFUSED_KERNELS[k]
+            )
+        if k not in _SVC_KERNELS:
+            raise ValueError(
+                f"anonlib SVC: kernel={kernel!r} is not a kernel name; "
+                f"this implementation carries {sorted(_SVC_KERNELS)} and refuses "
+                f"the others by name ({sorted(_SVC_REFUSED_KERNELS)})"
+            )
+        if isinstance(gamma, str):
+            g = gamma if gamma == gamma.lower() else gamma.lower()
+            if g not in ("auto", "scale"):
+                raise ValueError(
+                    f"anonlib SVC: gamma={gamma!r} is not a name; it is "
+                    "'auto', 'scale' or a float"
+                )
+            gamma = g
+        else:
+            gamma = float(gamma)
+            if not math.isfinite(gamma) or gamma < 0.0:
+                raise ValueError(
+                    "anonlib SVC: gamma must be finite and >= 0 for the RBF "
+                    f"kernel, got {gamma!r} (DEVIATION 636; scikit-learn's own "
+                    "constraint is gamma >= 0)"
+                )
+        if k == "poly":
+            if isinstance(degree, bool) or not isinstance(degree, numbers.Integral):
+                raise TypeError(
+                    f"anonlib SVC: degree={degree!r} must be an integer; the "
+                    "polynomial power is an ascending repeated product (DEVIATION 1663)"
+                )
+            degree = int(degree)
+            if not 0 <= degree <= _MAX_POLY_DEGREE:
+                raise ValueError(
+                    f"anonlib SVC: degree must be in [0, {_MAX_POLY_DEGREE}], got "
+                    f"{degree!r} (DEVIATION 1663)"
+                )
+            coef0 = float(coef0)
+            if not math.isfinite(coef0):
+                raise ValueError(
+                    f"anonlib SVC: coef0 must be finite, got {coef0!r} (DEVIATION 636)"
+                )
+        elif k == "sigmoid":
+            # tanh(gamma * K + coef0), the kernel_methods lane's TANH epilogue.
+            if degree != 3:
+                raise NotImplementedError(
+                    f"anonlib SVC: degree={degree!r} is refused with kernel='sigmoid'; "
+                    "it is read only by kernel='poly'"
+                )
+            coef0 = float(coef0)
+            if not math.isfinite(coef0):
+                raise ValueError(
+                    f"anonlib SVC: coef0 must be finite, got {coef0!r} (DEVIATION 636)"
+                )
+        else:
+            if degree != 3:
+                raise NotImplementedError(
+                    f"anonlib SVC: degree={degree!r} is refused with kernel={k!r}; "
+                    "it is read only by kernel='poly'. Passing it with another kernel "
+                    "would be a parameter accepted and ignored"
+                )
+            if coef0 != 0.0:
+                raise NotImplementedError(
+                    f"anonlib SVC: coef0={coef0!r} is refused with kernel={k!r}; it "
+                    "is read only by kernel='poly' and kernel='sigmoid'"
+                )
+        C = float(C)
+        if not math.isfinite(C):
+            raise ValueError(
+                f"anonlib SVC: C must be finite, got {C!r} (DEVIATION 636)"
+            )
+        if C <= 0.0:
+            raise ValueError(f"anonlib SVC: C must be positive, got {C!r}")
+        tol = float(tol)
+        if not math.isfinite(tol):
+            raise ValueError(
+                f"anonlib SVC: tol must be finite, got {tol!r} (DEVIATION 636)"
+            )
+        if tol <= 0.0:
+            raise ValueError(f"anonlib SVC: tol must be positive, got {tol!r}")
+        cache_size = float(cache_size)
+        if not (cache_size > 0.0) or not math.isfinite(cache_size):
+            raise ValueError(
+                "anonlib SVC: cache_size is the prediction buffer here "
+                f"(DEVIATION 871) and must be a positive finite MiB, got "
+                f"{cache_size!r}"
+            )
+        max_iter = int(max_iter)
+        if max_iter == 0 or max_iter < -1:
+            raise ValueError(
+                "anonlib SVC: max_iter is a positive cap or -1 for no "
+                f"limit (cuML's default), got {max_iter!r}"
+            )
+        nochange_steps = int(nochange_steps)
+        if nochange_steps < 0:
+            raise ValueError(
+                "anonlib SVC: nochange_steps cannot be negative, got "
+                f"{nochange_steps!r}"
+            )
+        if verbose:
+            raise NotImplementedError(
+                "anonlib SVC: verbose is refused; upstream it selects "
+                "CUML_LOG_DEBUG lines and this implementation prints none, so honoring "
+                "it is impossible and accepting it would be accepting-and-"
+                "ignoring"
+            )
+        if output_type is not None:
+            raise NotImplementedError(
+                "anonlib SVC: output_type is a cuML-internal array-type "
+                "selector; this package returns anonlib Arrays"
+            )
+        probability = bool(probability)
+        if not probability:
+            # scikit-learn accepts random_state always and reads it only for
+            # probability's cross-validation folds; the C-SVC solver draws no
+            # random numbers, so without probability it is accepted and unused
+            random_state = None
+        if random_state is not None and (
+                isinstance(random_state, bool) or not isinstance(random_state, numbers.Integral)
+                or not 0 <= int(random_state) < 2 ** 64):
+            raise ValueError(
+                "anonlib SVC: random_state must be None or an int in [0, 2**64) "
+                f"(the key of probability's fold shuffle), got {random_state!r}"
+            )
+        if class_weight is not None and not isinstance(class_weight, (dict, str)):
+            raise ValueError(
+                "anonlib SVC: class_weight is a dict, 'balanced' or None, "
+                f"got {type(class_weight).__name__}"
+            )
+        if decision_function_shape not in ("ovo", "ovr"):
+            raise ValueError(
+                "anonlib SVC: decision_function_shape is 'ovo' or 'ovr', got "
+                f"{decision_function_shape!r}"
+            )
+        break_ties = bool(break_ties)
+        if break_ties and decision_function_shape == "ovo":
+            raise ValueError(
+                "anonlib SVC: break_ties must be False when "
+                "decision_function_shape is 'ovo' (scikit-learn's rule)"
+            )
+        self._hp_C = C
+        self._hp_kernel = k
+        self._hp_degree = degree
+        self._hp_gamma = gamma
+        self._hp_coef0 = coef0
+        self._hp_tol = tol
+        self._hp_cache_size = cache_size
+        self._hp_max_iter = max_iter
+        self._hp_nochange_steps = nochange_steps
+        self._hp_random_state = None if random_state is None else int(random_state)
+        self._hp_probability = probability
+        self._hp_break_ties = break_ties
+
+    def _resolve_gamma(self, x):
+        """cuML's `_get_gamma`. 'auto' is `1 / n_cols`, exact for every
+        n_cols that is a power of two and correctly rounded otherwise;
+        'scale' is `1 / (n_cols * X.var())` from the EXACT variance of the
+        float32 cells, rounded once (`_scale_gamma.scale_gamma`, DEVIATION
+        870). Both are the same bits on every host."""
+        if self._hp_gamma == "auto":
+            return 1.0 / float(x.shape[1])
+        if self._hp_gamma == "scale":
+            return scale_gamma_x(self._bind(_EXT_NAME), x, x.shape[1])
+        return float(self._hp_gamma)
+
+    def _solve(self, x, labels, gamma, c_rows):
+        """ONE binary C-SVC solve through the binding: `labels` float32 with
+        two distinct values, `c_rows` the per-row bounds or None. Returns
+        (n_support, dual, support, sv, info) with the worst-case buffers
+        uncut."""
+        n_rows, n_cols = x.shape
+        tail = [] if c_rows is None else [addr_ro(c_rows, name="C * sample_weight")]
+        dual = empty((n_rows,), "<f4")
+        support = empty((n_rows,), "<i4")
+        sv = empty((n_rows * n_cols,), "<f4")
+        info = empty((5,), "<f8")
+        n_support = self._bind(_EXT_NAME).svc_fit(
+            addr_ro(x, name="x"),
+            addr_ro(labels, name="labels"),
+            addr(dual, name="dual"),
+            addr(support, name="support"),
+            addr(sv, name="sv"),
+            addr(info, name="info"),
+            # ORDER MATCHES bindings/_anonlib_svm.mojo::svc_fit_binding.
+            # n_rows, n_features, kernel, gamma, C, tol, max_iter,
+            # nochange_steps, degree, coef0[, the per-row bounds' address]
+            [n_rows, n_cols, _SVC_KERNELS[self._hp_kernel], gamma, self._hp_C, self._hp_tol,
+             self._hp_max_iter, self._hp_nochange_steps, int(self._hp_degree), float(self._hp_coef0)] + tail,
+        )
+        return int(n_support), dual, support, sv, info
+
+    def fit(self, X, y, sample_weight=None):
+        """Fit the support vector classifier.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+            Training data, converted to float32. With
+            `kernel='precomputed'`, the square n x n kernel matrix.
+        y : array-like of shape (n_samples,)
+            Class labels; two or more distinct values.
+        sample_weight : array-like of shape (n_samples,), default None
+            Per-sample weights; row i's penalty becomes `C * w_i` (times
+            its class weight). None weights every sample equally.
+
+        Returns
+        -------
+        self : SVC
+            The fitted estimator.
+        """
+        self._validate_params()
+        x, self.input_copied_ = as_f32_dense_c(X, ndim=2, name="X")
+        labels, classes, pair = _as_labels(y)
+        n_rows, n_cols = x.shape
+        n_y = pair.shape[0] if labels is None else labels.shape[0]
+        if n_y != n_rows:
+            raise ValueError(
+                f"anonlib SVC: y has {n_y} entries, X has {n_rows} rows"
+            )
+        if self._hp_kernel == "precomputed" and n_cols != n_rows:
+            raise ValueError(
+                "anonlib SVC: kernel='precomputed' needs the square n x n "
+                f"kernel matrix as X, got {n_rows} x {n_cols}"
+            )
+        gamma = self._resolve_gamma(x)
+        c_rows = _c_rows(self._bind(_EXT_NAME), self._hp_C, n_rows, sample_weight,
+                         getattr(self, "class_weight", None), y, "SVC")
+        if labels is None:
+            return self._fit_ovo(x, classes, pair, gamma, c_rows)
+        self.__dict__.pop("_pairs", None)
+        n_support, dual, support, sv, info = self._solve(x, labels, gamma, c_rows)
+        # `np.float32(...)`: one rounding of the float64 slot to binary32.
+        b = _round_f32(info[0])
+        label0 = _round_f32(info[3])
+        label1 = _round_f32(info[4])
+        # THE LABEL PAIR IS CHECKED, NOT ASSUMED. The solver finds the two
+        # distinct labels with its own host sort and maps the LARGER to +1;
+        # if that disagreed with this side's sorted unique, `predict` would
+        # map the device's answer onto the wrong class and the error would
+        # look like a bad model rather than a bad boundary.
+        if label0 != _round_f32(pair[0]) or label1 != _round_f32(pair[1]):
+            raise RuntimeError(
+                "anonlib SVC: the solver's label pair "
+                f"({float(label0)}, {float(label1)}) does not match the "
+                f"host's sorted unique ({float(pair[0])}, "
+                f"{float(pair[1])}); the class mapping cannot be trusted"
+            )
+        self.classes_ = classes
+        self.n_features_in_ = n_cols
+        self.n_support_ = n_support
+        self.n_iter_ = int(info[2])
+        self.intercept_ = Array.from_list([b], "<f4")
+        # A slice of an Array COPIES (the _array contract), so these three
+        # are compact C-contiguous Arrays detached from the worst-case
+        # buffers above, exactly as `np.ascontiguousarray` detached them.
+        self.support_ = support[:n_support]
+        self.support_vectors_ = sv[:n_support * n_cols].reshape(
+            (n_support, n_cols))
+        self.dual_coef_ = dual[:n_support].reshape((1, n_support))
+        self._gamma = gamma
+        self._label0 = label0
+        self._label1 = label1
+        if self._hp_probability:
+            self._fit_probability(
+                x, threshold_codes(labels, float(label0), strict=True).astype("<i4"),
+                gamma, c_rows)
+        else:
+            self.__dict__.pop("_prob_ab", None)
+        return self
+
+    def _fit_probability(self, x, codes, gamma, c_rows):
+        """probability=True: libsvm's `svm_binary_svc_probability` for every
+        class pair (i, j), i < j: that pair's rows, shuffled by a SplitMix64
+        stream keyed by `random_state` (0 when None) and the pair number,
+        five folds `[f n / 5, (f + 1) n / 5)` of the shuffle; each fold's
+        decision values from a binary machine fitted on the other four (the
+        rows in shuffle order, the per-row bounds cut to them, gamma the
+        whole fit's), a fold with one class taking libsvm's +1 / -1; then
+        `sigmoid_train` in libsvm's orientation (+1 = class i). Every number
+        before the sigmoid is the solver's; the sigmoid, the Newton steps
+        and the coupling are binary64 host arithmetic with the portable exp
+        and log, one written order, so the same bits on every column.
+        Sets `probA_` and `probB_` (one per pair, float64)."""
+        self.__dict__.pop("_prob_ab", None)
+        if not self._hp_probability:
+            return
+        k = len(self.classes_)
+        seed = 0 if self._hp_random_state is None else int(self._hp_random_state)
+        precomputed = self._hp_kernel == "precomputed"
+        native = self._bind(_EXT_NAME)
+        ab = []
+        pair_no = 0
+        n_all = codes.shape[0]
+        c_col = None if c_rows is None else c_rows.reshape((n_all, 1))
+        for ci in range(k):  # glue: one probability fit per class pair
+            for cj in range(ci + 1, k):  # glue: one probability fit per class pair
+                # the pair's rows in row order, selected in the binding (a
+                # device compaction on a GPU install); libsvm's +1 is class ci
+                idx_a, lab_a, _ = _pair_select(native, codes, ci, cj)
+                n = idx_a.shape[0]
+                perm = _native_perm_array(native, n, seed ^ ((pair_no * 0x9E3779B97F4A7C15) & 0xFFFFFFFFFFFFFFFF))
+                # the decisions in shuffle order; each fold's machine writes
+                # its held block in place (lane/cgr-kernel: the fold rows,
+                # labels and the unshuffle run in the binding, on the device
+                # on a GPU install; no Python list over the rows)
+                dec_perm = zeros((max(n, 1),), "<f4")
+                consts = [0.0] * 10
+                for f in range(5):  # glue: five Platt folds per pair
+                    begin = f * n // 5
+                    end = (f + 1) * n // 5
+                    h = end - begin
+                    nt = n - h
+                    rows_held = empty((max(n, 1),), "<i4")
+                    lab = empty((max(nt, 1),), "<f4")
+                    n_pos = int(native.svc_pair_epilogue(
+                        addr_ro(idx_a, name="pair rows"), addr_ro(perm, name="shuffle"),
+                        addr_ro(lab_a, name="pair labels"), addr(rows_held, name="fold rows"),
+                        [_GLUE_FOLD, n, begin, end, addr(lab, name="fold labels")])) if n else 0
+                    n_neg = nt - n_pos
+                    if n_pos == 0 or n_neg == 0:
+                        consts[2 * f] = 1.0
+                        consts[2 * f + 1] = 0.0 if nt == 0 else (1.0 if n_pos > 0 else -1.0)
+                        continue
+                    if h == 0:
+                        continue
+                    rows = rows_held[:nt]
+                    hrows = rows_held[nt:n]
+                    lab = lab[:nt]
+                    sub = _gather(native, x, rows, rows) if precomputed else _gather(native, x, rows)
+                    sub_c = None if c_col is None else _gather(native, c_col, rows).reshape((nt,))
+                    n_sv, dual, support, sv, info = self._solve(sub, lab, gamma, sub_c)
+                    q = _gather(native, x, hrows, rows) if precomputed else _gather(native, x, hrows)
+                    cols = sub.shape[1]
+                    self._machine(q, dual[:n_sv].reshape((1, n_sv)),
+                                  sv[:n_sv * cols].reshape((n_sv, cols)), n_sv,
+                                  _round_f32(info[0]), 0.0, 1.0, False,
+                                  support[:n_sv].tolist(), out_addr=addr(dec_perm, name="decisions") + 4 * begin)
+                # libsvm's orientation (positive toward class i) and +1/-1
+                # labels, back in pair row order, float64
+                dec = empty((max(n, 1),), "<f8")
+                labels = empty((max(n, 1),), "<f8")
+                cst = Array.from_list(consts, "<f4")
+                if n:
+                    native.svc_pair_epilogue(
+                        addr_ro(dec_perm, name="decisions"), addr_ro(perm, name="shuffle"),
+                        addr_ro(lab_a, name="pair labels"), addr(dec, name="pair decisions"),
+                        [_GLUE_FOLD_FINISH, n, addr_ro(cst, name="fold constants"),
+                         addr(labels, name="pair +1/-1 labels"), 0])
+                ab_out = array.array("d", [0.0, 0.0])
+                native.svc_platt_train(addr_ro(dec, name="pair decisions") if n else 0,
+                                       addr_ro(labels, name="pair labels") if n else 0,
+                                       ab_out.buffer_info()[0], n)
+                ab.append((ab_out[0], ab_out[1]))
+                pair_no += 1
+        self._prob_ab = ab
+        self.probA_ = Array.from_list([a for a, _ in ab], "<f8")  # glue: per-pair sigmoid parameters
+        self.probB_ = Array.from_list([b for _, b in ab], "<f8")  # glue: per-pair sigmoid parameters
+
+    def _fit_ovo(self, x, classes, codes, gamma, c_rows):
+        """MULTICLASS: one-vs-one, libsvm's (and scikit-learn's SVC's)
+        scheme, over the binary solver. For each class pair (i, j), i < j
+        in `classes_` order, the rows of class i or j are copied out in
+        their original order (exact bytes), class j is the solver's +1
+        (label 1.0, class i label 0.0), the per-row bounds are the full
+        fit's `_c_rows` cut to the same rows, and gamma is the one resolved
+        on the WHOLE X (scikit-learn's `_get_gamma` runs once, before the
+        pairs). Every number is the binary solver's; what is added here is
+        exact bookkeeping (row selection, index remapping, negation).
+
+        The public attributes are scikit-learn's multiclass layout, in its
+        orientation (a pair's decision is positive toward class i, the
+        negation of this solver's, which is exact): `support_` grouped by
+        class, ascending index within a class; `dual_coef_` (K - 1, n_SV);
+        `intercept_` (K (K - 1) / 2,); `n_support_` per class; `n_iter_`
+        per pair."""
+        n_rows, n_cols = x.shape
+        k = len(classes)
+        native = self._bind(_EXT_NAME)
+        pairs = []
+        for i in range(k):  # glue: one binary machine per class pair
+            for j in range(i + 1, k):  # glue: one binary machine per class pair
+                # the pair's rows in row order, their 0.0 / 1.0 labels and
+                # bounds, selected in the binding (a device compaction on a
+                # GPU install), then their X rows gathered there
+                idx_a, lab, sub_c = _pair_select(native, codes, i, j, c_rows)
+                if self._hp_kernel == "precomputed":
+                    # the pair's kernel matrix: its rows AND its columns
+                    sub = _gather(native, x, idx_a, idx_a)
+                else:
+                    sub = _gather(native, x, idx_a)
+                n_sv, dual, support, sv, info = self._solve(sub, lab, gamma, sub_c)
+                if _round_f32(info[3]) != 0.0 or _round_f32(info[4]) != 1.0:
+                    raise RuntimeError(
+                        "anonlib SVC: the solver's label pair for classes "
+                        f"({classes[i]!r}, {classes[j]!r}) is not (0.0, 1.0); "
+                        "the class mapping cannot be trusted")
+                sub_cols = sub.shape[1]
+                sv_rows = sv[:n_sv * sub_cols].reshape((n_sv, sub_cols))
+                # the pair's support in X's row numbers, gathered in the binding
+                pair_support = _gather_i32(native, idx_a, support[:n_sv])
+                if self._hp_kernel == "precomputed":
+                    # the support rows of the WHOLE kernel matrix, as the
+                    # binary fit keeps them (predict reads support_ only)
+                    sv_rows = _gather(native, x, pair_support)
+                pairs.append(dict(
+                    i=i, j=j,
+                    dual=dual[:n_sv].reshape((1, n_sv)),
+                    sv=sv_rows,
+                    support=pair_support,
+                    b=_round_f32(info[0]),
+                    n_iter=int(info[2]),
+                ))
+        self._set_ovo(classes, pairs, x, n_cols)
+        self._gamma = gamma
+        self._label0 = 0.0
+        self._label1 = 1.0
+        self._fit_probability(x, codes, gamma, c_rows)
+        return self
+
+    def _set_ovo(self, classes, pairs, x, n_cols):
+        """scikit-learn's multiclass attributes from the per-pair machines
+        (also `load`'s path, where `x` is None and the rows come from each
+        pair's own support vectors)."""
+        native = self._bind(_EXT_NAME)
+        if x is not None:
+            self._set_ovo_native(native, classes, pairs, x, n_cols)
+            return
+        # `load` (lane py-runtime-b: the per-vector Python dicts are gone):
+        # the same layout call as `fit`, with the row bound max(support) + 1;
+        # each original row's position in the saved pairs by one native
+        # scatter (a repeated row names the same X bytes), then the support
+        # rows by native gathers out of the saved pair rows
+        from ._buffer import _native
+        ps = _concat_words([_i32(p["support"]) for p in pairs], "<i4")  # glue: per-pair support arrays and sizes
+        total = ps.size
+        sv_all = _concat_f32([p["sv"] for p in pairs]).reshape((total, n_cols))  # glue: per-pair support arrays and sizes
+        n_rows = int(ps.max()) + 1 if total else 0
+        pos = zeros((max(n_rows, 1),), "<i8")
+        if total:
+            ps64 = ps.astype("<i8")
+            at = empty((total,), "<i8")
+            _native("arange_i64")(addr(at, name="positions"), 0, total)
+            _native("scatter_rows_bytes")(addr_ro(at, name="positions"), addr_ro(ps64, name="support"), total, 8,
+                                          addr(pos, name="row positions"), n_rows)
+        self._set_ovo_native(native, classes, pairs, None, n_cols, n_rows=n_rows, saved=(sv_all, pos))
+
+    def _set_ovo_native(self, native, classes, pairs, x, n_cols, n_rows=None, saved=None):
+        """`_set_ovo` in the binding (lane/apple-fast-py2mojo-linear,
+        `svm/impl/svc_ovo_layout.mojo`): the same support_ order, dual_coef_
+        cells and n_support_, then support_vectors_ as the gather of X at
+        support_ (the bytes the per-class dict held). `load` passes x None,
+        the row bound and `saved` = (the saved pair rows, each original
+        row's position in them)."""
+        k = len(classes)
+        if x is not None:
+            n_rows = x.shape[0]
+        sup_arrays = [_i32(p["support"]) for p in pairs]  # glue: per-pair support arrays and sizes
+        ms = [p["dual"].shape[1] for p in pairs]  # glue: per-pair support arrays and sizes
+        cap = min(n_rows, sum(ms))  # glue: per-pair support arrays and sizes
+        meta = [k, n_rows, len(pairs)]
+        for p, m in zip(pairs, ms):  # glue: per-pair support arrays and sizes
+            meta += [p["i"], p["j"], m]
+        support = empty((max(1, cap),), "<i4")
+        n_support = empty((k,), "<i4")
+        dual = empty((max(1, (k - 1) * cap),), "<f4")
+        n_sv = int(native.svc_ovo_layout(
+            [addr_ro(a, name="pair support") if m else 0 for a, m in zip(sup_arrays, ms)],  # glue: per-pair support arrays and sizes
+            [addr_ro(p["dual"], name="pair dual") if m else 0 for p, m in zip(pairs, ms)],  # glue: per-pair support arrays and sizes
+            meta,
+            [addr(support, name="support_"), addr(n_support, name="n_support_"),
+             addr(dual, name="dual_coef_"), cap]))
+        self.classes_ = classes
+        self.n_features_in_ = n_cols
+        self._pairs = pairs
+        if n_sv:
+            self.support_ = support[:n_sv]
+            if x is not None:
+                self.support_vectors_ = _gather(native, x, self.support_)
+            else:
+                from ._buffer import _native
+                sv_all, pos = saved
+                sup64 = self.support_.astype("<i8")
+                at = empty((n_sv,), "<i8")
+                _native("gather_i64")(addr_ro(pos, name="row positions"), n_rows, addr_ro(sup64, name="support_"),
+                                      n_sv, addr(at, name="saved positions"))
+                sv = empty((n_sv, n_cols), "<f4")
+                _native("gather_rows_bytes")(addr_ro(sv_all, name="saved rows"), addr(sv, name="support_vectors_"),
+                                             addr_ro(at, name="saved positions"), sv_all.shape[0], n_sv, 4 * n_cols)
+                self.support_vectors_ = sv
+            self.dual_coef_ = dual[:(k - 1) * n_sv].reshape((k - 1, n_sv))
+        else:
+            self.support_ = zeros((0,), "<i4")
+            self.support_vectors_ = zeros((0, n_cols), "<f4")
+            self.dual_coef_ = zeros((k - 1, 0), "<f4")
+        self.intercept_ = Array.from_list([-p["b"] for p in pairs], "<f4")  # glue: per-pair intercepts and iteration counts
+        self.n_support_ = n_support
+        self.n_iter_ = Array.from_list([p["n_iter"] for p in pairs], "<i4")  # glue: per-pair intercepts and iteration counts
+
+    def _dual_times_sv(self, dual_coef, support_vectors, out=None, row=0, negate=False):
+        """`dual_coef_ @ support_vectors_` in the binding (`svc_dual_gemv`,
+        on the device on a GPU install: an ascending binary64 chain per
+        feature), into row `row` of `out` (a new (1, d) Array when None),
+        negated when `negate` (exact)."""
+        native = self._bind(_EXT_NAME)
+        n_sv, n_features = support_vectors.shape
+        if out is None:
+            out = empty((1, n_features), "<f4")
+        if n_features:
+            native.svc_dual_gemv(
+                addr_ro(dual_coef, name="dual_coef_") if n_sv else 0,
+                addr_ro(support_vectors, name="support_vectors_") if n_sv else 0,
+                [n_sv, n_features, 1 if negate else 0], addr(out, name="coef_") + 4 * row * n_features)
+        return out
+
+    @property
+    def coef_(self):
+        """Primal weights, only for `kernel='linear'`.
+
+        Shape (1, n_features) for two classes and (K(K-1)/2, n_features)
+        for K > 2 classes, float32. Raises `AttributeError` for other
+        kernels or before `fit`.
+        """
+        if not hasattr(self, "dual_coef_"):
+            raise AttributeError("anonlib SVC: call fit() first")
+        if self._hp_kernel != "linear":
+            raise AttributeError(
+                "anonlib SVC: coef_ is only available for kernel='linear'"
+            )
+        pairs = self.__dict__.get("_pairs")
+        if pairs is not None:
+            # one row per pair in scikit-learn's orientation: the negation
+            # of each pair machine's own dual_coef_ @ support_vectors_
+            out = zeros((len(pairs), self.n_features_in_), "<f4")
+            for r, p in enumerate(pairs):           # glue: one gemv call per pair
+                if p["dual"].shape[1]:
+                    self._dual_times_sv(p["dual"], p["sv"], out, r, negate=True)
+            return out
+        if self.n_support_ == 0:
+            return zeros((1, self.n_features_in_), "<f4")
+        return self._dual_times_sv(self.dual_coef_, self.support_vectors_)
+
+    def _query(self, X):
+        if not hasattr(self, "dual_coef_"):
+            raise ValueError("anonlib SVC: call fit() first")
+        q, _ = as_f32_dense_c(X, ndim=2, name="X")
+        if q.shape[1] != self.n_features_in_:
+            raise ValueError(
+                f"anonlib SVC: X has {q.shape[1]} features, fit saw "
+                f"{self.n_features_in_}"
+            )
+        return q
+
+    def _machine(self, q, dual, sv, n_support, b, label0, label1, predict_class, support=None,
+                 out_addr=None):
+        """One machine's decisions (or labels) on q: a new float32 (n,)
+        Array, or written at `out_addr` (n float32 the caller owns; returns
+        None)."""
+        n_rows = q.shape[0]
+        out = empty((n_rows,), "<f4") if out_addr is None else None
+        n_features = self.n_features_in_
+        if self._hp_kernel == "precomputed" and n_support > 0:
+            # X is the cross-kernel against the TRAINING rows; the decision
+            # reads its columns at the support vectors and no support rows.
+            q = _precomputed_columns(self._bind(_EXT_NAME), q, support)
+            n_features = n_support
+            sv = dual
+        # Kept in locals so the arrays outlive the call; the Mojo side
+        # borrows these addresses and owns nothing (`_buffer.py`).
+        self._bind(_EXT_NAME).svc_predict(
+            addr_ro(q, name="q"),
+            addr_ro(dual, name="dual") if n_support > 0 else 0,
+            addr_ro(sv, name="sv") if n_support > 0 else 0,
+            addr(out, name="out") if out_addr is None else out_addr,
+            # ORDER MATCHES bindings/_anonlib_svm.mojo::svc_predict_binding.
+            # n_rows, n_features, n_support, b, classes[0], classes[1],
+            # kernel, gamma, predict_class, cache_size_mib, degree, coef0
+            [n_rows, n_features, n_support,
+             float(b), float(label0), float(label1),
+             _SVC_KERNELS[self._hp_kernel], self._gamma,
+             1 if predict_class else 0, self._hp_cache_size,
+             int(self._hp_degree), float(self._hp_coef0)],
+        )
+        return out
+
+    def _run(self, X, predict_class):
+        q = self._query(X)
+        return self._machine(q, self.dual_coef_, self.support_vectors_, self.n_support_,
+                             self.intercept_[0], self._label0, self._label1, predict_class,
+                             self.support_.tolist())
+
+    def _pair_decisions(self, X):
+        """Each pair machine's raw decision on X (this solver's
+        orientation: >= 0 toward class j), written by the machines straight
+        into ONE float32 (n_pairs, n) Array, pair-major (lane/py-dn-svm,
+        2026-09-28; before, a Python list per pair)."""
+        q = self._query(X)
+        n_rows = q.shape[0]
+        dec = empty((len(self._pairs), n_rows), "<f4")
+        base = addr(dec, name="decisions")
+        for pno, p in enumerate(self._pairs):  # glue: one machine per class pair
+            self._machine(q, p["dual"], p["sv"], p["dual"].shape[1], p["b"],
+                          0.0, 1.0, False, p["support"], out_addr=base + 4 * n_rows * pno)
+        return dec
+
+    def _epilogue(self, mode, dec, pairs, out_shape, out_dtype, ab=None, label1=0.0):
+        """The per-row epilogues in Mojo (`svc_pair_epilogue`,
+        svm/host/svc_proba.mojo): `dec` is the (n_pairs, n) float32
+        decisions, `pairs` the (i, j) class codes in pair order, `ab` the
+        per-pair (A, B). Same binary64 operations in the same order as the
+        Python they replaced (tests/_svm_reference.py: `ovr_scores`, the vote loop,
+        `_sigmoid_predict`, `_multiclass_probability`), so the same bits."""
+        n_pairs, n_rows = dec.shape
+        out = empty(out_shape, out_dtype)
+        if n_rows:
+            pi = array.array("i", [v for pair in pairs for v in pair])  # glue: pair codes and sigmoid parameters as words
+            abuf = array.array("d", [v for pair in ab for v in pair]) if ab is not None else None  # glue: pair codes and sigmoid parameters as words
+            self._bind(_EXT_NAME).svc_pair_epilogue(
+                addr_ro(dec, name="decisions"),
+                pi.buffer_info()[0] if len(pi) else 0,
+                abuf.buffer_info()[0] if abuf is not None and len(abuf) else 0,
+                addr(out, name="out"),
+                [mode, n_rows, n_pairs, len(self.classes_), float(label1)])
+        return out
+
+    def _pair_codes(self):
+        return [(p["i"], p["j"]) for p in self._pairs]  # glue: pair codes and sigmoid parameters as words
+
+    def decision_function(self, X):
+        """Evaluate the decision function for the rows of `X`.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_rows, n_features)
+            Query data. With `kernel='precomputed'`, the kernel between the
+            queries and the training rows, shape (n_rows, n_samples).
+
+        Returns
+        -------
+        Array
+            Two classes: shape (n_rows,), the raw
+            `sum_j K(x, sv_j) dual_j + b`, positive toward `classes_[1]`.
+            More classes with `decision_function_shape='ovo'`: shape
+            (n_rows, K(K-1)/2), float32, one column per class pair,
+            positive toward the pair's lower class. With 'ovr': shape
+            (n_rows, K), float64, scikit-learn's vote-plus-confidence
+            transform of the pairwise values.
+        """
+        if self.__dict__.get("_pairs") is None:
+            return self._run(X, False)
+        dec = self._pair_decisions(X)
+        n_pairs, n_rows = dec.shape
+        if self.decision_function_shape == "ovo":
+            return self._epilogue(_EPI_OVO, dec, self._pair_codes(), (n_rows, n_pairs), "<f4")
+        return self._epilogue(_EPI_OVR, dec, self._pair_codes(), (n_rows, len(self.classes_)), "<f8")
+
+    # Maintainer notes: binary predict is cuML's `applyPrediction` epilogue,
+    # ON THE DEVICE: the label is chosen there by `val + b < 0 ? classes_[0] :
+    # classes_[1]` and this maps the float32 label it wrote back into
+    # `classes_`'s dtype. Multiclass: libsvm's vote (a pair's decision < 0
+    # here votes class i, otherwise class j, the binary epilogue's rule).
+    def predict(self, X):
+        """Predict class labels for the rows of `X`.
+
+        Two classes: `classes_[1]` where the decision function is >= 0,
+        otherwise `classes_[0]`. More classes: one-vs-one vote, the most
+        votes winning and ties going to the lowest class; with
+        `break_ties=True` (and `decision_function_shape='ovr'`), the argmax
+        of the 'ovr' decision function, the first maximum winning.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_rows, n_features)
+            Query data (the cross-kernel with `kernel='precomputed'`).
+
+        Returns
+        -------
+        Array or list of shape (n_rows,)
+            Labels from `classes_`: an int64 or float64 Array for integer
+            or float labels, a Python list otherwise.
+        """
+        pairs = self.__dict__.get("_pairs")
+        if pairs is None:
+            raw = self._run(X, True)
+            n_rows = raw.shape[0]
+            codes = self._epilogue(_EPI_BINARY, raw.reshape((1, n_rows)), [(0, 1)], (n_rows,), "<i8",
+                                   label1=self._label1)
+            return decode_labels(self.classes_, codes)
+        dec = self._pair_decisions(X)
+        n_rows = dec.shape[1]
+        k = len(self.classes_)
+        if self._hp_break_ties:
+            return decode_labels(self.classes_, argmax_rows(
+                self._epilogue(_EPI_OVR, dec, self._pair_codes(), (n_rows, k), "<f8")))
+        return decode_labels(self.classes_,
+                             self._epilogue(_EPI_VOTES, dec, self._pair_codes(), (n_rows,), "<i8"))
+
+    # Maintainer note: libsvm's `svm_predict_probability`; the coupling is
+    # `_multiclass_probability`.
+    @available_if(_check_proba)
+    def predict_proba(self, X):
+        """Class probabilities from the fitted Platt scaling.
+
+        Follows libsvm: each class pair's decision value goes through its
+        fitted sigmoid (clamped to [1e-7, 1 - 1e-7]); with more than two
+        classes the pairwise probabilities are then coupled.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_rows, n_features)
+            Query data.
+
+        Returns
+        -------
+        Array of shape (n_rows, K), float64
+            Probabilities, columns in `classes_` order.
+
+        Raises
+        ------
+        AttributeError
+            If the model was fitted with `probability=False`.
+        """
+        ab = self.__dict__.get("_prob_ab")
+        if ab is None:
+            raise AttributeError(
+                "anonlib SVC: predict_proba is not available when "
+                "probability=False (scikit-learn's rule); fit with probability=True"
+            )
+        return self._proba(X, ab, _EPI_PROBA)
+
+    def _proba(self, X, ab, mode):
+        k = len(self.classes_)
+        if self.__dict__.get("_pairs") is None:
+            raw = self._run(X, False)
+            dec = raw.reshape((1, raw.shape[0]))
+            pairs = [(0, 1)]
+        else:
+            dec = self._pair_decisions(X)
+            pairs = self._pair_codes()
+        return self._epilogue(mode, dec, pairs, (dec.shape[1], k), "<f8", ab=ab)
+
+    # Maintainer note: the portable binary64 log (its Mojo twin, `pm_log`, in
+    # the same epilogue call); a probability <= 0 raises as
+    # `_portable_math.log` does.
+    @available_if(_check_proba)
+    def predict_log_proba(self, X):
+        """Natural log of `predict_proba(X)`.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_rows, n_features)
+            Query data.
+
+        Returns
+        -------
+        Array of shape (n_rows, K), float64
+            Log probabilities, columns in `classes_` order.
+
+        Raises
+        ------
+        AttributeError
+            If the model was fitted with `probability=False`.
+        """
+        ab = self.__dict__.get("_prob_ab")
+        if ab is None:
+            raise AttributeError(
+                "anonlib SVC: predict_proba is not available when "
+                "probability=False (scikit-learn's rule); fit with probability=True"
+            )
+        return self._proba(X, ab, _EPI_LOG_PROBA)
+
+    # Maintainer note: a Python count over O(rows) labels (DEVIATION 2365).
+    def score(self, X, y):
+        """Mean accuracy of `predict(X)` against `y`.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_rows, n_features)
+            Query data.
+        y : array-like of shape (n_rows,)
+            True labels.
+
+        Returns
+        -------
+        float
+            Fraction of rows predicted correctly.
+        """
+        return _accuracy_host(self.predict(X), y)
+
+    # Maintainer note, file layout: `dual_coef_`, `support_vectors_`,
+    # `intercept_` as fitted (float32), `support_` `<i4`, `classes_` as
+    # `_labels.classes_member`, `labels` `<f8` (the float32 label pair the
+    # solver returned, `_label0` and `_label1`), `hyper` `<f8` [C, tol,
+    # cache_size, the gamma the FIT resolved], `kernel` and `gamma` (the
+    # constructor's setting, 'auto' or a number) as strings, `meta` `<i8`
+    # [n_features_in_, n_support_, n_iter_, max_iter, nochange_steps, degree].
+    # `anonlib.host_model(path)` predicts through
+    # `_anonlib_svm_host.svc_predict`.
+    def save(self, path):
+        """Save the fitted model to `path` as an `.npz` file.
+
+        The file holds the fitted arrays, the hyperparameters, the gamma
+        resolved at fit and the numeric mode. Load it with `SVC.load`, or
+        predict from it on a CPU without a GPU with
+        `anonlib.host_model(path)`.
+
+        Parameters
+        ----------
+        path : str or path-like
+            Destination file.
+
+        Raises
+        ------
+        RuntimeError
+            If the model has not been fitted.
+        """
+        if not hasattr(self, "dual_coef_"):
+            raise RuntimeError("this estimator is not fitted yet")
+        arrays = {
+            "format": _SVC_FORMAT,
+            "estimator": type(self).__name__,
+            "numeric_mode": _saved_mode(self),
+            "kernel": str(self._hp_kernel),
+            "gamma": str(self._hp_gamma),
+            "dual_coef": self.dual_coef_,
+            "support_vectors": self.support_vectors_,
+            "support": self.support_,
+            "intercept": self.intercept_,
+            "classes": classes_member(self.classes_),
+            "labels": Array.from_list([float(self._label0), float(self._label1)], "<f8"),
+            "hyper": Array.from_list(
+                [float(self._hp_C), float(self._hp_tol), float(self._hp_cache_size), float(self._gamma)],
+                "<f8",
+            ),
+        }
+        if self.__dict__.get("_pairs") is None:
+            arrays["meta"] = Array.from_list(
+                [int(self.n_features_in_), int(self.n_support_), int(self.n_iter_),
+                 int(self._hp_max_iter), int(self._hp_nochange_steps), int(self._hp_degree)],
+                "<i8",
+            )
+        if self._hp_kernel in ("poly", "sigmoid"):
+            # Only for poly and sigmoid, so every linear and rbf file keeps its bytes.
+            arrays["coef0"] = Array.from_list([float(self._hp_coef0)], "<f8")
+        ab = self.__dict__.get("_prob_ab")
+        if ab is not None:
+            # probability=True only, so every other file keeps its bytes:
+            # the per-pair sigmoid (A, B), binary64.
+            arrays["prob_ab"] = Array.from_list([v for pair in ab for v in pair], "<f8")  # glue: saved per-pair metadata words
+        pairs = self.__dict__.get("_pairs")
+        if pairs is not None:
+            # MULTICLASS ONLY, so every binary file keeps its bytes: the
+            # one-vs-one machines themselves, concatenated in pair order
+            # ([i, j, n_support, n_iter] per pair), from which `load`
+            # rebuilds the public attributes exactly as `fit` built them.
+            nf = int(self.n_features_in_)
+            arrays["meta"] = Array.from_list(
+                [nf, len(self.support_.tolist()), sum(p["n_iter"] for p in pairs),  # glue: saved per-pair metadata words
+                 int(self._hp_max_iter), int(self._hp_nochange_steps), int(self._hp_degree)], "<i8")
+            arrays["labels"] = Array.from_list([0.0, 1.0], "<f8")
+            arrays["shape"] = str(self.decision_function_shape)
+            arrays["break_ties"] = Array.from_list([1 if self._hp_break_ties else 0], "<i8")
+            arrays["pair_meta"] = Array.from_list(
+                [v for p in pairs for v in (p["i"], p["j"], p["dual"].shape[1], p["n_iter"])], "<i8")  # glue: saved per-pair metadata words
+            arrays["pair_b"] = Array.from_list([p["b"] for p in pairs], "<f4")  # glue: saved per-pair metadata words
+            arrays["pair_support"] = _concat_words([_i32(p["support"]) for p in pairs], "<i4")  # glue: per-pair support arrays and sizes
+            arrays["pair_dual"] = _concat_f32([p["dual"] for p in pairs])  # glue: saved per-pair metadata words
+            arrays["pair_sv"] = _concat_f32([p["sv"] for p in pairs])  # glue: saved per-pair metadata words
+        return _serialize.write_npz(path, arrays)
+
+    @classmethod
+    def load(cls, path):
+        """Load a model written by `save`.
+
+        Every array is read at its saved dtype, never cast.
+
+        Parameters
+        ----------
+        path : str or path-like
+            File written by `SVC.save`.
+
+        Returns
+        -------
+        SVC
+            A fitted model, ready to predict, with the saved numeric mode.
+
+        Raises
+        ------
+        ValueError
+            If the file is not a valid saved `SVC`.
+        """
+        arrays = _serialize.read_npz(path, _SVC_FORMAT)
+        _check_saved_by(arrays, path, cls)
+        meta = _serialize.exact(arrays, "meta", "<i8")
+        if meta.size != 6:
+            raise ValueError(f"anonlib: {path!r} meta holds {meta.size} fields, 6 are needed")
+        hyper = _serialize.exact(arrays, "hyper", "<f8")
+        if hyper.size != 4:
+            raise ValueError(f"anonlib: {path!r} hyper holds {hyper.size} fields, 4 are needed")
+        gamma_setting = _serialize.scalar_str(arrays, "gamma")
+        kernel_setting = _serialize.scalar_str(arrays, "kernel")
+        coef0 = 0.0
+        if kernel_setting in ("poly", "sigmoid"):
+            coef0_arr = _serialize.exact(arrays, "coef0", "<f8")
+            if coef0_arr.size != 1:
+                raise ValueError(f"anonlib: {path!r} coef0 must hold one float64")
+            coef0 = float(coef0_arr[0])
+        obj = cls(
+            C=float(hyper[0]),
+            kernel=_serialize.scalar_str(arrays, "kernel"),
+            gamma=gamma_setting if gamma_setting in ("auto", "scale") else float(gamma_setting),
+            tol=float(hyper[1]),
+            cache_size=float(hyper[2]),
+            max_iter=int(meta[3]),
+            nochange_steps=int(meta[4]),
+            degree=int(meta[5]),
+            coef0=coef0,
+        )
+        _restore_mode(obj, arrays)
+        obj._validate_params()
+        nf, n_support = int(meta[0]), int(meta[1])
+        if "prob_ab" in arrays:
+            flat = _serialize.exact(arrays, "prob_ab", "<f8").tolist()
+            obj.probability = True
+            obj._hp_probability = True
+            obj._prob_ab = [(flat[2 * i], flat[2 * i + 1]) for i in range(len(flat) // 2)]  # glue: saved per-pair metadata words
+            obj.probA_ = Array.from_list(flat[0::2], "<f8")
+            obj.probB_ = Array.from_list(flat[1::2], "<f8")
+        if "pair_meta" in arrays:
+            return cls._load_ovo(obj, arrays, path, nf, hyper)
+        dual = _serialize.exact(arrays, "dual_coef", "<f4")
+        if dual.ndim != 2 or tuple(dual.shape) != (1, n_support):
+            raise ValueError(f"anonlib: {path!r} dual_coef shape {tuple(dual.shape)} is not (1, {n_support})")
+        sv = _serialize.exact(arrays, "support_vectors", "<f4")
+        if sv.ndim != 2 or tuple(sv.shape) != (n_support, nf):
+            raise ValueError(f"anonlib: {path!r} support_vectors shape {tuple(sv.shape)} is not ({n_support}, {nf})")
+        support = _serialize.exact(arrays, "support", "<i4")
+        if support.ndim != 1 or support.size != n_support:
+            raise ValueError(f"anonlib: {path!r} support does not match n_support_")
+        if kernel_setting == "precomputed":
+            _check_support_bounds(support, nf, path)
+        intercept = _serialize.exact(arrays, "intercept", "<f4")
+        if intercept.ndim != 1 or intercept.size != 1:
+            raise ValueError(f"anonlib: {path!r} intercept must hold one float32")
+        labels = _serialize.exact(arrays, "labels", "<f8")
+        if labels.size != 2:
+            raise ValueError(f"anonlib: {path!r} labels must hold the two solver labels")
+        obj.classes_ = classes_from_member(arrays["classes"])
+        if len(obj.classes_) != 2:
+            raise ValueError(f"anonlib: {path!r} must carry exactly two classes")
+        obj.n_features_in_ = nf
+        obj.n_support_ = n_support
+        obj.n_iter_ = int(meta[2])
+        obj.intercept_ = intercept
+        obj.support_ = support
+        obj.support_vectors_ = sv
+        obj.dual_coef_ = dual
+        obj._gamma = float(hyper[3])
+        obj._label0 = float(labels[0])
+        obj._label1 = float(labels[1])
+        return obj
+
+    @classmethod
+    def _load_ovo(cls, obj, arrays, path, nf, hyper):
+        """The multiclass half of `load`: the per-pair machines, then the
+        public attributes through `_set_ovo`, as `fit` sets them."""
+        classes = classes_from_member(arrays["classes"])
+        k = len(classes)
+        pm = _serialize.exact(arrays, "pair_meta", "<i8").tolist()
+        n_pairs = k * (k - 1) // 2
+        if k < 3 or len(pm) != 4 * n_pairs:
+            raise ValueError(f"anonlib: {path!r} pair_meta does not hold {n_pairs} pairs")
+        pb = _serialize.exact(arrays, "pair_b", "<f4").tolist()
+        # the per-pair blocks stay Arrays, cut by copying slices (lane
+        # py-runtime-b: no Python list of every saved value)
+        ps = _serialize.exact(arrays, "pair_support", "<i4").reshape((-1,))
+        if obj._hp_kernel == "precomputed":
+            _check_support_bounds(ps, nf, path)
+        pd = _serialize.exact(arrays, "pair_dual", "<f4").reshape((-1,))
+        pv = _serialize.exact(arrays, "pair_sv", "<f4").reshape((-1,))
+        total = sum(pm[4 * q + 2] for q in range(n_pairs))  # glue: pair metadata check over the class pairs
+        if len(pb) != n_pairs or ps.size != total or pd.size != total or pv.size != total * nf:
+            raise ValueError(f"anonlib: {path!r} pair arrays do not match pair_meta")
+        pairs, at, q = [], 0, 0
+        for i in range(k):  # glue: pair metadata check over the class pairs
+            for j in range(i + 1, k):  # glue: pair metadata check over the class pairs
+                pi, pj, n_sv, n_iter = pm[4 * q:4 * q + 4]
+                if (pi, pj) != (i, j):
+                    raise ValueError(f"anonlib: {path!r} pair {q} is ({pi}, {pj}), not ({i}, {j})")
+                pairs.append(dict(
+                    i=i, j=j,
+                    dual=pd[at:at + n_sv].reshape((1, n_sv)),
+                    sv=pv[at * nf:(at + n_sv) * nf].reshape((n_sv, nf)),
+                    support=ps[at:at + n_sv], b=pb[q], n_iter=int(n_iter)))
+                at += n_sv
+                q += 1
+        shape = _serialize.scalar_str(arrays, "shape")
+        ties = bool(_serialize.exact(arrays, "break_ties", "<i8").tolist()[0])
+        obj.decision_function_shape = "ovo" if shape == "ovo" else "ovr"
+        obj.break_ties = ties and obj.decision_function_shape == "ovr"
+        obj._hp_break_ties = obj.break_ties
+        obj._set_ovo(classes, pairs, None, nf)
+        obj._gamma = float(hyper[3])
+        obj._label0 = 0.0
+        obj._label1 = 1.0
+        return obj
+
+
+def _as_targets(y, n_rows):
+    """`y` as a 1-D contiguous float32 vector of regression targets.
+
+    NO `np.unique`, NO label pair, NO class count. `svr_impl.cuh:68` hands
+    `y` straight to `SmoSolver::Solve`, so a target is any finite float and
+    two rows sharing one are ordinary rather than interesting.
+
+    NO FINITENESS CHECK HERE EITHER, and that is deliberate rather than an
+    omission copied from `_as_labels`. `check_finite_list` in
+    `svm/impl/svr_impl.mojo::svr_fit` refuses a non-finite target BY
+    NAME with the offending flat index (DEVIATION 636), before any device
+    work reaches a kernel, and a
+    duplicate check on this side would make that refusal unreachable from
+    Python and therefore untestable. The house rule is to plumb the value
+    through and let the named refusal fire.
+    """
+    shape = _shape_of(y)
+    if len(shape) != 1:
+        raise ValueError(
+            f"anonlib SVR: y must be 1-D, got {len(shape)}-D shape {shape}"
+        )
+    a, _ = as_f32_c(y, ndim=1, name="y")
+    if a.shape[0] != n_rows:
+        raise ValueError(
+            f"anonlib SVR: y has {a.shape[0]} entries, X has {n_rows} rows"
+        )
+    return a
+
+
+# Maintainer notes (moved verbatim from the SVR docstring). NOTE: the kernel row
+# below says 'precomputed' is refused; the code accepts it (_SVR_KERNELS is
+# _SVC_KERNELS, and fit/predict handle it), so that row is stale.
+# Epsilon-support vector regression, backed by an SMO
+# solver and GPU kernel matrices (`svm/`, DEVIATIONS 630-637;
+# `svm/README.md`), the scikit-learn surface.
+#
+# THE TUBE IS THE ALGORITHM. Rows whose prediction lands inside a band of
+# half-width `epsilon` around the target cost nothing, so they never
+# become support vectors; the fit is determined by the rows outside it.
+# Raising `epsilon` widens the band and can only take rows out of the
+# support set, never add them, which is the one property of this
+# estimator a caller can check without a reference implementation, and
+# `python/anonlib/tests/test_svr_surface.py` checks it.
+#
+# WHAT IS HONORED, WHAT IS REFUSED, AND WHY -- one line per parameter,
+# because a parameter that is accepted and ignored is a wrong answer
+# waiting for a caller (the house rule). The file named on a refusal is
+# the file that raises it.
+#
+#     C               honored   the penalty. Refused if not finite or not
+#                               positive, by `_svm_impl.py` and again by
+#                               `svm/impl/svm_parameter.mojo`
+#                               (DEVIATION 636)
+#     epsilon         honored   the half-width of the insensitive tube,
+#                               cuML's `param.epsilon`, the parameter the
+#                               whole rung-2 implementation exists for. Passed
+#                               through UNCLAMPED so that
+#                               `svm/impl/svm_parameter.mojo::
+#                               check_rung1_scope`'s two refusals -- not
+#                               finite, and negative -- stay reachable
+#                               from this surface. They fire before any
+#                               device context exists
+#     kernel          honored   'linear', 'rbf', 'poly' and 'sigmoid', the
+#                               SVC's Gram and epilogues (DEVIATION 1663,
+#                               identical_tanh). 'precomputed' is REFUSED
+#                               BY NAME with what is missing
+#     gamma           honored   a finite float >= 0, or the string 'auto'
+#                               (= 1 / n_features, cuML's `_get_gamma`).
+#                               'scale' is resolved exactly, DEVIATION
+#                               870 below (theirs is the default)
+#     degree          honored   with kernel='poly': an integer in [0, 32]
+#     coef0           honored   with 'poly' and 'sigmoid': a finite float
+#     tol             honored   the stopping tolerance. Refused if not
+#                               finite or not positive, by `_svm_impl.py`
+#                               and `svm/impl/svm_parameter.mojo`
+#     cache_size      honored   ONLY as the prediction buffer, see
+#                               DEVIATION 871 below. The TRAINING LRU it
+#                               also names in the reference is unimplemented and
+#                               `svm/impl/svm_parameter.mojo` refuses
+#                               a non-zero one; `svm/estimator.mojo` pins
+#                               the training value at 0 so that refusal
+#                               is never reached from here
+#     max_iter        honored   cuML's total inner-iteration cap; -1 (the
+#                               default) is no limit. `_svm_impl.py`
+#                               refuses 0 and anything below -1
+#     nochange_steps  honored   cuML's convergence rule, with
+#                               its n_small_diff counter. NOT a
+#                               scikit-learn parameter; it is cuML's, and
+#                               it is here because the solver reads it
+#     verbose         refused   `_svm_impl.py`, for anything truthy. It
+#                               selects LOG LINES in the reference
+#                               (CUML_LOG_DEBUG); this implementation prints none,
+#                               so accepting it would be
+#                               accepting-and-ignoring
+#     output_type     refused   `_svm_impl.py`. A cuML-internal
+#                               array-type selector; this package returns
+#                               anonlib Arrays
+#     shrinking       absent    NOT A PARAMETER OF THIS CLASS, so passing
+#                               it is a TypeError naming it. It is
+#                               scikit-learn's (libsvm's) shrinking
+#                               heuristic and cuML has no such thing:
+#                               there is no row for it in
+#                               `svm/NOT_IMPLEMENTED.tsv` because there is
+#                               nothing in the reference to leave
+#                               unimplemented. `SVC` omits it for the same
+#                               reason
+#     sample_weight   honored   in fit(): the weighted `InitPenalty` arm,
+#                               row i's bound C * w_i at alpha_i and
+#                               alpha*_i (`_c_rows`)
+#     sparse X        honored   densified exactly (`as_f32_dense_c`), its
+#                               dense twin's path and bits; cuML's CSR
+#                               arms are not implemented
+#     non-finite X    refused   `svm/impl/svr_impl.mojo` at fit and
+#                               `svm/impl/svc_impl.mojo` at predict
+#                               name the flat index (DEVIATION 636)
+#                               rather than fitting it
+#     non-finite y    refused   the same `check_finite_list`, same
+#                               message, and it is the ONLY check `y`
+#                               gets on this class
+#
+# THE PARAMETER ORDER IS scikit-learn's `SVR`, and every name it shares
+# with scikit-learn means what scikit-learn means by it. TWO DEFAULTS
+# DIFFER and both are stated where they bite: `gamma` is 'auto' here and
+# 'scale' there (DEVIATION 870, below), and `cache_size` is 1024.0 MiB
+# here and 200 there because it is a different quantity on this surface
+# (DEVIATION 871). `shrinking` is absent, above.
+#
+# THIS CLASS MAKES NO CROSS-VENDOR CLAIM, and that is a narrower statement
+# than `SVC`'s. The classifier's 32-stage IDENTICAL card was diffed on
+# Apple M4, NVIDIA H100 and AMD MI325X at `a0a0eee` (E3 round 13,
+# 2026-08-28). The REGRESSION path was gated after that leg and has not
+# been in a three-vendor round: what stands behind it is 44 of 44 gates at
+# `fea6becc` on one box, of which 26 are the SVR ones, including four
+# property gates derived from the epsilon-insensitive formulation rather
+# than from this solver (a dual objective that must not increase, a KKT
+# gap, a tube bound, and a gradient recomputed from alpha alone that
+# matches the solver's `f` to 1.5e-07). A three-vendor SVR card is OWED.
+#
+# DEVIATION 870: `gamma='scale'` IS RESOLVED EXACTLY, AND THE DEFAULT
+# HERE IS STILL 'auto' (theirs is 'scale'; the default is kept so every
+# recorded default fit keeps its bits). 'scale' is `1 / (n_features *
+# X.var())` as theirs, but the variance is the EXACT population variance
+# of the float32 cells, formed in integers, and the reciprocal is rounded
+# once to binary64 (`_scale_gamma.scale_gamma`). Their float32 `X.var()`
+# carries its reduction's fold shape in its last bits; this one has no
+# fold to differ, so every host reads the same gamma bits, and it differs
+# from theirs by at most that reduction's rounding.
+#
+# DEVIATION 871: `cache_size` IS HONORED ONLY AT PREDICT, exactly as it is
+# on `SVC`. Upstream it is two things under one name, the training-time
+# `raft::cache` LRU and the ceiling on the prediction kernel-tile buffer
+# (`svm_base.pyx:554`). The prediction half is honored here exactly and is
+# a real knob: it sets the prediction batch size, and
+# `check_svr_device_is_launch_invariant` holds the answer fixed over it
+# from 0.001 MiB to 200 MiB ON THE REGRESSION PATH, which is a separate
+# gate from the classifier's because SVR runs `UpdateF` twice per batch
+# and so interleaves twice as many launches. The training half is NOT
+# implemented.
+#
+# DEVIATION 873: the fitted model crosses back to the host and is uploaded
+# again at every `predict`, because the binding retains no device pointer.
+# `fit` therefore allocates worst-case output buffers, `n_samples` dual
+# coefficients and `n_samples x n_features` support-vector floats, since
+# `n_support` is not known until the solve finishes. THOSE SIZES ARE NOT
+# DOUBLED for the regressor even though its solver domain is: `Results`
+# folds the two alpha halves before it selects, so at most `n_samples`
+# coefficients can be written.
+#
+# Attributes
+# ----------
+# support_ : Array (n_SV,) int32
+#     Indices of the support vectors in the training matrix.
+# support_vectors_ : Array (n_SV, n_features) float32
+# dual_coef_ : Array (1, n_SV) float32
+#     scikit-learn's 2-D layout of cuML's 1-D folded `dual_coefs`. Each
+#     entry is `alpha_i - alpha*_i` for one row, which is why there are
+#     `n_SV` of them and not `2 * n_SV`.
+# intercept_ : Array (1,) float32
+# n_support_ : int
+#     cuML's scalar count.
+# n_iter_ : int
+#     Total inner SMO iterations.
+# coef_ : Array (1, n_features) float32
+#     `dual_coef_ @ support_vectors_`, and only for `kernel='linear'`;
+#     raises AttributeError otherwise, as scikit-learn does.
+# n_features_in_ : int
+#
+class SVR(NumericModeMixin):
+    """Epsilon-support vector regression.
+
+    Follows scikit-learn's `SVR`, with cuML's `SVR` as the reference
+    implementation: an SMO solver with the kernel matrices computed on the
+    GPU. Rows whose prediction falls within `epsilon` of the target cost
+    nothing and never become support vectors, so raising `epsilon` can only
+    remove rows from the support set. `X` is converted to float32 (sparse
+    input is densified); non-finite values in `X` or `y` raise an error
+    naming the first bad cell. Supports the `'identical'` (default) and
+    `'fast'` numeric modes; `'fast'` is available on Apple GPUs only.
+
+    The parameters keep scikit-learn's order and meaning, with two
+    defaults that differ: `gamma='auto'` (scikit-learn uses 'scale') and
+    `cache_size=1024.0`, which here is the prediction buffer in MiB and
+    does not affect training (scikit-learn's 200 is a training cache).
+    There is no `shrinking` parameter; passing it raises `TypeError`.
+    `nochange_steps` is cuML's. Every parameter is keyword-only. A
+    parameter that would be ignored is refused: `degree` with any kernel
+    but 'poly', `coef0` with any kernel but 'poly' or 'sigmoid', and a
+    truthy `verbose` or any `output_type` raise `NotImplementedError`.
+
+    Parameters
+    ----------
+    kernel : {'linear', 'rbf', 'poly', 'sigmoid', 'precomputed'}, default 'rbf'
+        The kernel. 'poly' is `(gamma * <x, y> + coef0) ** degree`;
+        'sigmoid' is `tanh(gamma * <x, y> + coef0)`. With 'precomputed',
+        `X` is the n x n kernel matrix at fit and the q x n kernel against
+        the training rows at predict. Other names, including 'polynomial'
+        and 'tanh', raise.
+    degree : int, default 3
+        Degree of the 'poly' kernel, an integer in [0, 32]. Must stay 3
+        with any other kernel.
+    gamma : float, 'auto' or 'scale', default 'auto'
+        Kernel coefficient, a finite float >= 0. 'auto' is
+        `1 / n_features`; 'scale' is `1 / (n_features * X.var())`, computed
+        from the exact variance of the float32 data, so it can differ from
+        scikit-learn's float32 `X.var()` in the last bits.
+    coef0 : float, default 0.0
+        Independent term of the 'poly' and 'sigmoid' kernels, finite. Must
+        stay 0.0 with any other kernel.
+    tol : float, default 1e-3
+        Stopping tolerance. Must be finite and positive.
+    C : float, default 1.0
+        Regularization penalty. Must be finite and positive.
+    epsilon : float, default 0.1
+        Half-width of the epsilon-insensitive tube. Must be finite and
+        >= 0; an invalid value is refused when `fit` runs.
+    cache_size : float, default 1024.0
+        Size in MiB of the kernel tile buffer used at prediction, which
+        sets the prediction batch size; results do not depend on it. Must
+        be positive and finite.
+    verbose : bool, default False
+        Only False is accepted; this estimator prints no log lines.
+    max_iter : int, default -1
+        Cap on the total inner SMO iterations (cuML's meaning); -1 means no
+        limit. 0 and values below -1 are refused.
+    nochange_steps : int, default 1000
+        Follows cuML's ``nochange_steps`` convergence rule. Must be >= 0.
+    output_type : None, default None
+        Only None is accepted; results are anonlib Arrays.
+    numeric_mode : {'identical', 'fast'} or None, default None
+        Numeric mode for this estimator; None uses the process default.
+        ``'fast'`` is available on Apple GPUs only.
+
+    Attributes
+    ----------
+    support_ : Array of shape (n_SV,), int32
+        Indices of the support vectors in the training data.
+    support_vectors_ : Array of shape (n_SV, n_features), float32
+        The support vectors (rows of the kernel matrix with
+        `kernel='precomputed'`).
+    dual_coef_ : Array of shape (1, n_SV), float32
+        `alpha_i - alpha*_i` for each support vector, in scikit-learn's
+        layout.
+    intercept_ : Array of shape (1,), float32
+        Intercept of the decision function.
+    coef_ : Array of shape (1, n_features), float32
+        Primal weights `dual_coef_ @ support_vectors_`, only for
+        `kernel='linear'`; raises `AttributeError` otherwise, as
+        scikit-learn does.
+    n_support_ : int
+        Number of support vectors (cuML's scalar form; scikit-learn's is an
+        array).
+    n_iter_ : int
+        Total inner SMO iterations.
+    n_features_in_ : int
+        Number of features seen during `fit`.
+
+    Examples
+    --------
+    >>> import numpy as np, anonlib
+    >>> rng = np.random.default_rng(0)
+    >>> X = rng.random((1000, 8), dtype=np.float32)
+    >>> y = X.sum(axis=1)
+    >>> model = anonlib.SVR(C=1.0, epsilon=0.1).fit(X, y)
+    >>> pred = model.predict(X[:5])
+    """
+
+    #: scikit-learn's estimator kind: `cross_val_score` stratifies a
+    #: classifier's default folds, as scikit-learn's does.
+    _estimator_type = "regressor"
+
+    #: This family's binding, for `NumericModeMixin._bind`
+    #: (lane/inference-svm, 2026-09-15): `predict` binds through
+    #: `self._bind`, which resolves what `_extension` resolves, so
+    #: `_classical_host.HostSVR` answers the CPU binding as `HostSVC` does.
+    _BINDING = _EXT_NAME
+
+    def __init__(
+        self,
+        *,
+        kernel="rbf",
+        degree=3,
+        gamma="auto",
+        coef0=0.0,
+        tol=1e-3,
+        C=1.0,
+        epsilon=0.1,
+        cache_size=1024.0,
+        verbose=False,
+        max_iter=-1,
+        nochange_steps=1000,
+        output_type=None,
+    ):
+        # Stored verbatim (scikit-learn's convention); `_validate_params`
+        # checks them when `fit` (or `load`) runs and keeps the checked
+        # values the solver reads as `_hp_<name>`.
+        self.kernel = kernel
+        self.degree = degree
+        self.gamma = gamma
+        self.coef0 = coef0
+        self.tol = tol
+        self.C = C
+        self.epsilon = epsilon
+        self.cache_size = cache_size
+        self.verbose = verbose
+        self.max_iter = max_iter
+        self.nochange_steps = nochange_steps
+        self.output_type = output_type
+
+    def __setstate__(self, state):
+        # A model pickled before the parameter checks moved to fit carries
+        # no `_hp_*` working values: derive them from its stored parameters.
+        self.__dict__.update(state)
+        if "_hp_C" not in state and _is_fitted(self):
+            self._validate_params()
+
+    def _validate_params(self):
+        """The constructor checks, run at the start of `fit` and in `load`."""
+        kernel = self.kernel
+        degree = self.degree
+        gamma = self.gamma
+        coef0 = self.coef0
+        tol = self.tol
+        C = self.C
+        epsilon = self.epsilon
+        cache_size = self.cache_size
+        verbose = self.verbose
+        max_iter = self.max_iter
+        nochange_steps = self.nochange_steps
+        output_type = self.output_type
+
+        if not isinstance(kernel, str):
+            raise ValueError("anonlib SVR: kernel is a name")
+        # The caller's own string object when it is already lower case, so
+        # `get_params` hands `clone` back the object it was given.
+        k = kernel if kernel == kernel.lower() else kernel.lower()
+        if k in _SVR_REFUSED_KERNELS:
+            raise NotImplementedError(
+                f"anonlib SVR: kernel={kernel!r} is refused; "
+                + _SVR_REFUSED_KERNELS[k]
+            )
+        if k not in _SVR_KERNELS:
+            raise ValueError(
+                f"anonlib SVR: kernel={kernel!r} is not a kernel name; "
+                f"this implementation carries {sorted(_SVR_KERNELS)} and refuses "
+                f"the others by name ({sorted(_SVR_REFUSED_KERNELS)})"
+            )
+        if isinstance(gamma, str):
+            g = gamma if gamma == gamma.lower() else gamma.lower()
+            if g not in ("auto", "scale"):
+                raise ValueError(
+                    f"anonlib SVR: gamma={gamma!r} is not a name; it is "
+                    "'auto', 'scale' or a float"
+                )
+            gamma = g
+        else:
+            gamma = float(gamma)
+            if not math.isfinite(gamma) or gamma < 0.0:
+                raise ValueError(
+                    "anonlib SVR: gamma must be finite and >= 0 for the RBF "
+                    f"kernel, got {gamma!r} (DEVIATION 636; scikit-learn's own "
+                    "constraint is gamma >= 0)"
+                )
+        if k == "poly":
+            if isinstance(degree, bool) or not isinstance(degree, numbers.Integral):
+                raise TypeError(
+                    f"anonlib SVR: degree={degree!r} must be an integer; the "
+                    "polynomial power is an ascending repeated product (DEVIATION 1663)"
+                )
+            degree = int(degree)
+            if not 0 <= degree <= _MAX_POLY_DEGREE:
+                raise ValueError(
+                    f"anonlib SVR: degree must be in [0, {_MAX_POLY_DEGREE}], got "
+                    f"{degree!r} (DEVIATION 1663)"
+                )
+        elif degree != 3:
+            raise NotImplementedError(
+                f"anonlib SVR: degree={degree!r} is refused with kernel={k!r}; it "
+                "is read only by kernel='poly'. Passing it with another kernel "
+                "would be a parameter accepted and ignored"
+            )
+        if k in ("poly", "sigmoid"):
+            coef0 = float(coef0)
+            if not math.isfinite(coef0):
+                raise ValueError(
+                    f"anonlib SVR: coef0 must be finite, got {coef0!r} (DEVIATION 636)"
+                )
+        elif coef0 != 0.0:
+            raise NotImplementedError(
+                f"anonlib SVR: coef0={coef0!r} is refused with kernel={k!r}; it "
+                "is read only by kernel='poly' and kernel='sigmoid'"
+            )
+        C = float(C)
+        if not math.isfinite(C):
+            raise ValueError(
+                f"anonlib SVR: C must be finite, got {C!r} (DEVIATION 636)"
+            )
+        if C <= 0.0:
+            raise ValueError(f"anonlib SVR: C must be positive, got {C!r}")
+        tol = float(tol)
+        if not math.isfinite(tol):
+            raise ValueError(
+                f"anonlib SVR: tol must be finite, got {tol!r} (DEVIATION 636)"
+            )
+        if tol <= 0.0:
+            raise ValueError(f"anonlib SVR: tol must be positive, got {tol!r}")
+        # EPSILON IS NOT VALIDATED HERE, ON PURPOSE. `float()` is a
+        # conversion, not a policy: a string that is not a number still
+        # raises here, and every value that IS a number goes to the Mojo
+        # side unchanged so that `check_rung1_scope`'s "must be finite" and
+        # "must be non-negative" refusals stay reachable from Python. That
+        # is the same rule that keeps the non-finite-X refusal reachable.
+        epsilon = float(epsilon)
+        cache_size = float(cache_size)
+        if not (cache_size > 0.0) or not math.isfinite(cache_size):
+            raise ValueError(
+                "anonlib SVR: cache_size is the prediction buffer here "
+                f"(DEVIATION 871) and must be a positive finite MiB, got "
+                f"{cache_size!r}"
+            )
+        max_iter = int(max_iter)
+        if max_iter == 0 or max_iter < -1:
+            raise ValueError(
+                "anonlib SVR: max_iter is a positive cap or -1 for no "
+                f"limit (cuML's default), got {max_iter!r}"
+            )
+        nochange_steps = int(nochange_steps)
+        if nochange_steps < 0:
+            raise ValueError(
+                "anonlib SVR: nochange_steps cannot be negative, got "
+                f"{nochange_steps!r}"
+            )
+        if verbose:
+            raise NotImplementedError(
+                "anonlib SVR: verbose is refused; upstream it selects "
+                "CUML_LOG_DEBUG lines and this implementation prints none, so honoring "
+                "it is impossible and accepting it would be accepting-and-"
+                "ignoring"
+            )
+        if output_type is not None:
+            raise NotImplementedError(
+                "anonlib SVR: output_type is a cuML-internal array-type "
+                "selector; this package returns anonlib Arrays"
+            )
+        self._hp_kernel = k
+        self._hp_degree = degree
+        self._hp_gamma = gamma
+        self._hp_coef0 = coef0
+        self._hp_tol = tol
+        self._hp_C = C
+        self._hp_epsilon = epsilon
+        self._hp_cache_size = cache_size
+        self._hp_max_iter = max_iter
+        self._hp_nochange_steps = nochange_steps
+
+    _resolve_gamma = SVC._resolve_gamma
+    _dual_times_sv = SVC._dual_times_sv
+
+    def _kernel_tail(self):
+        """degree and coef0 as the bindings' optional trailing params: only
+        for 'poly' and 'sigmoid', so every linear and rbf call keeps its
+        exact params list."""
+        if self._hp_kernel in ("poly", "sigmoid"):
+            return [int(self._hp_degree), float(self._hp_coef0)]
+        return []
+
+    def _fit_tail(self, c_rows):
+        """svr_fit's optional slots: 9 the per-row bounds' address (0 = the
+        unweighted arm), then 10 degree and 11 coef0."""
+        kt = self._kernel_tail()
+        if c_rows is None and not kt:
+            return []
+        head = [0 if c_rows is None else addr_ro(c_rows, name="C * sample_weight")]
+        return head + kt
+
+    def fit(self, X, y, sample_weight=None):
+        """Fit the support vector regressor.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+            Training data, converted to float32. With
+            `kernel='precomputed'`, the square n x n kernel matrix.
+        y : array-like of shape (n_samples,)
+            Finite target values.
+        sample_weight : array-like of shape (n_samples,), default None
+            Per-sample weights; row i's penalty becomes `C * w_i`. None
+            weights every sample equally.
+
+        Returns
+        -------
+        self : SVR
+            The fitted estimator.
+        """
+        self._validate_params()
+        x, self.input_copied_ = as_f32_dense_c(X, ndim=2, name="X")
+        n_rows, n_cols = x.shape
+        targets = _as_targets(y, n_rows)
+        if self._hp_kernel == "precomputed" and n_cols != n_rows:
+            raise ValueError(
+                "anonlib SVR: kernel='precomputed' needs the square n x n "
+                f"kernel matrix as X, got {n_rows} x {n_cols}"
+            )
+        gamma = self._resolve_gamma(x)
+        c_rows = _c_rows(self._bind(_EXT_NAME), self._hp_C, n_rows, sample_weight, who="SVR")
+
+        # WORST-CASE OUTPUT BUFFERS, AND `n_rows` IS THE WORST CASE.
+        # The solver's domain is `2 * n_rows` (alpha+ and alpha-), but
+        # `Results::combine_coefs` folds the two halves before it selects,
+        # so at most `n_rows` coefficients, `n_rows` indices and
+        # `n_rows * n_cols` support-vector floats can ever be written. Every
+        # size here is a function of `(n_rows, n_cols)` alone, which is what
+        # lets this side allocate before the call.
+        dual = empty((n_rows,), "<f4")
+        support = empty((n_rows,), "<i4")
+        sv = empty((n_rows * n_cols,), "<f4")
+        # THREE, not SVC's five: slots 3 and 4 there are the class labels.
+        info = empty((3,), "<f8")
+        n_support = _extension(getattr(self, 'numeric_mode', None)).svr_fit(
+            addr_ro(x, name="x"),
+            addr_ro(targets, name="targets"),
+            addr(dual, name="dual"),
+            addr(support, name="support"),
+            addr(sv, name="sv"),
+            addr(info, name="info"),
+            # ORDER MATCHES bindings/_anonlib_svm.mojo::svr_fit_binding.
+            # n_rows, n_features, kernel, gamma, C, epsilon, tol, max_iter,
+            # nochange_steps[, the per-row bounds' address]
+            [n_rows, n_cols, _SVR_KERNELS[self._hp_kernel], gamma, self._hp_C,
+             self._hp_epsilon, self._hp_tol, self._hp_max_iter, self._hp_nochange_steps] + self._fit_tail(c_rows),
+        )
+        n_support = int(n_support)
+        b = _round_f32(info[0])
+
+        self.n_features_in_ = n_cols
+        self.n_support_ = n_support
+        self.n_iter_ = int(info[2])
+        self.intercept_ = Array.from_list([b], "<f4")
+        # Slices COPY (the _array contract): compact, C-contiguous, detached.
+        self.support_ = support[:n_support]
+        self.support_vectors_ = sv[:n_support * n_cols].reshape(
+            (n_support, n_cols))
+        self.dual_coef_ = dual[:n_support].reshape((1, n_support))
+        self._gamma = gamma
+        return self
+
+    @property
+    def coef_(self):
+        """Primal weights, shape (1, n_features), float32.
+
+        Only for `kernel='linear'`; raises `AttributeError` for other
+        kernels or before `fit`.
+        """
+        if not hasattr(self, "dual_coef_"):
+            raise AttributeError("anonlib SVR: call fit() first")
+        if self._hp_kernel != "linear":
+            raise AttributeError(
+                "anonlib SVR: coef_ is only available for kernel='linear'"
+            )
+        if self.n_support_ == 0:
+            return zeros((1, self.n_features_in_), "<f4")
+        return self._dual_times_sv(self.dual_coef_, self.support_vectors_)
+
+    # Maintainer note: there is no `decision_function` beside this and no
+    # `predict_class` under it: on a regressor the decision value IS the
+    # prediction, and cuML reaches it through the same `svcPredict` with the
+    # class epilogue switched off.
+    def predict(self, X):
+        """Predict target values for the rows of `X`.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_rows, n_features)
+            Query data. With `kernel='precomputed'`, the kernel between the
+            queries and the training rows, shape (n_rows, n_samples).
+
+        Returns
+        -------
+        Array of shape (n_rows,), float32
+            `sum_j K(x, sv_j) dual_j + b` for each row.
+        """
+        if not hasattr(self, "dual_coef_"):
+            raise ValueError("anonlib SVR: call fit() first")
+        q, _ = as_f32_dense_c(X, ndim=2, name="X")
+        if q.shape[1] != self.n_features_in_:
+            raise ValueError(
+                f"anonlib SVR: X has {q.shape[1]} features, fit saw "
+                f"{self.n_features_in_}"
+            )
+        n_rows = q.shape[0]
+        out = empty((n_rows,), "<f4")
+        # Kept in locals so the arrays outlive the call; the Mojo side
+        # borrows these addresses and owns nothing (`_buffer.py`).
+        dual = self.dual_coef_
+        sv = self.support_vectors_
+        n_features = self.n_features_in_
+        if self._hp_kernel == "precomputed" and self.n_support_ > 0:
+            # the cross-kernel's columns at the support vectors (SVC's rule)
+            q = _precomputed_columns(self._bind(_EXT_NAME), q, self.support_)
+            n_features = self.n_support_
+            sv = dual
+        self._bind(_EXT_NAME).svr_predict(
+            addr_ro(q, name="q"),
+            addr_ro(dual, name="dual") if self.n_support_ > 0 else 0,
+            addr_ro(sv, name="sv") if self.n_support_ > 0 else 0,
+            addr(out, name="out"),
+            # ORDER MATCHES bindings/_anonlib_svm.mojo::svr_predict_binding.
+            # n_rows, n_features, n_support, b, kernel, gamma,
+            # cache_size_mib
+            [n_rows, n_features, self.n_support_,
+             float(self.intercept_[0]), _SVR_KERNELS[self._hp_kernel], self._gamma,
+             self._hp_cache_size] + self._kernel_tail(),
+        )
+        return out
+
+    # Maintainer notes: accumulated in FLOAT64 from float32 predictions, which
+    # is what scikit-learn does and is not part of any identity claim.
+    # SEQUENTIALLY, in Python (`linear_model._r2_sums`, DEVIATION 2365): the
+    # NumPy-era pairwise sum could differ in the last bits.
+    def score(self, X, y):
+        """Coefficient of determination R^2 of `predict(X)` against `y`.
+
+        scikit-learn's definition, `1 - SS_res / SS_tot`, accumulated in
+        float64. A constant `y` scores 1.0 when predicted exactly and 0.0
+        otherwise.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_rows, n_features)
+            Query data.
+        y : array-like of shape (n_rows,)
+            True target values.
+
+        Returns
+        -------
+        float
+            The R^2 score.
+        """
+        pred = self.predict(X)
+        shape = _shape_of(y)
+        if len(shape) != 1:
+            raise ValueError(
+                f"anonlib SVR: y must be 1-D, got {len(shape)}-D shape {shape}"
+            )
+        if shape[0] != pred.shape[0]:
+            raise ValueError(
+                f"anonlib SVR: y has {shape[0]} entries, X has "
+                f"{pred.shape[0]} rows"
+            )
+        ss_res, ss_tot = _r2_sums(pred, y)
+        if ss_tot == 0.0:
+            # scikit-learn returns 1.0 for a perfect constant fit and 0.0
+            # otherwise; the ratio is undefined and this is its convention.
+            return 1.0 if ss_res == 0.0 else 0.0
+        return 1.0 - ss_res / ss_tot
+
+    # Maintainer note, file layout: `dual_coef_`, `support_vectors_`,
+    # `intercept_` as fitted (float32), `support_` `<i4`, `hyper` `<f8` [C,
+    # epsilon, tol, cache_size, the gamma the FIT resolved], `kernel` and
+    # `gamma` (the constructor's setting, 'auto' or a number) as strings,
+    # `meta` `<i8` [n_features_in_, n_support_, n_iter_, max_iter,
+    # nochange_steps], `kernel_params` [degree, coef0] for poly and sigmoid.
+    # `anonlib.host_model(path)` predicts through
+    # `_anonlib_svm_host.svr_predict`.
+    def save(self, path):
+        """Save the fitted model to `path` as an `.npz` file.
+
+        The file holds the fitted arrays, the hyperparameters, the gamma
+        resolved at fit and the numeric mode. Load it with `SVR.load`, or
+        predict from it on a CPU without a GPU with
+        `anonlib.host_model(path)`.
+
+        Parameters
+        ----------
+        path : str or path-like
+            Destination file.
+
+        Raises
+        ------
+        RuntimeError
+            If the model has not been fitted.
+        """
+        if not hasattr(self, "dual_coef_"):
+            raise RuntimeError("this estimator is not fitted yet")
+        return _serialize.write_npz(path, {
+            "format": _SVR_FORMAT,
+            "estimator": type(self).__name__,
+            "numeric_mode": _saved_mode(self),
+            "kernel": str(self._hp_kernel),
+            "gamma": str(self._hp_gamma),
+            "dual_coef": self.dual_coef_,
+            "support_vectors": self.support_vectors_,
+            "support": self.support_,
+            "intercept": self.intercept_,
+            "hyper": Array.from_list(
+                [float(self._hp_C), float(self._hp_epsilon), float(self._hp_tol),
+                 float(self._hp_cache_size), float(self._gamma)],
+                "<f8",
+            ),
+            "meta": Array.from_list(
+                [int(self.n_features_in_), int(self.n_support_), int(self.n_iter_),
+                 int(self._hp_max_iter), int(self._hp_nochange_steps)],
+                "<i8",
+            ),
+            # Only for poly and sigmoid, so every linear and rbf file keeps its bytes.
+            **({"kernel_params": Array.from_list([float(self._hp_degree), float(self._hp_coef0)], "<f8")}
+               if self._hp_kernel in ("poly", "sigmoid") else {}),
+        })
+
+    @classmethod
+    def load(cls, path):
+        """Load a model written by `save`.
+
+        Every array is read at its saved dtype, never cast.
+
+        Parameters
+        ----------
+        path : str or path-like
+            File written by `SVR.save`.
+
+        Returns
+        -------
+        SVR
+            A fitted model, ready to predict, with the saved numeric mode.
+
+        Raises
+        ------
+        ValueError
+            If the file is not a valid saved `SVR`.
+        """
+        arrays = _serialize.read_npz(path, _SVR_FORMAT)
+        _check_saved_by(arrays, path, cls)
+        meta = _serialize.exact(arrays, "meta", "<i8")
+        if meta.size != 5:
+            raise ValueError(f"anonlib: {path!r} meta holds {meta.size} fields, 5 are needed")
+        hyper = _serialize.exact(arrays, "hyper", "<f8")
+        if hyper.size != 5:
+            raise ValueError(f"anonlib: {path!r} hyper holds {hyper.size} fields, 5 are needed")
+        gamma_setting = _serialize.scalar_str(arrays, "gamma")
+        kernel_setting = _serialize.scalar_str(arrays, "kernel")
+        degree, coef0 = 3, 0.0
+        if kernel_setting in ("poly", "sigmoid"):
+            kpar = _serialize.exact(arrays, "kernel_params", "<f8")
+            if kpar.size != 2:
+                raise ValueError(f"anonlib: {path!r} kernel_params must hold degree and coef0")
+            degree, coef0 = int(kpar[0]), float(kpar[1])
+        obj = cls(
+            C=float(hyper[0]),
+            epsilon=float(hyper[1]),
+            kernel=kernel_setting,
+            degree=degree,
+            coef0=coef0,
+            gamma=gamma_setting if gamma_setting in ("auto", "scale") else float(gamma_setting),
+            tol=float(hyper[2]),
+            cache_size=float(hyper[3]),
+            max_iter=int(meta[3]),
+            nochange_steps=int(meta[4]),
+        )
+        _restore_mode(obj, arrays)
+        obj._validate_params()
+        nf, n_support = int(meta[0]), int(meta[1])
+        dual = _serialize.exact(arrays, "dual_coef", "<f4")
+        if dual.ndim != 2 or tuple(dual.shape) != (1, n_support):
+            raise ValueError(f"anonlib: {path!r} dual_coef shape {tuple(dual.shape)} is not (1, {n_support})")
+        sv = _serialize.exact(arrays, "support_vectors", "<f4")
+        if sv.ndim != 2 or tuple(sv.shape) != (n_support, nf):
+            raise ValueError(f"anonlib: {path!r} support_vectors shape {tuple(sv.shape)} is not ({n_support}, {nf})")
+        support = _serialize.exact(arrays, "support", "<i4")
+        if support.ndim != 1 or support.size != n_support:
+            raise ValueError(f"anonlib: {path!r} support does not match n_support_")
+        if kernel_setting == "precomputed":
+            _check_support_bounds(support, nf, path)
+        intercept = _serialize.exact(arrays, "intercept", "<f4")
+        if intercept.ndim != 1 or intercept.size != 1:
+            raise ValueError(f"anonlib: {path!r} intercept must hold one float32")
+        obj.n_features_in_ = nf
+        obj.n_support_ = n_support
+        obj.n_iter_ = int(meta[2])
+        obj.intercept_ = intercept
+        obj.support_ = support
+        obj.support_vectors_ = sv
+        obj.dual_coef_ = dual
+        obj._gamma = float(hyper[4])
+        return obj

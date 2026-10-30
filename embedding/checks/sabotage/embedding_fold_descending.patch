@@ -1,0 +1,13 @@
+diff --git a/autograd/kernels/embedding.mojo b/autograd/kernels/embedding.mojo
+index 2bd987daa..d31937609 100644
+--- a/autograd/kernels/embedding.mojo
++++ b/autograd/kernels/embedding.mojo
+@@ -249,7 +249,7 @@ def emb_backward_kernel(
+             dw.unsafe_store(cell, ftz(dy.unsafe_load(t1 * width + j)))
+             return
+ 
+-    comptime if SAB_FOLD_DESCENDING:
++    comptime if True:  # SABOTAGE (neural seam arm): SAB_FOLD_DESCENDING at its use site
+         var rdx = hi - 1
+         while rdx >= lo:
+             var td = Int(perm.unsafe_load(rdx))

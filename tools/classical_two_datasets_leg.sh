@@ -1,0 +1,494 @@
+#!/bin/sh
+# tools/classical_two_datasets_leg.sh -- DEVIATION 2570, the classical
+# opponent rows on the two benchmark datasets (CONTRIBUTING.md sections
+# 9 and 10). Runs ON THE BOX from /root/anonlib.
+#
+# NVIDIA (RunPod, DEVIATION 2571): driven phase by phase over tools/trees_leg.sh
+# ssh, each phase under nohup, so a harness bug costs one phase:
+#
+#   TREES_LEG_NAME=anonlib-ctd1 TREES_LEG_STATE=$HOME/anonlib-evidence/classical-h100/pod1 \
+#     sh tools/trees_leg.sh rent --gpu "NVIDIA H100 80GB HBM3" --minutes 70
+#   ... ssh 'cd /root/anonlib && nohup env ANONLIB_CTD_PHASES=setup \
+#            ANONLIB_CTD_LANES=kmeans,pca,ols,knn sh tools/classical_two_datasets_leg.sh \
+#            > /root/ctd_out/setup.console 2>&1 &'
+#   then PHASES="prep races" with ANONLIB_CTD_SMOKE_ROWS=20000 first, then the
+#   full shape, one ANONLIB_CTD_DATASETS at a time
+#   (bench/results/classical_h100_2026-09-11/batch*.sh are the runs, in order).
+#
+# AMD (DigitalOcean): tools/do_extra_leg.sh's ANONLIB_GEMM_LEG_EXTRA body, all
+# phases in one call (the default), from /root/anonlib with pixi on PATH:
+#
+#   ANONLIB_DO_TOKEN_FILE=$HOME/.anonlib_do_token \
+#   ANONLIB_GPU_ARCHS=gfx942 \
+#   ANONLIB_GEMM_LEG_EXTRA=tools/classical_two_datasets_leg.sh \
+#   ANONLIB_GEMM_LEG_OUT=$HOME/anonlib-evidence/classical-two-datasets-$(date -u +%Y-%m-%d_%H%M%S)-amd-leg1 \
+#   bash tools/do_extra_leg.sh amd --minutes 60 --skip-gates
+#
+# AMD (Hot Aisle MI300X, DEVIATION 2572): tools/classical_hotaisle_leg.sh is the
+# tools/hotaisle_leg.sh body; it calls this file once per phase group (setup,
+# smoke, prep, leg 1, leg 2) under one deadline. Evidence:
+# bench/results/classical_hotaisle_2026-09-11/.
+#
+# The DigitalOcean runner passes no environment to a body, so the lane list is this file's
+# default (kmeans,pca,ols,knn) and the second lease runs
+# tools/classical_two_datasets_leg2.sh (kde,svc), which sets
+# ANONLIB_CTD_LANES and execs this file.
+#
+# PHASES (ANONLIB_CTD_PHASES, default "setup prep races"), each step with a
+# row in status.tsv (name, exit, seconds); a red step does not stop the next,
+# because a red step is a finding:
+#   setup   env record; the opponents' Python (NVIDIA: the image's python3 with
+#           torch 2.4.1+cu124, plus scikit-learn, pyarrow and cuml-cu12==26.8.0
+#           from pypi.nvidia.com, the recipe of tools/trees_identical_remote.sh
+#           and the version of the existing H100 rows; AMD: a Python 3.12 venv
+#           with the torch ROCm pin of tools/do_byte_lm_setup.sh and current
+#           scikit-learn); the raw fetches at t=0, each decode after pip and
+#           its own fetch (writes <dataset>.done); the IDENTICAL bindings
+#           (bindings/build.sh always, build_estimators.sh for pca/ols/kde,
+#           build_svm.sh for svc) with ANONLIB_GPU_ARCHS when set; the
+#           ours import read back as identical
+#   prep    tools/classical_two_datasets.py prep, one dataset at a time
+#   races   one conductor per (lane, dataset), 1 warm-up + ROUNDS interleaved
+#           rounds, quality; SKIPPED_DEADLINE when the body deadline is
+#           closer than ANONLIB_CTD_MIN_RACE; summary.tsv after every race
+#
+# SMOKE: ANONLIB_CTD_SMOKE_ROWS=N preps capped blocks (prep --max-rows N)
+# into $DATA-smoke, writes under $OUT/smoke and races 1 round by default.
+#
+# THREADS: OMP_NUM_THREADS, OPENBLAS_NUM_THREADS, MKL_NUM_THREADS and
+# NUMEXPR_NUM_THREADS are UNSET for the whole body. Each race's JSON names the
+# pools threadpoolctl reports for a scikit-learn arm.
+#
+# POSIX sh only: the box's /bin/sh is dash.
+set -u
+ROOT=${ANONLIB_CTD_ROOT:-/root/anonlib}
+OUT=${ANONLIB_CTD_OUT:-/root/gemm_leg_out/classical-two-datasets}
+# setup's markers (setup.started, <dataset>.done) live here, smoke or not.
+BASE_OUT=$OUT
+DATA=${ANONLIB_CTD_DATA:-/root/ctd-data}
+WORK=${ANONLIB_CTD_WORK:-/root/ctd-work}
+VENV=${ANONLIB_CTD_VENV:-/root/ctd-venv}
+LANES=${ANONLIB_CTD_LANES:-kmeans,pca,ols,knn}
+# Commas or spaces (DEVIATION 2572: a runner env value may not hold a space).
+DATASETS=$(echo "${ANONLIB_CTD_DATASETS:-taxi istella}" | tr ',' ' ')
+PHASES=$(echo "${ANONLIB_CTD_PHASES:-setup prep races}" | tr ',' ' ')
+SMOKE=${ANONLIB_CTD_SMOKE_ROWS:-}
+ROUNDS=${ANONLIB_CTD_ROUNDS:-5}
+if [ -n "$SMOKE" ]; then
+    DATA="$DATA-smoke"
+    OUT="$OUT/smoke"
+    ROUNDS=${ANONLIB_CTD_ROUNDS:-1}
+fi
+BODY_SECONDS=${ANONLIB_CTD_BODY_SECONDS:-2100}
+MIN_RACE=${ANONLIB_CTD_MIN_RACE:-240}
+RACE_SECONDS=${ANONLIB_CTD_RACE_SECONDS:-900}
+JOBS=${ANONLIB_COMPILE_JOBS:-8}
+EXTRA_ARMS=${ANONLIB_CTD_EXTRA_ARMS:-}
+# One deadline across several calls of this file in one body (DEVIATION 2572).
+BODY_START=${ANONLIB_CTD_BODY_START:-$(date +%s)}
+# The Mac's copies of the two TLC months (2026-09-11), checked after any fetch.
+TAXI_SHA_2024_01=c4d59da7bbc8abaeeeb1727947ee93d9891a71acb42854bd80db1571b2030510
+TAXI_SHA_2024_02=c76c43c18c6c6664080dd920baab4928988d5786a6b65980792ca7cd796f9f20
+ISTELLA_TGZ_SHA=41b21116a3650cc043dbe16f02ee39f4467f9405b37fdbcc9a6a05e230a38981
+TAXI_WAIT=${ANONLIB_CTD_TAXI_WAIT:-0}
+UA="Mozilla/5.0 (X11; Linux x86_64) anonlib-bench"
+
+mkdir -p "$OUT" "$DATA" "$WORK"
+cd "$ROOT" || exit 9
+export PATH="$HOME/.pixi/bin:$PATH"
+unset OMP_NUM_THREADS OPENBLAS_NUM_THREADS MKL_NUM_THREADS NUMEXPR_NUM_THREADS
+export ANONLIB_NUMERIC_MODE=identical
+GBM_BENCH_DATA=${GBM_BENCH_DATA:-/root/datasets/gbm-bench}
+export GBM_BENCH_DATA
+COMMIT=$(sed -n 's/^commit=//p' /root/gemm_leg_out/leg.txt 2>/dev/null | head -1)
+[ -n "$COMMIT" ] || COMMIT=$(cat "$ROOT/SHIPPED_COMMIT.txt" 2>/dev/null)
+ANONLIB_REPO_COMMIT=${COMMIT:-unknown}
+export ANONLIB_REPO_COMMIT
+VENDOR=$(sed -n 's/^vendor=//p' /root/gemm_leg_out/leg.txt 2>/dev/null | head -1)
+PROVIDER=$(sed -n 's/^provider=//p' /root/gemm_leg_out/leg.txt 2>/dev/null | head -1)
+# tools/gemm_remote_leg.sh writes no provider= line; the Hot Aisle body names it.
+[ -n "$PROVIDER" ] || PROVIDER=${ANONLIB_CTD_PROVIDER:-}
+if [ -z "$VENDOR" ]; then
+    if [ -e /dev/kfd ] && { command -v rocm-smi || command -v rocminfo || command -v amd-smi; } > /dev/null 2>&1; then VENDOR=amd
+    elif command -v nvidia-smi > /dev/null 2>&1; then VENDOR=nvidia
+    else VENDOR=unknown; fi
+fi
+if [ "$VENDOR" = nvidia ]; then
+    PY=${ANONLIB_CTD_PYTHON:-python3}
+    OURS_PY=$PY
+    THEIRS_PY=$PY
+else
+    PY="$VENV/bin/python"
+    OURS_PY="pixi run python3"
+    THEIRS_PY="$VENV/bin/python"
+fi
+touch "$OUT/status.tsv"
+{
+    echo "lane=classical-two-datasets (DEVIATION 2570, 2571)"
+    echo "invoked=$(date -u +%Y-%m-%dT%H:%M:%SZ) phases=$PHASES smoke_rows=${SMOKE:-none}"
+    echo "vendor=$VENDOR provider=${PROVIDER:-unknown}"
+    echo "commit=$ANONLIB_REPO_COMMIT"
+    echo "lanes=$LANES"
+    echo "datasets=$DATASETS"
+    echo "rounds=$ROUNDS body_seconds=$BODY_SECONDS min_race=$MIN_RACE race_seconds=$RACE_SECONDS jobs=$JOBS"
+    echo "gpu_archs=${ANONLIB_GPU_ARCHS:-}"
+    echo "ours_python=$OURS_PY theirs_python=$THEIRS_PY extra_arms=$EXTRA_ARMS"
+} >> "$OUT/gate.txt"
+
+record() {
+    printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$(date -u +%H:%M:%S)" >> "$OUT/status.tsv"
+}
+run() {
+    _name=$1
+    shift
+    _t0=$(date +%s)
+    "$@" > "$OUT/$_name.log" 2>&1
+    _rc=$?
+    record "$_name" "$_rc" "$(( $(date +%s) - _t0 ))"
+    return $_rc
+}
+wants() {  # <lane>...: true when any is in LANES
+    for _w in "$@"; do
+        case ",$LANES," in *,"$_w",*) return 0 ;; esac
+    done
+    return 1
+}
+has_phase() {
+    case " $PHASES " in *" $1 "*) return 0 ;; esac
+    return 1
+}
+arms_for() {  # <lane>: the arms a race runs on this vendor
+    # FAIRNESS FIX (2026-10-13 audit): pca raced torch-gpu, a covariance eigh our harness wrote
+    # from torch ops (classical_two_datasets.TorchPCA), as an opponent. pca now falls through to
+    # the library arms only. Results raced before this change were wrong for this lane; apply
+    # extra scrutiny.
+    if [ "$VENDOR" = nvidia ]; then
+        case "$1" in
+            # FAIRNESS FIX (2026-10-13 audit): torch-gpu-eigh is harness-written and refused
+            # (classical_two_datasets.REFUSED_ARMS); torch-gpu is torch.linalg.lstsq(driver='gels').
+            # Results raced before this change were wrong for this lane; apply extra scrutiny.
+            ols) _a="ours,cuml-gpu,torch-gpu" ;;
+            # FAIRNESS FIX (2026-10-13 audit): kmeans and knn raced torch-gpu,
+            # the harness's own k-means / kNN from torch ops, not a library;
+            # dropped here and refused by the driver (REFUSED_ARMS). Results
+            # raced before this change were wrong for these lanes; apply extra
+            # scrutiny.
+            kmeans|knn) _a="ours,cuml-gpu" ;;
+            *) _a="ours,cuml-gpu" ;;
+        esac
+    else
+        case "$1" in
+            ols) _a="ours,sklearn-cpu,torch-gpu" ;;  # FAIRNESS FIX (2026-10-13 audit): -eigh refused
+            # FAIRNESS FIX (2026-10-13 audit, the author's correction): the
+            # harness torch arms are REPLACED on AMD by hipVS (AMD's cuVS port,
+            # installed in setup below): hipvs-gpu is cuvs.cluster.kmeans and
+            # cuvs.neighbors.brute_force; scikit-learn stays beside it. This leg
+            # is the AMD one (this branch also covers any non-NVIDIA vendor; an
+            # Apple board does not use this leg). UNVERIFIED AT RUNTIME. Results
+            # raced before this change were wrong for these lanes; apply extra
+            # scrutiny.
+            kmeans|knn) _a="ours,sklearn-cpu,hipvs-gpu" ;;
+            *) _a="ours,sklearn-cpu" ;;
+        esac
+    fi
+    [ -n "$EXTRA_ARMS" ] && _a="$_a,$EXTRA_ARMS"
+    echo "$_a"
+}
+
+# ============================================================================
+# setup
+# ============================================================================
+if has_phase setup; then
+    : > "$OUT/setup.started"
+    {
+        echo "== date"; date -u
+        echo "== uname"; uname -a
+        echo "== nproc"; nproc
+        echo "== lscpu"; lscpu 2>&1
+        echo "== free -g"; free -g 2>&1
+        if command -v rocm-smi > /dev/null 2>&1; then
+            echo "== rocm-smi --showproductname --showdriverversion"
+            rocm-smi --showproductname --showdriverversion 2>&1
+        fi
+        if command -v amd-smi > /dev/null 2>&1; then
+            echo "== amd-smi version"; amd-smi version 2>&1
+            echo "== amd-smi static --asic"; amd-smi static --asic 2>&1 | head -40
+        fi
+        if command -v rocminfo > /dev/null 2>&1; then
+            echo "== rocminfo (names)"; rocminfo 2>&1 | grep -E 'Marketing Name|Name: +gfx|Compute Unit' | head -20
+        fi
+        if [ -f /opt/rocm/.info/version ]; then
+            echo "== /opt/rocm/.info/version"; cat /opt/rocm/.info/version
+        fi
+        if [ -f /sys/module/amdgpu/version ]; then
+            echo "== /sys/module/amdgpu/version"; cat /sys/module/amdgpu/version
+        fi
+        if command -v nvidia-smi > /dev/null 2>&1; then
+            echo "== nvidia-smi"; nvidia-smi --query-gpu=name,driver_version,memory.total,uuid --format=csv 2>&1
+            nvidia-smi 2>&1 | head -12
+        fi
+        if command -v nvcc > /dev/null 2>&1; then
+            echo "== nvcc"; nvcc --version 2>&1 | tail -2
+        fi
+    } > "$OUT/env.txt" 2>&1
+    record env 0 0
+
+    # ---- background, at once: the raw fetches (curl, no numpy) ----------------
+    # DEVIATION 2572: the 472 MB Istella tarball and the two taxi months start at
+    # t=0 beside pixi and the builds; only the decode waits for the venv. Each
+    # file is checked against the Mac's sha256; a mismatch is deleted, so the
+    # decode step below either fetches again or reports the miss.
+    (
+        mkdir -p "$GBM_BENCH_DATA/istella" "$GBM_BENCH_DATA/taxi"
+        _t0=$(date +%s)
+        _tgz="$GBM_BENCH_DATA/istella/istella-s-letor.tar.gz"
+        # Resumed attempts, a clean restart from the third (the MI325X got HTTP
+        # 504 on a resume; tools/trees_hotaisle_body.sh).
+        _i=0
+        # DEVIATION 2704: the runner staged the decoded npz from R2; no tarball.
+        [ -f "$GBM_BENCH_DATA/istella/istella_speed.npz" ] && { _i=4; echo "istella=staged npz present (R2), tarball not fetched" >> "$OUT/fetch.txt"; }
+        while [ "$_i" -lt 4 ] && [ "$(sha256sum "$_tgz" 2>/dev/null | cut -c1-64)" != "$ISTELLA_TGZ_SHA" ]; do
+            _i=$((_i + 1))
+            [ "$_i" -ge 3 ] && rm -f "$_tgz"
+            timeout -k 10 1500 curl -fsSL -C - --retry 3 --retry-delay 5 -A "$UA" -o "$_tgz" \
+                http://library.istella.it/dataset/istella-s-letor.tar.gz >> "$OUT/istella_curl.log" 2>&1
+            echo "attempt=$_i curl_exit=$? size=$(stat -c %s "$_tgz" 2>/dev/null || echo 0) $(date -u +%T)" >> "$OUT/istella_curl.log"
+        done
+        _got=$(sha256sum "$_tgz" 2>/dev/null | cut -c1-64)
+        [ "$_got" = "$ISTELLA_TGZ_SHA" ] || rm -f "$_tgz"
+        echo "istella_tgz sha256=${_got:-none} expected=$ISTELLA_TGZ_SHA seconds=$(( $(date +%s) - _t0 ))" >> "$OUT/fetch.txt"
+        if [ -f "$_tgz" ]; then
+            _t0=$(date +%s)
+            tar -xzf "$_tgz" -C "$GBM_BENCH_DATA/istella" > "$OUT/istella_untar.log" 2>&1
+            echo "istella_untar rc=$? seconds=$(( $(date +%s) - _t0 ))" >> "$OUT/fetch.txt"
+        fi
+        : > "$OUT/fetch_istella.done"
+    ) &
+    (
+        _t0=$(date +%s)
+        # DEVIATION 2704: the staged npz IS the taxi dataset. Every arm reads
+        # `taxi_speed.npz`; the two parquet months exist only to decode into
+        # it. The istella half of this fetcher has tested for its npz since
+        # 2026-09-13 and the taxi half never did, so a box that had already
+        # received 419 MB of verified taxi from R2 went on to pull 2024-01 and
+        # 2024-02 from d37ci6vzurychx.cloudfront.net -- the one dataset every
+        # runner stages BY DEFAULT, and the one re-download that printed no
+        # R2_STAGING_MISSED line anywhere.
+        if [ -f "$GBM_BENCH_DATA/taxi/taxi_speed.npz" ]; then
+            echo "taxi=staged npz present (R2), parquet months not fetched" >> "$OUT/fetch.txt"
+            : > "$OUT/fetch_taxi.done"
+            exit 0
+        fi
+        for m in 2024-01 2024-02; do
+            _f="$GBM_BENCH_DATA/taxi/yellow_tripdata_$m.parquet"
+            [ -f "$_f" ] || { timeout -k 10 600 curl -fsSL --retry 3 -A "$UA" -o "$_f.part" -w '%{http_code}' \
+                "https://d37ci6vzurychx.cloudfront.net/trip-data/yellow_tripdata_$m.parquet" \
+                > "$OUT/taxi_curl_$m.txt" 2>&1 && mv "$_f.part" "$_f"; }
+            rm -f "$_f.part"
+        done
+        [ "$(sha256sum "$GBM_BENCH_DATA/taxi/yellow_tripdata_2024-01.parquet" 2>/dev/null | cut -c1-64)" = "$TAXI_SHA_2024_01" ] \
+            && [ "$(sha256sum "$GBM_BENCH_DATA/taxi/yellow_tripdata_2024-02.parquet" 2>/dev/null | cut -c1-64)" = "$TAXI_SHA_2024_02" ] \
+            || : > "$OUT/taxi_upload_wanted"
+        # A CDN that blocks the box: ANONLIB_CTD_TAXI_WAIT seconds for the
+        # Mac to upload the two months beside the cache (sha256 checked).
+        while :; do
+            _ok=1
+            for m in 2024-01 2024-02; do
+                _f="$GBM_BENCH_DATA/taxi/yellow_tripdata_$m.parquet"
+                case $m in 2024-01) _want=$TAXI_SHA_2024_01 ;; *) _want=$TAXI_SHA_2024_02 ;; esac
+                [ "$(sha256sum "$_f" 2>/dev/null | cut -c1-64)" = "$_want" ] || _ok=0
+            done
+            [ "$_ok" = 1 ] && break
+            [ $(( $(date +%s) - _t0 )) -ge "$TAXI_WAIT" ] && break
+            sleep 15
+        done
+        for m in 2024-01 2024-02; do
+            _f="$GBM_BENCH_DATA/taxi/yellow_tripdata_$m.parquet"
+            echo "taxi_$m curl_http=$(cat "$OUT/taxi_curl_$m.txt" 2>/dev/null) sha256=$(sha256sum "$_f" 2>/dev/null | cut -c1-64) sha_ok=$_ok seconds=$(( $(date +%s) - _t0 ))" >> "$OUT/fetch.txt"
+        done
+        : > "$OUT/fetch_taxi.done"
+    ) &
+
+    # ---- background: the opponents' Python, then the decodes -----------------
+    # The decodes start only after pip has finished, so no process has numpy
+    # loaded while pip replaces it underneath.
+    (
+        if [ "$VENDOR" = nvidia ]; then
+            run pip-base timeout -k 30 900 "$PY" -m pip install --no-input --disable-pip-version-check \
+                scikit-learn pyarrow threadpoolctl
+            run pip-cuml timeout -k 30 1500 "$PY" -m pip install --no-input --disable-pip-version-check \
+                --extra-index-url=https://pypi.nvidia.com cuml-cu12==26.8.0
+        else
+            BASE=/usr/bin/python3
+            # FAIRNESS FIX (2026-10-13 audit): the AMD torch pin was 2.6.0+rocm6.4.1 (repo.radeon.com
+            # cp312 wheels), an outdated release; on the same MI325X host torch 2.13.0+rocm7.1 ran the
+            # same torch arms 1.7-9.4x faster (2026-09-30 board). The pin is now the current release
+            # from the PyTorch ROCm 7.1 index (tools/bench_board.py AMD_TORCH_ROCM), and the old
+            # torch 2.6.0+rocm6.2.4 fallback is gone: a torch that does not see the GPU leaves the
+            # torch arms refusing by name rather than racing an outdated build. Results raced before
+            # this change were wrong for every AMD torch arm; apply extra scrutiny.
+            PIN="torch==2.13.0+rocm7.1"
+            PIN_INDEX="--extra-index-url https://download.pytorch.org/whl/rocm7.1"
+            # DEVIATION 2572: the pinned wheels are cp312. A box whose python3
+            # is not 3.12 (or has no venv module) gets a 3.12 venv from uv.
+            if "$BASE" -c 'import sys, venv, ensurepip; sys.exit(0 if sys.version_info[:2] == (3, 12) else 3)' > /dev/null 2>&1; then
+                run venv "$BASE" -m venv "$VENV"
+            else
+                run uv-get sh -c 'curl -LsSf https://astral.sh/uv/install.sh | env UV_UNMANAGED_INSTALL=/root/.local/uv sh'
+                run venv /root/.local/uv/uv venv --seed --python 3.12 "$VENV"
+            fi
+            # The opponent as a user installs it today: scikit-learn, NumPy and
+            # SciPy current from PyPI (the H100 recipe; the MI325X trees rows ran
+            # 1.9.1), versions in versions.txt and pip_freeze.txt.
+            # shellcheck disable=SC2086
+            run wheels timeout -k 30 1200 "$VENV/bin/pip" install --disable-pip-version-check --no-input \
+                --only-binary=:all: $PIN_INDEX $PIN numpy scipy scikit-learn threadpoolctl joblib pyarrow
+            # torch runs the harness's kernels on the GPU (is_available alone can
+            # be True on a wheel built without this gfx target); torch_source.txt
+            # says whether it did (no outdated fallback, see the FAIRNESS FIX above).
+            TPROBE='import sys, torch
+print("available", torch.cuda.is_available(), "hip", torch.version.hip)
+if not torch.cuda.is_available(): sys.exit(3)
+a = torch.randn(4096, 64, device="cuda")
+w = torch.linalg.eigh(a.T @ a)[0]
+d = torch.cdist(a[:16], a).topk(10, largest=False)[0]
+s = torch.linalg.lstsq(a - a.mean(0), a[:, :1]).solution
+c = torch.addmm((a[:8] * a[:8]).sum(1)[None], a, a[:8].T, alpha=-2.0).argmin(1)
+torch.cuda.synchronize()
+print("device", torch.cuda.get_device_name(0), float(w[-1]), float(d.sum()), float(s.sum()), int(c.sum()))'
+            # FAIRNESS FIX (2026-10-13 audit): hipVS (AMD's ROCm-DS port of cuVS, the `cuvs` API),
+            # the AMD GPU k-means / kNN opponent that replaces the harness's torch arms, installed
+            # as its install page gives it (amd-hipvs 1.0.0 from AMD's ROCm 7.2.3 index; it needs
+            # CuPy with ROCM_HOME set). A failed install is not fatal: the hipvs-gpu arms refuse
+            # by name. UNVERIFIED AT RUNTIME (2026-10-13). Results raced before this change were
+            # wrong for those lanes; apply extra scrutiny.
+            export ROCM_HOME="${ROCM_HOME:-/opt/rocm}"
+            run hipvs timeout -k 30 1500 "$VENV/bin/pip" install --disable-pip-version-check --no-input \
+                --extra-index-url=https://pypi.amd.com/rocm-7.2.3/simple/ amd-hipvs==1.0.0 || true
+            if timeout -k 10 300 "$VENV/bin/python" -c "$TPROBE" > "$OUT/torch_probe1.log" 2>&1; then
+                echo "torch_source=download.pytorch.org rocm7.1 torch 2.13.0 (probe ran eigh, cdist, topk, lstsq, addmm on the GPU)" > "$OUT/torch_source.txt"
+            else
+                echo "torch_source=download.pytorch.org rocm7.1 torch 2.13.0 DID NOT RUN on this GPU (torch_probe1.log); the torch arms refuse, no outdated fallback" > "$OUT/torch_source.txt"
+            fi
+        fi
+        "$PY" -m pip freeze > "$OUT/pip_freeze.txt" 2>&1
+        "$PY" - > "$OUT/versions.txt" 2>&1 <<'PYV'
+import numpy
+print("numpy", numpy.__version__)
+for name in ("torch", "cuml", "cuvs", "cupy", "sklearn", "scipy", "pyarrow"):
+    try:
+        mod = __import__(name)
+        extra = ""
+        if name == "torch":
+            extra = " cuda %s hip %s available %s device %s" % (
+                mod.version.cuda, getattr(mod.version, "hip", None), mod.cuda.is_available(),
+                mod.cuda.get_device_name(0) if mod.cuda.is_available() else "-")
+        if name == "cupy":
+            extra = " cuda_runtime %s driver_api %s" % (
+                mod.cuda.runtime.runtimeGetVersion(), mod.cuda.runtime.driverGetVersion())
+        print(name, mod.__version__ + extra)
+    except Exception as exc:  # noqa: BLE001
+        print(name, "NOT IMPORTABLE", repr(exc))
+PYV
+        # Each decode waits for its own raw fetch (a second writer on the same
+        # file is a torn file); a taxi upload wait does not hold Istella back.
+        ( while [ ! -f "$OUT/fetch_istella.done" ]; do sleep 5; done
+          run download-istella timeout -k 30 2700 "$PY" tools/speed_gbdt_arm.py --download istella
+          echo "rc=$?" > "$OUT/istella.done" ) &
+        while [ ! -f "$OUT/fetch_taxi.done" ]; do sleep 5; done
+        run download-taxi timeout -k 30 1500 "$PY" tools/speed_gbdt_arm.py --download taxi
+        echo "rc=$?" > "$OUT/taxi.done"
+        wait
+    ) &
+    PID_BG=$!
+
+    # ---- foreground: pixi and the IDENTICAL bindings the lanes need ------------
+    if ! command -v pixi > /dev/null 2>&1; then
+        run pixi-get sh -c 'curl -fsSL https://pixi.sh/install.sh | sh'
+    fi
+    run pixi-install timeout -k 30 1500 pixi install
+    BUILDS="build.sh"
+    wants pca ols kde && BUILDS="$BUILDS build_estimators.sh"
+    wants svc && BUILDS="$BUILDS build_svm.sh"
+    for b in $BUILDS; do
+        run "build-${b%.sh}" env ANONLIB_NUMERIC_MODE=identical ANONLIB_SKIP_BUILD_GATE=1 \
+            ANONLIB_COMPILE_JOBS="$JOBS" timeout -k 30 1500 sh "bindings/$b"
+    done
+    ls -la python/anonlib/identical > "$OUT/identical_bindings.txt" 2>&1
+    for so in python/anonlib/identical/*.so; do
+        [ -f "$so" ] || continue
+        printf '%s sha256=%s sm_90a=%s gfx942=%s %s=%s\n' "$so" "$(sha256sum "$so" | cut -c1-16)" \
+            "$(strings "$so" 2>/dev/null | grep -c sm_90a)" "$(strings "$so" 2>/dev/null | grep -c gfx942)" \
+            "${ANONLIB_GPU_ARCHS:-box_arch_unset}" \
+            "$( [ -n "${ANONLIB_GPU_ARCHS:-}" ] && strings "$so" 2>/dev/null | grep -c "${ANONLIB_GPU_ARCHS%%,*}")"
+    done > "$OUT/identical_archs.txt" 2>&1
+    record builds-done 0 "$(( $(date +%s) - BODY_START ))"
+    # pip may still be replacing numpy; the import waits for the background
+    # python work that precedes the downloads.
+    while [ ! -f "$OUT/versions.txt" ] || ! grep -q '^pyarrow\|^scipy' "$OUT/versions.txt" 2>/dev/null; do
+        sleep 10
+        kill -0 "$PID_BG" 2>/dev/null || break
+    done
+    run ours-import env PYTHONPATH="$ROOT/python" ANONLIB_NUMERIC_MODE=identical timeout -k 10 300 \
+        $OURS_PY -c 'import anonlib; km = anonlib.KMeans(n_clusters=2); print("anonlib", anonlib.__version__, km.numeric_mode_used(), km.vendor_used())'
+    while [ ! -f "$OUT/taxi.done" ]; do
+        sleep 10
+        kill -0 "$PID_BG" 2>/dev/null || break
+    done
+    record setup-done 0 "$(( $(date +%s) - BODY_START ))"
+fi
+
+# ============================================================================
+# prep, one dataset at a time (a failed download reds only its own rows)
+# ============================================================================
+if has_phase prep; then
+    for ds in $DATASETS; do
+        # A setup in this body decodes in the background: a second decode of the
+        # same cache is a torn file, so prep waits for this dataset's own marker.
+        if [ -f "$BASE_OUT/setup.started" ] && [ ! -f "$BASE_OUT/$ds.done" ]; then
+            _w0=$(date +%s)
+            while [ ! -f "$BASE_OUT/$ds.done" ] && [ $(( BODY_START + BODY_SECONDS - $(date +%s) )) -gt "$MIN_RACE" ]; do
+                sleep 10
+            done
+            record "wait-decode-$ds" "$( [ -f "$BASE_OUT/$ds.done" ] && echo 0 || echo DEADLINE)" "$(( $(date +%s) - _w0 ))"
+        fi
+        if [ -n "$SMOKE" ]; then
+            run "prep-$ds" timeout -k 30 1500 "$PY" tools/classical_two_datasets.py prep \
+                --data "$DATA" --lanes "$LANES" --datasets "$ds" --max-rows "$SMOKE"
+        else
+            run "prep-$ds" timeout -k 30 1500 "$PY" tools/classical_two_datasets.py prep \
+                --data "$DATA" --lanes "$LANES" --datasets "$ds"
+        fi
+    done
+fi
+
+# ============================================================================
+# races, lane order is priority order
+# ============================================================================
+if has_phase races; then
+    for lane in $(echo "$LANES" | tr ',' ' '); do
+        for ds in $DATASETS; do
+            remaining=$(( BODY_START + BODY_SECONDS - $(date +%s) ))
+            if [ "$remaining" -lt "$MIN_RACE" ]; then
+                record "race-$lane-$ds" SKIPPED_DEADLINE 0
+                continue
+            fi
+            bound=$RACE_SECONDS
+            [ "$remaining" -lt "$bound" ] && bound=$remaining
+            run "race-$lane-$ds" timeout -k 30 "$bound" "$PY" tools/classical_two_datasets.py race \
+                --lane "$lane" --dataset "$ds" --data "$DATA" --out "$OUT" --work "$WORK" --root "$ROOT" \
+                --rounds "$ROUNDS" --arms "$(arms_for "$lane")" \
+                --ours-python "$OURS_PY" --theirs-python "$THEIRS_PY"
+            # A conductor killed by the bound leaves no worker holding the GPU.
+            pkill -9 -f 'classical_two_datasets.py worker' > /dev/null 2>&1
+            "$PY" tools/classical_two_datasets.py summary --out "$OUT" > "$OUT/summary.log" 2>&1
+        done
+    done
+fi
+
+echo "finished=$(date -u +%Y-%m-%dT%H:%M:%SZ) phases=$PHASES" >> "$OUT/gate.txt"
+echo "---- status"
+cat "$OUT/status.tsv"
+echo "---- summary"
+cat "$OUT/summary.tsv" 2>/dev/null
+exit 0

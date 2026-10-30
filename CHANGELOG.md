@@ -1,0 +1,736 @@
+# Changelog
+
+All notable changes to anonlib are recorded here, newest first, in the style of Keep a Changelog.
+
+## 0.8.55 (published 2026-10-20)
+
+- Import pretrained models: `anonlib.import_model` takes a `torch.export.ExportedProgram` or an ONNX file (opset 13 or later) and returns a
+  program that runs on the GPU in one call. Operations it cannot run are named in one error. In `identical` mode, anonlib returns the same
+  bits on Apple, NVIDIA and AMD GPUs, and an imported model inherits it.
+- A verified model catalog, `anonlib.models.catalog()`, lists pretrained models checked on Apple, NVIDIA and AMD GPUs, with the exact source,
+  the import command and the output digest; `anonlib.models.verify_catalog_entry(name)` repeats the check on your install. It covers
+  ResNet-18, SqueezeNet 1.1, MobileNet-v3 small, ResNet-50, an MNIST network and SmolLM2-135M.
+- `python -m anonlib verify-model` checks a saved model on another GPU against the report saved beside it.
+- Captured programs: `Session.capture` and `Session.run` record a model once and run it in one call; `Program.save` and
+  `Session.load_program` store and reload it on any install.
+- Load weights from PyTorch state dicts and safetensors files: `Sequential.load_state_dict` and `Session.load_weights`.
+- Train custom models with `ops.Session`: optimizer steps on the GPU (`optimizer`, `step`, schedules), second derivatives (`vjp`, `jvp`,
+  `hvp`, `backward(create_graph=True)`), and tensors of any rank (reshape, permute, broadcasting, axis reductions, batched matrix products,
+  concatenation, convolution with groups, pooling).
+- Save, load and resume `Sequential` training and session state exactly; `Sequential.export` saves a model for inference.
+- `Sequential` accepts inputs of any numeric dtype and memory layout without copying them first.
+
+## 0.8.54 (published 2026-10-20)
+
+- A native autograd engine: every operation records its gradient, and the backward pass runs on the GPU. In
+  `identical` mode, anonlib returns the same bits on Apple, NVIDIA and AMD GPUs, and models you build on the
+  engine inherit it.
+- `anonlib.Sequential`: build a feed-forward model layer by layer (linear, activations, layer norm, residual
+  connections), choose its loss, optimizer and learning-rate schedule with `compile`, then `fit`, `predict` and
+  `predict_proba`.
+- `anonlib.ops.Session`: compose your own inference or training algorithm from anonlib's operations, with
+  gradients through `Session(record=True)`, `backward` and `grad`.
+- The engine's optimizers (SGD with momentum and Nesterov, Adam, AdamW), losses (squared, absolute, Huber, binary
+  and multiclass cross-entropy), metrics (accuracy, log loss, ROC AUC) and data steps (seeded shuffling, batching
+  and dropout) give the same results on every vendor.
+- The MLP, recurrent, transformer, Mamba, Samba, convolutional and language-model trainers train through the engine;
+  it is their only backward pass. Their results are unchanged.
+- MLP training is faster on NVIDIA and AMD GPUs through a split-K matrix product and a fused loss block.
+- The VAR Cholesky solve returns the partial factor when a pivot is not positive, and the layer-norm statistics seam
+  check matches the kernel again.
+- New guide: Build your own model.
+
+## 0.8.53 (published 2026-10-19)
+
+- Linux installs include NVIDIA PTX through the automatically installed, exact-version
+  `anonlib-nvidia-ptx` dependency. Native NVIDIA and PTX payloads each fit within PyPI's per-file limit.
+  The installation command remains `pip install anonlib`.
+
+## 0.8.52 (published 2026-10-18)
+
+- `SGDClassifier`, `SGDRegressor`, `Perceptron` and the passive-aggressive estimators fit small and unscaled datasets as
+  well as scikit-learn with the default `batch_size='auto'`: each epoch takes more update steps, and `SGDClassifier` sums
+  its rows' updates on scikit-learn's learning-rate schedule.
+- Arrays of `dtype=object` holding numbers are accepted the way scikit-learn accepts them.
+- Gradient boosting: multiclass, one-vs-all and multi-target (`MultiRMSE`) leaf values are computed entirely on the GPU, and
+  categorical-feature predictions expand their features on the GPU. Fewer waits between boosting rounds.
+- Factor analysis in `fast` mode on Apple GPUs waits less often during its decomposition and is now faster than
+  `identical` mode once its GPU programs are compiled.
+- IVF-Flat searches with `k > 32` return the same distances as the other search paths in `identical` mode.
+- `parallel_ensemble.score_isolation_forest` and `parallel_classical.predict_svm` return exactly what the single-device
+  estimators return.
+
+## 0.8.51 (published 2026-10-17)
+
+- `SGDClassifier` and `Perceptron` default to `batch_size='auto'` again: the fixed default of 0.8.50 (`4096` and `256`)
+  took one full-batch step per epoch on datasets smaller than the batch and underfit unscaled small datasets.
+
+## 0.8.50 (published 2026-10-17)
+
+- `SGDClassifier` and `Perceptron` default to a fixed minibatch again (`batch_size=4096` and `batch_size=256`): on these two,
+  the row-count choice was slower and less accurate on small datasets. `batch_size='auto'` is still accepted.
+  `SGDRegressor` and `PassiveAggressiveClassifier` keep `batch_size='auto'` as their default.
+- Gradient boosting, factor analysis, Huber regression and spectral embedding: per-leaf and per-coefficient reductions
+  and copies that ran on the CPU now run on the device. Results are unchanged in `identical` mode.
+
+## 0.8.49 (published 2026-10-16)
+
+- On AMD GPUs, each process now starts in under a second, and several processes can share one GPU. MAX's device memory
+  manager is bounded to 1 GiB per process (`MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_SIZE`; your own setting takes precedence).
+- `python -m anonlib verify` runs about 3 to 20 times faster: cells run in batches inside one worker process, and a
+  crashed batch's remaining cells rerun one per process. `--fresh-process-per-cell` keeps the previous behavior.
+- The bundled reference covers this release: `verify` reports every lane, including the ones whose results changed in
+  0.8.47 and 0.8.48. In `identical` mode, anonlib returns the same bits on Apple, NVIDIA and AMD GPUs.
+
+## 0.8.48 (published 2026-10-16)
+
+- scikit-learn's own estimator checks (`sklearn.utils.estimator_checks`) pass for every public estimator, except the checks
+  scikit-learn itself excuses for its estimator of the same name, and float32 results compared at float64 tolerance.
+- Input is checked the way scikit-learn checks it, with scikit-learn's messages: sparse, complex, empty and 1-D input, NaN or
+  infinity in `X` or `y`, a missing `y`, a column-vector `y`, a continuous target passed to a classifier, and a feature count that
+  differs from the one seen in `fit`. `n_features_in_` and `feature_names_in_` are set by `fit`. pandas DataFrames and Series are
+  accepted wherever arrays are.
+- Results are NumPy arrays: `predict`, `predict_proba`, `decision_function`, `transform` and the fitted attributes (`coef_`,
+  `labels_`, ...) return `numpy.ndarray`. Methods that only exist for some settings (for example `predict` on `DBSCAN` without
+  stored prediction data, or `predict_proba` on `SVC` without `probability=True`) are absent, as in scikit-learn.
+- `sample_weight` works, and fitting with weights is equivalent to repeating or removing rows, on `LogisticRegression`,
+  `LinearSVC`, `LinearSVR`, `ElasticNet`, `Lasso`, `LassoCV`, `ElasticNetCV`, `Ridge`, `RandomForestClassifier`,
+  `RandomForestRegressor`, `ExtraTreesClassifier`, `ExtraTreesRegressor`, the decision trees, `SVC`, `SVR`, `Bagging`, `Voting`
+  and `Stacking`. `class_weight` works on `LogisticRegression`, `LinearSVC` and the tree ensembles.
+- Class labels can be strings on every classifier, including `KNeighborsClassifier`.
+- New defaults match scikit-learn: `SVC(decision_function_shape='ovr')` and `AgglomerativeClustering(connectivity=None)`.
+  `SGDClassifier`, `SGDRegressor`, `Perceptron` and `PassiveAggressiveClassifier` choose their minibatch size from the number of
+  rows (`batch_size='auto'`), so small datasets fit as well as large ones.
+- Fixes: `DecisionTreeClassifier` and `DecisionTreeRegressor` fit again; `Ridge`, `PCA` and `TSNE` accept one feature or one
+  component; `ElasticNet` and `Lasso` predict a single row; `SpectralClustering`, `IncrementalPCA` and `GaussianProcessRegressor`
+  fit small or poorly conditioned data that scikit-learn fits; `LabelPropagation` and `LabelSpreading` work under
+  `cross_val_score`; `MultiOutputClassifier` has `score`; the CV estimators accept scikit-learn's CV splitters.
+- In `identical` mode, anonlib returns the same bits on Apple, NVIDIA and AMD GPUs. Results change in this release for
+  `QuantileRegressor`, and for weighted fits of the trees and `GaussianProcessRegressor`, on every GPU and the CPU together.
+
+## 0.8.46 (published 2026-10-15)
+
+- Every public estimator works with scikit-learn's tools: `get_params`, `set_params`, `clone`, tags,
+  `Pipeline`, `GridSearchCV` and `cross_val_score`. Classifiers and regressors without a `score` method now have
+  one (accuracy and R²). `MLPClassifier`, `MLPRegressor`, the LSTM and GRU models and the forecasting models
+  (`AutoARIMA`, `ETS`, the Theta and Croston models, `GARCH`) are included.
+- scikit-learn's import paths work: for example `from anonlib.linear_model import Lasso`, and the new modules
+  `anonlib.naive_bayes`, `discriminant_analysis`, `cross_decomposition`, `isotonic`, `semi_supervised`,
+  `kernel_approximation`, `kernel_ridge`, `gaussian_process`, `covariance`, `impute`, `feature_selection`,
+  `random_projection`, `tree`, `calibration`, `multiclass`, `multioutput` and `neural_network`.
+- The naive Bayes classifiers, `LinearDiscriminantAnalysis`, `QuadraticDiscriminantAnalysis`, `LabelPropagation`,
+  `LabelSpreading` and `NearestCentroid` are classifiers to scikit-learn, so `cross_val_score` splits their folds
+  by class, as scikit-learn does.
+- `ARDRegression` retries a failed float32 factorization with a stabilized one instead of continuing with it.
+  `KNNImputer` averages all donors tied at the k-th distance. `CagraIndex` searches with a minimum seed and
+  iteration budget. These change results in `identical` mode on every GPU and the CPU together.
+- In `fast` mode on Apple GPUs, `anonlib.linalg.matmul_bf16` runs, and float32 matrix products whose inner
+  dimension is not a multiple of the kernel's block run up to 20 times faster.
+
+## 0.8.45 (published 2026-10-14)
+
+- `TSNE` takes `post_exaggeration_learning_rate_factor` (default 1.0): the step size after the early exaggeration
+  phase is `learning_rate` times this factor. 2.0 runs cuML's schedule. Results at the default are unchanged.
+- `IVFSQIndex` takes `max_train_points_per_cluster` (default None), cuVS's `ivf_sq` setting of the same name: the
+  coarse k-means and the quantization ranges train on `min(n_samples, m * n_lists)` evenly spaced rows. Results at
+  the default are unchanged.
+- `python -m anonlib identity` runs again. It compares this machine against the identity record taken from the
+  0.8.44 wheels on Apple M4, NVIDIA L40S and AMD MI325X GPUs (454 lanes, 4086 cells, the same bits on all three).
+
+## 0.8.44 (published 2026-10-13)
+
+- Gradient boosting with `grow_policy="Lossguide"` (and any fit where `max_leaves` is below `2**max_depth`) no longer
+  writes past a host buffer when it reads leaf statistics back from the GPU. On Apple this could crash the process
+  intermittently.
+- Two-level feature-frequency boosting computes the correct leaf values on NVIDIA, AMD and the CPU: the leaf step read
+  per-row statistics at the wrong position after the rows were reordered. Apple was already correct; all four now agree.
+- `eigh` on the CPU uses the same tridiagonal solver as the GPU from 64 columns up, so KernelPCA, FastICA, factor
+  rotations, FactorAnalysis and MinCovDet give the same bits on the CPU and the GPU. The tridiagonal solver flushes
+  subnormal values the same way on every device.
+- `python -m anonlib verify --all` records a check whose worker crashes and continues with the rest, instead of
+  stopping the whole run. The run still reports the crash and exits non-zero.
+- Verification covers `eigh` and its consumers at 72 and 128 columns.
+- The `deterministic` numeric mode has been removed; use `identical`.
+- `anonlib doctor` recognizes the published Linux wheels: it lists the installed `anonlib-nvidia` and
+  `anonlib-amd` packages and their GPU architecture sets, and reports whether the backend loaded instead of
+  saying no Linux wheel is published.
+- Correct the IDENTICAL verifier: Apple, NVIDIA and AMD must use the same reference hashes.
+  Remove the Apple-only lookup introduced in 0.8.43 and restore Apple participation in reference
+  conflicts and corroboration. Apple FAST has no identity promise; it does not exempt IDENTICAL.
+  This corrects verification and the documented contract.
+
+## 0.8.43 (published 2026-10-13)
+
+- MinCovDet and EllipticEnvelope fit data with many features: the chi-squared distribution function no longer
+  underflows in its upper tail (series below a + 1, continued fraction above it), so the consistency factor is finite at
+  220 features, and the factor itself is computed in compiled code. The IDENTICAL C-step uses a Cholesky factor per
+  candidate for the determinant and the solve (NVIDIA L40S: 186 s -> 169 s on the 100,000 x 220 board fit, same
+  quality). FAST on Apple processes the candidates in groups that fit device memory, so 100,000-row fits complete.
+- GaussianMixture FAST on Apple accumulates covariances and their Cholesky factors in compensated float-float
+  arithmetic (up to 32 features), so fits that FAST refused as ill-defined now complete.
+- Identity re-records select far fewer lanes: rows admitted by the last release are measured from that release, files
+  that only route the CPU bindings no longer select the GPU columns, and a NumPy call no longer reads as a harness-wide
+  change (`tools/identity_columns.py changed-lanes`, `tools/lane_select.py`).
+
+- Release (lane release-no-rented-smoke): releases rent nothing. `tools/release.py --smoke-via lq` (the default) runs
+  the NVIDIA and AMD wheel columns on the nv and amd boxes we already hold: `tools/release_lq_smoke.py` copies the final
+  wheels there, queues `tools/release_wheel_smoke.sh --local` with `lq add --front` (next after the running job, ahead of
+  the grid queue, no binding build) and brings the receipts home. The Hopper column runs only with `--hopper-box`;
+  without one publish-nvidia no longer waits for it, the sm_90a payload publishes on its GitHub build receipt and the
+  alpha manifest and vendor README say its smoke was not run. `--smoke-via rent` keeps the old rented smoke.
+
+- Board (lane shap-xvendor-identity): the kernel-shap and permutation-shap cells were the board's only two cross-vendor
+  digest disagreements. The explainer kernels are integer soft-float64 units, the same words on NVIDIA and AMD; the model
+  the harness handed them (a NumPy/LAPACK ridge: dgemm, dgesv, dgemv on each box's host CPU) and the `exact` reference
+  the digest hashes were the box's bits. Our arm now explains this library's device ridge (`anonlib.RidgeCV(alphas=[1.0])`,
+  the ridge-cv lane's x_linear fit and predict, identical across the vendors on every grid run), fit before the clock, and the
+  exact reference folds the background mean in one fixed order. The opponents keep the NumPy ridge they were scored with
+  (no re-score); `tools/shap_xvendor_probe.py` prints both models' digests per box.
+
+## 0.8.42 (published 2026-10-12)
+
+- LARS and LassoLars on Apple use the same blocked Gram fold as NVIDIA and AMD: every LARS cell now matches the
+  NVIDIA, AMD and host digests bit for bit (the Apple exclusion in `x_linear/device.mojo` is gone).
+- KernelPCA: the device eigensolver (tridiagonal from n = 64) is the same on every vendor; NVIDIA, AMD and Apple agree
+  bit for bit, and the host column keeps its Jacobi solver. Notes at the dispatch sites in `_expansion_neighbors.py`.
+- resnet-block and conv2d board cells are scored against a rebuilt host reference (0.0 relative error on AMD).
+- Docstrings of the public API rewritten for users (docs.anon.example): what each estimator does, parameters, returns,
+  examples. Project URLs in the package metadata point at anon.example and docs.anon.example.
+- Identity reference table regenerated from an NVIDIA RTX 4090 (sm_89) column and an AMD MI325X (gfx942) column at the
+  same code; the admit accepts vendor columns recorded at commits that differ only in docs or docstrings.
+- Release tooling: the changed-lane selector no longer re-records every lane for A/B records or packed runtime
+  libraries; the release tool finds the system CA bundle when the interpreter has none. The NVIDIA wheel stays sm_89
+  only (PTX slot registered, unshipped).
+
+## 0.8.41 (published 2026-10-12)
+
+- Linux core, anonlib-nvidia and anonlib-amd (0.8.39 and 0.8.40 published macOS only: the packer still demanded the
+  PTX slot in the NVIDIA wheel). The NVIDIA wheel is sm_89 only, as in 0.8.38; the PTX slot (sm_80) stays registered,
+  built and recorded but unshipped while the 134 MiB wheel is over PyPI's 100 MiB limit.
+
+## 0.8.40 (published 2026-10-12, macOS only)
+
+- Linux core, anonlib-nvidia and anonlib-amd from the 0.8.39 source plus one loader fix. 0.8.39 published macOS
+  only: its NVIDIA wheel packed at 134 MiB with the PTX slot beside sm_89, over PyPI's 100 MiB limit, and the 0.8.39
+  loader refused an NVIDIA wheel without that slot.
+- NVIDIA wheel: sm_89 only, as in 0.8.38. The PTX slot (sm_80, for Hopper and Blackwell) is built and recorded but
+  not shipped (`gpu_plugins.ptx_shipped=False`); the loader accepts the wheel without it. It ships when PyPI raises
+  the anonlib-nvidia file limit.
+
+## 0.8.39 (published 2026-10-12, macOS only)
+
+- Wave-2 IDENTICAL defaults, each decided by a same-box A/B on NVIDIA L40S and AMD MI325X (one run per arm, average of
+  the two vendors, digests equal across vendors). New defaults, each with a `_OFF` define that restores the old path:
+  CNN resident grads (no host waits inside conv/BN/pool calls; global pools 0.08x), BatchNorm grid statistics (0.47x,
+  bits change, host column agrees), speculative Nelder-Mead for theta and no-season ETS (0.10-0.34x), the ETS(A, A|Ad, N)
+  team (0.015x, forecast error unchanged), register-tiled float Gram for ridge (0.95x), range-pass radix sort for the
+  prep lanes (0.95x), KDE query tiles (0.34x on taxi, 1.24x on istella), lean KNNImputer fit (0.09x), one-block SVC
+  solve (0.69x), resident permutation SHAP (0.02-0.10x), resident MiniBatchKMeans (0.43x), strided IVF-PQ trainset
+  (0.46x, recall up). Also from the owed round: ElasticNetCV score blocks 1024 (0.94x).
+- Nineteen wave-2 experiments that lost or stayed within noise were deleted with tombstones, restore patches under
+  experiments/removed/ and guard refusals (docs/TOMBSTONES.md); three owed losers likewise (LM grouped Adam, Mamba-3 S17
+  tail double buffer, Mamba-1 affine-prefix scan).
+- Reference table re-recorded for the lanes whose bits changed (NVIDIA == AMD), every other row kept.
+- Board tools: the neural layer lanes' quality cells read the fixtures again (the host-quality child now receives the
+  fixture directory and the dataset).
+
+## 0.8.38 (published 2026-10-10)
+
+- Linux only (macOS stays at 0.8.37): the Linux core, anonlib-nvidia and anonlib-amd, from the 0.8.37 source plus
+  the release fixes below. 0.8.37 published macOS and anonlib-amd only; its Linux core and NVIDIA plugin never shipped.
+- 0.8.38 NVIDIA wheel: sm_89 only; H100 (sm_90) is not supported in this release: the sm_89 cubins carry no PTX, the
+  loader never crosses a compute-capability major, and the wheel bundles no PTX fallback, so the import refuses with no
+  compatible native set. sm_90a returns when PyPI raises the anonlib-nvidia file-size limit (with it the wheel is
+  134.6 MiB, over the 100 MiB default).
+- verify-causal-lm --compare: host vs device, the KV/state digest is recorded, not required (logits and every other part
+  must match; device vs device stays exact). Identity is required NVIDIA vs AMD only (2026-10-07).
+
+## 0.8.37 (published 2026-10-10)
+
+- IDENTICAL defaults flipped from the switch grid run ge123e6f9 (NVIDIA L40S and AMD MI325X, full board data, one run per arm;
+  verdict = the average of the two vendors against the measured noise floor): Ridge and OLS solve the Gram system (Ridge taxi
+  50.0 -> 4.8 ms NVIDIA, 16.3 -> 3.0 ms AMD; OLS taxi 34.0 -> 17.5 / 14.5 -> 8.1 ms), TSQR leaves of 2048 rows for OLS and
+  randomized SVD, ordered GBDT T22 with the grid-fold standard (istella 54.4 -> 36.7 s NVIDIA), histogram replication by device
+  SM count for every GBDT lane, loss-guide batch 128, the KMeans centroid fold for KMeans, GMM and IVF initialization, and the IVF
+  direct distance. Each old path stays selectable with a `_OFF` define for the grid; the switch declarations cite the numbers.
+  Bits change for the Gram solve, the ordered grid-fold, the 2048-row TSQR leaves and the IVF direct distance (host column follows).
+- Five grid losers deleted with tombstone comments at every site, verdict and ratio in the guard refusals, and rows in
+  `docs/apple-fast/EXPERIMENTS.md`: C25 projection reuse, C58 shared prep, the QN IDN deconvolution, the GMM symmetric covariance
+  (1.84x / 1.45x slower, -0.78% log-likelihood) and T19 (quality loss).
+- Board: two clocks per cell (whole operation including the host-to-device copy, and kernel only) with the copy's source; ratios
+  against torch GPU arms use kernel/kernel, every other opponent whole/whole; `tools/board_clock_audit.py` reports which clock
+  each stored cell is. Our arm records its copy separately in both the classical and the algos drivers; no opponent is re-scored.
+- Tooling: the per-algorithm switch grid (`tools/six_lane_grid.py`, full factorial up to 128 configurations else pairwise),
+  the decision roll-up (`tools/six_lane_grid_decide.py`), the lq route with prebuilt binding stores, and the second-pass renderer.
+
+## 0.8.36 (published 2026-10-03)
+
+`python -m anonlib verify` works again: the bundled reference table and the 58 portable models are regenerated from columns recorded on NVIDIA (L40S, sm_89), AMD (MI325X, gfx942), Apple (M4, Metal) and the host column at this release's code (0.8.35 shipped a stale table, so `verify --quick` stopped at its self-test). `verify --quick` reads VERIFIED on 32 of 32 lanes. Releases now refuse to publish when `verify --self-test` fails on the built wheel.
+
+### Fixed
+- `import anonlib` on every platform after a merge regression; CPU-only installs: RF, ExtraTrees, decision trees, ensembles, SHAP, IsolationForest, Ridge and DART no longer call GPU-only entries; LinearRegression fits on CPU-only installs; host Lasso/ElasticNet argument count; host GBDT accepts one-border features and binary class_weights; non-metric MDS no longer overruns isotonic buffers (segfault).
+- Depthwise GBDT on subnormal inputs (Metal flushed subnormals in the binarize compare); FastICA on duplicate columns; FactorAnalysis overflow on wide data; SVC sample weights; int15 quantization on Apple (shared page over 32 KiB); feature-frequency GBDT use-after-free on NVIDIA; TreeSHAP on Metal; gp-optimize seed; IDENTICAL BayesianRidge on data with null directions (istella r2 restored).
+
+### Changed (GPU path only, in parallel; Python is glue)
+- Device L-BFGS for Huber, LogisticRegressionCV and the GP hyperparameters; BGMM, OPTICS xi, SGD epoch end and shuffle, Cholesky logdet and rank-one update, QR, QN sums, Boruvka, IVF query/extend, MoE grouping and resample statistics on the device.
+- Runtime compute moved from Python into Mojo: CV folds and splitters, schedules, weight init (counter-based), scores, label maps, prep, tokenizer/BPE, token prefetch and multi-GPU dispatch (no Python worker threads).
+- Apple FAST defaults merged by the Apple FAST lanes since 0.8.35.
+
+### Bits that change from 0.8.35 (same on every vendor and the host column)
+Huber, LogisticRegressionCV and GP optimizer state; BGMM (float-float); OPTICS xi ratio tests; SGD epoch order (keyed Feistel permutation); Cholesky logdet for n > 256; GLM multiclass bias; resample standard error and BCa; t-SNE normalizer and KL total; RNN/CNN/MLP/t-SNE weight init and shuffles; BayesianRidge on near-null directions; non-metric MDS.
+
+### Known
+Eight verifier lanes still disagree across vendors on a few cells (umap and par-graph-umap ties batch, OPTICS metrics and nearest centroid on denormal, three x_prep lanes); those cells carry no reference until the fix in 0.8.37.
+
+## 0.8.35 (published 2026-10-03)
+
+GPU fits, transforms and predictions no longer contain CPU steps: the host-route debt went from 816 rows to 32: 18 are the CPU-only column's host-pool row passes (PR #86) and 14 are small scalar or k-sized steps. Main at b2f5fa7f2 builds every binding on NVIDIA (sm_89), AMD (gfx942) and Apple Metal, and the verifier cross-check (`python -m anonlib verify --cross-check default`) agrees bit for bit on all 48 compared cell parts across NVIDIA, AMD, Apple and the host column. IDENTICAL means the same bits across hardware within a release; bits change from 0.8.34 where a fold order changed (listed below).
+
+### Changed (GPU path only, in parallel)
+- Linear: the one-block `fit_kernel` is deleted. QuantileRegressor, ARD, Ridge/RidgeCV/RidgeClassifier, LARS and weighted BayesianRidge read rows on the grid; PAVA (IsotonicRegression) is parallel; LogisticRegressionCV fold ids and held-out scores are built on the device; RidgeCV k-fold scoring is blocked.
+- Decomposition: eigh and the kit SVD use round-robin Jacobi at every size (one-block fallbacks deleted); LTSA, Hessian and modified LLE solve their local eigenproblems in batches; `sparse_encode` lars runs per row on the device; the Lanczos projected eigensolve and `eigh` UPLO run on the device.
+- SVGP, GPR fit/predict and LabelPropagation/LabelSpreading stay resident on the device; SVC probability folds and working-set selection run on the grid; the GPU GaussianProcessClassifier no longer loads host code.
+- Clustering: AgglomerativeClustering with `connectivity`, OPTICS ordering, MeanShift and AffinityPropagation post-processing, k-means++ seeding and BGMM responsibilities run on the device.
+- HDBSCAN: condensed tree, stability, EOM/leaf selection, labels, prediction data, the sparse mutual-reachability MST (device Boruvka) and core-distance kNN run on the device.
+- Metrics: ROC/PR curves, roc_auc_score and average_precision_score run fully on the device; KernelExplainer and PermutationExplainer build coalitions in device batches.
+- The GPU GBDT class no longer imports host code; `language_model` and `neural_inference` load on first use.
+- AMD attention forward uses MFMA by default (PR #63); the x_linear host column uses the host pool for row passes (PR #86); SGD host predictor tracks subnormal partials (PR #85).
+- Apple FAST defaults merged by the Apple FAST lanes since 0.8.34.
+
+### Bits that change from 0.8.34 (same on every vendor and the host column)
+eigh and x_decomp SVD (round-robin order, float32 convergence test); LTSA/Hessian/modified LLE; Lanczos column signs; k-means sum scale and k-means++ picks; MinCovDet; OneClassSVM rho; GBDT boost_from_average bias; SVC probA_/probB_ and the probability-CV shuffle; t-SNE Z sum; QuantileRegressor; IsotonicRegression pooling; weighted BayesianRidge, weighted Ridge and RidgeCV scores; ARD starting variance; GPR y^T alpha and lml for n > 2048; HDBSCAN stabilities; BGMM lower bound; weighted ROC/PR curves; AUC/AP (float-float fold instead of fsum, about 1e-14 relative); KernelExplainer sampled coalitions (paired draws).
+
+## 0.8.34 (published 2026-10-01)
+
+Every change below was measured on the NVIDIA L40S, the AMD MI325X and the Apple M3 Ultra before merging, with the same digests on every vendor and the same bits as the route it replaces unless it says otherwise.
+
+### Changed (neural)
+- Attention stack (PR #65, with #58-#61): lm-train-step 41.3 -> 37.0 ms on NVIDIA and 75.5 -> 58.5 ms on AMD.
+- Pooled logits host storage (PR #67): lm-forward 51.4 -> 17.1 ms on NVIDIA and 37.6 -> 22.7 ms on AMD.
+- Download pipeline (PR #57): lm-forward -10% on NVIDIA, -6% on AMD.
+- Grouped GEMM reuses the caller's workspace on NVIDIA (PR #68) and the NVIDIA short-k tile rule (PR #69): L40S train step -6% together.
+- dK/dV block of 16 rows as the AMD default (PR #71): dK/dV 0.60 -> 0.44 ms per layer, MI325X train step -2%.
+- AMD GEMM tile minimum of 1024 blocks (PR #55): AMD lm-train-step 101 -> 75 ms; AMD split-plan cap of 1M cells (PR #52): 1.2x.
+- regs2h as the AMD S16 default (PR #50): samba-train-step -10% on AMD.
+- Apple: byte-LM transport defaults (PR #51, lm-forward 1.3x), byte-LM device arenas (PR #53, lm-train-step 1.48x), matrix-unit attention forward stagings (PR #54, lm-forward 77.7 -> 66.8 ms) and dK/dV transposed staging off (PR #70, train step -12%).
+
+### Changed (classical)
+- GLM fits stop on the Newton decrement and run on the host route (PR #73); on NVIDIA, gamma and tweedie keep the device route. Poisson on the taxi block: 49.1 s -> 2.1 s on NVIDIA, 78.4 s -> 1.4 s on AMD. The fitted coefficients change and are the same on every vendor.
+- SVD U from the sliced orthogonalization (PR #23): new U bits, the same on all three vendors; svd taxi 2-4.7x.
+
+## 0.8.33 (published 2026-10-01)
+
+Every change below was measured before merging, with the same digests on NVIDIA, AMD and Apple (or on every vendor named) and the same bits as the route it replaces unless it says otherwise.
+
+### Fixed
+- Mamba-3 and Samba training on Apple GPUs (PR #28). In 0.8.32 a threadgroup page larger than the Metal limit made Mamba-3 backward fail on Apple. It runs again on the M3 Ultra, and its digests equal NVIDIA and AMD.
+- Fix Lars (DEVIATION 5010): an active coefficient that crosses zero no longer flips its sign in the equiangular step. That flip came from scikit-learn's lar method, and it makes the path diverge. On the bench board's Istella regression cell, held-out R2 goes from -1.36 to 0.309 (least squares 0.330). scikit-learn's own Lars scores -4e13 on that cell. Lars fits without a crossing, and every LassoLars fit, keep the same bits.
+- The k-means++ float scan now runs at a 32-lane warp on every vendor, so IVF and k-means seeding give the same bits on NVIDIA, AMD, the CPU and Metal. The identity harness inputs no longer depend on the host BLAS.
+- The IVF filter (PR #48): check-ivf passes in both tiers on all three vendors.
+
+### Changed (classical)
+- Louvain as a sparse walk, 61-66x on AMD and NVIDIA (PR #20).
+- GARCH series as host tasks, 93-128x on the AMD box (PR #21).
+- Prophet series as host tasks, 30-186x on both GPUs (PR #30).
+- Connected components as a sparse walk, 8-20x on both GPUs (PR #27).
+- PageRank over the nonzero cells, 5-53x on all three vendors (PR #35).
+- TreeSHAP rows over host tasks, 12-31x on all three vendors (PR #36).
+- Gaussian and sparse random projection, 2.1-5.1x on AMD, NVIDIA and Apple (PR #32).
+- Blocked LU (PR #37) and the LU solve host walk (PR #42): LU cells 3.7-13x on all three vendors.
+- Bit-inert geqrf/orgqr kernels, QR and SVD 1.3-4.6x on both GPUs (PR #24); the QR host walk is the default on AMD and Apple, 2.2-4.9x, with the device route kept on NVIDIA (PR #41).
+- TSQR steps split into reflector and apply kernels: SVD 1.8-2.7x, full PCA 5-8x (PR #43).
+- IVF search grouped by list, 3-8x on AMD and NVIDIA (PR #47); the IVF build uploads the caller's list directly (PR #39).
+
+### Changed (neural)
+- Mamba-3 backward 2.5x on Metal with the Apple half-page S16 arms (PR #44).
+- Mixture-of-experts tiled expert products, 6.0-7.5x on NVIDIA and AMD (PR #34).
+- Embedding transfers, 1.8-7.9x (PR #33).
+- The pooled resident optimizer with the staged Apple download: Apple optimizer cells 3.6-3.9x (PR #31). The pool is the Apple default only; NVIDIA and AMD keep the earlier transport, same bytes (PR #38).
+- Apple layernorm 2.1x through pooled stages and device buffers in the sequence executor (PR #45).
+- Byte LM inference with masked keys skipped and key packs, lm-infer 1.28x (PR #16, #17, #22).
+- Host training and inference passes over host tasks (PR #14, #15, #18, #25, #26, #29), each gated bit for bit on Zen 4 and Zen 5 hosts.
+
+### Documentation
+- The identity contract now reads: IDENTICAL means the same bits across hardware within a release; bits may change between alpha releases.
+
+Reuse completed checks on merged main. No fresh numerical verification or installed wheel smoke is run for this release.
+
+## 0.8.32 (published 2026-10-01)
+
+- Ship merged main: KernelPCA GPU top-k Lanczos on by default in scope (exact dense path otherwise), ordered-boosting speed with the Apple 256-thread histogram cap, the GBDT split-score fix (gradients snapped onto the histogram's fixed-point grid), the fused small-MLP training step, and the strides, S16 and priority passes on the neural kernels.
+- Ship neural pass 4 (PR #8): optimizer moments stay resident on the device between steps for AdamW, Adam and SGD (every byte equal to the per-step route on NVIDIA and AMD). The Mamba-3 S16 arm defaults to regs2 on AMD and regs elsewhere, same bits.
+- Ship the byte LM CPU inference token split (PR #10) and the CPU training step over host tasks (PR #11, #12), same bits as before.
+- AMD MI325X checks of the 2026-09-30 merges are in bench/results/amd-verify-20260930. They found three differences that the released 0.8.31 wheel has too: SGD with regularization and LARS at 200k rows follow the host CPU model (not the GPU vendor), and IVF at 40k rows differs on the AMD GPU. These are not fixed in this release.
+- Reuse completed checks on merged main. No fresh numerical verification or installed wheel smoke is run for this release.
+
+## 0.8.31 (published 2026-09-29)
+
+- Ship the merged HDBSCAN sparse mutual-reachability MST, preserving exact tie order and avoiding the quadratic graph above 46,340 rows. The lane passed Apple, NVIDIA and AMD identity checks, including matching 70,000-row card hashes.
+- Ship the merged Nystroem stable radix basis sort, replacing quadratic ranking and removing the 4,096-row pool bound. The lane passed Apple, NVIDIA and AMD checks, including 100,000 rows.
+- Reuse completed checks on merged main and unchanged native binaries. No fresh numerical verification or installed wheel smoke is run for this release.
+
+## 0.8.30 (published 2026-09-29)
+
+- Ship the merged LLE iterative route above 200 rows and bounded dense QR/Jacobi SVD launches with poisoned read-back on Metal.
+- Reuse the completed AMD MI325X, NVIDIA A40 and M2 Pro checks across 18 decomposition lanes. No fresh numerical verification or installed wheel smoke is run for this release.
+
+## 0.8.29 (published 2026-09-29)
+
+- Ship the merged Bayesian Gaussian mixture covariance fix: deterministic GEMM accumulation replaces the long float32 sum. The lane passed Apple, NVIDIA and AMD identity checks before merging.
+- Ship the merged DBSCAN edge-count fix: keep exact 64-bit totals and halve batches when their CSR would exceed int32 capacity. The lane passed Apple, NVIDIA and AMD identity checks, including the five-billion-edge case.
+- Build from current main, retaining the shipped verifier/compare improvements and LabelBinarizer inverse-transform correction. Reuse completed lane qualification; do not repeat numerical certification for merged fixes.
+
+
+### Added
+- `anonlib.linalg.matmul_int15`, with `quantize_int15` and `dequantize_int15`: a 15-bit integer matrix product under the contract `anonlib.identical.gemm.int15i64.v1`. Each row of each operand is quantized from its float32 values to 15-bit integer codes with one power-of-two scale, split into two int8 planes, and multiplied on the integer matrix units with exact integer sums, so the result is the same bits on NVIDIA, AMD, Apple and the CPU. A contracted extent above `linalg.INT15_MAX_K` (65536) is refused by name. The same bits were recorded on an H100, an MI325X, an M3 Ultra and an M2 Pro over 178 cases, and every sabotage arm of its gates was seen failing. The technique is an application of known work (the Ozaki scheme on integer matrix units, and fixed-point arithmetic); nothing here is new.
+- The tuned integer matrix unit kernels behind it, a parallel quantizer, their gates (`pixi run check-gemm-int15`, `check-gemm-lowbit`, `check-gemm-int8-mma-tuned`, `check-gemm-int8-pieces-tuned`, each with an arm that must fail), and the timing harnesses and their results under `bench/results/`.
+- A selector for the number format of the matrix products: `anonlib.numeric_profile()`, `anonlib.set_numeric_profile()`, `anonlib.numeric_profiles()`, `anonlib.numeric_profile_measured()` and `numeric_profile=` on model loading and on `TransformerBlock`. Two profiles are registered: `fp32_v1` and `fixed15_v1`.
+
+### Changed
+- **FP32 remains the default; `fixed15_v1` is opt-in.** The unreleased default flip was reverted at the user's request. `anonlib.models.CausalLM` and `ParallelCausalLM` use `fp32_v1` unless explicitly opted in through `numeric_profile="fixed15_v1"`, `set_numeric_profile("fixed15_v1")`, or `ANONLIB_NUMERIC_PROFILE=fixed15_v1`. Under that opt-in, transformer projections, the output head and Q.K^T use 15-bit integer products. P.V, norms, RoPE, softmax and residuals stay float32. The following results describe the optional profile, not default execution:
+  - Different bits. The logits are not the ones earlier versions returned for the same model and input.
+  - The same bits on every vendor. The new logits are identical on NVIDIA, AMD, Apple and the CPU, and decoding token by token gives the same logits as one prefill. SmolLM2-360M's full logits were recorded with the same hash on an RTX 4090, an H100, an MI325X, an M2 Pro and the CPU.
+  - Quality. Held-out perplexity of SmolLM2-360M changed by +0.0006% on enwik8 and +0.0033% on pile_github against `fp32_v1`, both within +0.004%.
+  - Time. A 512-token prefill of SmolLM2-360M takes 0.34 to 0.40 of `fp32_v1`'s time on an RTX 4090, 0.64 to 0.68 on an H100 and 0.85 to 0.89 on an MI325X. It is slower on Apple at large shapes: the 15-bit product at the model's 512-token rows takes 3.4 to 3.65 times the float32 product's time on an M3 Ultra and an M2 Pro. On Apple, the first model that uses the profile raises a `NumericProfileSpeedWarning` once.
+  - Opt-in `generate` on NVIDIA runs one resident session under `fixed15_v1`, as it does under `fp32_v1`. The blocks' and the head's 15-bit weights stay on the device, products of up to 16 rows take the decode kernel, and the attention scores of every head are computed in one launch. Its tokens and logits are bit-identical to the per-layer route. From a 512-token SmolLM2-360M prompt, `generate` took this much of `fp32_v1`'s resident session's time: 0.92 (32 new tokens) and 0.95 (128) on an H100, and 0.91 and 0.88 on an RTX 4090. Per decode token it took 25.2 against 26.1 ms on the H100 and 19.1 against 22.3 ms on the 4090 (7 alternated rounds). Both profiles prescribe the same arithmetic across vendors; the default is FP32 everywhere. The opt-in has costs on AMD and Apple:
+  - On AMD and Apple, the resident session under `fixed15_v1` has not been gated, so `generate` there runs the per-layer route, where under `fp32_v1` it ran the resident session. Against `fp32_v1`'s resident session, that `generate` has not been measured on AMD. On an MI325X the whole model on the per-layer route took 0.87 of `fp32_v1`'s per-layer time at prefill and 0.65 per decode token.
+  - On Apple the opt-in profile is slower. SmolLM2-360M's whole model on an M2 Pro took 4.5 times `fp32_v1`'s time at prefill and 2.6 times per decode token (per-layer route, both profiles).
+- **What does not change.** Mamba models, a `TransformerBlock` built directly, and every trainer (the optimizers, `SambaStack`, the byte language model trainers) still compute `fp32_v1` when you name nothing, and a model's `numeric_profile` attribute tells you which profile it runs. Training under `fixed15_v1` is refused by name. So is `fixed15_v1` on a Mamba model. A saved state with no profile field is read as `fp32_v1`. The `hf-causal-lm` and `par-causal-lm` verifier lanes load `fp32_v1` by name, because their reference digests were recorded under it.
+- **Default arithmetic stays FP32 without configuration.** To override an explicit process/environment opt-in, pass `numeric_profile="fp32_v1"` to `CausalLM.load`. Existing states retain their recorded profile when restored. No fixed15 kernel arithmetic was removed or changed by restoring the default; the wheel still includes the new opt-in code and other merged improvements, so it is not the same artifact as the previous release.
+
+### Measured
+- The time of the complete 15-bit inference call over our own fp32.v1 call at the same 512-token rows, on the same box, in the same run: H100 0.43 to 0.50 (run 5); MI325X 0.19 to 0.30, with a stand-in recombination, one run; M3 Ultra 3.4 to 3.6, on the float unit, untuned.
+
+## 0.8.28 (published 2026-09-29)
+
+- Fix binary `LabelBinarizer.inverse_transform` for two-column input: read within the output allocation before selecting its last column. This fixes the `x-prep-inverse-transforms/wide` verifier assertion. The correction was already committed in source but absent from the prior verifier-only wheels.
+- Reuse published 0.8.27 native binaries, references and verifier code; apply only the exact Python bounds fix and version metadata, recorded in `PYTHON_PATCH.json` and checked again before publication.
+
+## 0.8.27 (published 2026-09-29)
+
+### Fixed
+- Verification reports now fingerprint every fixture used by bundled saved-model checks, including non-base fixtures in quick/default runs. Previously these missing fingerprints could make valid reports incomparable.
+- `verify --compare` compares the bundled GPU and CPU cross-check values as well as the main cell table. Missing rows, failed workers and same-answer local divergences cannot become a successful comparison. Cross-check values and execution scope are now covered by commitments.
+- Comparison tolerates different scopes: shared compatible checks are compared, missing checks are listed per side, and incompatible inputs are flagged per cell without discarding unrelated matches. Actual mismatches outrank incomplete coverage.
+- `verify --compare A B --json-out comparison.json` saves its result using the same output option as verification. Scope still comes from the input reports; comparison does not rerun algorithms.
+- Verifier-only update of 0.8.26: algorithm code, native binaries, fixtures and references are unchanged. Existing numerical runs remain valid for that unchanged payload.
+
+## 0.8.26 (published 2026-09-29)
+
+### Changed
+- Verifier-only wheel update of 0.8.25: algorithm Python, native binaries, fixtures and reference hashes are reused byte-for-byte. Unreleased algorithm changes above are not included.
+- Bare `verify` combines inference and classical training on the base fixture; `--quick` samples the same scope, and `--all` / `--full` use all nine fixtures. Neural training is separately selected with `--neural-training`.
+- Routine GPU verification includes direct CPU/GPU inference comparisons. Full cross-checks have no lane cap, run sequential batches, include forest/GBDT routes, and fail on missing comparisons. Spectral batch comparisons now receive the same held-out affinity input on both devices.
+- Verifier-only publication checks every wheel member against its published PyPI base, allowing only committed verifier files and version metadata changes. Existing numerical results are retained without repeating algorithm certification.
+
+## 0.8.25 (published 2026-09-29)
+
+### Added
+- Optional `anonlib[verify]` and `anonlib[numpy]` extras. The base package does not require NumPy; optional array-based APIs provide installation guidance when it is absent.
+- The full verifier includes applicable batch-invariance checks and reports missing, refused and inapplicable cases separately.
+- `UMAP` option parity with umap-learn: `n_components` 1 to 32, any `local_connectivity`, `metric` sqeuclidean / cosine / manhattan / chebyshev / minkowski (`metric_kwds={'p': p}`), `init` 'random' / 'pca' / an array, `a` and `b` given directly, and supervised `fit(X, y)` with `target_metric` 'categorical' or 'l2', `target_weight` and `target_n_neighbors`. `densmap=True` and a non-euclidean `output_metric` are refused by name. Default fits keep their bits.
+- `numpy`-style `anonlib.linalg.qr` modes 'reduced', 'complete', 'r' and 'raw', and `anonlib.linalg.svd` returning (U, S, Vh); `AlternatingLeastSquares(use_cg=True)`.
+
+### Changed
+- Consolidated Apple performance work across ANN, clustering, decomposition, linear models, metrics, neighbors, preprocessing and trees. Experimental paths remain opt-in where qualification is incomplete.
+- `anonlib.linalg.qr(a)` preserves its published `mode='r'` default and R-only result. Request `mode='reduced'` explicitly for the new `(Q, R)` result. The existing TSQR R preserves its bits; its row signs can differ from the R produced alongside Q.
+- `TruncatedSVD.explained_variance_` and `explained_variance_ratio_` are computed in TruncatedSVD's own binding (`tsvd_explained`) instead of through the decomposition expansion binding; the default fit no longer loads `_anonlib_x_decomp`. The values are scikit-learn's definition as before, with a different (pinned) summation order, so their last bits may differ from the previous unreleased build.
+- `anonlib.linalg.eigh(a, UPLO="L")` reads ONE triangle of `a`, as `numpy.linalg.eigh` does: the lower (the default) or, with `UPLO="U"`, the upper triangle mirrored across the diagonal; the other triangle is never read. Through 0.8.24 it fed the whole matrix to the Jacobi, so a NON-symmetric input returned a different answer from numpy's. Symmetric inputs return the same bits as before.
+- `SpectralEmbedding(eigen_tol=<float>)` sets the Lanczos tolerance (a positive float; `'auto'` is cuVS's 1e-5). `PCA(svd_solver="arpack")`, `TruncatedSVD(algorithm="arpack")`, a nonzero `tol` on either, `SpectralEmbedding(eigen_solver=...)` other than None, and `Isomap` / `LocallyLinearEmbedding(eigen_solver="arpack")` are refused by name: those solvers are not implemented, and running an exact solver under their names would be a silent substitution.
+
+### Fixed
+- Cross-platform GP binding imports and Metal barrier declarations compile consistently.
+- Verification jobs propagate failures, exclude timing fields from bitwise comparisons and bound optional timing work.
+- Tree-wrapper packaging records its device-free dispatch role and checks its RF/GBDT device dependencies.
+
+## 0.8.24 (published 2026-09-27)
+
+### Fixed
+- Linux ships again. 0.8.23 published the macOS wheel only: its AMD (gfx942) build failed because the Apple left-looking Cholesky kernel was launched behind a runtime guard and so compiled into every GPU target, where its Apple matrix-unit instructions do not exist (mixture, gp, kernel_methods). The launch is now compile-time gated (`cholesky/checks/potrf.mojo`); no bit moves on any column. Every binding changed since 0.8.22 cross-compiles for gfx942 (32 of 32). Linux users get 0.8.23's GaussianMixture and FAST-quality fixes with this release.
+
+### Changed
+- Apple GPU, IDENTICAL, same bits: the matrix-unit admission bound is exact, with a per-cell refusal in the Cholesky update; the Cholesky back solve stages operands ahead of the chain; ARIMA's forward-difference gradient runs in one stacked evaluation.
+
+## 0.8.23 (published 2026-09-26)
+
+### Fixed
+- `GaussianMixture(init_params="kmeans")` seeds its k-means with the classic greedy k-means++ (scikit-learn's `KMeans` default) instead of cuVS's k-means|| (DEVIATION 3133). On few-valued data the k-means|| start left one cluster with most rows beside clusters of 1 to 7 rows, and the fit scored far below scikit-learn: on 20 taxi windows of 2,000 rows (10 offsets x 2 seeds) the median held-out mean log-likelihood gap to scikit-learn 1.7.2 went from -4240 to -356 (IDENTICAL) and from -5320 to -1.9 (FAST), and scikit-learn scored higher in 10 of 17 comparable fits instead of 17 of 18. IDENTICAL bits move for every `init_params="kmeans"` fit, on every column (`gmm`, `gmm-sample`, `par-gmm`); `init_params="random"` is unchanged.
+- `ANONLIB_VENDOR=cpu` selects the CPU path on macOS. The macOS wheel returned before reading it, so through 0.8.22 a Mac asking for the CPU silently got the Metal set; it now loads the CPU-only bindings (`python/anonlib/_backend.py`), whose results equal the Metal IDENTICAL fits bit for bit (KMeans, LinearRegression, RandomForest checked).
+
+### Changed
+- FAST keeps the reference quality: UMAP's spectral initialization solves to the reference tolerance again, and Lossguide grows best-first one leaf at a time again (the 16-leaf batch cost quality). FAST ARIMA uses the serial Kalman filter by default.
+- Apple GPU, IDENTICAL, same bits: the transposed GEMM on the simdgroup matrix unit where the window admission holds, skinny GEMM shapes on split-K, Lanczos restarts on the device, the spectral kNN graph built on the device, the SVC/SVR block solve, ARIMA's Kalman loop at the state dimension, a left-looking Cholesky, IVF-Flat search in one launch, and DBSCAN and k-means++ schedules.
+
+## 0.8.22 (published 2026-09-26)
+
+### Changed
+- The first release of the split Linux packages described under 0.8.21 (`anonlib`, `anonlib-nvidia`, `anonlib-amd`; `pip install anonlib` installs all three). 0.8.21 published the macOS wheel only: its Linux set was refused before upload because the two plugins carried two platform tags (`manylinux_2_34` and `manylinux_2_35`) and the core one. All three now carry the core's `manylinux_2_35_x86_64` alone (`packaging/linux/audit.sh`). No native library changed from 0.8.21.
+
+## 0.8.21 (published 2026-09-26)
+
+### Changed
+- Linux ships as three PyPI packages: `anonlib` (Python, the CPU bindings and the MAX runtime), `anonlib-nvidia` (the CUDA sets) and `anonlib-amd` (the HIP set). `pip install anonlib` installs all three at the same version, so the install command does not change. The GPU code is byte for byte the combined wheel's, installed at the same paths (`python/anonlib/gpu_plugins.py`). macOS stays one wheel.
+- Apple GPU, IDENTICAL: the attention forward's scores and context and the backward's `dy` chain run on the simdgroup matrix unit. On the M4 the matrix multiply-accumulate equals the FMA chain on every cell probed (4.19M cells over 9 operand kinds, including products and partial sums straddling 2^-126), so the matrix chain is the attention chain; the causal diagonal keeps the scalar chain. Byte LM forward attention 127 to 85 ms per kernel at 1 x 2048, d768; per-step witnesses equal the shipped build's (`-D ANONLIB_ATTN_NO_APPLE_MMA` reverts).
+
+## 0.8.20 (published 2026-09-26)
+
+### Changed
+- IDENTICAL arithmetic no longer depends on whether the compiler contracts a multiply into the add that follows it. Every such pair is written either as an explicit fused multiply-add or as a pinned product that no backend can fuse (`pinned_mul_f32` / `pinned_mul_f64` in `checks/numerics.mojo`: a fence on CPUs, `mul.rn` on NVIDIA, `v_mul` on AMD, an unflagged `fma(a, b, -0)` on Apple), and `tools/contraction_census.py` names any source line whose fused operations change between the default build and `--fp-mode contract=off`. The bits are 0.8.19's: 209 lanes, three fixtures each, equal to the 0.8.19 Metal, CUDA and HIP columns on Apple and CPU (default and `contract=off`, 627 of 627), on an NVIDIA L40S (621 of 621) and on an AMD MI300X (621 of 621).
+- Apple GPU, IDENTICAL: the transposed GEMM is threadgroup-tiled, the tuned GEMM runs admitted windows on the simdgroup matrix unit (whose fp32 8x8x8 multiply-accumulate was shown to be the same ascending FMA chain), the Gram split-K and the quasi-Newton steps read their operands coalesced, and the byte language model's embedding and head weights are views of the flat parameters (less memory, same step). Same bits: the byte LM step witnesses equal on the M4, an H100 and an MI300X.
+- Apple GPU, FAST (trees and classical, which do not promise identical bits): RandomForest and ExtraTrees histogram and split passes, SVC and SVR working sets, ARIMA (batched L-BFGS, the Kalman filter in parallel over time), UMAP's spectral initialization, IVF-Flat search and training, k-means++ seeding, DBSCAN, HDBSCAN and AgglomerativeClustering (Boruvka minimum spanning tree without the dense graph), Cholesky, Holt-Winters and the quasi-Newton gradient.
+- Linux IDENTICAL CUDA sets (sm_89, sm_90a) ship machine code: every IDENTICAL kernel is compiled at build time by a pinned ptxas (CUDA 12.5.82) with `--fmad=false` and stored as an LZ4-compressed fatbin in place of its PTX (`packaging/linux/cubin_contract.py`), so the user's driver no longer JIT-compiles them. The toolkit is 12.5 on purpose: CUDA 13 binaries would need a 580 driver even under MAX's `MODULAR_NVPTX_COMPILER_PATH` escape, 12.5 ones do not, so the driver floor is unchanged. On 0.8.19 the whole release column ran with the driver JIT disabled on an RTX 4090 and an H100 (driver 580) and an RTX 2000 Ada (driver 570), with the same bits as the recorded Apple, AMD and NVIDIA columns (`bench/results/nvidia_fatbin_2026-09-26/`). The wheel audit refuses IDENTICAL CUDA PTX outside a small JIT-invariant exception.
+
+## 0.8.19 (published 2026-09-25)
+
+### Changed
+- NVIDIA (sm_90a) training takes 30.7 s per optimizer step at the GPT-3 Small shape on one H100, down from 38.8 s, with the same bits (`bench/results/nvidia_step_time_2026-09-25/`). Three NVIDIA-only changes: GEMM window admission (a 16-deep window whose staged operands provably cannot produce a subnormal step result runs the bare `fma.rn`, which is then the contract step exactly; every other window keeps the two-instruction step; `-D ANONLIB_GEMM_NO_WINDOW_ADMIT=1` reverts); a 128x64 kpack GEMM tile under a 512-thread launch bound (a schedule: every cell's chain, leaves and fold are unchanged; `-D ANONLIB_GEMM_NO_KPACK_NARROW=1` reverts); and launch bounds on the attention forward (1024) and dq (768) kernels, register allocation only (`-D ANONLIB_ATTN_NO_LAUNCH_BOUND=1` reverts). Every other column declares 1024 on those two attention kernels.
+- AMD (gfx942) training takes 29.1 s per optimizer step at the same shape on one MI300X, down from 32.3 s in 0.8.18, with the same bits (`bench/results/amd_step_time_2026-09-24/`, "Pass 2"). The matrix-core GEMM applies the same exact-admission argument per window: where the block's staged operands prove every accumulator stays a multiple of 2^-126, the MFMA step alone is the contract step and the product by one is not issued (AMD only; `-D ANONLIB_GEMM_MFMA_NO_ADMIT=1` reverts). The AMD attention kernels on the matrix cores are not in this release; they stay off by default until their 16x16x1 step is explained.
+- Every column: the embedding backward's run-start prefix sum runs in one block of 256 threads instead of one thread. Integer addition is exact, so every word equals the serial kernel's (`-D ANONLIB_EMB_SERIAL_RUN_BEGIN=1` reverts).
+- Proofs of the merged source, built from source on each box (`bench/results/release_0819_proofs_2026-09-25/`): on a Hot Aisle MI300X and on a RunPod H100, the replays of steps 101 to 103 and 1999 to 2000 from the run's checkpoints equal the H100 chain line by line (state digests abc8b816b5c3fb15, a9421f91b947f82c, fcdb48b8ab51f2ef, dcb05e4e668a81e1, 0e39ed2bfe9bcbae; gradients, the 64 losses and the learning-rate bits); the T3-shape GEMM hashes equal the VALU kernels on AMD (64 of 64 lines over six operand kinds) and 0.8.18's NVIDIA GEMM on NVIDIA (72 of 72), the NVIDIA admission sabotage differs on 12 lines, and the 64 AMD lines equal the NVIDIA ones hash for hash; the GEMM device, backward and workspace checks are green on both; 181 of the 201 GEMM-reaching identity lanes read IDENTICAL on each vendor (6,813 cell parts) and none divergent, with the same 20 refused on both for bindings the boxes did not build. Apple: the changed kernels compile to AIR for apple-m4 on a Linux host; no Apple GPU ran for this release.
+
+## 0.8.18 (published 2026-09-25)
+
+### Changed
+- AMD (gfx942) training is about 4.4 times faster per optimizer step at the GPT-3 Small shape, with the same bits. On a Hot Aisle MI300X one optimizer step of 64 shards (batch 4, length 2048, 162,147,840 parameters) went from 141.0 s to 32.3 s (`bench/results/amd_step_time_2026-09-24/`): the two IDENTICAL GEMM kernels declare their real 256-thread launch size so the gfx942 backend no longer spills the 128x128 register tile; the tuned GEMM calls run on the matrix cores (`v_mfma_f32_32x32x1f32`, one product per step, the flush spelled as a product by one) with a grouped launch; the AMD leaf-split dispatch; `ftz` spelled as one class compare in AMD device code; and the NVIDIA attention block map as AMD's default. Every replayed optimizer step from the run's checkpoints (steps 101 to 103 and 1999 to 2000) equals the H100 chain line by line on state, gradient, the 64 losses and the learning-rate bits; 181 of the 201 GEMM-reaching identity lanes read IDENTICAL on AMD against the shipped references and none divergent (20 refused for bindings the box did not build). The GEMM launch bound is the one change that reaches NVIDIA binaries (`.maxntid 256` on sm_89 and sm_90a); Apple carries no bound. The NVIDIA and AMD release columns and a two-step replay against the live chain on each vendor gate this release.
+
+## 0.8.17 (published 2026-09-24)
+
+### Fixed
+- The live cross-vendor worker runs on Python 3.10 and 3.11 from the wheel. `ParallelByteLanguageModelTrainer.fold_export`, `cross_vendor.state_hash`, the worker's parameter count and its shard gradient views called `memoryview` on the package's own `Array`, which cannot export the buffer protocol below Python 3.12 (`TypeError: memoryview: a bytes-like object is required, not 'Array'`, seen on a Python 3.11 H100 box on 2026-09-23). They read through `_buffer.flat_bytes`, which works on every supported Python. No arithmetic changed; the native libraries are the 0.8.16 bytes.
+
+## 0.8.16 (published 2026-09-23)
+
+### Fixed
+- Float16 safetensors checkpoints load on Python 3.10 and 3.11. `memoryview.cast("e")` exists only from Python 3.12; the F16 bytes are now copied as they are and widened from their bits on every version, the same bits as before (subnormal, negative zero and scalar tensors checked). Every F16 checkpoint read on 3.10 and 3.11 in 0.8.15 raised `memoryview: destination format must be a native single character format`.
+- `tools/lm_segment.py`: an expected chain line written before chain lines named their hash scheme is compared as the first scheme (`sha256.v1`), and the recipe names the scheme a run hashes under, so a segment replayed on another vendor is held to the recorded digests rather than to the label.
+- Loading a native binding no longer leaves `PYTHONEXECUTABLE`, `PYTHONPATH` and `MOJO_PYTHON_LIBRARY` set in the process environment. The bundled runtime sets them in the C environ when a binding loads, so a child interpreter started with `sys.executable` could lose its virtual environment (seen on Python 3.11: no NumPy in the child). Every binding load now restores the three variables as it found them, through the C environ.
+- The Python test suite runs on Python 3.10 and 3.11 (`bench/results/python_versions_2026-09-23`): `bytes(Array)`, a `math.fma` use and two test fixtures that relied on Python 3.12 or 3.13 behavior are fixed, and the tools tests skip rather than abort without optional packages.
+
+### Changed
+- Native libraries rebuilt from source.
+
+## 0.8.15 (published 2026-09-22)
+
+### Fixed
+- AMD gfx942 builds are byte-reproducible: the GEMM and Holt-Winters kernels compute their index arithmetic with unsigned division and loop counters, so repeated builds of the same source produce the same AMD binaries (23 of 23 identical bindings across six clean builds). No floating-point operation or order changed; NVIDIA binaries are unchanged.
+
+### Changed
+- Native libraries rebuilt from source.
+
+### Added
+- `tools/lm_segment.py`: one segment of a checkpoint-to-checkpoint language-model run on any box. A recipe (shape, K shards, optimizer, a learning-rate table of float32 bits, the token stream's identity) never changes between segments; steps are numbered globally; every step writes a hash-chained line (state, summed gradient, losses, learning-rate bits); checkpoints stream in the `anonlib.byte-lm-stream.v1` format on a cadence, at a boundary minus two and at the end, pinned in a manifest and PUT to presigned URLs as written; `--expect-chain` holds a run to another run's chain step for step and stops on the first difference (route B against route A, an arrival replay against the sender); `--zero-moments` is the negative control; `compare` and `manifests` hold chains and checkpoints across runs. Verified on the M4 at a small shape: three segments, a second route from the first route's checkpoints, an arrival replay, the control failing and a wrong recipe refused.
+- `ParallelByteLanguageModelTrainer.set_lr` (native `byte_lm_parallel_set_lr`): the learning rate every replica uses at its next update, for a per-step schedule; held bit for bit equal to a fresh open at that rate. `export_raw`: the four state arrays without the per-element admission pass, for hashing and checkpoints at scale.
+- `anonlib.cross_vendor` chained protocol (`--chained`): contiguous shard blocks, one gradient per worker on the wire instead of one per shard, the same bits as the gathered fold and the one-process column; `ordered_fold(..., prefix=)` and `fold_pair` with a vectorized NumPy spelling held equal to the pure-Python one; `Worker(lr_for_step=)`.
+- `tools/fineweb_tokens.py`: FineWeb-Edu parquet shards (or `fineweb_text.py` text) to one pinned `anonlib.byte-lm.tokens.v1` stream through the pinned vocabulary, one document per row, streamed, with a held-out tail range.
+- The GPT-3 Small run's token stream is in the R2 dataset store: FineWeb-Edu shards 000 to 003 and 013 through the pinned vocabulary, 3.11B ids in seven pinned parts, produced byte-identically on three CPUs (`bench/results/fineweb_tokens_2026-09-22`).
+- `ParallelByteLanguageModelTrainer.fold_reset`, `shard_gradient_fold`, `fold_add` and `fold_export` (native `byte_lm_parallel_fold_*`): a live worker's block of the ordered fold on its own device with the kernel `train_step` uses; the chained `cross_vendor` worker uses them when the binding has them, so no gradient is downloaded per shard and the fold costs milliseconds instead of the 184 s a host fold cost at 162M parameters. The coordinator's per-step record carries phase timings (gradients in, each worker's fold round trip, apply, the step).
+- `tools/lm_segment.py --live-role coordinator|worker`: the multi-vendor segment inside the segment runner, writing the same chain lines and checkpoints as a one-box segment; `tools/lm_segment_body.sh`, `tools/lm_segment_leg.py` (renders a segment's leg body and mints its presigned URLs), `tools/lm_live_leg.sh` and `tools/lm_live_link.sh` (two rented boxes joined through an ssh tunnel), `tools/lm_run_driver.py` (every segment of every route in dependency order, with a ledger, the halt rule, a GPU-type walk and an AMD provider walk that waits for capacity). Chain lines name their hash scheme (`sliced-sha256-8.v2`: eight slices hashed in threads, about five times faster than one sha256 at this size) and compare only under one scheme. `tools/do_extra_leg.sh --size --region`.
+- `tools/gemm_remote_leg.sh` and `tools/do_extra_leg.sh` take `--segment-lease N --dollar-cap USD`: a lease above one hour, named, and refused unless its worst case at the box's own hourly price is under the cap (RunPod: `costPerHr` after the create, the pod terminated on refusal; DigitalOcean: `price_hourly` from the sizes API before the create). `--minutes` above 60 stays refused.
+
+## 0.8.14 (published 2026-09-22)
+
+### Changed
+- `ExponentialSmoothing` takes `initialization_method`, default `"estimated"`: the initial level, trend and seasonal states are fitted jointly with the smoothing parameters. `"heuristic"` (alias `"cuml"`) is the 0.8.13 fit, and saved models without the field load as `"heuristic"`.
+- `GradientBoosting` trains small IDENTICAL pools, and pools of one-border columns, on the CPU host route with the same bits.
+- Native libraries rebuilt from source, including ordered resident forest inference on every GPU vendor, per-vendor exact random forest training kernels and a parallel Holt-Winters fit kernel.
+
+### Fixed
+- Random forest `fit` no longer hangs on NaN in `X`; the tree family refuses NaN and infinite inputs with a `ValueError` naming them.
+- `KMeans`, `DBSCAN` and `KernelDensity` refuse NaN and infinite inputs at `fit`, and `Embedding` refuses non-integer ids.
+- Classical estimators have `get_params` and work with `clone` and `cross_val_score`; `anonlib.Array` converts through `__array__`; `import anonlib.metrics` works; `SVC` accepts string labels.
+- `GradientBoostingRegressor` targets and the scalers accept nested Python lists.
+- `LanguageModelHostTrainer` defaults `weight_decay` to 0.01, like the GPU trainer.
+- The GreedyLogSum border penalty uses the portable logarithm, so borders near a tie agree across platforms.
+- `python -m anonlib verify` with no card runs the quick check instead of ending with no reference.
+
+## 0.8.13 (published 2026-09-21)
+
+### Fixed
+- Quantile regression, extra trees and random forest `predict` and `predict_proba` no longer read Python objects after releasing the interpreter lock, which could crash the process.
+
+## 0.8.12 (published 2026-09-21)
+
+### Added
+- Experimental live cross-vendor training (`anonlib.cross_vendor`). GPUs from different vendors, in different machines, train one language model together, and every replica holds the same bits after every step, checked by a hash of each worker's full training state.
+- `ParallelByteLanguageModelTrainer.shard_gradient` and `apply_gradient`.
+
+### Fixed
+- Apple language-model training with two or more blocks no longer aborts at small batch times length.
+
+### Changed
+- Native libraries rebuilt from source, including exact GPT backward fusions on NVIDIA and AMD and grouped symmetric-tree inference launches.
+- Updated research preprint.
+
+## 0.8.11 (published 2026-09-21)
+
+### Added
+- The research preprint ships in both platform wheels and is linked from the README.
+
+Documentation-only release. Numerical code, reference data and native libraries are unchanged from 0.8.10.
+
+## 0.8.10 (published 2026-09-20)
+
+### Added
+- Cross-validation accepts explicit Metal `devices=(0,)`.
+- Parallel causal language models can assign every layer to Metal device 0.
+
+### Changed
+- `verify --par all` runs all fixtures by default, and every lane and fixture must carry its own placement witness.
+- Parallel estimators with serialization must produce actual model bytes, and incomplete records are rejected.
+
+### Fixed
+- Parallel workers set native device counts to their own visible device group.
+- Parallel ARIMA keeps the caller's trend configuration and saved-model metadata.
+- The causal-language-model batch verifier closes its workers on success and failure.
+
+## 0.8.9 (published 2026-09-20)
+
+### Added
+- CPU-only installs can train. Gradient boosting supports regression, classification, multiclass and ranking fits on the CPU, including bootstrap sampling and score noise.
+- `LinearSVC`, `LinearSVR`, `QNRegressor` and the `anonlib.svm` namespace.
+- `SpectralEmbedding` and `manifold.spectral_embedding`.
+- CatBoost-style boosting defaults, ordered boosting, seven border selection methods and quantile starting constants.
+- Random Forest and Extra Trees select resident parallel-groves inference automatically in FAST mode.
+
+### Fixed
+- CPU HDBSCAN no longer produces NaN distances from a temporary-buffer lifetime error.
+- GPU held-out loss curves, early stopping and model shrinking agree with the CPU when average boosting is disabled.
+
+## 0.8.8 (published 2026-09-19)
+
+### Fixed
+- CPU replay of GPU-written CTR models no longer erases the recorded GPU model-byte reference.
+
+### Changed
+- Python and reference patches can reuse a published wheel's native libraries when their compile inputs are unchanged. Native binaries are the same as 0.8.7.
+
+## 0.8.7 (published 2026-09-18)
+
+Version 0.8.6 was prepared but never published. Its changes ship here.
+
+### Added
+- `python -m anonlib verify --all`, `--self-test` and `--json`. Users can check an installed wheel against shipped reference hashes, watch the verifier fail on a deliberately perturbed input, and export per-cell evidence. See docs/VERIFY.md.
+- `python -m anonlib identity`, which diffs a local run against the Apple, NVIDIA and AMD columns shipped in the wheel.
+- Every CPU host binding ships in both wheels, so a CPU-only install can verify many more lanes.
+- Public CPU inference from GPU-saved models for most estimators, including k-means, DBSCAN, agglomerative and spectral clustering, neighbors, kernel density, Gaussian processes, Gaussian mixtures, HDBSCAN, isolation forest, ARIMA, Holt-Winters, UMAP, PCA, scalers, linear and kernel models, SVMs, IVF indexes, embeddings, Cholesky, gradient boosting with CTR tables, and the MLP, Transformer, Mamba and Samba blocks. `anonlib.host_model(path)` loads any saved model on a CPU.
+- Incremental CPU decoding with `allocate_state`, a carried state and `step`, bitwise equal to a full forward pass.
+- Low-bit inference weights. Every inference class accepts bf16 or int8 packed weights through `anonlib.lowbit.pack` and computes the same bits as the fp32 block on the materialized weights. int8 GEMM uses NVIDIA and AMD integer matrix units.
+- `TransformerBlock` options for common decoder families (RoPE variants, biases, norm types, MLP types, QK norm, attention softcap).
+- Experimental checkpoint loader `anonlib.models.CausalLM.load` for Hugging Face `config.json` and `.safetensors` checkpoints, plus `models.Tokenizer.from_pretrained` for byte-level BPE families.
+- `GaussianProcessClassifier`, GP kernel hyperparameter optimization, `GaussianProcessRegressor(normalize_y=True)` and `sample_y`.
+- `GaussianMixture.sample`, `KMeans.transform`, `KMeans` save and load, `IVFIndex.extend`, `SpectralClustering.predict`.
+- HDBSCAN `approximate_predict`, `membership_vector` and `all_points_membership_vectors`.
+- ARIMA exogenous regressors.
+- Ranking losses `QueryRMSE`, `PairLogit` and `YetiRank` for `GradientBoosting`, with `group_id` and explicit pairs.
+- `SVC(kernel='poly')`, weighted `score` on tree estimators, weighted `accuracy_score` and `r2_score`, and `metrics.fowlkes_mallows_score`.
+- `BpeTokenizer.encode_batch`, `decode_batch` and `decode_bytes_batch`.
+- The bootstrap, permutation test, Monte Carlo integration and `kpss_test` work on a CPU-only install.
+
+### Changed
+- `GPT2Tokenizer` is renamed `BpeTokenizer`. The old name remains as a deprecated alias.
+- `verify --all` reports INCOMPLETE and exits 4 when any part was refused. Only a run with nothing refused reads VERIFIED.
+- `UMAP.transform` no longer depends on the query batch. A batch of N rows returns the same bytes as N single-row calls. Recorded UMAP transform outputs change.
+- `GradientBoosting(l2_leaf_reg=None)` is the new default and takes each loss's own default.
+- The README states Apple silicon support up front, and the Apple tree speed ratio was withdrawn.
+
+### Removed
+- The GPT-2 vocabulary and reference data. Tokenizers load a vocabulary the user supplies.
+
+## 0.8.5 (published 2026-09-14)
+
+### Fixed
+- `ExperimentalTwoLevelFeatureFreq` returns the same predictions on every GPU vendor. Its histogram accumulator was undersized.
+- Linux and macOS wheel packaging regressions for the CPU training binding.
+
+### Changed
+- AMD GEMM uses a new staging schedule with unchanged bits.
+
+## 0.8.4 (published 2026-09-13)
+
+### Added
+- CPU training for the byte-level language model (`LanguageModelHostTrainer`) in both wheels, bitwise identical to the GPU.
+- The language model's initialization is a pinned function of the parameter index, so seed, corpus and config determine the trained bits.
+
+### Changed
+- Shorter neural training steps on NVIDIA and AMD than in 0.8.3, with no bit changed (GEMM staging, attention exp stash, leaner step glue).
+- Gradient boosting under IDENTICAL partitions leaves on the device on every vendor.
+
+### Fixed
+- A GPU-resident array passed to an estimator is refused with a clear error naming its type and device.
+
+## 0.8.3 (published 2026-09-11)
+
+### Fixed
+- `SVC` and `SVR` fits with more than 512 training rows no longer fail on NVIDIA GPUs.
+- IDENTICAL `LinearRegression` handles badly scaled designs. The eigensolver no longer overflows, and the rank cutoff is relative.
+
+## 0.8.2 (published 2026-09-11)
+
+### Fixed
+- IDENTICAL gradient boosting on AMD GPUs. Histogram kernels could skip a block-wide sync, so fits on tied data could differ between runs and from other vendors.
+
+## 0.8.1 (published 2026-09-11)
+
+### Fixed
+- Buffer conversions no longer fail in a process that also imports cuML.
+
+## 0.8.0 (published 2026-09-10)
+
+### Changed
+- Only the tree families (GBDT, Random Forest, Extra Trees) ship the `fast` and `deterministic` tiers. Every other estimator is `identical` only and refuses other tiers by name.
+- Estimators return `anonlib.Array`, and NumPy is no longer a runtime dependency. `numpy.asarray(result)` gives a zero-copy view.
+
+### Added
+- Optional GPU `parallel_groves` prediction for Random Forest and Extra Trees.
+- Random Forest `class_weight`, per-tree GBDT feature sampling and minimum child Hessian for Newton growth.
+- GBDT classifier and regressor adapters and scikit-learn-style parameter and scoring protocols.
+- GPU metrics (regression errors, classification scores, log loss, ROC AUC, precision-recall curves).
+- GPU `StandardScaler`, `MinMaxScaler` and serial `cross_val_score`.
+- `LanguageModelConfig` and `LanguageModelTrainer` with configurable layers and vocabularies and resident training sessions.
+- IVF selection through k=1024.
+
+## 0.7.0 (published 2026-09-09)
+
+Version 0.6.1 was prepared but never published. Its changes ship here.
+
+### Added
+- One Linux x86-64 wheel carrying CUDA sm_89, CUDA sm_90 and HIP gfx942.
+
+### Changed
+- The identical path no longer calls the host C library, so every host computes the same bits.
+
+### Fixed
+- Mamba-3 DETERMINISTIC mode on CUDA uses the stable small-dt softplus.
+
+## 0.6.0 (published 2026-09-06)
+
+### Added
+- `UMAP.transform` for unseen samples against a fitted model.
+
+### Changed
+- UMAP stores its fuzzy graph in CSR form.
+- Binding compilation uses two workers by default, configurable with `ANONLIB_COMPILE_JOBS`.
+- The identical path's last host libm calls were replaced with portable implementations.
+
+## 0.5.0 (published 2026-09-05)
+
+### Added
+- macOS arm64 wheel with 15 native extensions in all three modes.
+- `UMAP.fit` and `fit_transform` for dense Euclidean input with 2D and 3D embeddings.
+- Wheel admission checks for contents, digests, platform tags and native extensions.
+
+### Changed
+- Documentation consolidated around one roadmap, support matrix (SUPPORT_MATRIX.md), verification guide and numerical contracts.
+
+## 0.4.0 (unreleased 2026-09-02)
+
+Prepared but never published to PyPI. Its contents shipped in 0.5.0.
+
+### Added
+- Mamba 1, 2 and 3 and Transformer forward and backward with Python bindings.
+- Wider cross-vendor identity coverage across classical ML, linear algebra, trees, sequence models and training.
+- The 15-extension packaging surface and stricter release checks.
+
+## Earlier releases
+
+Versions 0.1.0 through 0.3.1 established the Mojo GPU implementation, Python packaging and initial Apple, AMD and NVIDIA support. 0.3.0 is yanked on PyPI because its Linux wheel required AVX-512; use 0.3.1 or later.

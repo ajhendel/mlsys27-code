@@ -1,0 +1,724 @@
+#!/bin/sh
+# tools/gap_column_leg.sh: the on-box body (ANONLIB_GEMM_LEG_EXTRA for
+# tools/gemm_remote_leg.sh) of a GPU identity column that closes vendor-class
+# gaps in the verification matrix (tools/verification_matrix.py). ONE BODY, EITHER VENDOR, LANES FROM
+# THE ENVIRONMENT.
+#
+# THIS FILE IS NEVER ANONLIB_GEMM_LEG_EXTRA ITSELF. A WRAPPER IS.
+# tools/gemm_remote_leg.sh runs the extra body as `sh /root/gemm_leg_extra.sh`
+# with NO ENVIRONMENT PASSTHROUGH, so a ANONLIB_GAP_* set on the driving Mac
+# reaches the pod in no form whatever. Naming this file directly therefore
+# rents a box, runs this body with an empty lane list, and exits 8. MEASURED
+# TWICE on 2026-09-19 -- pods 7whutyzv73i9ul (NVIDIA) and 3hz64m4pbs523f
+# (AMD), three minutes and about $0.16 between them -- against an earlier
+# version of these very lines, which spelled the invocation that cannot work.
+# Ship a wrapper that sets the variables and execs THIS FILE OUT OF THE PINNED
+# ARCHIVE, so the body that runs is the committed one:
+#
+#   cat > /tmp/wrap.sh <<'EOF'
+#   #!/bin/sh
+#   ANONLIB_GAP_LANES=a,b,c
+#   ANONLIB_GAP_SLUG=vendor-class-gaps
+#   ANONLIB_GAP_COMMIT_DIR=bench/results/identity_break/<dir>/
+#   ANONLIB_COMPILE_JOBS=16
+#   export ANONLIB_GAP_LANES ANONLIB_GAP_SLUG ANONLIB_GAP_COMMIT_DIR \
+#          ANONLIB_COMPILE_JOBS
+#   exec sh /root/anonlib/tools/gap_column_leg.sh
+#   EOF
+#   ANONLIB_GEMM_LEG_EXTRA=/tmp/wrap.sh \
+#   sh tools/gemm_remote_leg.sh nvidia --rent --allow-concurrent \
+#      --local-card <an apple.card from a previous leg>
+#
+# and, for an all-`par-*` lane list on a box rented with
+# ANONLIB_GEMM_LEG_GPU_COUNT=2, ANONLIB_GAP_TWO_DEVICE=1 in the wrapper.
+#
+# THE WRAPPER IS ALSO WHERE ANONLIB_COMPILE_JOBS IS PINNED. tools/bincache.py
+# keys it, so two legs that let the pod's vCPU count decide it cannot share a
+# cache entry however identical everything else is.
+#
+# WHY THIS FILE IS NOT tools/single_device_gaps_nvidia_leg.sh ANY MORE.
+# It is that file (ed0d6e48b), renamed and generalized on 2026-09-19 rather
+# than copied. By that afternoon the tree held THREE near-identical gap-column
+# bodies -- tools/gpu_class_gaps_nvidia_leg.sh, tools/gpu_class_gaps_amd_leg.sh
+# and this one -- differing in their lane lists, their `nvidia-smi` versus
+# `rocminfo` probe, and in WHICH OF THE DAY'S THREE DEFECTS EACH ONE HAD
+# LEARNED ABOUT YET. That last difference is the whole problem: the AMD body
+# learned about libAnonlibMath.so and never learned to derive its build set,
+# and the NVIDIA bodies learned the opposite halves on different pods. A
+# fourth copy would have arrived knowing some other subset. So the vendor
+# probe below branches, the lane list comes from the caller, and there is one
+# place where a lesson lands.
+#
+# WHAT THE VENDOR BRANCH ACTUALLY DECIDES, AND WHAT IT DOES NOT.
+# Only three things: which SMI to read the device out of, how to derive
+# ANONLIB_GPU_ARCHS, and what goes in the label. Everything downstream --
+# the build set, the host families, the fixtures, the repeats, the
+# admissibility rules -- is vendor-independent, and it has to be, because the
+# claim this column records is that it is NOT vendor-dependent.
+#
+# THE FOUR DEFECTS THIS BODY IS BUILT AROUND, ALL FOUND ON 2026-09-19:
+#
+# 1. THE HOST MATH LIBRARY, OR NOTHING IMPORTS. See the phase itself, below.
+#    Two pods came home with every binding built and not one cell. It is not
+#    a GPU, a vendor or a lane-list problem and it fails identically on both.
+#
+# 2. A HAND-WRITTEN GPU FAMILY LIST ROTS. Both of the morning's legs shipped
+#    one and each lost lanes to it in the same hour: the NVIDIA list omitted
+#    `build_preprocessing`, so gp-normalize-y recorded 18 cells reading
+#    "needs .../identical/_anonlib_preprocessing.so, which is not built"
+#    (GaussianProcessRegressor(normalize_y=True) centres y with StandardScaler's
+#    pinned folds, and nothing in the lane's NAME says so); the AMD list
+#    omitted `build_metrics` and gbdt-adapter-score-weighted lost nine cells
+#    the same way. So the GPU set below is DERIVED from bindings/build*.sh and
+#    every family is built. Measured: 1204 s for all 23 on an RTX 4090 against
+#    605 s for a picked eleven. Three hundred seconds buys the class of
+#    mistake away inside a lease that still finished with 35 minutes spare.
+#
+# 3. AND THE HOST FAMILIES ARE A SECOND, SEPARATE LIST THAT NOBODY BUILT.
+#    Every lane here is anchored `cross-route` by tools/lane_applicability.py:
+#    the GPU cell is compared against the SAME BOX'S HOST ROUTE, so a lane
+#    whose host binding is missing refuses on a GPU column even with all 23
+#    GPU families present. `bindings/build_*_host.sh` is a shim that execs
+#    bindings/build_host_family.sh, which REFUSES when ANONLIB_GPU_ARCHS is
+#    set -- which this file exports -- so they cannot simply be swept into the
+#    loop above. They are derived instead from the ONE table that already
+#    answers "which host family serves this lane", python/anonlib/
+#    host_surface.py's FAMILIES, read at run time with the lane list in hand.
+#    Not typed out here: a list of families in a leg script is the same second
+#    answer that defect 2 is about, wearing host clothes.
+#
+# 4. AND THEN THE BACKSTOP ANYWAY. After the column runs, this file GREPS ITS
+#    OWN JSON for the refusal text's `bindings/build_*.sh`, builds whatever it
+#    names, and runs the column again over the same path. The refusal NAMES
+#    ITS OWN CURE verbatim in the cell. If the two derivations above are wrong
+#    in a way nobody has thought of, the leg corrects itself inside the lease
+#    instead of reporting the same gap a third time. Normally it finds nothing
+#    and says so, which is what it reported on pod o20ynm82l55geo.
+#
+# THE DELIVERABLE COMES BEFORE THE INSURANCE. The ordering below is: the
+# families this lane list is DECLARED to need, then the column, then every
+# remaining GPU family, then the backstop and a second column if it found
+# anything. ed0d6e48b built all 23 first and had 35 minutes to spare, so this
+# is not a budget fix; it is so that a lease that dies early still comes home
+# with a column rather than with a build log.
+#
+# A DEGENERATE LANE IS NOT IN THE LANE LIST AND MUST NOT BE.
+# tools/lane_applicability.py holds the rule: a lane whose arithmetic is the
+# CPU host route measures THAT BOX'S CPU on a GPU column and says nothing
+# about cuda or hip. Running one here would record a passing cell that means
+# nothing. ANONLIB_GAP_DEGENERATE names such lanes instead, and the body
+# runs `lane_applicability --check` on them ON THIS BOX so the refusal comes
+# home in the operator's own words rather than in mine.
+#
+# THE COLUMN MUST BE ADMISSIBLE OR IT IS NOT EVIDENCE.
+# python/anonlib/_verify_reference.admit wants identical mode, a 40-hex
+# commit, the default fixture set at the default size, one device,
+# heldout_seed 1, no `*_sabotage` flag, and a PATH carrying none of
+# "partial", "probe", "unfixed", "post-merge-smoke" and no basename carrying
+# "sabotage". Hence: no --fixtures cap, no ANONLIB_IDENTITY_*_SABOTAGE
+# anywhere in this file, the commit witness taken from the runner's own
+# leg.txt rather than guessed, and the import check called `import_check` and
+# not `import_probe` -- "probe" is an EXCLUDED PATH TOKEN and a stray file of
+# that name next to the column is one rename away from refusing it.
+#
+# THE IMPORT CHECK RUNS AFTER THE BUILDS, NOT BEFORE. Both of the morning's
+# legs placed theirs before the bindings build, where `import anonlib` under
+# ANONLIB_NUMERIC_MODE=identical CANNOT succeed -- it refuses with "no
+# identical binary exists under .../identical" until at least one is built. A
+# check that cannot pass is not a check.
+#
+# ONE DEVICE BY DEFAULT, ASSERTED AND PRINTED. `admit` refuses a column
+# recording par_devices, and a second visible GPU would make every cell below
+# a different claim than the one this column is recorded as. The ONE exception
+# is ANONLIB_GAP_TWO_DEVICE=1 with an all-`par-*` lane list, which adds a
+# SECOND column at ANONLIB_PAR_DEVICES=0,1 after the one above and holds the
+# two to each other on the box; a `par-*` driver's claim is not stateable on
+# one device and `admit(..., par_axis=True)` is the only rule that admits the
+# run that can state it. Nothing else changes: the column phase itself never
+# sets ANONLIB_PAR_DEVICES, so it records par_devices="0" on a two-GPU box
+# exactly as it does on a one-GPU box. On AMD there is a
+# second reason: the MI300X SR-IOV peer-copy stale read (fixed by routing
+# cross-device bytes through transfer_bytes host staging, d36cd8cb4). This leg
+# does not test that fix and does not depend on it -- GPU_COUNT stays 1 and no
+# phase here copies a byte between devices.
+#
+# EVERY PHASE IS BOUNDED, AND THE BOUND SHRINKS AS THE LEASE BURNS. The
+# runner polls for a completion sentinel and fetches NOTHING from a body that
+# never finishes, so a slow compile must cost a later phase its ceiling rather
+# than cost the whole leg its fetch.
+#
+# POSIX sh: the pod's /bin/sh is dash. `set -u` and deliberately NOT `set -e`:
+# a phase that fails is a FINDING and its log must come home.
+set -u
+cd /root/anonlib || exit 9
+SLUG="${ANONLIB_GAP_SLUG:-gap-column}"
+OUT="/root/gemm_leg_out/$SLUG"
+mkdir -p "$OUT/logs"
+G="$OUT/gate.txt"
+JOBS="${ANONLIB_COMPILE_JOBS:-8}"
+# rocminfo and rocm-smi live in /opt/rocm/bin, which the ROCm images do not
+# always put on a non-login shell's PATH.
+PATH="$PATH:/opt/rocm/bin"
+export PATH
+
+LANES="${ANONLIB_GAP_LANES:-}"
+DEGENERATE="${ANONLIB_GAP_DEGENERATE:-}"
+
+T0=$(date +%s)
+BUDGET="${ANONLIB_GAP_BUDGET:-2500}"
+# The runner's own work bound is MINUTES*60 - 600; for a 60-minute lease that
+# is 3000 s, and the device check and card ahead of this body cost about 100 s
+# of it. 2500 s leaves the runner margin to poll, fetch and terminate after
+# this body writes its sentinel.
+cap() {
+    _want=$1
+    _left=$(( T0 + BUDGET - $(date +%s) ))
+    [ "$_left" -lt 60 ] && _left=60
+    if [ "$_want" -gt "$_left" ]; then echo "$_left"; else echo "$_want"; fi
+}
+say() { echo "$@" >> "$G"; }
+run() {
+    _n=$1; shift
+    _t0=$(date +%s)
+    "$@" > "$OUT/logs/$_n.log" 2>&1
+    _e=$?
+    echo "$_n	$_e	$(( $(date +%s) - _t0 ))" >> "$OUT/status.tsv"
+    return "$_e"
+}
+say "started=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+say "budget_seconds=$BUDGET"
+say "slug=$SLUG"
+say "lanes=$LANES"
+say "degenerate_lanes=${DEGENERATE:-none}"
+if [ -z "$LANES" ]; then
+    say "NO LANES: ANONLIB_GAP_LANES is empty; this body has nothing to record"
+    exit 8
+fi
+
+# THE COMMIT WITNESS, OR identity_break REFUSES TO WRITE A JSON. The box has
+# no .git (the runner ships `git archive` at a pinned sha) and the gemm
+# payload writes no commit.txt for the extra body. The runner DOES record the
+# commit in /root/gemm_leg_out/leg.txt. Take it from there, and never guess.
+if [ ! -s /root/anonlib/commit.txt ]; then
+    _c=$(sed -n 's/^commit=//p' /root/gemm_leg_out/leg.txt 2>/dev/null | head -1 | awk '{print $1}')
+    case "$_c" in
+        [0-9a-f][0-9a-f]*) printf '%s\n' "$_c" > /root/anonlib/commit.txt ;;
+        *) say "NO COMMIT WITNESS: leg.txt gave '$_c'; the identity phase will refuse" ;;
+    esac
+fi
+say "commit=$(head -1 /root/anonlib/commit.txt 2>/dev/null)"
+
+# ------------------------------------------------------------ the box itself
+# The ONLY vendor branch in this file. device_class() in
+# python/anonlib/_verify_reference.py reads the class out of the label, so
+# the label must start with "nvidia" or "amd" and below it does.
+if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
+    VENDOR=nvidia
+    nvidia-smi --query-gpu=name,driver_version,compute_cap,memory.total --format=csv,noheader \
+        > "$OUT/logs/device.txt" 2>&1
+    say "device=$(tr '\n' ' ' < "$OUT/logs/device.txt")"
+    VISIBLE=$(nvidia-smi -L 2>/dev/null | grep -c '^GPU ')
+    say "visible_gpus=$VISIBLE"
+    if [ -z "${ANONLIB_GPU_ARCHS:-}" ]; then
+        _cc=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1 | tr -d ' ')
+        case "$_cc" in
+            9.0)  ANONLIB_GPU_ARCHS=sm_90a ;;
+            8.9)  ANONLIB_GPU_ARCHS=sm_89 ;;
+            8.6)  ANONLIB_GPU_ARCHS=sm_86 ;;
+            8.0)  ANONLIB_GPU_ARCHS=sm_80 ;;
+            12.0) ANONLIB_GPU_ARCHS=sm_120a ;;
+            *)    ANONLIB_GPU_ARCHS="sm_$(echo "$_cc" | tr -d .)" ;;
+        esac
+        export ANONLIB_GPU_ARCHS
+    fi
+    _prod=$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)
+else
+    VENDOR=amd
+    { rocm-smi --showproductname; echo "-- driver --"; cat /sys/module/amdgpu/version 2>/dev/null;
+      echo "-- agents --"; rocminfo 2>/dev/null | grep -E 'Name:|gfx' | head -20; } \
+        > "$OUT/logs/device.txt" 2>&1
+    say "device=$(rocm-smi --showproductname 2>/dev/null | tr '\n' ' ' | cut -c1-200)"
+    say "amdgpu_driver=$(cat /sys/module/amdgpu/version 2>/dev/null)"
+    VISIBLE=$(rocminfo 2>/dev/null | grep -c -E '^ *Name: *gfx')
+    say "visible_gpus=$VISIBLE"
+    if [ -z "${ANONLIB_GPU_ARCHS:-}" ]; then
+        ANONLIB_GPU_ARCHS=$(rocminfo 2>/dev/null | grep -m1 -oE 'gfx[0-9a-z]+')
+        export ANONLIB_GPU_ARCHS
+    fi
+    # The marketing name, from rocm-smi's "Card series" field and, when that
+    # layout moves between ROCm releases, from rocminfo's Marketing Name.
+    _prod=$(rocm-smi --showproductname 2>/dev/null | sed -n 's/.*[Cc]ard [Ss]eries:[[:space:]]*//p' | head -1)
+    [ -z "$_prod" ] && _prod=$(rocminfo 2>/dev/null | sed -n 's/^ *Marketing Name: *//p' | grep -i -m1 'instinct\|radeon')
+fi
+say "vendor_probe=$VENDOR"
+say "gpu_archs=${ANONLIB_GPU_ARCHS:-unset}"
+[ -z "${ANONLIB_GPU_ARCHS:-}" ] && say "NO ARCHITECTURE: bindings/build_byte_lm.sh and its siblings refuse without one"
+_prod=$(printf '%s' "$_prod" | tr 'A-Z ' 'a-z-' | tr -cd 'a-z0-9-' | cut -c1-24)
+[ -z "$_prod" ] && _prod=gpu
+LABEL="$VENDOR-$_prod-${ANONLIB_GPU_ARCHS:-unknown}"
+say "vendor_label=$LABEL"
+JSON="$OUT/$LABEL.$SLUG.json"
+
+# ------------------------------------------------ THE R2 BINDING CACHE
+# WHY THIS AND NOT `sh bindings/X.sh`. This shape of leg spends TEN TO TWENTY
+# MINUTES COMPILING and then a few minutes doing identity work on fixtures
+# that are 20000 x 16 float32 -- 1.28 MB. Measured: 1010 s of builds against
+# 1006 s of identity run on 2026-09-14 (166 lanes, two GPUs), and 1204 s of
+# builds for 23 binding families on 2026-09-19. Three legs on 2026-09-19
+# rebuilt the SAME families at the SAME commit within hours of each other. On
+# a $4.78/h two-GPU box the compile is most of the bill.
+#
+# tools/bincache.py makes each build a content-addressed lookup in the R2
+# bucket that already holds the datasets: bincache/v1/<device arch>/<image
+# slug>/<key>.tar.gz. The key is the import closure of the entry .mojo, every
+# shell script the build execs, pixi.toml and pixi.lock, the pinned toolchain,
+# every ANONLIB_/MOJO_/MODULAR_ variable that can reach the compiler, the
+# numeric mode, the arch the box reports, the container image, the OS
+# (os-release, glibc, ld, cc), the host CPU on the machines where
+# bindings/build_*.sh does not pin --target-cpu, and the absolute repo path
+# (the rpath into .pixi is baked in). A hit is therefore
+# the binary THIS box would have produced, and the archive's manifest is
+# re-verified here against the key and the fields this box computed before a
+# single byte is placed.
+#
+# IT IS A PASS-THROUGH, NOT A DEPENDENCY. `bincache.py build X` runs `sh X`
+# unchanged when /root/.anonlib_bincache/urls.tsv is absent (the Mac did not
+# stage, because ANONLIB_BINCACHE was not 1), when ANONLIB_BINCACHE=0,
+# when the key cannot be computed, and on every miss or rejection. A cold
+# cache costs the key computation, seconds over the whole leg, and the leg
+# still builds everything from source. `command -v python3` is checked because
+# a box without one must build, not die.
+#
+# A SABOTAGE BUILD IS NEVER SERVED AS A PRODUCTION BINDING. bincache.py
+# refuses to look up or upload any build whose arguments or ANONLIB_*
+# environment mention SABOTAGE or FAULT_INJECT, unless the caller opts in with
+# ANONLIB_BINCACHE_NEGATIVE=1 -- and then the fields carry variant=sabotage,
+# so the key cannot equal a production key, and both the lookup and the upload
+# use the separate bincache/sabotage-v1/ prefix that a production build never
+# reads. THIS BODY SETS NO SABOTAGE DEFINE AND NEVER SETS THAT VARIABLE.
+BINCACHE="sh"
+if command -v python3 > /dev/null 2>&1 && [ -f tools/bincache.py ]; then
+    BINCACHE="python3 tools/bincache.py build"
+fi
+if [ -f /root/.anonlib_bincache/urls.tsv ]; then
+    _bcmap="staged entries=$(grep -c '^get' /root/.anonlib_bincache/urls.tsv)"
+else
+    _bcmap="absent (every build compiles from source)"
+fi
+say "bincache=$BINCACHE map=$_bcmap"
+
+# WHAT THE CACHE ACTUALLY DID, in the gate file, because a wiring change that
+# cannot be read back is not a fix. `hit` means no compiler ran for that
+# family; `refused:` and `miss` both compiled from source.
+bincache_report() {
+    _bcp="${ANONLIB_BINCACHE_OUT:-/root/gemm_leg_out/bincache}/provenance.tsv"
+    if [ -f "$_bcp" ]; then
+        say "bincache_outcomes=$(cut -f3 "$_bcp" | sort | uniq -c | tr '\n' ' ')"
+        say "bincache_build_seconds=$(awk -F'\t' '{s+=$5} END {printf "%.0f", s}' "$_bcp")"
+    else
+        say "bincache_outcomes=none (pass-through: no map, no python3, or ANONLIB_BINCACHE=0)"
+    fi
+}
+
+build() {
+    # shellcheck disable=SC2086  # $BINCACHE is one word or three, split on purpose
+    run "$1" timeout "$(cap 420)" env ANONLIB_NUMERIC_MODE=identical ANONLIB_SKIP_BUILD_GATE=1 \
+        ANONLIB_COMPILE_JOBS="$JOBS" $BINCACHE "bindings/$1.sh"
+}
+# `env -u ANONLIB_GPU_ARCHS` comes FIRST and not as decoration: this file
+# exports that variable and bindings/build_host_family.sh REFUSES a CPU build
+# that carries one. `env FOO=1 -u BAR` does NOT unset BAR, because env stops
+# parsing options at the first assignment.
+build_host() {
+    # shellcheck disable=SC2086  # $BINCACHE is one word or three, split on purpose
+    run "$1" timeout "$(cap 420)" env -u ANONLIB_GPU_ARCHS ANONLIB_TARGET_COLUMN=cpu \
+        ANONLIB_NUMERIC_MODE=identical ANONLIB_BUILD_JOBS="$JOBS" $BINCACHE "bindings/$1.sh"
+}
+
+# ------------------------------------------- THE HOST MATH LIBRARY, OR NOTHING IMPORTS
+# MEASURED TWICE ON 2026-09-19, on pod 9laka4vs9h2zli (NVIDIA) and pod
+# f7qt7xpx8f6raq (AMD): the identity phase died ONE SECOND in, before any GPU
+# work, at
+#
+#   OSError: python/anonlib/.libs/libAnonlibMath.so: cannot open shared
+#   object file: No such file or directory
+#
+# with every binding built and NOT ONE CELL recorded.
+#
+# `python/anonlib/_portable_math.py` dlopens that library, and
+# `_training_impl.py:1844`'s `def kaiming_uniform(self, shape, fan_in,
+# a=math.sqrt(5.0))` evaluates it as a DEFAULT ARGUMENT at class definition
+# time, so `import anonlib` needs it unconditionally. It is not lazy and no
+# lane can avoid it. Nothing under bindings/ builds it, `python/anonlib/.libs/`
+# is gitignored so `git archive` ships nothing, and the only thing in the tree
+# that compiles it is `packaging/macos/build_release_wheel.sh`, which does not
+# run on Linux. A developer Mac has it sitting in the checkout from some past
+# wheel build and never notices; a freshly rented box cannot import the
+# package at all.
+#
+# This calls the tree's OWN recipe, `packaging/portable_math/stage.py`'s
+# build(), rather than retyping its compiler flags here -- those flags
+# (-ffp-contract=off, -fno-fast-math, -march=x86-64-v3, -nostdlib) are the
+# arithmetic contract, and a second copy of them is a second answer to it.
+run portable_math timeout "$(cap 300)" env PYTHONPATH=/root/anonlib/packaging/portable_math \
+    pixi run python -c "import pathlib, stage; stage.build(pathlib.Path('/root/anonlib/python/anonlib/.libs/libAnonlibMath.so'))"
+say "portable_math_exit=$(awk -F'	' '$1=="portable_math"{print $2}' "$OUT/status.tsv")"
+ls -l python/anonlib/.libs/ >> "$G" 2>&1
+
+# -------------------------------------------------- WHAT THIS LANE LIST DECLARES
+# Two derivations, both read out of the tree with the lane list in hand, both
+# printed so a wrong one is visible in the gate file rather than in a refusal
+# nine minutes later. `routes` is the GPU family a host family routes to;
+# `training_lanes`/`inference_lanes` is which lanes it serves. This is the
+# same table python/anonlib/host_surface.py's own gate reads.
+#
+# AND IT LOADS host_surface.py BY FILE PATH, NOT AS `anonlib.host_surface`.
+# MEASURED ON BOTH PODS, 2026-09-19 (xu7xs1a76fo6d2 and 2gwy35qui0kwvu): the
+# import form returned NOTHING on each, because `anonlib/__init__.py` runs
+# `_backend.select()`, which under ANONLIB_NUMERIC_MODE=identical -- which
+# the runner's own remote body exports -- refuses with "no identical binary
+# exists under .../identical" until at least one binding is built. This
+# derivation runs BEFORE the first build BY DESIGN, so the package import can
+# never succeed here: it is the "a check that cannot pass" shape that put the
+# import check after the builds, one level down, and it cost this file its own
+# first derivation on both boxes. host_surface.py imports argparse, json and
+# sys and nothing else, so loading the FILE sidesteps the package entirely.
+DECL=$(timeout "$(cap 120)" pixi run python - "$LANES" <<'PY' 2>> "$OUT/logs/declared.log"
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location(
+    "_gap_host_surface", "/root/anonlib/python/anonlib/host_surface.py")
+hs = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(hs)
+want = {s for s in sys.argv[1].split(",") if s}
+host, gpu = [], []
+for f in hs.FAMILIES:
+    served = set(f.get("training_lanes", ())) | set(f.get("inference_lanes", ()))
+    if not (served & want):
+        continue
+    host.append("build_%s_host" % f["family"])
+    r = f.get("routes")
+    if r:
+        gpu.append("build_" + r.replace("_anonlib_", ""))
+print("HOST " + " ".join(sorted(set(host))))
+print("GPU " + " ".join(sorted(set(gpu))))
+PY
+)
+DECL_HOST=$(printf '%s\n' "$DECL" | sed -n 's/^HOST //p')
+DECL_GPU=$(printf '%s\n' "$DECL" | sed -n 's/^GPU //p')
+say "declared_host_families=${DECL_HOST:-NONE-DERIVED}"
+say "declared_gpu_families=${DECL_GPU:-NONE-DERIVED}"
+[ -z "$DECL_HOST" ] && say "THE HOST DERIVATION RETURNED NOTHING. See logs/declared.log; the loop below builds every GPU family regardless, and the backstop still names what refuses."
+
+# ---------------------------------------- the declared families, then the column
+# `build` is the shared kernels and fixtures every lane reaches, so it leads
+# whatever the derivation said.
+#
+# AN ALL-`par-*` LANE LIST DERIVES NOTHING, AND THE DERIVATION CANNOT SAY SO.
+# MEASURED on pod 70i7hnr5avagda, 2026-09-20. The derivation above walks
+# host_surface.FAMILIES and keeps a family whose `training_lanes` or
+# `inference_lanes` intersect the lane list. NO `par-*` LANE IS IN ANY
+# FAMILY'S LANE LIST -- that is the same fact that makes 36 of them read
+# `none` in the sabotage census -- so for a pure par lane list both DECL_GPU
+# and DECL_HOST come back EMPTY, the loop below builds `build` alone, and the
+# column refuses with its own cure in every cell:
+#
+#   ImportError: numeric_mode='identical' needs
+#   python/anonlib/identical/_anonlib_gbdt.so, which is not built
+#
+# That leg then spent 1130 s in the insurance pass building the very family
+# the column had just named, reached the backstop rerun with 275 s of budget
+# and the two-device column with 61 s, and BOTH exited 124. It came home with
+# `complete:false` on both halves -- 13 cells and 1 cell -- and `--diff`
+# printed "no DIVERGENT or MOVED cell" over them, which is a verification that
+# cannot fail. `admit()` refused both, correctly, so nothing was credited.
+#
+# So a two-device leg builds EVERYTHING FIRST. It is not an optimisation: for
+# this lane list the derivation has no information to give, and the cost of
+# asking the insurance pass to supply it afterwards is the deliverable.
+if [ "${ANONLIB_GAP_TWO_DEVICE:-0}" = 1 ]; then
+    say "two_device_leg=1: building every family BEFORE the columns (a par-* lane list derives no families)"
+    DECL_GPU=$(ls bindings/build*.sh \
+               | sed 's#^bindings/##; s#\.sh$##' \
+               | grep -v -e '^build_host_family$' -e '_host$' \
+               | tr '\n' ' ')
+    DECL_HOST=$(ls bindings/build_*_host.sh \
+                | sed 's#^bindings/##; s#\.sh$##' \
+                | tr '\n' ' ')
+    say "two_device_gpu_families=$DECL_GPU"
+    say "two_device_host_families=$DECL_HOST"
+fi
+built=0; failed=""; DONE=""
+for b in build $DECL_GPU; do
+    [ -f "bindings/$b.sh" ] || { say "derived a GPU build that does not exist: $b"; continue; }
+    case " $DONE " in *" $b "*) continue ;; esac
+    DONE="$DONE $b"
+    if build "$b"; then built=$(( built + 1 )); else failed="$failed $b"; fi
+done
+for b in $DECL_HOST; do
+    [ -f "bindings/$b.sh" ] || { say "derived a host build that does not exist: $b"; continue; }
+    case " $DONE " in *" $b "*) continue ;; esac
+    DONE="$DONE $b"
+    if build_host "$b"; then built=$(( built + 1 )); else failed="$failed $b"; fi
+done
+say "declared_families_built=$built failed=${failed:-none}"
+
+# THE IMPORT CHECK, AFTER THE BUILDS. Under identical mode this refuses
+# outright until at least one binding exists, which is why both of
+# 2026-09-19's morning legs got a guaranteed failure out of the same two lines.
+run import_check timeout "$(cap 300)" env ANONLIB_NUMERIC_MODE=identical PYTHONPATH=/root/anonlib/python \
+    pixi run python -c "import anonlib; print('IMPORT_OK', anonlib.vendor(), anonlib.__version__)"
+say "import_check=$(tail -1 "$OUT/logs/import_check.log" 2>/dev/null)"
+
+# ------------------------------------------------------------------ the deliverable
+# Default fixtures, default size, two repeats in one process, one device. No
+# sabotage switch is set anywhere in this run.
+#
+# ANONLIB_GAP_PARTS: FIVE OF NINE PARTS IS NOT A COLUMN (2026-09-20).
+# `_verify_reference.PARTS` is train, infer, model, batch, stepfull and
+# `OPTIONAL_PARTS` is batchgrad, batchscale, ragged, rlpair. Of those nine,
+# `identity_break` runs train/infer/model/batch/rlpair by default and needs
+# --step-full, --batch-grad, --batch-scale and --ragged to be ASKED for the
+# rest. Every gap column this body has recorded was therefore five parts
+# wide, and the four neural lanes it was supposed to have closed --
+# transformer, transformer-window, samba, samba-untied-dropout-accum -- came
+# home carrying a current, admissible NVIDIA column with NO `stepfull` cell
+# in it. A missing part reads as a covered lane, which is the whole trouble:
+# nothing refuses, nothing is flagged, and the gap stays open while the
+# matrix counts the lane as done.
+#
+# So the extra part flags are a VARIABLE, the caller names them, and the
+# gate line below records what this column actually asked for. Unset keeps
+# the historical five-part behaviour rather than silently changing the shape
+# of every column this body has ever produced.
+PARTS_FLAGS="${ANONLIB_GAP_PARTS:-}"
+say "extra_part_flags=${PARTS_FLAGS:-none (train,infer,model,batch,rlpair only)}"
+column() {
+    run "$1" timeout "$(cap 1200)" env ANONLIB_NUMERIC_MODE=identical PYTHONPATH=/root/anonlib/python \
+        pixi run python tools/identity_break.py --lanes "$LANES" --repeats "${ANONLIB_GAP_REPEATS:-1}" \
+        $PARTS_FLAGS \
+        --vendor "$LABEL" --json "$JSON"
+    say "$1_exit=$(awk -F'	' -v n="$1" '$1==n{print $2}' "$OUT/status.tsv")"
+    grep -E '^cells=|MOVED|DIVERGENT|REFUSED|RELOAD' "$OUT/logs/$1.log" | head -120 >> "$G"
+    cp "$OUT/logs/$1.log" "$OUT/$1.log" 2>/dev/null
+}
+column column
+say "elapsed_after_column=$(( $(date +%s) - T0 ))"
+
+# --------------------------------------------- THE INSURANCE: every other family
+# The deliverable is already on disk. Whatever is left of the budget goes on
+# the families the derivation did NOT name, so that the backstop below has
+# them in hand: `bindings/build*.sh` minus `build_host_family.sh` (the
+# parameterized builder the shims exec, not a build by itself) and minus every
+# `build_*_host.sh` already built above.
+for s in bindings/build*.sh; do
+    n=$(basename "$s" .sh)
+    [ "$n" = build_host_family ] && continue
+    case " $DONE " in *" $n "*) continue ;; esac
+    DONE="$DONE $n"
+    case "$n" in
+        build_*_host) build_host "$n" || failed="$failed $n" ;;
+        *)            build "$n"      || failed="$failed $n" ;;
+    esac
+done
+say "all_families_failed=${failed:-none}"
+sha256sum python/anonlib/identical/*.so python/anonlib/host/*.so >> "$G" 2>/dev/null
+say "elapsed_after_all_families=$(( $(date +%s) - T0 ))"
+
+# ------------------------------------------------------- THE BACKSTOP, AND WHY
+# The refusal these lanes exist to escape NAMES ITS OWN CURE, verbatim, in the
+# cell: "Build it with ANONLIB_NUMERIC_MODE=identical bash
+# bindings/build_preprocessing.sh". Read it back out of the JSON rather than
+# out of a human's reading of a lane body: if the derivations above missed a
+# family for a reason nobody has thought of, this fixes it inside the lease
+# instead of reporting the same gap a third time. Normally it finds nothing
+# and says so. grep -o, not sed: the whole JSON can be one line and sed would
+# keep only the last match on it.
+MISSING=$(grep -o 'bindings/build[a-z_]*\.sh' "$JSON" 2>/dev/null | sed 's#bindings/##; s#\.sh$##' | sort -u | tr '\n' ' ')
+say "backstop_missing_families=${MISSING:-none}"
+if [ -n "$MISSING" ]; then
+    for b in $MISSING; do
+        [ -f "bindings/$b.sh" ] || { say "backstop: no such build script: $b"; continue; }
+        case "$b" in
+            *_host) build_host "$b" ;;
+            *)      build "$b" ;;
+        esac
+    done
+    sha256sum python/anonlib/identical/*.so python/anonlib/host/*.so >> "$G" 2>/dev/null
+    column column-after-backstop
+fi
+
+# ====================================== THE SECOND DEVICE, WHEN THE LANES ARE par-*
+# ANONLIB_GAP_TWO_DEVICE=1 (with ANONLIB_GEMM_LEG_GPU_COUNT=2) adds the
+# only run that can STATE a `par-*` driver's claim, and it is the same lane
+# list, the same build, the same box and the same commit as the column above.
+#
+# WHY THE PAIR AND NOT THE TWO-DEVICE COLUMN ALONE. `_par_devices`'s own
+# docstring is the claim: "A two-device column ... must hash equal, cell for
+# cell, to the one-device column of the same commit". A two-device column on
+# its own asserts nothing -- it is a set of hashes with nothing to be equal
+# to. The one-device half is the column phase that already ran, so the pair
+# costs one extra identity run and no extra build.
+#
+# AND WHY THE ONE-DEVICE HALF IS NOT THE DELIVERABLE HERE.
+# `lane_applicability.degenerate` holds every `par-*` lane on a one-device
+# column: with one shard the equality they assert is not false, it is not
+# expressible. So for a par lane list the one-device column is the REFERENCE
+# and the two-device column is the EVIDENCE -- the reverse of every other
+# lane list this body runs, and the reason `admit` grew `par_axis=True` on
+# 2026-09-19. ONLY a `par-*` lane may be credited from a column admitted that
+# way, and this phase refuses a lane list that is not all `par-*`.
+#
+# TWO DEVICES, COUNTED AND REFUSED BY NAME. A box that came back with one
+# agent would run this phase as a second copy of the column above and the
+# "they agree" line would be a tautology: the verification that cannot fail.
+if [ "${ANONLIB_GAP_TWO_DEVICE:-0}" = 1 ]; then
+    TWO="$OUT/$LABEL.$SLUG.two-device.json"
+    _notpar=$(printf '%s' "$LANES" | tr ',' '\n' | grep -cv '^par-')
+    if [ "${VISIBLE:-0}" -lt 2 ]; then
+        say "TWO-DEVICE PHASE REFUSED: the box reports ${VISIBLE:-0} visible GPU(s); a two-device claim needs 2. Nothing was run."
+    elif [ "$_notpar" -gt 0 ]; then
+        say "TWO-DEVICE PHASE REFUSED: $_notpar lane(s) in the list do not start 'par-'. Only a par-* lane may be credited from a par_axis column."
+    else
+        run column-two timeout "$(cap 1200)" env ANONLIB_NUMERIC_MODE=identical \
+            ANONLIB_PAR_DEVICES=0,1 PYTHONPATH=/root/anonlib/python \
+            pixi run python tools/identity_break.py --lanes "$LANES" --repeats "${ANONLIB_GAP_REPEATS:-1}" \
+            $PARTS_FLAGS \
+            --vendor "$LABEL" --json "$TWO"
+        say "column_two_exit=$(awk -F'	' '$1=="column-two"{print $2}' "$OUT/status.tsv")"
+        grep -E '^cells=|MOVED|DIVERGENT|REFUSED|RELOAD' "$OUT/logs/column-two.log" | head -120 >> "$G"
+        cp "$OUT/logs/column-two.log" "$OUT/column-two.log" 2>/dev/null
+    fi
+    # THE DIFF RUNS HERE, WHILE THE BOX CAN STILL BE ASKED AGAIN. `--diff`
+    # exits non-zero on any DIVERGENT, MOVED or RELOAD-MOVED cell, and a cell
+    # that disagrees is re-run SOLO -- one lane at a time, one process at a
+    # time -- before anybody at home calls it real.
+    if [ -s "$JSON" ] && [ -s "$TWO" ]; then
+        run par_diff timeout "$(cap 300)" env ANONLIB_NUMERIC_MODE=identical \
+            PYTHONPATH=/root/anonlib/python \
+            pixi run python tools/identity_break.py --diff "$JSON" "$TWO"
+        say "par_diff_exit=$(awk -F'	' '$1=="par_diff"{print $2}' "$OUT/status.tsv")"
+        grep -E 'summary|DIVERGENT|MOVED|REFUSED|NOT-COMPARED' "$OUT/logs/par_diff.log" | head -40 >> "$G"
+        cp "$OUT/logs/par_diff.log" "$OUT/par_diff.log" 2>/dev/null
+        # THE SELECTOR MUST MATCH EVERY WAY A CELL CAN DISAGREE, NOT TWO OF
+        # THEM (2026-09-20). This grep read `DIVERGENT|MOVED`, and the line
+        # above it -- the one that writes the gate file -- already knew the
+        # set is larger: `DIVERGENT|MOVED|REFUSED|NOT-COMPARED`. So a cell
+        # reading ONE-COLUMN or REFUSED was reported in the gate and then
+        # silently left out of the solo re-run set, and the column came home
+        # looking cleaner than the run had been. An earlier lease on
+        # tools/two_device_par_class_amd_leg.sh, which carries the same
+        # selector at its line 334, ended without ever asking the question a
+        # second time for exactly this reason.
+        #
+        # ONE-COLUMN is the case the narrow pattern could never match: it is
+        # what `--diff` prints when a cell exists on ONE side only, which is
+        # precisely the shape a par-* lane takes when the two-device arm
+        # refuses and the one-device arm does not.
+        #
+        # AND THE SELECTOR IS POSITIVE, NOT A LONGER DENYLIST. An earlier fix
+        # here enumerated the failure verdicts
+        # (DIVERGENT|MOVED|REFUSED|ONE-COLUMN|NOT-COMPARED), which is the same
+        # mistake one size larger: a verdict added later is silently dropped
+        # again, exactly as ONE-COLUMN was. This selects a lane UNLESS the
+        # verdict is one of the three that mean "no disagreement" --
+        # `IDENTICAL xN`, `N/A`, `NOT-COMPARED` -- so a new verdict is caught
+        # by default and has to be explicitly excused to be ignored.
+        #
+        # Taken verbatim from tools/two_device_par_class_amd_leg.sh, which
+        # carries the same phase; the two files had already drifted into two
+        # copies of one selector and fixing only one would have left the other
+        # to be found again. Measured on a log carrying one row of each
+        # verdict: the old grep selected 3 lanes, this selects 6.
+        _bad=$(awk -F'|' '
+            { lane = $2; sub(/^ +/, "", lane); sub(/ +$/, "", lane) }
+            lane !~ /^par-[a-z0-9_-]+\// { next }
+            {
+                v = $3; sub(/^ +/, "", v); sub(/ +$/, "", v)
+                if (v ~ /^[a-z]/) { v = $4; sub(/^ +/, "", v); sub(/ +$/, "", v) }
+                if (v ~ /^IDENTICAL x[0-9]+$/ || v == "N/A" || v == "NOT-COMPARED") next
+                sub(/\/.*/, "", lane); print lane
+            }' "$OUT/logs/par_diff.log" 2>/dev/null \
+            | sort -u | tr '\n' ',' | sed 's/,$//')
+        if [ -n "$_bad" ]; then
+            say "DISAGREEING LANES: $_bad -- re-running each arm SOLO before this is reported"
+            run solo_one timeout "$(cap 600)" env ANONLIB_NUMERIC_MODE=identical ANONLIB_PAR_DEVICES=0 \
+                PYTHONPATH=/root/anonlib/python pixi run python tools/identity_break.py \
+                --lanes "$_bad" --repeats "${ANONLIB_GAP_REPEATS:-1}" --vendor "$LABEL" --json "$OUT/solo-one-rerun.json"
+            run solo_two timeout "$(cap 600)" env ANONLIB_NUMERIC_MODE=identical ANONLIB_PAR_DEVICES=0,1 \
+                PYTHONPATH=/root/anonlib/python pixi run python tools/identity_break.py \
+                --lanes "$_bad" --repeats "${ANONLIB_GAP_REPEATS:-1}" --vendor "$LABEL" --json "$OUT/solo-two-rerun.json"
+            run solo_diff timeout "$(cap 300)" env ANONLIB_NUMERIC_MODE=identical PYTHONPATH=/root/anonlib/python \
+                pixi run python tools/identity_break.py --diff "$OUT/solo-one-rerun.json" "$OUT/solo-two-rerun.json"
+            say "solo_diff_exit=$(awk -F'	' '$1=="solo_diff"{print $2}' "$OUT/status.tsv")"
+            grep -E 'summary|DIVERGENT|MOVED' "$OUT/logs/solo_diff.log" | head -40 >> "$G"
+        else
+            say "no DIVERGENT or MOVED cell in the one-vs-two diff"
+        fi
+    else
+        say "PAR DIFF SKIPPED: one or both columns are missing or empty"
+    fi
+fi
+
+# ======================= ADMISSIBILITY, AT THE PATH THE COLUMN WILL BE COMMITTED AT
+# `admit` is PATH SENSITIVE: _EXCLUDED_PATH_TOKENS, _EXCLUDED_BASENAME_TOKENS
+# and the quarantine prefix all read the path it is given. Asking it about the
+# ON-BOX path answers a question nobody will ever ask again, so it is asked
+# about ANONLIB_GAP_COMMIT_DIR, the repo-relative directory these files will
+# land in. It is asked a SECOND time at home, at the real path, because only
+# that one is the claim -- a leg was caught by exactly that difference on
+# 2026-09-19. ANONLIB_NUMERIC_MODE is set because `_verify_reference` lives
+# INSIDE the package, so reaching it runs `__init__.py` and `_backend.select()`,
+# which refuses an unset mode on a box that has only identical bindings.
+COMMIT_DIR="${ANONLIB_GAP_COMMIT_DIR:-bench/results/identity_break/$SLUG/}"
+say "admit_commit_dir=$COMMIT_DIR"
+run admit_check timeout "$(cap 180)" env ANONLIB_NUMERIC_MODE=identical \
+    PYTHONPATH=/root/anonlib/python pixi run python -c "
+import glob, json, os, sys
+from anonlib import _verify_reference as vr
+for p in sorted(glob.glob('$OUT/*.json')):
+    name = os.path.basename(p)
+    try:
+        j = json.load(open(p))
+    except Exception as exc:
+        print(name, 'UNREADABLE', exc); continue
+    at = '$COMMIT_DIR' + name
+    why = vr.admit(j, at)
+    why_par = vr.admit(j, at, par_axis=True)
+    print(name,
+          'par_devices=' + str((j.get('package') or {}).get('par_devices')),
+          'cells=' + str(len(j.get('cells') or {})),
+          'admit=' + ('ADMISSIBLE' if why is None else why),
+          'admit_par_axis=' + ('ADMISSIBLE' if why_par is None else why_par),
+          'at=' + at)
+"
+say "--- admit, at the committed path ---"
+cat "$OUT/logs/admit_check.log" >> "$G" 2>/dev/null
+cp "$OUT/logs/admit_check.log" "$OUT/admit_check.log" 2>/dev/null
+
+# ------------------------------------- THE LANES THAT ARE NOT HERE, IN ITS WORDS
+# Not a lane list this file argues with: the rule lives in
+# tools/lane_applicability.py and this prints what it says ON THIS BOX. A lane
+# whose arithmetic is the CPU host route would record a passing cell here that
+# measures this box's CPU and says nothing about cuda or hip.
+if [ -n "$DEGENERATE" ]; then
+    _col="$VENDOR-1gpu"
+    # shellcheck disable=SC2046
+    run degenerate_check timeout "$(cap 120)" env PYTHONPATH=/root/anonlib/python \
+        pixi run python tools/lane_applicability.py --check --column "$_col" \
+        --lanes $(printf '%s' "$DEGENERATE" | tr ',' ' ')
+    say "--- the refusal, verbatim, from $_col ---"
+    cat "$OUT/logs/degenerate_check.log" >> "$G" 2>/dev/null
+    cp "$OUT/logs/degenerate_check.log" "$OUT/degenerate_check.log" 2>/dev/null
+fi
+
+# THE CROSS-COLUMN DIFF IS NOT RUN HERE. `git archive` ships the source only,
+# so bench/results/ does not exist on this box and the other vendors' columns
+# are not here to diff against. That diff costs nothing at home, against the
+# fetched column, and that is where it runs -- and where a DIVERGENT cell gets
+# re-run SOLO on this same pod before anyone calls it real.
+
+# --------------------------------------------------------------- bring it home
+cat "$OUT/status.tsv" >> "$G" 2>/dev/null
+ls -l "$OUT" >> "$G" 2>/dev/null
+bincache_report
+say "finished=$(date -u +%Y-%m-%dT%H:%M:%SZ)"

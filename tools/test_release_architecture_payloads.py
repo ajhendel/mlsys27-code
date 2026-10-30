@@ -1,0 +1,73 @@
+"""Architecture publish ordering and actual installed-target admission."""
+import hashlib
+import json
+from pathlib import Path
+import runpy
+import zipfile
+
+import pytest
+import release
+import release_reuse
+import index_release_check as index
+import qualify_verifier_wheel as qualifier
+
+
+def test_registry_parity_and_no_experimental_publication():
+    registry = runpy.run_path(str(release.ROOT / 'python/anonlib/gpu_plugins.py'))
+    rows = registry['distribution_rows']()
+    assert set(index.PROJECTS) == {'anonlib', *(r['distribution'] for r in rows)}
+    assert qualifier.PLUGIN_DISTRIBUTIONS == {r['wheel_name']: r['distribution'] for r in rows}
+    assert 'nvidia-ptx80' not in release.SPLIT_PACKAGES
+    assert 'nvidia-ptx80' not in registry['PAYLOADS']
+    assert all(r['release_enabled'] for r in rows)
+    for row in rows:
+        expected = registry['package_requirements'](row['profile'], '1.2.3')
+        assert index.REQUIRES[row['distribution']] == tuple(r.split('==')[0] for r in expected)
+
+
+def test_payloads_cannot_publish_before_own_architecture_checks():
+    # 2026-10-08, releases rent nothing: the Hopper column gates publish-nvidia only when a Hopper box is held
+    # (Release.hopper_required adds the need); otherwise publish-nvidia waits for it to settle (AFTER)
+    for vendor, columns in release.NATIVE_COLUMNS.items():
+        for column in columns:
+            if column == 'nvidia-hopper':
+                assert 'gpu-column-nvidia-hopper' in release.AFTER['publish-nvidia']
+                continue
+            assert 'gpu-column-' + column in release.NEEDS['publish-' + vendor]
+        assert 'linux-joint-diff' not in release.NEEDS['publish-' + vendor]   # deleted 2026-10-10: identity runs ONCE
+    assert {'publish-nvidia', 'publish-amd'} <= set(release.NEEDS['publish-core-linux'])
+    assert 'linux-joint-diff' not in release.AFTER
+
+
+def test_target_admission_requires_actual_installed_arch(tmp_path):
+    runner = object.__new__(release.Release)
+    receipt = tmp_path / 'results.json'
+    receipt.write_text(json.dumps({'installed': {'gpu_arch': 'sm_89'}}))
+    assert runner.column_arch_ok(tmp_path, ('sm_89',))
+    assert not runner.column_arch_ok(tmp_path, ('sm_90', 'sm_90a'))
+    receipt.write_text(json.dumps({'installed': {'vendor': 'cuda'}}))
+    assert not runner.column_arch_ok(tmp_path, ('sm_89',))
+
+
+def test_synthetic_reuse_normalizes_roots_without_changing_bytes(tmp_path):
+    core = tmp_path / 'anonlib-1-py3-none-manylinux.whl'
+    payload = tmp_path / 'anonlib_nvidia-1-py3-none-manylinux.whl'
+    with zipfile.ZipFile(core, 'w') as z:
+        z.writestr('anonlib/__init__.py', b'core')
+        z.writestr('anonlib-1.dist-info/LINUX_PAYLOAD.json', json.dumps({
+            'extensions': {'anonlib/cuda_native/sm_89/identical/kernel.so': 'hash'}, 'split': {}}))
+    with zipfile.ZipFile(payload, 'w') as z:
+        z.writestr('anonlib/cuda_native/sm_89/identical/kernel.so', b'exact bytes')
+    merged = release.merge_split([core, payload], tmp_path / 'merged.whl')
+    with zipfile.ZipFile(merged) as z:
+        assert z.read('anonlib/cuda/sm_89/identical/kernel.so') == b'exact bytes'
+        metadata = json.loads(z.read('anonlib-1.dist-info/LINUX_PAYLOAD.json'))
+        assert metadata['extensions'] == {'anonlib/cuda/sm_89/identical/kernel.so': 'hash'}
+    # the PTX slot's installed root maps back to its set path, like cuda_native
+    assert release_reuse.legacy_archive_path('anonlib/cuda_ptx/sm_80/kernel.so') == 'anonlib/cuda/sm_80/kernel.so'
+
+
+def test_missing_payload_index_release_is_refused():
+    from test_index_release_check import run
+    _, errors = run(missing=('anonlib-nvidia',))
+    assert len(errors) == 1 and 'anonlib-nvidia' in errors[0]

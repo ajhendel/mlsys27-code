@@ -1,0 +1,1468 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 the authors. Part of anonlib, DOI-WITHHELD
+"""THE MAIN BOARD: a rolling board per vendor column, the newest default race of
+each lane x dataset on main, IN ADDITION to the release boards (the author,
+2026-10-09: "a board that is just the latest as of everything even if not
+coming from a pypi release").
+
+    python3 tools/main_board_ingest.py --check      # dry run: the cells that would change
+    python3 tools/main_board_ingest.py              # write bench/results/bench_board/main-<column>/
+
+COLUMNS  one per GPU MODEL, routed by box (tools/board_hardware.py BOXES; the lq job id prefix names the box:
+         n nv, v nv2, a amd, b amd2): nvidia-l40s (nv, nv2), amd-mi325x (amd, DO), amd-mi300x (amd2, Hot Aisle).
+         Apple later. the author 2026-10-10: every row names its exact hardware and version; never mix GPU models
+         in a column. Every row (ours, each opponent, each LEDGER and FAILED row) carries `hardware` and
+         `version`; a ratio is computed only between rows of the same hardware, any other opponent row reads
+         NOT-COMPARABLE (different hardware). An observation whose recorded vendor or GPU name disagrees with the
+         box table is refused: FAILED table, reason "hardware mismatch: ...".
+LABEL    `main@<sha>` of the newest cell, never a wheel number. The board is
+         unreleased: not reproducible by pip install; the release boards are
+         the reference.
+
+INPUTS (every path is an argument; the defaults are the grid collector's files)
+  (a) lq results, `--results BOX=PATH` (default ~/anonlib-evidence/grid-lq/
+      {nv,nv2,amd}-results.txt): lines
+      `<id> <vendor> main@<sha> ALGOS lane=<l> dataset=<d> arm=ours status=<s>
+      median_ms=<ms> quality={...} digest=<h>` (the ALGOS_RE of
+      tools/six_lane_grid_lq.py). A line with a `[...]` env bracket is an A/B
+      or grid arm (ANONLIB_BUILD_DEFINES, ANONLIB_GRID_TAG, PREBUILT, ...)
+      and is SKIPPED; so is any branch other than `--branch` (main).
+  (b) board-runner summaries, `--grid-logs BOX=PATH` (default
+      {nv,nv2,amd}-grid-logs.txt): the `GRIDBB ...` lines of
+      tools/six_lane_grid_bb.py, prefixed by their log path
+      (/root/lq/out/<id>/...). The job's CMD line in (a) decides: branch main,
+      an env bracket holding ONLY ANONLIB_GRID_TAG (box_job.sh exports the
+      CMD tag there), and a tag that is not a grid run's (`--skip-tag-re`:
+      `g<8 hex>.` run ids, smoke tags). Any other ANONLIB_* token (build
+      defines, an ENV= switch) means not the default configuration: skipped.
+  (c) optional `--json-dir DIR`: bench_board board.json files found under DIR
+      (an lq job's bb/board.json). The job id comes from the path
+      (/<id>/bb/board.json) and must pass the (b) job rule; the commit
+      (box.repo.commit) must be an ancestor of `--main-ref`. These cells keep
+      their clock span (`upload_ms_separate`), so both of our clocks show.
+  (d) the column's previous main board (its own cells re-enter the choice, so
+      a rotated results file never drops a cell) and its LEDGER.json.
+
+THE RULE: per (column, lane, dataset) the newest race wins, newest = highest
+commit date of its sha (`git log -1 --format=%ct <sha>`; a sha not in this
+repo is skipped with a note), ties by job number, over the runs whose status
+is ok. A newer ok cell REPLACES an older one whatever the two times are: the
+board never keeps an older number because it was lower. A run that is not ok
+(error, refused, timeout, not_ready, NO-RECORD, NO-OURS-CELL) is never a
+numeric cell and never replaces an ok cell (orchestrator, 2026-10-09): it goes
+to the board's FAILED table (lane, dataset, sha, job, the result line's reason
+text), and an older ok cell stays, flagged "newer run <sha>/<job> failed:
+<reason>". Every replaced or failed observation goes to LEDGER.json /
+LEDGER.md with its numbers and the cell that stayed. The Identity section at
+the top of BOARD.md lists every DIFFER cell by name with both digests and the
+sha.
+
+EACH CELL: lane, dataset, mode identical, our median (one scored run), the
+quality metrics, the output digest, commit sha, box/job id, commit date, and
+the opponents COPIED from the stored opponent boards (`--opponents
+COLUMN=LABEL=PATH`, in priority order; never re-run here), with the stored
+cells' clock spans. The board is written THROUGH tools/bench_board.py
+(add_ratios, save_result, write_board -> render_board, which draws both clocks
+from tools/board_clock_audit.py: torch GPU arms kernel/kernel, every other arm
+whole/whole, never an invented copy time). Identity: the digest of the same
+lane x dataset x sha on the other vendor, MATCH / DIFFER / n/a, in the cell's
+`main_board.identity` and in its status column.
+
+Opponents are withheld (not copied) for an algos or classical2 race whose lane
+settings at this tree's HEAD differ from the settings the opponent race
+recorded: a ratio against different settings would not compare. The race
+says so on the board.
+
+This is tooling (standard library only); it times nothing and runs nothing on
+a box. The board never states a direction.
+"""
+from __future__ import annotations
+
+import argparse
+import copy
+import datetime
+import hashlib
+import importlib.util
+import json
+import os
+import re
+import subprocess
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(HERE)
+EVIDENCE = os.path.expanduser("~/anonlib-evidence")
+GRID_LQ = os.path.join(EVIDENCE, "grid-lq")
+BOARD_ROOT = os.path.join(REPO, "bench", "results", "bench_board")
+
+SCHEMA_NOTE = "anonlib-main-board/1"
+
+
+def _load_hw():
+    spec = importlib.util.spec_from_file_location("board_hardware_for_main_board", os.path.join(HERE, "board_hardware.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+# the author 2026-10-10: every row names its exact hardware and version; never mix GPU models in a column.
+# The box table lives in ONE place (tools/board_hardware.py); columns are per GPU model, routed by box.
+HW = _load_hw()
+COLUMN_GPU = {k: dict(v) for k, v in HW.COLUMNS.items()}
+COLUMN_VENDOR = {k: v["vendor"] for k, v in COLUMN_GPU.items()}
+BOX_TEXT = {b: HW.box_hardware(b) for b in HW.BOXES}
+OTHER_VENDOR = {"nvidia": "amd", "amd": "nvidia"}
+LQ_BOXES = ("nv", "nv2", "amd", "amd2")
+OPPONENT_ARCHIVE = os.path.join(REPO, "bench", "results", "opponent-archive")
+
+DEFAULT_RESULTS = ["%s=%s" % (b, os.path.join(GRID_LQ, "%s-results.txt" % b)) for b in LQ_BOXES]
+DEFAULT_GRID_LOGS = ["%s=%s" % (b, os.path.join(GRID_LQ, "%s-grid-logs.txt" % b)) for b in LQ_BOXES]
+#: The stored opponent boards, per column, highest priority first: the Oct 6
+#: opponent re-score (carries the clock spans of AGENTS.md item 6), then the
+#: release boards' own opponent cells (0.8.25, board-resume-r2).
+DEFAULT_OPPONENTS = [
+    "nvidia-l40s=opponents-default-20261006=" + os.path.join(BOARD_ROOT, "overnight-20261006-nvidia-default", "board.json"),
+    "nvidia-l40s=opponents-specific-20261006=" + os.path.join(BOARD_ROOT, "overnight-20261006-nvidia-specific", "board.json"),
+    "nvidia-l40s=release-board-resume-r2=" + os.path.join(EVIDENCE, "board-resume-r2", "nvidia-l40s", "board", "board.json"),
+    "amd-mi325x=opponents-20261006=" + os.path.join(BOARD_ROOT, "overnight-20261006-amd", "board.json"),
+    "amd-mi325x=release-board-resume-r2=" + os.path.join(EVIDENCE, "board-resume-r2", "amd-mi325x", "board", "board.json"),
+]
+#: Grid run tags (tools/six_lane_grid_lq.py run_id_of: 'g' + 8 hex, then '.<pack>') and smoke tags.
+DEFAULT_SKIP_TAG_RE = r"^g[0-9a-f]{8}[A-Za-z0-9_-]*\.|smoke"
+
+# The line grammar of tools/six_lane_grid_lq.py (RESULT_RE, ALGOS_RE, DIGEST_TAIL_RE, GRIDBB_RE), copied so
+# this tool loads no grid module; tools/test_main_board_ingest.py holds them to the same fixtures.
+RESULT_RE = re.compile(r"^(?P<id>[A-Za-z]\d+) (?P<vendor>nvidia|amd) (?P<branch>\S+?)@(?P<head>[0-9a-f]+)(?P<rest>.*)$")
+ALGOS_RE = re.compile(r"(?:^|\s)ALGOS lane=(?P<lane>\S+) dataset=(?P<ds>\S+) arm=(?P<arm>\S+) status=(?P<status>\S+) "
+                      r"median_ms=(?P<ms>\S+)(?: quality=(?P<q>.*))?$")
+# ROUNDS-DIFFER(<d0>,<d1>,...) is lq's tail when its per-run digests disagreed (before 2026-10-12 it pooled the arms,
+# so most such tails were artifacts); the quality dict in front of it is still valid, the digest is unknown.
+DIGEST_TAIL_RE = re.compile(r" digest=([0-9a-f]+|none|ROUNDS-DIFFER\([^)]*\))$")
+GRIDBB_RE = re.compile(r"^GRIDBB tag=(?P<tag>\S+) vendor=(?P<vendor>\S+) head=(?P<head>\S+) family=(?P<family>\S+) "
+                       r"lane=(?P<lane>\S+) dataset=(?P<ds>\S+) status=(?P<status>\S+) median_ms=(?P<ms>\S+) "
+                       r"hash=(?P<hash>\S+) quality=(?P<q>.*)$")
+CMD_RE = re.compile(r"^\s*CMD (?P<tag>\S+) rc=(?P<rc>-?\d+)")
+JOB_IN_PATH_RE = re.compile(r"(?:^|/)([A-Za-z]\d{3,})/")
+DIGEST_CHARS = 16          # box_job.sh keeps the first 16 hex characters of a digest
+TAG_ENV = "ANONLIB_GRID_TAG"
+INFRA = ("not_ready", "NO-RECORD", "NO-OURS-CELL")
+#: Lane-settings keys that change what a race measures (bench_board_algos.lane_config,
+#: bench_board_more.LANE_CONFIG); descriptive text keys are not compared.
+SETTINGS_KEYS = ("params", "dataset_params", "block", "task", "kind", "stride_subsets", "sklearn", "cuml", "rows")
+PRIORITY = {"paired": 4, "json": 3, "algos": 2, "gridbb": 2, "previous": 1}
+OB_FIELDS = ("column", "vendor", "box", "job", "sha", "ct", "kind", "family", "lane", "dataset", "race_id",
+             "status_raw", "status", "infra", "median_ms", "quality", "digest", "comparability", "evidence",
+             "measured", "tag", "reason", "hardware", "version", "gpu_recorded", "measured_cell", "paired_race", "paired_box")
+#: A line that records the GPU a job ran on (FSPEED-HEADER device=, an ALGOS/GRIDBB device header); a value with
+#: spaces is quoted or written with '_'. Text naming no GPU ("gpu", "selftest") is not judged.
+DEVICE_LINE_RE = re.compile(r"(?:^|[\s:])(?:FSPEED-HEADER|ALGOS-HEADER|ALGOS-DEVICE|GRIDBB-DEVICE)\b.*?"
+                            r"\b(?:device_name|gpu_name|device|gpu)=(\"[^\"]*\"|\S+)")
+
+
+def now_utc():
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def iso(ct):
+    if ct is None:
+        return None
+    return datetime.datetime.fromtimestamp(int(ct), datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def load_bench_board():
+    spec = importlib.util.spec_from_file_location("bench_board_for_main_board", os.path.join(HERE, "bench_board.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+# ---------------------------------------------------------------------------
+# git: commit dates
+# ---------------------------------------------------------------------------
+
+class GitResolver:
+    """sha prefix -> (full sha, commit time) or None when the repo lacks it."""
+
+    def __init__(self, repo, main_ref="origin/main"):
+        self.repo, self.main_ref = repo, main_ref
+        self.cache, self.anc, self.ver = {}, {}, {}
+
+    def __call__(self, sha):
+        if sha not in self.cache:
+            p = subprocess.run(["git", "-C", self.repo, "log", "-1", "--no-walk", "--format=%H %ct", sha, "--"],
+                               capture_output=True, text=True)
+            parts = p.stdout.split()
+            self.cache[sha] = (parts[0], int(parts[1])) if p.returncode == 0 and len(parts) == 2 else None
+        return self.cache[sha]
+
+    def version(self, full):
+        """'anonlib <version> (source build, main@<sha9>)': python/anonlib/_version.py at that commit."""
+        if full not in self.ver:
+            p = subprocess.run(["git", "-C", self.repo, "show", "%s:python/anonlib/_version.py" % full],
+                               capture_output=True, text=True)
+            m = re.search(r"__version__\s*=\s*[\"']([^\"']+)", p.stdout) if p.returncode == 0 else None
+            self.ver[full] = "anonlib %s (source build, main@%s)" % (
+                m.group(1) if m else "version unrecorded", full[:9])
+        return self.ver[full]
+
+    def on_main(self, full):
+        if full not in self.anc:
+            p = subprocess.run(["git", "-C", self.repo, "merge-base", "--is-ancestor", full, self.main_ref],
+                               capture_output=True, text=True)
+            self.anc[full] = p.returncode == 0
+        return self.anc[full]
+
+
+# ---------------------------------------------------------------------------
+# Parsing (pure: text in, records out)
+# ---------------------------------------------------------------------------
+
+def _num(text):
+    try:
+        v = float(text)
+    except (TypeError, ValueError):
+        return None
+    return v if v == v and v not in (float("inf"), float("-inf")) else None
+
+
+def split_bracket(rest):
+    """' [ K=V K2=V2 ] tail' -> ({K: V, ...}, ' tail'); no bracket -> (None, rest).
+    A bracket word without '=' is kept under '_words'."""
+    s = rest.lstrip()
+    if not s.startswith("["):
+        return None, rest
+    end = s.find("]")
+    if end < 0:
+        return {"_words": [s[1:]]}, ""
+    env = {}
+    for tok in s[1:end].split():
+        if "=" in tok:
+            k, v = tok.split("=", 1)
+            env[k] = v
+        else:
+            env.setdefault("_words", []).append(tok)
+    return env, " " + s[end + 1:].lstrip()
+
+
+def parse_algos(text):
+    m = ALGOS_RE.search(text)
+    if not m:
+        return None
+    q, digest = m.group("q"), None
+    if q is not None:
+        d = DIGEST_TAIL_RE.search(q)
+        if d:
+            digest = None if d.group(1) == "none" or d.group(1).startswith("ROUNDS-DIFFER") else d.group(1)[:DIGEST_CHARS]
+            q = q[:d.start()]
+        try:
+            q = json.loads(q)
+        except ValueError:
+            q = None
+    return dict(lane=m.group("lane"), dataset=m.group("ds"), arm=m.group("arm"), status=m.group("status"),
+                median_ms=_num(m.group("ms")), quality=q if isinstance(q, dict) else {}, digest=digest)
+
+
+def parse_results(lines, box, evidence):
+    """results.txt lines of one box -> (jobs {id: job}, ALGOS records [..])."""
+    jobs, algos = {}, []
+    for raw in lines:
+        m = RESULT_RE.match(raw.strip())
+        if not m:
+            continue
+        jid = m.group("id")
+        # the job id prefix names the box (n nv, v nv2, a amd, b amd2), whatever file the line was pulled into
+        jbox = HW.box_for_job(jid, box)
+        env, tail = split_bracket(m.group("rest"))
+        job = jobs.setdefault(jid, dict(box=jbox, id=jid, vendor=m.group("vendor"), branch=m.group("branch"),
+                                        head=m.group("head"), env={}, bracket=False, cmd_tag=None))
+        if env is not None:
+            job["bracket"] = True
+            job["env"].update(env)
+        c = CMD_RE.match(tail)
+        if c:
+            job["cmd_tag"] = c.group("tag")
+            continue
+        a = parse_algos(tail)
+        if a:
+            algos.append(dict(a, box=jbox, job=jid, vendor=m.group("vendor"), branch=m.group("branch"),
+                              head=m.group("head"), env=env, evidence=evidence))
+    return jobs, algos
+
+
+def parse_gridbb(lines, box, evidence):
+    """grid-logs lines ('<log path>:GRIDBB tag=...') of one box -> GRIDBB records [..]."""
+    out = []
+    for raw in lines:
+        i = raw.find("GRIDBB tag=")
+        if i < 0:
+            continue
+        m = GRIDBB_RE.match(raw[i:].strip())
+        if not m:
+            continue
+        jm = JOB_IN_PATH_RE.findall(raw[:i])
+        try:
+            q = json.loads(m.group("q"))
+        except ValueError:
+            q = {}
+        h = m.group("hash")
+        out.append(dict(box=HW.box_for_job(jm[-1] if jm else None, box), job=jm[-1] if jm else None, tag=m.group("tag"), vendor=m.group("vendor"),
+                        head=m.group("head"), family=m.group("family"), lane=m.group("lane"),
+                        dataset=m.group("ds"), status=m.group("status"), median_ms=_num(m.group("ms")),
+                        quality=q if isinstance(q, dict) else {},
+                        digest=None if h in ("none", "None", "") else h[:DIGEST_CHARS], evidence=evidence))
+    return out
+
+
+def parse_devices(lines, box):
+    """{(box, job): recorded GPU name} from device header lines (results or grid-logs, a log path naming the job)."""
+    out = {}
+    for raw in lines:
+        m = DEVICE_LINE_RE.search(raw)
+        if not m:
+            continue
+        r = RESULT_RE.match(raw.strip())
+        jm = JOB_IN_PATH_RE.findall(raw[:m.start()] + "/")
+        jid = r.group("id") if r else (jm[-1] if jm else None)
+        if jid:
+            out[(HW.box_for_job(jid, box), jid)] = m.group(1).strip('"').replace("_", " ")
+    return out
+
+
+def board_status(raw, median_ms):
+    """A driver status -> the board's status text."""
+    raw = str(raw)
+    if raw == "ok":
+        return "ok" if median_ms is not None else "REFUSED(ok without a median)"
+    if raw in ("not-scored", "recompiled-in-clock") and median_ms is not None:
+        # timed in every round, quality scorer failed or did not run (lane harness-evidence, 2026-10-14):
+        # shown as measured with "quality not scored"; a display status, never an exclusion
+        return raw
+    if raw.startswith(("REFUSED", "QUALITY", "HOST-MEMORY", "MODE-MISMATCH", "PARTIAL", "UNKNOWN")):
+        return raw          # bench_board's own status text (GRIDBB writes its spaces as '_')
+    return "REFUSED(%s)" % raw
+
+
+def is_infra(raw):
+    return any(str(raw).startswith(s) or str(raw).startswith("REFUSED(%s" % s) for s in INFRA)
+
+
+# ---------------------------------------------------------------------------
+# Admission: default configuration on main only
+# ---------------------------------------------------------------------------
+
+class Skips:
+    def __init__(self):
+        self.counts, self.notes = {}, []
+
+    def add(self, reason, note=None):
+        self.counts[reason] = self.counts.get(reason, 0) + 1
+        if note and len(self.notes) < 200:
+            self.notes.append("%s: %s" % (reason, note))
+
+
+def job_is_default(job, branch, skip_tag_re):
+    """None when a CMD job ran the default configuration on `branch`, else the reason."""
+    if job is None:
+        return "no job line in results"
+    if job["branch"] != branch:
+        return "branch %s" % job["branch"]
+    env = job.get("env") or {}
+    extra = sorted(k for k in env if k != TAG_ENV)
+    if extra:
+        return "A/B or switched build (%s)" % ",".join(extra)
+    tag = env.get(TAG_ENV) or job.get("cmd_tag") or ""
+    if skip_tag_re.search(tag):
+        return "grid or smoke tag"
+    return None
+
+
+def make_ob(BB, resolve, skips, *, kind, vendor, box, job, head, family, lane, dataset, status_raw, median_ms,
+            quality, digest, evidence, comparability=None, measured=None, tag=None, full=None, gpu_recorded=None):
+    # the author 2026-10-10: every row names its exact hardware and version; never mix GPU models in a column.
+    # The column is the BOX's GPU model (tools/board_hardware.py), never the vendor.
+    column = HW.column_for_box(box)
+    if column is None:
+        skips.add("box without a main-board column", "%s (%s)" % (box, vendor))
+        return None
+    # Grep-able guard: a recorded vendor or GPU name that disagrees with the box table refuses the observation.
+    mismatch = HW.gpu_mismatch(box, vendor, gpu_recorded)
+    if mismatch:
+        status_raw, median_ms = "REFUSED(hardware mismatch)", None
+        skips.add("hardware mismatch", "%s/%s %s/%s: %s" % (box, job, lane, dataset, mismatch))
+    if full is None:
+        r = resolve(head)
+        if r is None:
+            skips.add("sha not in this repo", "%s %s/%s %s %s/%s" % (head, box, job, kind, lane, dataset))
+            return None
+        full, ct = r
+    else:
+        ct = (resolve(full) or (full, None))[1]
+        if ct is None:
+            skips.add("sha not in this repo", "%s %s/%s %s %s/%s" % (full, box, job, kind, lane, dataset))
+            return None
+    shape = "full" if family == "neural" else None
+    version = resolve.version(full) if hasattr(resolve, "version") else "anonlib (source build, main@%s)" % full[:9]
+    reason = mismatch or failure_reason(status_raw, median_ms, quality)
+    return dict(column=column, vendor=vendor, box=box, job=job, sha=full, ct=ct, kind=kind, family=family,
+                hardware=HW.box_hardware(box), version=version, gpu_recorded=gpu_recorded,
+                lane=lane, dataset=dataset, race_id=BB.race_id(family, lane, dataset, None, shape),
+                status_raw=status_raw, status=board_status(status_raw, median_ms), infra=is_infra(status_raw),
+                median_ms=median_ms, quality=quality or {}, digest=digest, comparability=comparability or {},
+                evidence=evidence, measured=measured, tag=tag, reason=reason)
+
+
+def failure_reason(status_raw, median_ms, quality):
+    """The failure text a result line carries: its status, plus any error/reason text its quality holds.
+    None for an ok run with a median."""
+    if str(status_raw) == "ok" and median_ms is not None:
+        return None
+    parts = [str(status_raw) if str(status_raw) != "ok" else "ok without a median"]
+    for k in ("error", "reason", "refused", "message"):
+        v = (quality or {}).get(k) if isinstance(quality, dict) else None
+        if isinstance(v, str) and v.strip():
+            parts.append("%s: %s" % (k, " ".join(v.split())[:240]))
+    return "; ".join(parts)
+
+
+def admit_algos(BB, rec, branch, resolve, skips, devices=None):
+    if rec["branch"] != branch:
+        skips.add("ALGOS: branch other than %s" % branch)
+        return None
+    if rec["env"] is not None:
+        keys = sorted(k for k in rec["env"] if k != "_words")
+        skips.add("ALGOS: A/B or grid arm (%s)" % (",".join(keys) or "bracket"))
+        return None
+    if rec["arm"] != "ours":
+        skips.add("ALGOS: arm %s" % rec["arm"])
+        return None
+    if rec["lane"] not in BB.ALGOS_LANES:
+        skips.add("ALGOS: lane not on the board", rec["lane"])
+        return None
+    return make_ob(BB, resolve, skips, kind="algos", vendor=rec["vendor"], box=rec["box"], job=rec["job"],
+                   head=rec["head"], family="algos", lane=rec["lane"], dataset=rec["dataset"],
+                   status_raw=rec["status"], median_ms=rec["median_ms"], quality=rec["quality"],
+                   digest=rec["digest"], evidence=rec["evidence"],
+                   gpu_recorded=(devices or {}).get((rec["box"], rec["job"])))
+
+
+def unplanned_reason(BB, family, lane, dataset):
+    """None when bench_board plans the (family, lane, dataset) race, else why it never will.
+
+    A GRIDBB line for a race bench_board never plans says NO-RECORD, and that is a request error, not a failed
+    cell (lane F3, 2026-10-10): nv n0570 / amd a0885 asked neural:conv2d|moe|resnet-block:synthetic (algos lanes,
+    whose ok cells are algos/<lane>/synthetic/rows=full), nv n0320 / amd a0499 asked
+    trees:gbdt-categorical:istella (the lane is taxi only, bench_board.TREE_TASK_DATASETS). Those rows sat in
+    FAILED with "ok cell on the board: none" under a race id no ok run ever has. tools/six_lane_grid_bb.py now
+    refuses such a request up front (GRIDBB-UNPLANNED)."""
+    if family not in BB.FAMILIES:
+        return "unknown family %s" % family
+    if lane not in BB.family_lanes(family):
+        owner = [f for f in BB.FAMILIES if lane in BB.family_lanes(f)]
+        return "lane %s is not in bench_board family %s%s" % (lane, family, (" (it is %s)" % ",".join(owner)) if owner else "")
+    if family == "trees" and not BB.tree_task_datasets(lane, [dataset]):
+        return "bench_board plans no %s race for %s (TREE_TASK_DATASETS)" % (dataset, lane)
+    return None
+
+
+def admit_gridbb(BB, rec, jobs, branch, skip_tag_re, resolve, skips, devices=None):
+    job = jobs.get((rec["box"], rec["job"])) if rec["job"] else None
+    why = job_is_default(job, branch, skip_tag_re)
+    if why:
+        skips.add("GRIDBB: " + why.split(" (")[0], "%s/%s %s" % (rec["box"], rec["job"], rec["tag"]))
+        return None
+    if not (job["head"].startswith(rec["head"]) or rec["head"].startswith(job["head"])):
+        skips.add("GRIDBB: head differs from its job", "%s/%s %s vs %s" % (rec["box"], rec["job"], rec["head"], job["head"]))
+        return None
+    if rec["family"] not in BB.FAMILIES:
+        skips.add("GRIDBB: unknown family", rec["family"])
+        return None
+    why = unplanned_reason(BB, rec["family"], rec["lane"], rec["dataset"])
+    if why:
+        skips.add("GRIDBB: not a bench_board race", "%s/%s %s %s/%s/%s: %s" % (
+            rec["box"], rec["job"], rec["tag"], rec["family"], rec["lane"], rec["dataset"], why))
+        return None
+    return make_ob(BB, resolve, skips, kind="gridbb", vendor=rec["vendor"], box=rec["box"], job=rec["job"],
+                   head=job["head"], family=rec["family"], lane=rec["lane"], dataset=rec["dataset"],
+                   status_raw=rec["status"], median_ms=rec["median_ms"], quality=rec["quality"],
+                   digest=rec["digest"], evidence=rec["evidence"], tag=rec["tag"],
+                   gpu_recorded=(devices or {}).get((rec["box"], rec["job"])))
+
+
+def json_observations(BB, json_dir, jobs, branch, skip_tag_re, resolve, skips):
+    """bench_board board.json files under json_dir -> observations of our IDENTICAL cell per race."""
+    out = []
+    if not json_dir:
+        return out
+    by_id = {}
+    for (box, jid), job in jobs.items():
+        by_id.setdefault(jid, []).append(job)
+    for root, _dirs, files in os.walk(json_dir):
+        if "board.json" not in files:
+            continue
+        path = os.path.join(root, "board.json")
+        ids = JOB_IN_PATH_RE.findall(path.replace(os.sep, "/"))
+        jid = ids[-1] if ids else None
+        cands = by_id.get(jid) or []
+        job = cands[0] if len(cands) == 1 else None
+        why = job_is_default(job, branch, skip_tag_re) if len(cands) <= 1 else "job id on several boxes"
+        if why:
+            skips.add("JSON: " + why.split(" (")[0], path)
+            continue
+        try:
+            board = BB.load_result(path) or {}
+        except (OSError, ValueError) as exc:
+            skips.add("JSON: unreadable", "%s (%s)" % (path, exc.__class__.__name__))
+            continue
+        if (board.get("config") or {}).get("smoke"):
+            skips.add("JSON: smoke run", path)
+            continue
+        commit = ((board.get("box") or {}).get("repo") or {}).get("commit") or ""
+        r = resolve(commit) if commit else None
+        if r is None or not resolve.on_main(r[0]) or not r[0].startswith(job["head"]):
+            skips.add("JSON: commit not on main or not the job's", "%s %s" % (path, commit[:9]))
+            continue
+        vendor = ((board.get("box") or {}).get("gpu") or {}).get("vendor") or job["vendor"]
+        gpu_name = ((board.get("box") or {}).get("gpu") or {}).get("name")
+        for rid, rr in sorted((board.get("races") or {}).items()):
+            cell = next((c for c in rr.get("cells") or [] if c.get("arm") == "ours" and c.get("mode") == "identical"),
+                        None)
+            if cell is None or cell.get("rows_tag") not in (None, "full"):
+                skips.add("JSON: race without a full-size IDENTICAL cell of ours", rid)
+                continue
+            ob = make_ob(BB, resolve, skips, kind="json", vendor=vendor, box=job["box"], job=jid, head=job["head"],
+                         family=rr.get("family"), lane=rr.get("lane"), dataset=rr.get("dataset"),
+                         status_raw=cell.get("status"), median_ms=cell.get("median_ms"),
+                         quality=cell.get("quality"), digest=(cell.get("hash") or "")[:DIGEST_CHARS] or None,
+                         evidence=path, comparability=cell.get("comparability"), measured=rr.get("finished"),
+                         full=r[0], gpu_recorded=cell.get("device_name") or gpu_name)
+            if ob is not None and ob["status_raw"] != "REFUSED(hardware mismatch)":
+                ob["status"] = cell.get("status") or ob["status"]
+                # Preserve the measuring worker's evidence. Never reconstruct
+                # its parameters, versions or source from today's checkout.
+                ob["measured_cell"] = copy.deepcopy(cell)
+                out.append(ob)
+    return out
+
+
+def previous_observations(prev):
+    """The cells of ours on the column's previous main board, as observations."""
+    out = []
+    for rr in ((prev or {}).get("races") or {}).values():
+        for c in rr.get("cells") or []:
+            mb = c.get("main_board") or {}
+            ob = mb.get("observation")
+            if c.get("library") == "anonlib" and isinstance(ob, dict) and ob.get("sha"):
+                item = _reroute(dict({k: ob.get(k) for k in OB_FIELDS}, prior_kind=ob.get("kind"), kind="previous"))
+                # A rebuild is not a new measurement. Preserve an unchanged
+                # historical pair and its audit instead of borrowing different
+                # opponents or reconstructing its old settings from today's code.
+                # Ephemeral only: not OB_FIELDS, so no recursively nested boards.
+                if not item.get("paired_race"):
+                    item["preserved_race"] = copy.deepcopy(rr)
+                out.append(item)
+    # the failed runs the previous board listed (FAILED table, flags), so a rotated input keeps them too
+    for ob in ((prev or {}).get("main_board") or {}).get("failed_observations") or []:
+        if isinstance(ob, dict) and ob.get("sha"):
+            out.append(_reroute(dict({k: ob.get(k) for k in OB_FIELDS}, prior_kind=ob.get("kind"), kind="previous")))
+    return [o for o in out if o.get("column")]
+
+
+def retained_opponent_problems(race, ours, opponent):
+    """Validate an immutable store hit without inventing current provenance."""
+    bad = []
+    own = ours.get("measurement") or {}
+    measured = opponent.get("measurement") or {}
+    if measured.get("completeness") != "complete" or not measured.get("id"):
+        bad.append("incomplete retained measurement")
+    for name in ("source", "artifacts"):
+        ref = measured.get(name) or {}
+        digest = ref.get("sha256") or ""
+        if (ref.get("status") != "verified" or not re.fullmatch(r"[0-9a-f]{64}", digest)
+                or not ref.get("r2_bucket") or not (ref.get("r2_key") or "").endswith("/" + digest + ".tar.gz")):
+            bad.append("retained %s lacks a verified content-addressed archive" % name)
+    def gpu_kind(cell):
+        m = cell.get("measurement") or {}
+        worker = m.get("hardware") or {}
+        gpu = (m.get("controller_hardware") or {}).get("gpu") or {}
+        model = HW.canonical_model(gpu.get("name"))
+        # The old worker's UUID, host and driver may differ. Its recorded
+        # vendor/model must still identify the same kind of timing GPU.
+        if worker.get("status") != "verified" or not model or worker.get("vendor") != gpu.get("vendor"):
+            return None
+        for text in (worker.get("gpu_driver_identity"), cell.get("device_name"), cell.get("hardware")):
+            other = HW.canonical_model(text)
+            if other is not None and other != model:
+                return None
+        return gpu.get("vendor"), model
+    if gpu_kind(ours) is None or gpu_kind(ours) != gpu_kind(opponent):
+        bad.append("retained worker GPU kind is missing or differs")
+    for cell in (ours, opponent):
+        params = (cell.get("measurement") or {}).get("parameters") or {}
+        impl = params.get("implementation") or {}
+        if not params.get("params") or not impl.get("module") or not impl.get("name"):
+            bad.append("effective settings or library implementation missing")
+        if params != cell.get("params"):
+            bad.append("cell parameters differ from retained worker readback")
+    po, pt = (own.get("parameters") or {}).get("params") or {}, (measured.get("parameters") or {}).get("params") or {}
+    exceptions = list((race.get("params") or {}).get("exceptions") or []) + list(measured.get("parameter_exceptions") or [])
+    allowed = {e.get("param") for e in exceptions if e.get("arm") == opponent.get("arm") and e.get("reason")}
+    if (set(po) ^ set(pt)) - {"seed"} - allowed:
+        bad.append("work-changing parameter coverage differs")
+    problems, missing, readback = RF._pair_problems(race, ours, opponent)
+    bad.extend(problems + missing)
+    if not readback:
+        bad.append("no comparable effective settings")
+    return sorted(set(bad))
+
+
+def paired_observations(BB, specs, resolve, skips):
+    """Import an actual paired session, retaining its opponents across rebuilds.
+
+    The measurement ID is its job identity; no lq job or historical opponent
+    is invented. Fairness still judges every pair after assembly.
+    """
+    out = []
+    for box, path in _pairs(specs or []):
+        board = BB.load_result(path)
+        for rid, rr in (board.get("races") or {}).items():
+            rr = copy.deepcopy(rr)
+            cells = rr.get("cells") or []
+            ours = next((c for c in cells if c.get("library") == "anonlib" and c.get("mode") == "identical"), None)
+            measured = [c for c in cells if c.get("status") in ("ok", "not-scored", "recompiled-in-clock")]
+            if not ours or ours.get("rows_tag") not in (None, "full") or rr.get("params_check") != "MATCHED":
+                raise ValueError("paired board lacks a full-recipe, parameter-checked own arm: " + rid)
+            m = ours.get("measurement") or {}
+            for c in measured:
+                cm = c.get("measurement") or {}
+                if c.get("mode") == "opponent" and c.get("stored"):
+                    # FAIRNESS FIX (2026-10-13 audit): valid historical store
+                    # hits were rejected because their source/host/UUID was
+                    # not ours. Retain their actual bytes and provenance;
+                    # compare settings, GPU kind and derivable clocks instead.
+                    problems = retained_opponent_problems(rr, ours, c)
+                    rr.setdefault("retained_opponent_checks", {})[c["arm"]] = dict(
+                        measurement_id=cm.get("id"), problems=problems)
+                    if problems:
+                        ex = rr.setdefault("opponents_excluded", {"arms": [], "why": {}})
+                        ex["arms"] = sorted(set(ex.get("arms", [])) | {c["arm"]})
+                        ex.setdefault("why", {})[c["arm"]] = "retained opponent evidence: " + "; ".join(problems)
+                        ex["reason"] = "; ".join("%s: %s" % item for item in sorted(ex["why"].items()))
+                    continue
+                if (cm.get("completeness") != "complete" or not cm.get("id")
+                        or any((cm.get(k) or {}).get("status") != "verified" for k in ("source", "artifacts"))
+                        or cm.get("hardware") != m.get("hardware") or cm.get("source") != m.get("source")):
+                    raise ValueError("paired board has incomplete or mixed worker evidence: " + rid)
+            sha = (m.get("source") or {}).get("commit")
+            if not sha or not resolve.on_main(sha):
+                raise ValueError("paired source freeze is not on main: " + rid)
+            ob = make_ob(BB, resolve, skips, kind="paired", vendor=(board.get("box", {}).get("gpu") or {}).get("vendor"), box=box,
+                job="paired-" + m["id"], head=sha, family=rr["family"], lane=rr["lane"], dataset=rr["dataset"],
+                status_raw=ours.get("status"), median_ms=ours.get("median_ms"), quality=ours.get("quality"),
+                digest=ours.get("hash"), evidence=path, comparability=ours.get("comparability"),
+                measured=rr.get("finished"), gpu_recorded=(board.get("box", {}).get("gpu") or {}).get("name"))
+            if ob is None or ob["status_raw"] == "REFUSED(hardware mismatch)":
+                raise ValueError("paired source commit or hardware refused: " + rid)
+            ob.update(measured_cell=copy.deepcopy(ours), paired_race=copy.deepcopy(rr),
+                      paired_box=copy.deepcopy(board.get("box")), version=ours.get("library_version"))
+            out.append(ob)
+    return out
+
+
+def _reroute(ob):
+    """A previous board's observation: its box from the job id prefix, its column from the box's GPU model and its
+    hardware from the box table (an older board stored neither). the author 2026-10-10: every row names its exact
+    hardware and version; never mix GPU models in a column."""
+    ob["box"] = HW.box_for_job(ob.get("job"), ob.get("box"))
+    ob["column"] = HW.column_for_box(ob["box"])
+    ob["hardware"] = HW.box_hardware(ob["box"])
+    return ob
+
+
+# ---------------------------------------------------------------------------
+# Choice: newest wins
+# ---------------------------------------------------------------------------
+
+def job_number(job):
+    m = re.search(r"\d+", str(job or ""))
+    return int(m.group(0)) if m else -1
+
+
+def order_key(ob):
+    return (ob.get("ct") or 0, job_number(ob.get("job")), str(ob.get("job") or ""), PRIORITY.get(ob["kind"], 0))
+
+
+def dedupe(observations):
+    """One observation per (vendor, box, job, race): a fresh parse over the previous board, a JSON cell
+    over its summary line."""
+    best = {}
+    for ob in observations:
+        k = (ob["vendor"], ob["box"], ob["job"], ob["race_id"])
+        if k not in best or PRIORITY.get(ob["kind"], 0) >= PRIORITY.get(best[k]["kind"], 0):
+            best[k] = ob
+    return list(best.values())
+
+
+def ident_group(ob):
+    kind = source_kind(ob)
+    return "algos-race" if kind == "algos" else "board"
+
+
+def short(ob):
+    return dict(sha=ob["sha"], commit_date=iso(ob.get("ct")), box=ob["box"], job=ob["job"], kind=source_kind(ob),
+                hardware=ob.get("hardware") or HW.box_hardware(ob["box"]), version=ob.get("version"),
+                status=ob["status"], median_ms=ob.get("median_ms"), digest=ob.get("digest"),
+                evidence=ob.get("evidence"), reason=ob.get("reason"))
+
+
+def source_kind(ob):
+    """The input an observation came from (a re-read previous-board observation keeps its first kind)."""
+    return (ob.get("prior_kind") or "previous") if ob["kind"] == "previous" else ob["kind"]
+
+
+def stored_ob(ob):
+    return dict({k: ob.get(k) for k in OB_FIELDS}, kind=source_kind(ob))
+
+
+def is_ok(ob):
+    """Only an ok run with a median becomes a numeric board cell (orchestrator, 2026-10-09): error,
+    refused, timeout, not_ready, NO-RECORD and NO-OURS-CELL never do, and never replace an ok cell."""
+    # "not-scored" (timed in full, scorer failed) is a display status, never an exclusion (the author, 2026-10-14)
+    # "recompiled-in-clock" (a compile inside the timed run) is shown flagged, never excluded (the author, 2026-10-14)
+    return ob.get("status") in ("ok", "not-scored", "recompiled-in-clock") and ob.get("median_ms") is not None
+
+
+def recovered_predecessors(group):
+    """Verified evidence corrections replace their own unchanged measurement.
+
+    FAIRNESS FIX (2026-10-13 audit): paired job IDs are content hashes, so
+    sorting their digits could retain a shapes-only record over its recovered
+    quality. A correction is not a new timing and must not compete by hash.
+    Preserve the predecessor in the ledger, including when quality now fails.
+    """
+    superseded = set()
+    for new in group:
+        measurement = (new.get("measured_cell") or {}).get("measurement") or {}
+        recovery = measurement.get("quality_recovery") or {}
+        if not is_ok(new) or any((recovery.get(k) or {}).get("status") != "verified"
+                                 for k in ("artifact", "original_receipt", "source")):
+            continue
+        for old in group:
+            previous = (old.get("measured_cell") or {}).get("measurement") or {}
+            if previous.get("id") != recovery.get("previous_id") or not previous.get("id"):
+                continue
+            if all(new.get(k) == old.get(k) for k in ("sha", "box", "race_id", "median_ms", "digest", "measured")):
+                superseded.add(id(old))
+    return superseded
+
+
+def choose(observations):
+    """-> (winners {(column, race_id): newest ok ob}, failures {(column, race_id): [failed obs newer than
+    the winner, or all of them when the race has no ok run], newest first}, ledger entries [..])."""
+    groups = {}
+    for ob in observations:
+        groups.setdefault((ob["column"], ob["race_id"]), []).append(ob)
+    winners, failures, ledger = {}, {}, []
+    for key, group in sorted(groups.items()):
+        group.sort(key=order_key, reverse=True)
+        superseded = recovered_predecessors(group)
+        ok = [o for o in group if is_ok(o) and id(o) not in superseded]
+        win = ok[0] if ok else None
+        if win is not None:
+            winners[key] = win
+        newer_failed = [o for o in group if not is_ok(o) and (win is None or order_key(o) > order_key(win))]
+        if newer_failed:
+            failures[key] = newer_failed
+        for o in group:
+            if o is win:
+                continue
+            failed = not is_ok(o)
+            if id(o) in superseded:
+                reason = "verified quality recovery supersedes the unchanged measurement evidence"
+            elif failed and o["infra"]:
+                reason = "infrastructure status %s never replaces an ok cell" % o["status_raw"]
+            elif failed:
+                reason = "failed run (%s) never replaces an ok cell" % (o.get("reason") or o["status"])
+            elif o.get("ct") == win.get("ct"):
+                reason = "same commit date, earlier job"
+            else:
+                reason = "older commit"
+            if failed and win is None:
+                reason += "; no ok run of this race: FAILED table"
+            elif failed and order_key(o) > order_key(win):
+                reason += "; flagged on the ok cell from main@%s" % win["sha"][:9]
+            ledger.append(dict(column=key[0], race=key[1], reason=reason, failed=failed, replaced=short(o),
+                               replaced_by=short(win) if win else None))
+    return winners, failures, ledger
+
+
+def identity_index(observations):
+    idx = {}
+    for ob in observations:
+        if is_ok(ob) and ob.get("digest"):
+            idx.setdefault((ob["vendor"], ob["race_id"], ob["sha"], ident_group(ob)), []).append(ob)
+    return idx
+
+
+def identity(ob, idx):
+    other = OTHER_VENDOR.get(ob["vendor"])
+    cands = idx.get((other, ob["race_id"], ob["sha"], ident_group(ob))) or []
+    if not cands or not ob.get("digest") or ob["status"] != "ok":
+        return dict(status="n/a", other_column="the %s columns" % other, other_digest=None, other_job=None)
+    o = max(cands, key=order_key)
+    same = o["digest"][:DIGEST_CHARS] == ob["digest"][:DIGEST_CHARS]
+    return dict(status="MATCH" if same else "DIFFER", other_column=o["column"], other_hardware=o.get("hardware"),
+                other_digest=o["digest"], other_job="%s/%s" % (o["box"], o["job"]))
+
+
+# ---------------------------------------------------------------------------
+# Opponents: copied from the stored opponent boards
+# ---------------------------------------------------------------------------
+
+def load_opponent_sources(BB, specs, column, skips):
+    out = []
+    for spec in specs:
+        col, label, path = spec.split("=", 2)
+        if col != column:
+            continue
+        if not os.path.exists(path):
+            skips.add("opponent board missing", "%s %s" % (column, path))
+            continue
+        out.append(dict(label=label, path=path, board=BB.load_result(path) or {}))
+    return out
+
+
+#: Descriptive keys of a tree lane config (tools/speed_gbdt_arm.py lane_config) that do not change the work.
+TREE_TEXT_KEYS = ("harness", "mismatches", "objectives")
+
+
+def _settings_view(cfg, family=None):
+    if isinstance(cfg, str):
+        try:
+            cfg = json.loads(cfg)
+        except ValueError:
+            return None
+    if not isinstance(cfg, dict):
+        return None
+    if family == "trees":
+        # FAIRNESS FIX (2026-10-13 audit): tree races were never checked for settings drift (SETTINGS_KEYS names no
+        # tree knob). Every work-changing tree setting is now compared: the whole config minus descriptive text.
+        return json.dumps({k: v for k, v in cfg.items() if k not in TREE_TEXT_KEYS}, sort_keys=True, default=str)
+    return json.dumps({k: cfg.get(k) for k in SETTINGS_KEYS if k in cfg}, sort_keys=True, default=str)
+
+
+def current_lane_config(BB, family, lane):
+    try:
+        if family == "algos":
+            return BB.ALGOS.lane_config(lane)
+        if family == "classical2":
+            return BB.MORE.LANE_CONFIG.get(lane)
+        if family == "trees":
+            # FAIRNESS FIX (2026-10-13 audit): this returned None for trees, so a tree opponent cell measured at old
+            # settings (for example the 2026-10-06 depthwise, lossguide and categorical cells) kept being copied next
+            # to new runs of ours. Now the tree lane's config at HEAD, as tools/bench_board.py race_settings records it.
+            return BB._load_tool("speed_gbdt_arm").lane_config(lane, "shipped")
+    except Exception:          # noqa: BLE001  (a lane the tool does not know, or numpy absent)
+        return None
+    return None
+
+
+def recorded_lane_config(race):
+    """The lane config an opponent race recorded: the race's own, else (tree opponent boards keep it only per cell)
+    the first cell's settings.lane_config."""
+    if race.get("lane_config") is not None:
+        return race.get("lane_config")
+    for c in race.get("cells") or []:
+        st = c.get("settings")
+        if isinstance(st, str):
+            try:
+                st = json.loads(st)
+            except ValueError:
+                st = None
+        if isinstance(st, dict) and st.get("lane_config") is not None:
+            return st["lane_config"]
+    return None
+
+
+def copy_opponents(BB, sources, family, lane, race_id, archive=None, backfill=None):
+    """-> (opponent cells, the first source race (for lane_config), withheld reason or None)."""
+    cells, first, seen = [], None, set()
+    cur = _settings_view(current_lane_config(BB, family, lane), family)
+    for src in sources:
+        rr = ((src["board"].get("races") or {}).get(race_id))
+        if not rr:
+            continue
+        if cur is not None and _settings_view(recorded_lane_config(rr), family) not in (None, cur):
+            return [], rr, ("opponents withheld: the lane settings at this tree's HEAD differ from the settings "
+                            "%s recorded for its opponent race (an opponent job must score them again)" % src["label"])
+        box = src["board"].get("box") or {}
+        for c in rr.get("cells") or []:
+            if c.get("library") == "anonlib" or str(c.get("arm", "")).startswith("ours") or c.get("arm") in seen:
+                continue
+            seen.add(c.get("arm"))
+            oc = copy.deepcopy(c)
+            for k in ("ratio_ours_identical_over", "ratio_ours_fast_over", "ratio_ours_identical_clock",
+                      "ratio_ours_fast_clock", "clock"):
+                oc.pop(k, None)
+            oc["copied_from"] = {"board": src["label"], "path": src["path"], "race": race_id,
+                                 "box": (box.get("host") or {}).get("hostname"),
+                                 "gpu": (box.get("gpu") or {}).get("name"),
+                                 "measured": (c.get("stored") or {}).get("measured_at") or rr.get("finished")}
+            span = (oc.get("comparability") or {}).get("span") or {}
+            if span.get("input_home") == "host" and isinstance(span.get("upload_ms_untimed"), (int, float)):
+                # FAIRNESS FIX (2026-10-13 audit): cells copied from the 2026-10-06 opponent boards carry the label
+                # input_home "host" although their upload ran before the clock (upload_ms_untimed is set; the driver
+                # label was fixed on 2026-10-08, 06b172ccb). The tables then left out the dagger that says the
+                # opponent's clock excludes its copy. A recorded untimed upload means the inputs were on the device.
+                span["input_home"] = "device"
+                span["input_home_relabelled"] = "host -> device (upload_ms_untimed recorded; 2026-10-13 audit)"
+            old = oc.get("source")
+            oc["source"] = "copied from %s%s" % (src["label"], ("; " + old) if old else "")
+            # the author 2026-10-10: every row names its exact hardware and version; never mix GPU models in a column.
+            # From what the measuring run recorded (stored record, the cell, its board box, the opponent
+            # archive), else "unknown (copied from <source>)": never a guess.
+            used = HW.opponent_fields(oc, box, src["label"], archive)
+            if backfill is not None:
+                for field, where in used.items():
+                    backfill[(field, where)] = backfill.get((field, where), 0) + 1
+            cells.append(oc)
+        if first is None:
+            first = rr
+    return cells, first, None
+
+
+# ---------------------------------------------------------------------------
+# Assembly: the result structure tools/bench_board.py writes and renders
+# ---------------------------------------------------------------------------
+
+def failed_flag(o):
+    return "newer run %s/%s failed: %s" % (o["sha"][:9], o["job"], o.get("reason") or o["status"])
+
+
+def our_cell(BB, ob, ident, newer_failed=()):
+    ms = ob.get("median_ms") if ob["status"] in ("ok", "not-scored", "recompiled-in-clock") else None
+    tail = "main@%s %s/%s %s; identity vs %s: %s" % (
+        ob["sha"][:9], ob["box"], ob["job"], (iso(ob.get("ct")) or "?")[:10], ident["other_column"], ident["status"])
+    flags = [failed_flag(o) for o in newer_failed]
+    if flags:
+        tail += "; " + "; ".join(flags)
+    cell = {
+        "family": ob["family"], "lane": ob["lane"], "dataset": ob["dataset"], "rows": None, "rows_tag": "full",
+        "neural_shape": "full" if ob["family"] == "neural" else None,
+        "arm": "ours", "library": "anonlib", "mode": "identical",
+        "device": BB.arm_device("ours", ob["vendor"]),
+        "settings": {"rounds": 1, "source": "main board: one scored run of ours (%s)" % ob["kind"]},
+        "times_ms": [ms] if ms is not None else [], "warmup_ms": None,
+        "median_ms": ms, "min_ms": ms, "max_ms": ms, "rounds": 1 if ms is not None else 0,
+        "status": ob["status"], "quality": ob.get("quality") or {}, "hash": ob.get("digest"), "hash_stable": None,
+        "verdict": "main board, one scored run", "comparability": ob.get("comparability") or {},
+        "peak_host_mb": None, "peak_gpu_mb": None, "memory": {},
+        "source": tail,
+        "main_board": {"sha": ob["sha"], "commit_date": iso(ob.get("ct")), "box": ob["box"], "job": ob["job"],
+                       "measured": ob.get("measured"), "identity": ident, "newer_failed": flags,
+                       "observation": stored_ob(ob)},
+    }
+    original = ob.get("measured_cell") or {}
+    for field in ("measurement", "params", "settings", "library_version", "device_name", "shape",
+                  "times_ms", "warmup_ms", "min_ms", "max_ms", "rounds", "state_receipts", "operations",
+                  "comparability", "memory", "peak_host_mb", "peak_gpu_mb", "hash_stable", "installed_wheel",
+                  "iteration_receipts", "fitted_parameters"):
+        if field in original:
+            cell[field] = copy.deepcopy(original[field])
+    # the author 2026-10-10: every row names its exact hardware and version; never mix GPU models in a column.
+    return HW.our_fields(cell, box=ob["box"], version_text=ob.get("version") or "anonlib (source build, main@%s)"
+                         % ob["sha"][:9], source="box table (job %s/%s)" % (ob["box"], ob["job"]))
+
+
+def _md(v):
+    return " ".join(str(v if v is not None else "-").split()).replace("|", "/")
+
+
+def identity_section(races):
+    """The identity table: every DIFFER cell by name first (a cross-vendor difference is the board's most
+    important fact), then the counts."""
+    differ, counts = [], {}
+    for rid in sorted(races):
+        c = next(x for x in races[rid]["cells"] if x.get("library") == "anonlib")
+        ident = c["main_board"]["identity"]
+        counts[ident["status"]] = counts.get(ident["status"], 0) + 1
+        if ident["status"] == "DIFFER":
+            differ.append((rid, c, ident))
+    L = ["Same lane, dataset and commit on the other GPU vendor (identity = equal output digests on NVIDIA "
+         "and AMD). Counts: %s." % (", ".join("%s %d" % kv for kv in sorted(counts.items())) or "none"), ""]
+    if differ:
+        L += ["**DIFFER: %d cells whose digest differs from the other vendor's at the same commit.**" % len(differ),
+              "", "| race | commit | this column: hardware, box/job, digest | other column: hardware, box/job, digest |",
+              "|---|---|---|---|"]
+        for rid, c, ident in differ:
+            mb = c["main_board"]
+            L.append("| %s | main@%s | %s, %s/%s %s | %s, %s %s |" % (
+                _md(rid), _md(mb["sha"][:9]), _md(c.get("hardware")), _md(mb["box"]), _md(mb["job"]),
+                _md(c.get("hash")), _md(ident.get("other_hardware") or ident["other_column"]),
+                _md(ident["other_job"]), _md(ident["other_digest"])))
+    else:
+        L.append("DIFFER: none.")
+    return {"title": "Identity", "lines": L}
+
+
+def failed_section(failures, winners, column):
+    rows = []
+    for (col, rid), obs in sorted(failures.items()):
+        if col != column:
+            continue
+        win = winners.get((col, rid))
+        for o in obs:
+            rows.append("| %s | %s | main@%s | %s | %s | %s/%s | %s | %s |" % (
+                _md(o["lane"]), _md(o["dataset"]), _md(o["sha"][:9]),
+                _md(o.get("hardware") or HW.box_hardware(o["box"])), _md(o.get("version")), _md(o["box"]), _md(o["job"]),
+                _md(o.get("reason") or o["status"]),
+                "main@%s %s/%s stays" % (win["sha"][:9], win["box"], win["job"]) if win else "none"))
+    L = ["Runs on main whose status is not ok (error, refused, timeout, not_ready, NO-RECORD, NO-OURS-CELL). "
+         "They are never a numeric cell and never replace an ok cell; an older ok cell stays on the board "
+         "flagged with the failed run. %d failed runs." % len(rows), ""]
+    if rows:
+        L += ["| lane | dataset | commit | hardware | version | box/job | reason | ok cell on the board |",
+              "|---|---|---|---|---|---|---|---|"] + rows
+    return {"title": "FAILED", "lines": L}, len(rows)
+
+
+def assemble(BB, column, winners, ledger, idx, sources, inputs, generated, failures=None, archive=None,
+             backfill=None):
+    failures = failures or {}
+    races, withheld, boxes, shas = {}, 0, set(), []
+    for (col, rid), ob in sorted(winners.items()):
+        if col != column:
+            continue
+        ident = identity(ob, idx)
+        cell = our_cell(BB, ob, ident, failures.get((col, rid)) or ())
+        paired = ob.get("paired_race")
+        if paired:
+            src_rr, why = paired, None
+            opps = copy.deepcopy([c for c in paired.get("cells", []) if c.get("library") != "anonlib"])
+            for c in opps:
+                c["copied_from"] = dict(board="paired session", path=ob["evidence"], race=rid)
+                HW.opponent_fields(c, ob.get("paired_box"), "paired session")
+        else:
+            opps, src_rr, why = copy_opponents(BB, sources, ob["family"], ob["lane"], rid, archive, backfill)
+        # FAIRNESS FIX (2026-10-15): an opponent the lane refuses by name never stands as its opponent,
+        # whatever board it was copied from (tools/bench_board.py REFUSED_LANE_ARMS)
+        BB.refuse_lane_arm_cells(ob["lane"], opps)
+        # our cell without a quality (the host reference refused) whose output hash equals a copied opponent's:
+        # quality {"identical_to": <arm>} (tools/bench_board.py stored_identity_quality; a digest compare only)
+        cells = BB.add_ratios(BB.stored_identity_quality([cell] + opps))
+        lane_config = copy.deepcopy((src_rr or {}).get("lane_config")) if src_rr else None
+        if why:
+            withheld += 1
+            lane_config = copy.deepcopy(current_lane_config(BB, ob["family"], ob["lane"])) or {}
+            lane_config["mismatches"] = list(lane_config.get("mismatches") or []) + [why]
+        rr = {"id": rid, "family": ob["family"], "lane": ob["lane"], "dataset": ob["dataset"], "rows": None,
+              "shape": "full" if ob["family"] == "neural" else None,
+              "status": "done" if ob["status"] in ("ok", "not-scored", "recompiled-in-clock") else "failed", "rc": None,
+              "log": "%s (%s/%s)" % (ob.get("evidence"), ob["box"], ob["job"]),
+              "host": {"hostname": BOX_TEXT.get(ob["box"], ob["box"]) + " job " + str(ob["job"])},
+              "cells": cells, "infer_cells": [],
+              "params_check": "not checked on the main board (our one scored run; opponents copied, never re-run)",
+              "opponent_source": {"withheld": why} if why else
+              {"boards": sorted({c["copied_from"]["board"] for c in opps})},
+              "main_board": {"sha": ob["sha"], "box": ob["box"], "job": ob["job"], "identity": ident["status"]}}
+        if lane_config:
+            rr["lane_config"] = lane_config
+        if paired:
+            for field in ("params", "params_check", "preflight", "audit", "rerace", "opponents_excluded",
+                          "retained_opponent_checks", "command", "finished", "started",
+                          "evidence_directory", "evidence_receipt", "infer_cells"):
+                if field in paired:
+                    rr[field] = copy.deepcopy(paired[field])
+            rr["host"] = copy.deepcopy(paired.get("host"))
+            rr["opponent_source"] = dict(paired_session=ob["job"], path=ob["evidence"])
+            for c in rr.get("infer_cells", []):
+                if c.get("library") == "anonlib":
+                    HW.our_fields(c, box=ob["box"], version_text=ob["version"], source="paired worker record")
+                else:
+                    HW.opponent_fields(c, ob.get("paired_box"), "paired session")
+        elif ob.get("preserved_race"):
+            rr = copy.deepcopy(ob["preserved_race"])
+            rr["main_board"]["identity"] = ident["status"]
+            original = next(c for c in rr["cells"] if c.get("library") == "anonlib")
+            original["main_board"]["identity"] = ident
+            original["main_board"]["newer_failed"] = cell["main_board"]["newer_failed"]
+        # neural lanes: the headline is ours IDENTICAL over torch's fastest bf16 arm, the fp32 twin beside it
+        # (tools/bench_board.py neural_headline; render_board draws the table and each race's headline line)
+        hl = BB.neural_headline(rr)
+        if hl is not None:
+            rr["neural_headline"] = hl
+        races[rid] = rr
+        boxes.add(ob["box"])
+        shas.append((ob.get("ct") or 0, ob["sha"]))
+    shas.sort()
+    newest = shas[-1][1] if shas else None
+    oldest = shas[0][1] if shas else None
+    label = "main@%s" % newest[:9] if newest else "main@none"
+    n_replaced = sum(1 for e in ledger if e["column"] == column)
+    idn = {}
+    for rr in races.values():
+        s = rr["main_board"]["identity"]
+        idn[s] = idn.get(s, 0) + 1
+    notes = [
+        "MAIN BOARD %s, version label %s. Unreleased: not reproducible by pip install; the release boards are "
+        "the reference." % (column, label),
+        "Cells: %d races; oldest cell main@%s (%s), newest cell main@%s (%s). Boxes: %s." % (
+            len(races), (oldest or "none")[:9], iso(shas[0][0]) if shas else "-", (newest or "none")[:9],
+            iso(shas[-1][0]) if shas else "-", ", ".join(BOX_TEXT.get(b, b) for b in sorted(boxes)) or "none"),
+        "Rule: each lane x dataset shows the newest default-configuration race on main (highest commit date, "
+        "then job number) whose status is ok. A newer ok cell replaces an older one whatever the two times "
+        "are; a run that is not ok is never a numeric cell and never replaces an ok cell (FAILED table; an "
+        "older ok cell stays, flagged with the newer failed run). %d replaced or failed observations are in "
+        "LEDGER.md. A/B and grid arms (ANONLIB_BUILD_DEFINES, ANONLIB_GRID_TAG grid runs) are never on "
+        "this board." % n_replaced,
+        "Ours: recorded scored runs from lq jobs or verified paired sessions; the status column "
+        "names the cell's commit, box/job, commit date and the other vendor's digest at the same commit "
+        "(identity: %s)." % (", ".join("%s %d" % kv for kv in sorted(idn.items())) or "none"),
+        "Opponents: retained from each paired session when present; otherwise retained historical pairs or "
+        "stored opponent boards (%s). Ingestion runs no measurements. `ours IDENTICAL / arm` "
+        "divides the two stored medians, and the clock columns read a torch GPU arm kernel/kernel and every "
+        "other arm whole/whole (AGENTS.md measurement item 6). Our kernel clock is `-` unless the cell recorded "
+        "upload_ms_separate. Opponents withheld for changed lane settings: %d races." % (
+            ", ".join(s["label"] for s in sources) or "none found", withheld),
+        "Provenance: main@ identifies the source or harness freeze. Paired wheel runs separately record the "
+        "installed library version and loaded binary hashes; they are not source builds of that harness commit.",
+        "Neural lanes: the headline (its own table, and a line under each neural race) is ours IDENTICAL over "
+        "torch's fastest bf16 arm, eager or compile, what customers run; the fp32 twin is the second column. "
+        "Note: " + BB.IDENTITY_TAX_NOTE + ". A cell of ours whose output hash equals a copied opponent's shows "
+        "quality identical_to=<arm> (the same bits) where the own-host reference gave none.",
+    ]
+    fsec, n_failed = failed_section(failures, winners, column)
+    isec = identity_section(races)
+    differ = [{"race": rid, "sha": rr["main_board"]["sha"],
+               "digest": next(c for c in rr["cells"] if c.get("library") == "anonlib").get("hash"),
+               "job": "%s/%s" % (rr["main_board"]["box"], rr["main_board"]["job"]),
+               "other": next(c for c in rr["cells"] if c.get("library") == "anonlib")["main_board"]["identity"]}
+              for rid, rr in sorted(races.items()) if rr["main_board"]["identity"] == "DIFFER"]
+    gpu = dict(COLUMN_GPU[column])
+    result = {
+        "schema": BB.SCHEMA, "main_board_schema": SCHEMA_NOTE, "created": generated,
+        "box": {"gpu": gpu, "host": {"hostname": ", ".join(BOX_TEXT.get(b, b) for b in sorted(boxes)) or None},
+                "anonlib": {"version": label,
+                              "wheel": {"file": "mixed source/wheel provenance; see each cell's version and measurement record",
+                                        "sha256": "-"}},
+                "repo": {"commit": newest}},
+        "config": {"vendor": COLUMN_VENDOR[column], "modes": ["identical"], "rounds": 1, "smoke": False,
+                   "families": sorted({rr["family"] for rr in races.values()})},
+        "plan": sorted(races), "races": races, "board_notes": notes, "board_sections": [isec, fsec],
+        "main_board": {"column": column, "label": label, "newest_sha": newest, "oldest_sha": oldest,
+                       "boxes": sorted(boxes), "replaced": n_replaced, "withheld_opponents": withheld,
+                       "identity": idn, "differ": differ, "failed_runs": n_failed, "inputs": inputs,
+                       "failed_observations": [stored_ob(o) for (col, _rid), obs in sorted(failures.items())
+                                               if col == column for o in obs],
+                       "opponent_boards": [{"label": s["label"], "path": s["path"]} for s in sources]},
+    }
+    return result
+
+
+def diff_boards(prev, new):
+    """-> [(kind, race_id, old text, new text)] for cells of ours that would change."""
+    def view(board):
+        out = {}
+        for rid, rr in ((board or {}).get("races") or {}).items():
+            c = next((c for c in rr.get("cells") or [] if c.get("library") == "anonlib"), None)
+            if c is not None:
+                mb = c.get("main_board") or {}
+                out[rid] = (str(mb.get("sha") or "")[:9], "%s/%s" % (mb.get("box"), mb.get("job")),
+                            c.get("median_ms"), c.get("status"), c.get("hash"),
+                            "; ".join(mb.get("newer_failed") or []))
+        return out
+    a, b = view(prev), view(new)
+    txt = lambda v: "main@%s %s %s ms %s digest %s%s" % (   # noqa: E731
+        v[0], v[1], v[2], v[3], v[4], (" [%s]" % v[5]) if v[5] else "")
+    out = []
+    for rid in sorted(set(a) | set(b)):
+        if rid not in a:
+            out.append(("ADD", rid, "-", txt(b[rid])))
+        elif rid not in b:
+            out.append(("DROP", rid, txt(a[rid]), "-"))
+        elif a[rid] != b[rid]:
+            out.append(("CHANGE", rid, txt(a[rid]), txt(b[rid])))
+    return out
+
+
+def merge_ledger(old, new):
+    seen, out = set(), []
+    for e in list(new) + list(old or []):
+        r = e.get("replaced") or {}
+        k = (e.get("column"), e.get("race"), r.get("sha"), r.get("box"), r.get("job"), r.get("kind"))
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(e)
+    return out
+
+
+def render_ledger(column, entries):
+    L = ["# Main board ledger: %s" % column, "",
+         "Every observation the newest-wins rule did not put on the board, with its numbers and the cell that "
+         "replaced it (tools/main_board_ingest.py). Times are milliseconds of one scored run.", "",
+         "the author 2026-10-10: every row names its exact hardware and version; never mix GPU models in a column.", "",
+         "| race | reason | replaced: commit, hardware, version, box/job, ms, status, digest | "
+         "by: commit, hardware, version, box/job, ms, status, digest |",
+         "|---|---|---|---|"]
+    fmt = lambda s: "-" if not s else "main@%s, %s, %s, %s/%s %s %s %s" % (   # noqa: E731
+        str(s.get("sha"))[:9], s.get("hardware") or HW.box_hardware(HW.box_for_job(s.get("job"), s.get("box"))),
+        s.get("version") or "version unrecorded", s.get("box"), s.get("job"), s.get("median_ms"), s.get("status"),
+        s.get("digest"))
+    for e in sorted(entries, key=lambda e: (e["race"], str((e.get("replaced") or {}).get("commit_date")))):
+        L.append("| %s | %s | %s | %s |" % (e["race"], e["reason"], fmt(e.get("replaced")),
+                                            fmt(e.get("replaced_by"))))
+    return "\n".join(L).replace("faster", "[direction word removed]").replace("slower", "[direction word removed]") + "\n"
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def _pairs(specs):
+    out = []
+    for s in specs:
+        box, path = s.split("=", 1)
+        out.append((box, os.path.expanduser(path)))
+    return out
+
+
+def _read_lines(path, skips):
+    try:
+        with open(path, errors="replace") as fh:
+            return fh.read().splitlines()
+    except OSError:
+        skips.add("input file missing", path)
+        return []
+
+
+def collect(BB, args, resolve, skips):
+    jobs, recs, obs, devices = {}, [], [], {}
+    skip_tag_re = re.compile(args.skip_tag_re)
+    for box, path in _pairs(args.results):
+        lines = _read_lines(path, skips)
+        devices.update(parse_devices(lines, box))
+        j, a = parse_results(lines, box, path)
+        for jid, job in j.items():
+            jobs[(job["box"], jid)] = job
+        recs.extend(a)
+    grid = []
+    for box, path in _pairs(args.grid_logs):
+        lines = _read_lines(path, skips)
+        devices.update(parse_devices(lines, box))
+        grid.append((box, path, lines))
+    for rec in recs:
+        ob = admit_algos(BB, rec, args.branch, resolve, skips, devices)
+        if ob is not None:
+            obs.append(ob)
+    for box, path, lines in grid:
+        for rec in parse_gridbb(lines, box, path):
+            ob = admit_gridbb(BB, rec, jobs, args.branch, skip_tag_re, resolve, skips, devices)
+            if ob is not None:
+                obs.append(ob)
+    obs.extend(json_observations(BB, args.json_dir, jobs, args.branch, skip_tag_re, resolve, skips))
+    obs.extend(paired_observations(BB, getattr(args, "paired_board", None), resolve, skips))
+    return obs
+
+
+# ---------------------------------------------------------------------------
+# Fairness marks (the author, 2026-10-13 audit)
+# ---------------------------------------------------------------------------
+# FAIRNESS FIX (2026-10-13 audit): the main boards paired our one scored run with opponent cells copied from other
+# boards and never compared the arms' settings, and audit marks were lost at every rebuild. The rule now lives in
+# one module, tools/race_fairness.py (AGENTS.md "Race fairness"), which every rebuild applies; these names are kept
+# for callers and tests.
+def _load_race_fairness():
+    spec = importlib.util.spec_from_file_location("race_fairness", os.path.join(HERE, "race_fairness.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+RF = _load_race_fairness()
+
+
+def _load_call_lines():
+    spec = importlib.util.spec_from_file_location("race_call_line", os.path.join(HERE, "race_call_line.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+CALLS = _load_call_lines()
+TIE_BAND = RF.TIE_BAND
+pairing = RF.pairing
+fairness_rule = RF.fairness_rule
+_n_iter = RF.n_iter
+
+
+def apply_fairness(board, prev, today):
+    """tools/race_fairness.py apply(): every row of every race gets its audit entry; returns the races marked x."""
+    for race in (board.get("races") or {}).values():
+        checked = race.get("retained_opponent_checks") or {}
+        ours = next((c for c in race.get("cells", []) if c.get("library") == "anonlib"
+                     and c.get("mode") == "identical"), None)
+        if not checked or ours is None:
+            continue
+        excluded = False
+        for c in race.get("cells", []):
+            if c.get("arm") not in checked or not c.get("stored"):
+                continue
+            problems = retained_opponent_problems(race, ours, c)
+            checked[c["arm"]] = dict(measurement_id=(c.get("measurement") or {}).get("id"), problems=problems)
+            if problems:
+                ex = race.setdefault("opponents_excluded", {"arms": [], "why": {}})
+                ex["arms"] = sorted(set(ex.get("arms", [])) | {c["arm"]})
+                ex.setdefault("why", {})[c["arm"]] = "retained opponent evidence: " + "; ".join(problems)
+                ex["reason"] = "; ".join("%s: %s" % item for item in sorted(ex["why"].items()))
+                excluded = True
+        if excluded:
+            # Display annotation changes opponent row bytes during assembly.
+            # Bind this freshly rechecked exclusion after those changes so the
+            # fairness tool cannot discard it as an unsupported old finding.
+            race["opponents_excluded"]["basis"] = RF.exclusion_basis(race)
+    return RF.apply(board, prev or {}, today)
+
+
+def build_parser():
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--results", action="append", help="BOX=PATH lq results file (repeatable; default %s)"
+                   % ", ".join(DEFAULT_RESULTS))
+    p.add_argument("--grid-logs", action="append", help="BOX=PATH grid-logs file with GRIDBB lines (repeatable)")
+    p.add_argument("--json-dir", help="directory of bench_board board.json files from lq jobs (optional)")
+    p.add_argument("--paired-board", action="append", help="BOX=PATH verified paired board; preserves its actual opponents")
+    p.add_argument("--opponents", action="append", help="COLUMN=LABEL=PATH stored opponent board, priority order")
+    p.add_argument("--columns", default=",".join(COLUMN_GPU))
+    p.add_argument("--opponent-archive", default=OPPONENT_ARCHIVE,
+                   help="dir of <column>/opponent-cells-all.jsonl.gz: fills an opponent row's hardware / version "
+                        "its copied cell lacks (same arm, lane, dataset, median)")
+    p.add_argument("--out-root", default=BOARD_ROOT, help="board roots go to <out-root>/main-<column>/")
+    p.add_argument("--repo", default=REPO, help="git repo resolving commit dates")
+    p.add_argument("--main-ref", default="origin/main")
+    p.add_argument("--branch", default="main", help="the results' branch label admitted")
+    p.add_argument("--skip-tag-re", default=DEFAULT_SKIP_TAG_RE)
+    p.add_argument("--check", action="store_true", help="dry run: print the cells that would change, write nothing")
+    p.add_argument("--max-lines", type=int, default=40, help="change lines printed per column with --check")
+    return p
+
+
+def run(argv=None, BB=None, resolve=None, out=sys.stdout):
+    args = build_parser().parse_args(argv)
+    args.results = args.results or DEFAULT_RESULTS
+    args.grid_logs = args.grid_logs or DEFAULT_GRID_LOGS
+    args.opponents = args.opponents or DEFAULT_OPPONENTS
+    BB = BB or load_bench_board()
+    resolve = resolve or GitResolver(args.repo, args.main_ref)
+    skips = Skips()
+    fresh = collect(BB, args, resolve, skips)
+    generated = now_utc()
+    inputs = {"results": args.results, "grid_logs": args.grid_logs, "json_dir": args.json_dir,
+              "paired_boards": args.paired_board, "branch": args.branch, "generated": generated}
+    columns = [c for c in args.columns.split(",") if c]
+    prevs, all_obs = {}, list(fresh)
+    for column in columns:
+        if column not in COLUMN_VENDOR:
+            raise SystemExit("main_board_ingest: unknown column %r (known: %s)" % (column, ", ".join(COLUMN_VENDOR)))
+        root = os.path.join(args.out_root, "main-%s" % column)
+        prevs[column] = (root, BB.load_result(os.path.join(root, "board.json")))
+        for ob in previous_observations(prevs[column][1]):
+            # a failed row an older board stored for a race bench_board never plans leaves with this ingest
+            why = None if is_ok(ob) else unplanned_reason(BB, ob.get("family"), ob.get("lane"), ob.get("dataset"))
+            if why:
+                skips.add("previous FAILED row: not a bench_board race", "%s/%s %s/%s/%s: %s" % (
+                    ob.get("box"), ob.get("job"), ob.get("family"), ob.get("lane"), ob.get("dataset"), why))
+                continue
+            all_obs.append(ob)
+    for ob in all_obs:
+        # an observation an older board stored without a version: the version file at its commit
+        if not ob.get("version") and hasattr(resolve, "version"):
+            ob["version"] = resolve.version(ob["sha"])
+    obs = dedupe(all_obs)
+    winners, failures, ledger = choose(obs)
+    idx = identity_index(obs)
+    summary = {}
+    for column in columns:
+        root, prev = prevs[column]
+        sources = load_opponent_sources(BB, args.opponents, column, skips)
+        archive = HW.archive_index(os.path.join(args.opponent_archive or "", column, "opponent-cells-all.jsonl.gz"))
+        backfill = {}
+        result = assemble(BB, column, winners, ledger, idx, sources, inputs, generated, failures, archive, backfill)
+        # the readable call line of every arm, derived from its recorded invocation (display only; ignored by
+        # race_fairness.pairing, so no audit moves)
+        CALLS.annotate_board(result)
+        apply_fairness(result, prev, generated[:10])
+        # the author 2026-10-10: every row names its exact hardware and version; never mix GPU models in a column.
+        unknown, notcmp = [], 0
+        for rid, rr in sorted(result["races"].items()):
+            for c in rr["cells"]:
+                if c.get("library") == "anonlib":
+                    backfill[("hardware", "box table")] = backfill.get(("hardware", "box table"), 0) + 1
+                    backfill[("version", "git _version.py")] = backfill.get(("version", "git _version.py"), 0) + 1
+                if c.get("hardware_comparable") is False:
+                    notcmp += 1
+                if c.get("hardware_source") == "unknown" or c.get("version_source") == "unknown":
+                    unknown.append("%s %s: %s; %s" % (rid, c.get("arm"), c.get("hardware"), c.get("version")))
+        result["main_board"]["backfill"] = {"filled": {"%s<-%s" % k: v for k, v in sorted(backfill.items())},
+                                            "unknown_rows": unknown, "not_comparable_rows": notcmp}
+        changes = diff_boards(prev, result)
+        mine = [e for e in ledger if e["column"] == column]
+        kinds = {}
+        for k, _r, _a, _b in changes:
+            kinds[k] = kinds.get(k, 0) + 1
+        mb = result["main_board"]
+        line = ("MAINBOARD column=%s label=%s races=%d add=%d change=%d drop=%d failed=%d ledger=%d "
+                "withheld_opponents=%d identity=%s" % (
+                    column, mb["label"], len(result["races"]), kinds.get("ADD", 0), kinds.get("CHANGE", 0),
+                    kinds.get("DROP", 0), mb["failed_runs"], len(mine), mb["withheld_opponents"],
+                    ",".join("%s:%d" % kv for kv in sorted(mb["identity"].items())) or "none"))
+        print(line, file=out)
+        for d in mb["differ"]:
+            print("  DIFFER %s main@%s %s %s vs %s %s %s" % (
+                d["race"], d["sha"][:9], d["job"], d["digest"], d["other"]["other_column"],
+                d["other"]["other_job"], d["other"]["other_digest"]), file=out)
+        bf = result["main_board"]["backfill"]
+        print("MAINBOARD-BACKFILL column=%s %s unknown=%d not_comparable=%d" % (
+            column, " ".join("%s=%d" % kv for kv in bf["filled"].items()), len(bf["unknown_rows"]),
+            bf["not_comparable_rows"]), file=out)
+        for u in bf["unknown_rows"][:5]:
+            print("  UNKNOWN %s" % u, file=out)
+        summary[column] = line
+        if args.check:
+            for k, rid, a, b in changes[:args.max_lines]:
+                print("  %s %s: %s -> %s" % (k, rid, a, b), file=out)
+            if len(changes) > args.max_lines:
+                print("  ... %d more" % (len(changes) - args.max_lines), file=out)
+            continue
+        os.makedirs(root, exist_ok=True)
+        BB.save_result(os.path.join(root, "board.json"), result)
+        BB.write_board(root, result)
+        old_ledger = []
+        lp = os.path.join(root, "LEDGER.json")
+        if os.path.exists(lp):
+            with open(lp) as fh:
+                old_ledger = (json.load(fh) or {}).get("entries") or []
+        entries = merge_ledger(old_ledger, mine)
+        with open(lp + ".tmp", "w") as fh:
+            json.dump({"schema": SCHEMA_NOTE, "column": column, "updated": generated, "entries": entries},
+                      fh, indent=1, sort_keys=True, default=str)
+        os.replace(lp + ".tmp", lp)
+        with open(os.path.join(root, "LEDGER.md"), "w") as fh:
+            fh.write(render_ledger(column, entries))
+        with open(os.path.join(root, "INGEST.json"), "w") as fh:
+            json.dump({"generated": generated, "inputs": inputs, "summary": line, "skipped": skips.counts,
+                       "skip_notes": skips.notes}, fh, indent=1, sort_keys=True)
+    print("MAINBOARD-SKIPS %s" % json.dumps(skips.counts, sort_keys=True), file=out)
+    for n in skips.notes[:10]:
+        print("  skip %s" % n, file=out)
+    if len(skips.notes) > 10:
+        print("  ... %d more skip notes%s" % (len(skips.notes) - 10, "" if args.check else " (INGEST.json)"), file=out)
+    return summary
+
+
+def main(argv=None):
+    run(argv)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

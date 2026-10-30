@@ -1,0 +1,246 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 the authors. Part of anonlib, DOI-WITHHELD
+"""Host-pointer surface for KernelDensity: what `bindings/` calls.
+
+**WIRED**, corrected 2026-09-01. This docstring said "NOT YET WIRED into
+`bindings/_anonlib_estimators.mojo` or `python/anonlib/`" and that has
+been false since the identity lane took the hand-off:
+`bindings/_anonlib_estimators.mojo:367-426` is
+`kde_score_samples_binding` over this function and
+`python/anonlib/density.py::KernelDensity.score_samples` calls it. The
+sentence is deleted rather than annotated (fix-docs-on-discovery). Shape
+is still `glm/estimator.mojo::ols_fit_host`'s.
+
+ONE PARAMETER OF THIS FUNCTION IS NOT REACHABLE FROM PYTHON YET, and it is
+named rather than left as a surprise: `metric_arg` (Minkowski's `p`).
+`kde_score_samples_binding` length-checks its `params` list at exactly 5
+entries (`:392-396`) and has no slot for a sixth, so the Python surface can
+only reach the default `2.0`. `python/anonlib/density.py` refuses
+`metric_params` with any other value BY NAME for that reason and says so.
+Closing it is a two-line change in `bindings/` (accept 5 or 6, read
+`params[5]` as `metric_arg` when present) and `bindings/` is not this
+lane's directory; the exact diff is in the hand-off note in
+`kde/README.md`.
+
+`kde_score_samples_host` takes the training rows, the query rows and the
+optional weights as host lists, validates exactly as cuML's `fit` and
+`score_samples` do (`kde/impl/neighbors/kernel_density.mojo::
+kde_fit_validate`, `kernel_from_name`, `metric_from_name` -- every
+unimplemented choice REFUSED BY NAME) plus DEVIATION 604's finiteness rules
+(`kde_validate_data`: no NaN/inf in the data, the sqeuclidean magnitude
+bound, a normal bandwidth and normal finite weights), uploads, runs `ML::KDE::score_samples`
+(`kde/impl/kde.mojo`) with the environment's identity trace
+(`ANONLIB_IDENTITY_TRACE`), and returns `n_query` float32 log-densities.
+
+cuML's `fit` keeps `X` on the device and `score_samples` reuses it, and
+SINCE 2026-09-17 SO DOES THIS TREE: `kde/resident_fit.mojo` (DEVIATION
+3003) validates and uploads the fit set once and `KernelDensity.
+score_samples` scores through its handle where the GPU binding exports
+it. This entry is the one-shot form, which the gates, the card and the
+CPU host binding use.
+"""
+
+# DEVIATION 2486: bulk host staging; stream/lifetime boundaries unchanged.
+from bindings.hostptr import copy_f32
+from max.gpu.host import DeviceBuffer, DeviceContext
+from core.neural_context import process_ctx
+from checks.numerics import GLOBAL_NUMERIC_MODE as _DEVCTX_MODE, NUMERIC_IDENTICAL as _DEVCTX_IDENTICAL
+
+#: This binding's ONE process-lifetime DeviceContext (core/neural_context.mojo,
+#: lane/devctx-lifetime): a context per call exhausts Metal command queues.
+comptime _DEVCTX_SLOT = "MojoEstimatorsContextIdentical" if _DEVCTX_MODE == _DEVCTX_IDENTICAL else "MojoEstimatorsContextFast"
+
+
+from core.identity_trace import IdentityTrace
+from kde.impl.kde import score_samples
+from kde.impl.neighbors.kernel_density import (
+    KDE_ELEM_TPB,
+    KDE_LSE_TPB,
+    host_sum_weights,
+    kde_fit_validate,
+    kde_validate_data,
+    kde_validate_data_ptr,
+    kernel_from_name,
+    metric_from_name,
+)
+
+
+def _upload(ctx: DeviceContext, values: List[Float32]) raises -> DeviceBuffer[DType.float32]:
+    var n = len(values)
+    var buf = ctx.enqueue_create_buffer[DType.float32](n)
+    var host = ctx.enqueue_create_host_buffer[DType.float32](n)
+    copy_f32(values.unsafe_ptr(), host.unsafe_ptr(), n)
+    ctx.enqueue_copy(dst_buf=buf, src_ptr=host.unsafe_ptr())
+    ctx.synchronize()
+    _ = host^
+    return buf^
+
+
+def kde_score_samples_host(
+    train: List[Float32],
+    n_train: Int,
+    query: List[Float32],
+    n_query: Int,
+    n_features: Int,
+    bandwidth: Float32,
+    kernel: String,
+    metric: String,
+    weights: List[Float32],
+    has_weights: Bool,
+    elem_tpb: Int = KDE_ELEM_TPB,
+    lse_tpb: Int = KDE_LSE_TPB,
+    metric_arg: Float32 = Float32(2.0),
+) raises -> List[Float32]:
+    """`KernelDensity(bandwidth, kernel, metric).fit(X_train,
+    sample_weight).score_samples(X_query)`, one shot, host in and host out.
+    Row-major `train` (`n_train x n_features`) and `query` (`n_query x
+    n_features`). Raises, by name, on everything cuML's validation raises
+    on and on every unimplemented metric/kernel.
+
+    `metric_arg` is Minkowski's `p`, their name for it. cuML's
+    `KernelDensity` has no `p` parameter at all; it takes `metric_params`
+    and forwards `list(metric_params.values())[0]` as `metric_arg`
+    (`kernel_density.py:302-313`), so a caller following their surface
+    passes the single value of that dict here. Defaults to their
+    `pairwise_distances` default of 2 (`pairwise_distances.pyx:266`), which
+    is also what `score_samples` uses when `metric_params` is empty. It is
+    refused by value for non-Lp-valid p (DEVIATION 552) inside
+    `pairwise_distance`, before any launch."""
+    var k = kernel_from_name(kernel)
+    var m = metric_from_name(metric)
+    kde_fit_validate(n_train, n_features, bandwidth, k, m, weights, has_weights)
+    if n_query <= 0:
+        raise Error("kde: X must have at least one row (n_query)")
+    # DEVIATION 604: finite data (and the sqeuclidean magnitude bound),
+    # refused by name BEFORE any upload; the length check is inside.
+    kde_validate_data(train, n_train, n_features, m, "train")
+    kde_validate_data(query, n_query, n_features, m, "query")
+    var ctx = process_ctx[_DEVCTX_SLOT]()
+    var dtrain = _upload(ctx, train)
+    var dquery = _upload(ctx, query)
+    var dweights: DeviceBuffer[DType.float32]
+    var sum_w = Float32(n_train)
+    if has_weights:
+        dweights = _upload(ctx, weights)
+        sum_w = host_sum_weights(weights)
+    else:
+        var one = List[Float32]()
+        one.append(Float32(1.0))
+        dweights = _upload(ctx, one)
+    var dout = ctx.enqueue_create_buffer[DType.float32](n_query)
+    ctx.synchronize()
+    var trace = IdentityTrace()
+    trace.header(
+        "kde: n_train=" + String(n_train) + " n_query=" + String(n_query)
+        + " n_features=" + String(n_features) + " kernel=" + kernel
+        + " metric=" + metric + " metric_arg=" + String(metric_arg)
+        + " weighted=" + String(has_weights)
+    )
+    score_samples(
+        ctx, dquery, dtrain, dweights, has_weights, dout,
+        n_query, n_train, n_features, bandwidth, sum_w, k, m, metric_arg,
+        trace, elem_tpb, lse_tpb,
+    )
+    var host = ctx.enqueue_create_host_buffer[DType.float32](n_query)
+    ctx.enqueue_copy(dst_ptr=host.unsafe_ptr(), src_buf=dout)
+    ctx.synchronize()
+    var out = List[Float32]()
+    for i in range(n_query):
+        out.append(host.unsafe_ptr().unsafe_load(i))
+    _ = host^
+    _ = dtrain^
+    _ = dquery^
+    _ = dweights^
+    _ = dout^
+    # DEVIATION 1946: the context dies LAST, after every value built on it.
+    _ = ctx^
+    return out^
+
+
+def _upload_ptr(
+    ctx: DeviceContext,
+    values: MutPointer[Float32, MutUntrackedOrigin],
+    n: Int,
+) raises -> DeviceBuffer[DType.float32]:
+    """DEVIATION 2660: `_upload` from the caller's memory, one host copy
+    (caller to pinned) instead of two (caller to `List` to pinned)."""
+    var buf = ctx.enqueue_create_buffer[DType.float32](n)
+    var host = ctx.enqueue_create_host_buffer[DType.float32](n)
+    copy_f32(values, host.unsafe_ptr(), n)
+    ctx.enqueue_copy(dst_buf=buf, src_ptr=host.unsafe_ptr())
+    ctx.synchronize()
+    _ = host^
+    return buf^
+
+
+def kde_score_samples_host_ptr(
+    train: MutPointer[Float32, MutUntrackedOrigin],
+    n_train: Int,
+    query: MutPointer[Float32, MutUntrackedOrigin],
+    n_query: Int,
+    n_features: Int,
+    bandwidth: Float32,
+    kernel: String,
+    metric: String,
+    weights: List[Float32],
+    has_weights: Bool,
+    scores: MutPointer[Float32, MutUntrackedOrigin],
+    elem_tpb: Int = KDE_ELEM_TPB,
+    lse_tpb: Int = KDE_LSE_TPB,
+    metric_arg: Float32 = Float32(2.0),
+) raises:
+    """DEVIATION 2660: `kde_score_samples_host` over the caller's memory.
+
+    `train` (`n_train x n_features`) and `query` (`n_query x n_features`)
+    are read in place: validated by `kde_validate_data_ptr` (the same rules
+    and the same first refusal as `kde_validate_data`) and copied once into
+    pinned staging. `scores` receives the `n_query` scores straight from
+    the pinned download buffer. The checks run in `kde_score_samples_host`'s
+    order (names, `kde_fit_validate`, `n_query`, train data, query data),
+    so a bad call raises the same error; the device path, the trace and
+    therefore the bits are that function's. Nothing is written to `scores`
+    on a refusal."""
+    var k = kernel_from_name(kernel)
+    var m = metric_from_name(metric)
+    kde_fit_validate(n_train, n_features, bandwidth, k, m, weights, has_weights)
+    if n_query <= 0:
+        raise Error("kde: X must have at least one row (n_query)")
+    kde_validate_data_ptr(train, n_train, n_features, m, "train")
+    kde_validate_data_ptr(query, n_query, n_features, m, "query")
+    var ctx = process_ctx[_DEVCTX_SLOT]()
+    var dtrain = _upload_ptr(ctx, train, n_train * n_features)
+    var dquery = _upload_ptr(ctx, query, n_query * n_features)
+    var dweights: DeviceBuffer[DType.float32]
+    var sum_w = Float32(n_train)
+    if has_weights:
+        dweights = _upload(ctx, weights)
+        sum_w = host_sum_weights(weights)
+    else:
+        var one = List[Float32]()
+        one.append(Float32(1.0))
+        dweights = _upload(ctx, one)
+    var dout = ctx.enqueue_create_buffer[DType.float32](n_query)
+    ctx.synchronize()
+    var trace = IdentityTrace()
+    trace.header(
+        "kde: n_train=" + String(n_train) + " n_query=" + String(n_query)
+        + " n_features=" + String(n_features) + " kernel=" + kernel
+        + " metric=" + metric + " metric_arg=" + String(metric_arg)
+        + " weighted=" + String(has_weights)
+    )
+    score_samples(
+        ctx, dquery, dtrain, dweights, has_weights, dout,
+        n_query, n_train, n_features, bandwidth, sum_w, k, m, metric_arg,
+        trace, elem_tpb, lse_tpb,
+    )
+    var host = ctx.enqueue_create_host_buffer[DType.float32](n_query)
+    ctx.enqueue_copy(dst_ptr=host.unsafe_ptr(), src_buf=dout)
+    ctx.synchronize()
+    copy_f32(host.unsafe_ptr(), scores, n_query)
+    _ = host^
+    _ = dtrain^
+    _ = dquery^
+    _ = dweights^
+    _ = dout^
+    # DEVIATION 1946: the context dies LAST, after every value built on it.
+    _ = ctx^

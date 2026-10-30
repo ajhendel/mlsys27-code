@@ -1,0 +1,231 @@
+#!/usr/bin/env bash
+# ROOT ONLY on an already rented/prepared Linux GPU. No install, rental,
+# transport, benchmark, packing or publication. One actual architecture/build.
+# bash tools/release061_remote_build.sh cuda sm_89 /absolute/NEW_OUT
+# Required: ANONLIB_COMMIT(full SHA), ANONLIB_PYTHON(existing absolute Python),
+# ANONLIB_RELEASE_BUILD_SECONDS(120..6000, already excludes lease fetch reserve).
+# Optional: ANONLIB_BUILD_JOBS (auto, the default, or 1..16; tools/build_sizing.py).
+set -euo pipefail
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+cd "$ROOT"
+[[ $(uname -s) == Linux && $# == 3 ]] || { echo 'Remote Linux: vendor arch NEW_OUT required' >&2; exit 2; }
+vendor=$1 arch=$2 OUT=$3
+case "$vendor:$arch" in
+    # DEVIATION 2293: sm_90a is the Hopper slot's buildable spelling.
+    cuda:sm_80|cuda:sm_89|cuda:sm_90|cuda:sm_90a) guard=tools/nvidia_serial_guard.py; column=nvidia ;;
+    hip:gfx942) guard=tools/amd_serial_guard.py; column=amd ;;
+    *) echo 'Only cuda:sm_80 (the PTX set), cuda:sm_89, cuda:sm_90, cuda:sm_90a or hip:gfx942' >&2; exit 2 ;;
+esac
+# THE CPU BUILD ROUTE (tools/release_linux_build.sh, 2026-09-22). Mojo compiles
+# a GPU set ahead of time from --target-accelerator alone (PTX for NVIDIA, a
+# code object for AMD), so a release set does not need its GPU to be BUILT.
+# ANONLIB_RELEASE_NO_DEVICE=1 builds on a CPU-only box: the guard is the CPU
+# one (which refuses if any GPU device node is visible), the preflight records
+# that no device was read instead of reading one, and the postflight requires
+# the read-back architecture to equal the requested one. Everything else, the
+# build, the read-backs and the provenance, is the same code as the GPU legs.
+# Proven 2026-09-22 at d181d9792 (0.8.14): both NVIDIA sets byte-identical to
+# the GPU-box builds of the same commit (132 of 132 binaries); the AMD set
+# matched 62 of 66 because the Mojo compiler's gfx942 output is not
+# reproducible run to run (packaging/linux/build_sets.sh has the measurements;
+# docs/RELEASE_CHECKLIST.md 2c).
+NO_DEVICE=${ANONLIB_RELEASE_NO_DEVICE:-0}
+case "$NO_DEVICE" in 0) ;; 1) guard=tools/cpu_build_guard.py ;; *) echo 'ANONLIB_RELEASE_NO_DEVICE must be 0 or 1' >&2; exit 2 ;; esac
+PY=${ANONLIB_PYTHON:?existing absolute stdlib Python executable required}
+commit=${ANONLIB_COMMIT:?full frozen source commit required}
+seconds=${ANONLIB_RELEASE_BUILD_SECONDS:?remaining work seconds, excluding fetch reserve}
+[[ "$PY" = /* && -x "$PY" && "$commit" =~ ^[0-9a-f]{40}$ ]] || exit 2
+[[ "$seconds" =~ ^[0-9]+$ ]] && ((seconds >= 120 && seconds <= 6000)) || exit 2
+[[ "$OUT" = /* && ! -e "$OUT" && ! -L "$OUT" ]] || { echo 'New absolute output directory required' >&2; exit 2; }
+command -v taskset >/dev/null
+command -v pixi >/dev/null
+command -v objdump >/dev/null
+command -v patchelf >/dev/null || { echo 'Prepare patchelf before the build campaign; implicit installation refused' >&2; exit 2; }
+[[ -x "$ROOT/.pixi/envs/default/bin/mojo" && -x "$ROOT/.pixi/envs/default/bin/python" ]] || {
+    echo 'Prepare the locked Pixi default environment before this campaign' >&2; exit 2;
+}
+export ANONLIB_BUILD_PIXI_ENV=default ANONLIB_QUALIFY_PYTHON="$PY"
+export ANONLIB_PACKAGE_BYTE_LM=1
+export ANONLIB_GPU_ARCHS="$arch" ANONLIB_COMMIT="$commit"
+# THE PTX SLOT IS A RELEASE SET LIKE ANY ARCH (the author 2026-10-10: PTX is a normal
+# target; no flag). cuda/sm_80 is only ever the PTX set (gpu_plugins.PTX_ARCH):
+# build_sets.sh keeps its rounding-pinned PTX and writes PTX_BASELINE.json
+# instead of converting the IDENTICAL modules to sm_80 cubins.
+if [[ "$vendor" = cuda && "$arch" = sm_80 ]]; then
+    export ANONLIB_CUDA_CODE_FORMAT=ptx
+else
+    export ANONLIB_CUDA_CODE_FORMAT=native
+fi
+export ANONLIB_TARGET_COLUMN="$column" ANONLIB_LINUX_CPU=x86-64-v3
+unset ANONLIB_GPU_ARCH ANONLIB_VENDOR PYTHONHOME PYTHONPATH
+export PYTHONNOUSERSITE=1 PYTHONUNBUFFERED=1
+# DEVIATION 2501: the extension builds run ANONLIB_BUILD_JOBS at a time,
+# each still capped at two compiler workers and one BLAS thread; the
+# campaign's affinity is 2 x jobs cores and only the build step's guard is
+# widened to it. Every other step keeps the serial two-core, 12 GiB cap.
+# THE BOX SIZES THE BUILD (tools/build_sizing.py, 2026-09-25): unset or
+# `auto`, jobs = min(16, usable cores / 2, 0.6 x available GiB / per-job GiB)
+# and the build step's RSS cap is per-job GiB x jobs + 2; a box too small for
+# one job is refused here, before anything compiles. ANONLIB_BUILD_JOBS=N
+# stays an explicit override (the cap still follows N). The CPU build box
+# (NO_DEVICE=1) keeps its 16 GiB per job.
+sizing=$("$PY" "$ROOT/tools/build_sizing.py" --jobs "${ANONLIB_BUILD_JOBS:-auto}" --shell) || {
+    echo 'Build sizing refused (tools/build_sizing.py); nothing was built' >&2; exit 2;
+}
+BUILD_JOBS= BUILD_RSS_GIB= BOX_CORES= BOX_MEM_GIB= BUILD_PER_JOB_GIB= BUILD_SIZING=
+eval "$sizing"
+[[ "$BUILD_JOBS" =~ ^[1-9][0-9]?$ && "$BUILD_JOBS" -le 16 && "$BUILD_RSS_GIB" =~ ^[1-9][0-9]*$ ]] || { echo 'ANONLIB_BUILD_JOBS must be auto or 1..16' >&2; exit 2; }
+# A leg that sized the build before a container narrowed the box says so.
+[[ -n "${RELEASE_BUILD_SIZED_BY:-}" ]] && BUILD_SIZING="$BUILD_SIZING ($RELEASE_BUILD_SIZED_BY)"
+BUILD_CORES=$((2 * BUILD_JOBS))
+[[ "$NO_DEVICE" = 1 ]] && BUILD_RSS_GIB=$((16 * BUILD_JOBS))
+export ANONLIB_BUILD_JOBS=$BUILD_JOBS ANONLIB_COMPILE_JOBS=2 MAX_JOBS=2 CMAKE_BUILD_PARALLEL_LEVEL=2
+export ANONLIB_CPU_THREADS=2 CARGO_BUILD_JOBS=2 RAYON_NUM_THREADS=2
+export OMP_NUM_THREADS=1 OMP_THREAD_LIMIT=1 OMP_MAX_ACTIVE_LEVELS=1
+export OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 BLIS_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1 NUMEXPR_MAX_THREADS=1 VECLIB_MAXIMUM_THREADS=1
+export MAKEFLAGS=-j2 MFLAGS=-j2 GNUMAKEFLAGS=
+cores=$("$PY" -c 'import os, sys; print(",".join(map(str, sorted(os.sched_getaffinity(0))[:int(sys.argv[1])])))' "$BUILD_CORES")
+[[ -n "$cores" ]] || exit 2
+taskset -pc "$cores" $$
+"$PY" -c 'import os, sys; assert 1 <= len(os.sched_getaffinity(0)) <= int(sys.argv[1])' "$BUILD_CORES"
+umask 077
+mkdir "$OUT"
+deadline=$(($(date +%s) + seconds - 30))
+active_guard=
+cleanup() {
+    local status=$?
+    trap - EXIT
+    trap '' TERM HUP INT
+    if [[ -n "$active_guard" ]]; then
+        kill -TERM "$active_guard" 2>/dev/null || true
+        wait "$active_guard" 2>/dev/null || true
+    fi
+    (set -o noclobber; printf '%s\n' "$status" > "$OUT/exit_code")
+    exit "$status"
+}
+trap cleanup EXIT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+trap 'exit 130' INT
+: > "$OUT/results.tsv"
+cp "$ROOT/tools/release061_remote_build.sh" "$OUT/campaign-source.sh"
+printf '%s\n' "vendor=$vendor" "architecture=$arch" "source_commit=$commit" \
+    "cpu_affinity=$cores" "build_jobs=$BUILD_JOBS" "build_cores=$BUILD_CORES" "work_seconds=$seconds" 'rss_gib=12' 'pixi_environment=default' \
+    "kernel_column=$column" 'linux_cpu=x86-64-v3' "patchelf=$(command -v patchelf)" "no_device=$NO_DEVICE" "build_rss_gib=$BUILD_RSS_GIB" \
+    "build_sizing=$BUILD_SIZING" "box_cores=$BOX_CORES" "box_mem_available_gib=$BOX_MEM_GIB" "build_per_job_gib=$BUILD_PER_JOB_GIB" \
+    'scope=one architecture full46 build; byte LM IDENTICAL only; no installed wheel or numerical admission' > "$OUT/campaign.txt"
+run() {
+    local name=$1 cap=$2 remaining status
+    shift 2
+    remaining=$((deadline - $(date +%s)))
+    if ((remaining < 15)); then
+        printf '%s\t124\tSKIPPED_DEADLINE\n' "$name" >> "$OUT/results.tsv"
+        return 124
+    fi
+    ((cap <= remaining)) || cap=$remaining
+    # The build step alone runs on BUILD_CORES; every other job stays on two.
+    local guard_cores=2 guard_rss=12
+    [[ "$name" = full46-build ]] && guard_cores=$BUILD_CORES && guard_rss=$BUILD_RSS_GIB
+    printf '%q ' "$PY" "$guard" --seconds "$cap" --rss-gib "$guard_rss" --cores "$guard_cores" -- "$@" > "$OUT/$name.command.txt"
+    printf '\n' >> "$OUT/$name.command.txt"
+    "$PY" "$guard" --seconds "$cap" --rss-gib "$guard_rss" --cores "$guard_cores" -- "$@" > "$OUT/$name.log" 2>&1 &
+    active_guard=$!
+    status=0
+    wait "$active_guard" || status=$?
+    active_guard=
+    printf '%s\t%s\n' "$name" "$status" >> "$OUT/results.tsv"
+    return "$status"
+}
+
+cat > "$OUT/preflight.py" <<'PYPROBE'
+import importlib.util, json, os, pathlib, subprocess, sys
+root, out = map(pathlib.Path, sys.argv[1:3])
+vendor, arch, commit, no_device = sys.argv[3:]
+sys.path.insert(0, str(root / 'tools'))
+from check_linux_release_qualification import native_inventory, inventory_digest
+if (root / '.git').exists():
+    actual = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=root, text=True, timeout=10).strip()
+    if actual != commit:
+        raise SystemExit('Checkout commit differs from root pin')
+    # Tracked source must be clean; output evidence is retained separately.
+    subprocess.run(['git', 'diff', '--quiet', 'HEAD', '--'], cwd=root, timeout=15, check=True)
+else:
+    if (root / 'commit.txt').read_text().strip() != commit:
+        raise SystemExit('Archive commit witness differs from root pin')
+# _backend.py imports host_surface relatively (f74fdfc22), so it is loaded as a
+# submodule of a stand-in package over python/anonlib. Importing the real
+# package would run __init__.py, which loads bindings this build has not made.
+import types
+probe_pkg = types.ModuleType('release_backend_probe')
+probe_pkg.__path__ = [str(root / 'python/anonlib')]
+sys.modules['release_backend_probe'] = probe_pkg
+spec = importlib.util.spec_from_file_location('release_backend_probe._backend', root / 'python/anonlib/_backend.py')
+backend = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = backend
+spec.loader.exec_module(backend)
+if no_device == '1':
+    # THE CPU BUILD ROUTE: nothing is read from a device, and that is recorded
+    # as such. The architecture is the requested one; the build's own
+    # arch_readback.txt (build_sets.sh) and the postflight below prove the
+    # binaries carry exactly it.
+    actual_arch, how = arch, 'no-device: CPU build box, target from ANONLIB_GPU_ARCHS=' + arch
+else:
+    actual_arch, how = backend._device_arch(vendor)
+# DEVIATION 2293: the device reports sm_90; an sm_90a build targets exactly
+# that chip. This is _backend.py's own selector rule (the `a` restricts WHICH
+# DEVICES, and this is one of them), applied to the build side so the box we
+# build on and the name we build under can differ by that suffix and nothing
+# else. cuda only: hip code objects are ISA-exact and take no suffix rule.
+if actual_arch != arch and not (vendor == 'cuda' and arch == actual_arch + 'a'):
+    raise SystemExit('Physical device does not match requested architecture: ' + repr((actual_arch, arch, how)))
+inventory = native_inventory(root)
+# DEVIATION 2290: this schema string names the script (release061_remote_build.sh,
+# kept by name for its controllers), not the version built. The version is
+# python/anonlib/_version.py and the assembly profile is release-linux3.
+record = dict(schema='anonlib.release061.build-preflight.v1', source_commit=commit,
+              source_inventory=inventory, source_sha256=inventory_digest(inventory),
+              vendor=vendor, device_architecture=actual_arch, architecture_probe=how,
+              device_read=(no_device != '1'),
+              cpu_affinity=sorted(os.sched_getaffinity(0)), pixi_environment='default',
+              scope='Physical device and source witness; no installed qualification')
+(out / 'preflight.json').write_text(json.dumps(record, indent=2) + '\n')
+PYPROBE
+run resource-prefix-tests 45 "$PY" "$ROOT/tools/test_linux_surface_resource_caps.py"
+run physical-source-preflight 60 "$PY" "$OUT/preflight.py" "$ROOT" "$OUT" "$vendor" "$arch" "$commit" "$NO_DEVICE"
+# The sizing record, copied into build-provenance.json as build_resources.
+printf '{"jobs": %s, "rss_cap_gib": %s, "cores": %s, "mem_available_gib": %s, "per_job_gib": %s, "sizing": "%s", "build_cores": %s}\n' \
+    "$BUILD_JOBS" "$BUILD_RSS_GIB" "$BOX_CORES" "$BOX_MEM_GIB" "$BUILD_PER_JOB_GIB" "$BUILD_SIZING" "$BUILD_CORES" > "$OUT/build-sizing.json"
+export RELEASE_BUILD_SIZING_FILE="$OUT/build-sizing.json"
+run full46-build "$seconds" bash "$ROOT/tools/linux_surface_qualification.sh" build "$OUT/build"
+cat > "$OUT/postflight.py" <<'PYPOST'
+import json, pathlib, sys
+out = pathlib.Path(sys.argv[1])
+sys.path.insert(0, str(pathlib.Path.cwd() / 'tools'))
+from verify_linux_surface_qualification import MODES, expected_bindings
+expected_count = sum(len(expected_bindings(mode, True)) for mode in MODES)
+before = json.loads((out / 'preflight.json').read_text())
+proof = json.loads((out / 'build/build-provenance.json').read_text())
+if (proof.get('complete') is not True or proof.get('build_exit') != 0
+        or proof.get('source_commit') != before['source_commit']
+        or proof.get('source_inventory') != before['source_inventory']
+        or proof.get('source_sha256') != before['source_sha256']):
+    raise SystemExit('Build proof differs from preflight or is incomplete')
+# DEVIATION 2293, postflight side: the device reports sm_90 and the build is
+# sm_90a; the same suffix rule the preflight applies holds here, cuda only.
+# Until 2026-09-10 this check demanded string equality and marked every
+# green H100 leg (0.7.0 included) build-proof-check 1.
+built = {p.split('/')[2] for p in proof.get('extensions', {})}
+witness = before['device_architecture']
+if len(built) != 1 or not (built == {witness} or (before['vendor'] == 'cuda' and built == {witness + 'a'})):
+    raise SystemExit('Built architecture differs from physical GPU witness: ' + repr((sorted(built), witness)))
+prefix = 'anonlib/' + before['vendor'] + '/' + next(iter(built)) + '/'
+if len(proof.get('extensions', {})) != expected_count or not all(p.startswith(prefix) for p in proof['extensions']):
+    raise SystemExit('Built architecture differs from physical GPU witness')
+byte_members = {p for p in proof['extensions'] if p.endswith('/_anonlib_byte_lm.so')}
+if byte_members != {prefix + 'identical/_anonlib_byte_lm.so'}:
+    raise SystemExit('Byte LM must exist exactly once, in IDENTICAL')
+print(json.dumps(dict(status='BUILT_NOT_INSTALLED', extensions=expected_count,
+                     vendor=before['vendor'], architecture=before['device_architecture'])))
+PYPOST
+run build-proof-check 30 "$PY" "$OUT/postflight.py" "$OUT"

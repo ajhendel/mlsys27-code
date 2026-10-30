@@ -1,0 +1,62 @@
+# Public names left out of docs.anon.example, one per line: name <TAB> reason.
+# Rule (CLAUDE.md "Public docs and docstrings"): broken, unverified or unfinished = not documented.
+# "Unverified" = no matching NVIDIA and AMD reference records in `python -m anonlib verify --coverage`
+# for the shipped release, or (multi-GPU) no cross-vendor qualification. Remove a line once it qualifies.
+# Checked against 0.8.41 on 2026-10-12.
+Conv2d	CNN lanes (x-cnn-*): no NVIDIA+AMD reference records in 0.8.41
+Conv1d	CNN lanes: no NVIDIA+AMD reference records
+MaxPool2d	CNN lanes: no NVIDIA+AMD reference records
+AvgPool2d	CNN lanes: no NVIDIA+AMD reference records
+MaxPool1d	CNN lanes: no NVIDIA+AMD reference records
+AvgPool1d	CNN lanes: no NVIDIA+AMD reference records
+CNNClassifier	CNN lanes: no NVIDIA+AMD reference records
+BatchNorm2d	CNN lanes: no NVIDIA+AMD reference records
+BatchNorm1d	CNN lanes: no NVIDIA+AMD reference records
+Dropout2d	CNN lanes: no NVIDIA+AMD reference records
+AdaptiveAvgPool2d	CNN lanes: no NVIDIA+AMD reference records
+AdaptiveMaxPool2d	CNN lanes: no NVIDIA+AMD reference records
+BasicBlock	CNN lanes: no NVIDIA+AMD reference records
+GCNConv	CNN/GNN lanes: no NVIDIA+AMD reference records
+SAGEConv	CNN/GNN lanes: no NVIDIA+AMD reference records
+Adafactor	sequence-adafactor lane: no NVIDIA+AMD reference records
+LAMB	sequence-lamb lane: no NVIDIA+AMD reference records
+LanguageModelHostTrainer	byte-lm-host-train lane: no NVIDIA+AMD reference records
+OffloadedByteLanguageModelTrainer	multi-GPU: NVIDIA-only evidence, no cross-vendor qualification
+PooledByteLanguageModelTrainer	multi-GPU: NVIDIA-only evidence, no cross-vendor qualification
+ParallelByteLanguageModelTrainer	multi-GPU: no cross-vendor qualification
+ParallelNeuralTrainer	multi-GPU: no cross-vendor qualification
+parallel_forecasting	multi-GPU: physical qualification pending
+parallel_gaussian_process	multi-GPU: physical qualification pending
+parallel_ivf	multi-GPU: physical qualification pending
+parallel_model_selection	multi-GPU: physical qualification pending
+DistributedIVFIndex	multi-GPU: physical qualification pending
+ExperimentalTwoLevelFeatureFreq	name marks it experimental (unfinished)
+OrderedRMSE	needs installed-artifact qualification (unverified)
+GPT2Tokenizer	deprecated alias of BpeTokenizer; its page renders blank
+# Members (Class.member or module.member): skipped by conf.py's autodoc-skip-member hook.
+SmallMLPTrainer.train_steps	Apple FAST multistep build only; raises RuntimeError elsewhere
+TransformerBlock.forward_with_tape	tape API not in the shipped binding; unverified
+TransformerBlock.backward_from_tape	tape API not in the shipped binding; unverified
+Mamba3Block.install_owned_weights	owned-weights build only; raises RuntimeError elsewhere
+Mamba3Block.export_owned_weights	owned-weights build only; raises RuntimeError elsewhere
+Mamba3Block.release_owned_weights	owned-weights build only; raises RuntimeError elsewhere
+resample.fast_defines	internal build switches, no meaning to users
+parallel_causal_lm.ParallelCausalLM	multi-GPU layer ownership: no cross-vendor qualification
+linalg_fast.has_bf16	experimental Apple BF16 candidate; installed-release qualification pending
+linalg_fast.to_bf16	experimental Apple BF16 candidate; installed-release qualification pending
+linalg_fast.from_bf16	experimental Apple BF16 candidate; installed-release qualification pending
+linalg_fast.matmul_bf16	experimental Apple BF16 candidate; installed-release qualification pending
+# Direct native aliases report their binding module to autodoc.
+_anonlib_linalg.has_bf16	experimental Apple BF16 candidate; installed-release qualification pending
+_anonlib_linalg.to_bf16	experimental Apple BF16 candidate; installed-release qualification pending
+_anonlib_linalg.from_bf16	experimental Apple BF16 candidate; installed-release qualification pending
+_anonlib_linalg.matmul_bf16	experimental Apple BF16 candidate; installed-release qualification pending
+_anonlib_linalg.fast_bf16_available	experimental Apple BF16 candidate; installed-release qualification pending
+_anonlib_linalg.fast_to_bf16	experimental Apple BF16 candidate; installed-release qualification pending
+_anonlib_linalg.fast_from_bf16	experimental Apple BF16 candidate; installed-release qualification pending
+_anonlib_linalg.fast_matmul_bf16	experimental Apple BF16 candidate; installed-release qualification pending
+_anonlib_linalg.public_fast_to_bf16	experimental Apple BF16 candidate; installed-release qualification pending
+_anonlib_linalg.public_fast_from_bf16	experimental Apple BF16 candidate; installed-release qualification pending
+Sequential.dropout	needs the tape's dropout in the build (-D ANONLIB_AUTOGRAD_HAS_DROPOUT); refused by name in the shipped bindings
+Session.profile_reset	diagnostic launch profile for development, not user API
+Session.profile_report	diagnostic launch profile for development, not user API

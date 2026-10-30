@@ -1,0 +1,288 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 the authors. Part of anonlib, DOI-WITHHELD
+"""`svdEig`: the SVD of a tall matrix through the eigendecomposition of its Gram.
+
+Reference: `svdEig`, `raft/cpp/include/raft/linalg/detail/svd.cuh` (RAFT
+`661a3b8`). Partial: `svdEig` only (`svdQR`, `svdJacobi` and `svdReconstruction`
+are not implemented; see `glm/NOT_IMPLEMENTED.tsv`).
+
+The reference steps (`svd.cuh:112-171`):
+
+    in_cross_mult = A^T A          gemm, CUBLAS_OP_T / CUBLAS_OP_N
+    eigDC(in_cross_mult) -> V, S   cuSOLVER syevd; S ASCENDING
+    col_reverse(V); row_reverse(S) -> DESCENDING
+    S = sqrt(S)                    seqRoot(S, S, 1, n_cols, set_neg_zero=true)
+    if gen_left_vec:
+        U = A V                    gemm, CUBLAS_OP_N / CUBLAS_OP_N
+        U /= S (per column)        matrixVectorBinaryDivSkipZero<false,true>
+                                   -- |S| < 1e-10 leaves the column AS IS
+
+It is `cuml/cpp/src/glm/ridge.cuh::ridgeEig`'s first call, and the only
+caller here. **It is the same first two steps as `lstsq_eig`** (`glm/impl/
+linalg/detail/lstsq.mojo`): `core/gemm.mojo::gemm_tn` for the Gram and
+`jacobi_eigh_kernel` for the eigendecomposition, so everything IDENTITY_PATHS
+rows 27 and 31 pinned is reached here unchanged.
+
+THE REVERSE IS A SORT, FOR THE SAME REASON `eig_and_truncate` GIVES
+---------------------------------------------------------------------
+cuSOLVER returns eigenvalues ascending, so `col_reverse`/`row_reverse` make
+them descending. Cyclic Jacobi does not order anything, so a reverse here
+would be an arbitrary permutation. The descending ORDER is the semantic and
+is produced on the device by ranking INDICES (`_descending_order_kernel`,
+comparisons only, ties to the lower index) and applied by
+`gather_columns_kernel`.
+For ridge the order is not even observable in exact arithmetic -- `w = V
+diag(.) V^T A^T b` is permutation-invariant -- but the final `w = V S_nnz`
+sums over columns IN INDEX ORDER, so the order is a rounding order, and
+matching the reference is how a cross-vendor card stays comparable stage for
+stage.
+
+WHAT IS NOT IMPLEMENTED: `gen_left_vec == false` returns before `U`; both callers
+here pass `true` and the flag is honored anyway. The two-stream overlap is
+absent as in `lstsq.mojo`.
+"""
+
+from core.device_zero import enqueue_fill
+from std.gpu import block_dim, block_idx, thread_idx
+from max.gpu.host import DeviceBuffer, DeviceContext
+from x_decomp.cells import F32Ptr
+from x_decomp.eigh_scale import enqueue_es_scale, enqueue_es_unscale
+
+from decomposition.spectrum_order_device import spectrum_rank_desc
+
+from core.column_stats import diagonal_to_vector_kernel
+from core.gemm import gemm_nt, gemm_tn
+from core.identity_trace import IdentityTrace
+from experiments.classical_identical_ideas.fg_linear_controls import IDN_JACOBI_ROUND_ROBIN
+from decomposition.impl.linalg.detail.pca import _eig_rr_device
+from decomposition.checks.jacobi_eigh_device import (
+    JACOBI_INFO_UNWRITTEN,
+    JACOBI_SWEEPS,
+    JACOBI_TOL,
+    JACOBI_ROT_TPB,
+    jacobi_eigh_kernel,
+)
+from glm.impl.matrix.math import (
+    MATRIX_ELEM_TPB,
+    gather_columns_kernel,
+    gather_vector_kernel,
+    matrix_vector_binary_div_skip_zero_kernel,
+    seq_root_kernel,
+)
+
+
+def _descending_order_kernel(
+    key: MutPointer[Float32, MutAnyOrigin],
+    n_in: Int32,
+    order: MutPointer[Int32, MutAnyOrigin],
+):
+    """`col_reverse`/`row_reverse`'s semantic for an unordered eigensolver:
+    thread i puts index i at its rank in the DESCENDING order
+    (`decomposition/spectrum_order_device.mojo::spectrum_rank_desc`: the
+    float bits made monotone, ties to the LOWER index). Comparisons only.
+    lane/apple-fast-purity2: was a host selection sort of the downloaded
+    eigenvalues (strict `>`, whose tie order was not the lower index); the
+    host column (`glm/host/glm_oracle.mojo`) now ranks the same way."""
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    var n = Int(n_in)
+    if i < n:
+        order.unsafe_store(spectrum_rank_desc(key, n, i), Int32(i))
+
+
+def svd_eig_traced(
+    ctx: DeviceContext,
+    mut a: DeviceBuffer[DType.float32],
+    n_rows: Int,
+    n_cols: Int,
+    mut s: DeviceBuffer[DType.float32],
+    mut u: DeviceBuffer[DType.float32],
+    mut v: DeviceBuffer[DType.float32],
+    gen_left_vec: Bool,
+    mut trace: IdentityTrace,
+    tag: String,
+) raises:
+    """`svdEig(handle, in, n_rows, n_cols, S, U, V, gen_left_vec, stream)`.
+
+    `a` is `n_rows x n_cols` row-major and is NOT modified. `s` is `n_cols`,
+    `u` is `n_rows x n_cols` (written only if `gen_left_vec`), `v` is
+    `n_cols x n_cols` with the right singular vectors as COLUMNS, descending.
+    `tag` prefixes the card's stage names (`ridge.svd.*`).
+    """
+    var xa = ctx.enqueue_create_buffer[DType.float32](n_rows * n_cols)
+    var xa2 = ctx.enqueue_create_buffer[DType.float32](n_rows * n_cols)
+    ctx.synchronize()
+    svd_eig_scratch_traced(ctx, a, n_rows, n_cols, s, u, v, gen_left_vec, xa, xa2, trace, tag)
+    _ = xa^
+    _ = xa2^
+
+
+def svd_eig_scratch_traced(
+    ctx: DeviceContext,
+    mut a: DeviceBuffer[DType.float32],
+    n_rows: Int,
+    n_cols: Int,
+    mut s: DeviceBuffer[DType.float32],
+    mut u: DeviceBuffer[DType.float32],
+    mut v: DeviceBuffer[DType.float32],
+    gen_left_vec: Bool,
+    mut xa: DeviceBuffer[DType.float32],
+    mut xa2: DeviceBuffer[DType.float32],
+    mut trace: IdentityTrace,
+    tag: String,
+) raises:
+    """`svd_eig_traced` with the Gram's `gemm_tn` scratch (`xt`, `xt2`)
+    handed in by the caller (lane apple-fast-ridgespeed): a caller holding a
+    dead rows x cols buffer passes it instead of two fresh allocations. Same
+    kernels, same launch shapes, same words; `xa`/`xa2` carry `gemm_tn`'s
+    contracts (`k * m` floats where its arm reads them)."""
+    var cov = ctx.enqueue_create_buffer[DType.float32](n_cols * n_cols)
+    var v_raw = ctx.enqueue_create_buffer[DType.float32](n_cols * n_cols)
+    var vt = ctx.enqueue_create_buffer[DType.float32](n_cols * n_cols)
+    var s_raw = ctx.enqueue_create_buffer[DType.float32](n_cols)
+    var info_buf = ctx.enqueue_create_buffer[DType.float32](3)
+    enqueue_fill(ctx, info_buf, JACOBI_INFO_UNWRITTEN)
+    ctx.synchronize()
+
+    # in_cross_mult <- A^T A. `svd.cuh:132-144`. Through `gemm_tn`'s
+    # dispatch: the pinned split-K Gram kernel at the shipped shapes (row
+    # 27), refused by name past its capacity under IDENTICAL.
+    gemm_tn(ctx, cov, a, xa, xa2, n_cols, n_cols, n_rows)
+    ctx.synchronize()
+    trace.record_device[DType.float32](
+        ctx, tag + ".covA", cov, n_cols * n_cols
+    )
+    # lane idn-cov-overflow: the power-of-two range scale of
+    # x_decomp/eigh_scale.mojo on the Gram (no write while max |cov| is in
+    # [2^-33, 2^32)) so the Jacobi's ||A||_F^2 stays finite; the
+    # eigenvalues unscaled after it. `host_svd_eig` takes the same.
+    var dfac = enqueue_es_scale(ctx, F32Ptr(unsafe_from_address=Int(cov.unsafe_ptr())), 1, n_cols)
+
+    # eigDC -> V, S. `svd.cuh:146`. The device Jacobi (row 31) consumes
+    # `cov` and leaves S on its diagonal; `eigDC` ABORTS on a non-zero
+    # `dev_info` (`raft/linalg/detail/eig.cuh:149-151`) and so does this.
+    comptime if IDN_JACOBI_ROUND_ROBIN:
+        # lane fg-linear L1 (default ON 2026-10-09, -D ANONLIB_IDN_JACOBI_ROUND_ROBIN_OFF for the cyclic block;
+        # experiments/classical_identical_ideas/fg_linear_controls.mojo): the
+        # round-robin rounds, every rotation of a round in parallel, the same
+        # layout out (cov diagonal = eigenvalues, v_raw columns = vectors,
+        # info_buf = converged / off / sweeps). Host column: host_eigh_rr.
+        _eig_rr_device(ctx, cov, v_raw, info_buf, n_cols)
+    else:
+        ctx.enqueue_function[jacobi_eigh_kernel[JACOBI_ROT_TPB]](
+            cov.unsafe_ptr(),
+            v_raw.unsafe_ptr(),
+            info_buf.unsafe_ptr(),
+            Int32(n_cols),
+            Int32(JACOBI_SWEEPS),
+            Float32(JACOBI_TOL),
+            grid_dim=(1, 1, 1),
+            block_dim=(JACOBI_ROT_TPB, 1, 1),
+        )
+    ctx.enqueue_function[diagonal_to_vector_kernel](
+        s_raw.unsafe_ptr(),
+        cov.unsafe_ptr(),
+        Int32(n_cols),
+        grid_dim=((n_cols + MATRIX_ELEM_TPB - 1) // MATRIX_ELEM_TPB, 1, 1),
+        block_dim=(MATRIX_ELEM_TPB, 1, 1),
+    )
+    enqueue_es_unscale(ctx, F32Ptr(unsafe_from_address=Int(s_raw.unsafe_ptr())), dfac, 1, n_cols)
+    var h_info = ctx.enqueue_create_host_buffer[DType.float32](3)
+    ctx.enqueue_copy(dst_ptr=h_info.unsafe_ptr(), src_buf=info_buf)
+    ctx.synchronize()
+    if h_info.unsafe_ptr().unsafe_load(0) == JACOBI_INFO_UNWRITTEN:
+        raise Error(
+            "svdEig: the device Jacobi eigensolver DID NOT WRITE its info"
+            " buffer, so it never ran or its launch failed. This is NOT a"
+            " convergence failure and must not be reported as one: the"
+            " sentinel -1.0 is a value the kernel never stores. Check that"
+            " the binding is built for this device and that the launch"
+            " above it did not fault."
+        )
+    if h_info.unsafe_ptr().unsafe_load(0) == Float32(0.0):
+        raise Error(
+            "svdEig: the device Jacobi did not converge in "
+            + String(JACOBI_SWEEPS)
+            + " sweeps on the "
+            + String(n_cols)
+            + " x "
+            + String(n_cols)
+            + " Gram matrix; ||offdiag||_F / ||.||_F is still "
+            + String(h_info.unsafe_ptr().unsafe_load(1))
+            + ". eigDC aborts here too (raft eig.cuh:149)."
+        )
+    _ = h_info^
+    _ = dfac^
+    trace.record_device[DType.float32](ctx, tag + ".eigvals", s_raw, n_cols)
+    trace.record_device[DType.float32](ctx, tag + ".info", info_buf, 3)
+
+    # col_reverse(V); row_reverse(S). `svd.cuh:148-151`. A permutation of
+    # indices, computed on the host, applied on the device; the module
+    # docstring says why it is a sort and not a reverse.
+    var d_order = ctx.enqueue_create_buffer[DType.int32](n_cols)
+    ctx.enqueue_function[_descending_order_kernel](
+        s_raw.unsafe_ptr(),
+        Int32(n_cols),
+        d_order.unsafe_ptr(),
+        grid_dim=((n_cols + MATRIX_ELEM_TPB - 1) // MATRIX_ELEM_TPB, 1, 1),
+        block_dim=(MATRIX_ELEM_TPB, 1, 1),
+    )
+    trace.record_device[DType.int32](ctx, tag + ".order", d_order, n_cols)
+    ctx.enqueue_function[gather_columns_kernel](
+        v.unsafe_ptr(),
+        vt.unsafe_ptr(),
+        v_raw.unsafe_ptr(),
+        d_order.unsafe_ptr(),
+        Int32(n_cols),
+        grid_dim=((n_cols * n_cols + MATRIX_ELEM_TPB - 1) // MATRIX_ELEM_TPB, 1, 1),
+        block_dim=(MATRIX_ELEM_TPB, 1, 1),
+    )
+    ctx.enqueue_function[gather_vector_kernel](
+        s.unsafe_ptr(),
+        s_raw.unsafe_ptr(),
+        d_order.unsafe_ptr(),
+        Int32(n_cols),
+        grid_dim=((n_cols + MATRIX_ELEM_TPB - 1) // MATRIX_ELEM_TPB, 1, 1),
+        block_dim=(MATRIX_ELEM_TPB, 1, 1),
+    )
+    # seqRoot(S, S, alpha=1, n_cols, set_neg_zero=true). `svd.cuh:153`.
+    ctx.enqueue_function[seq_root_kernel](
+        s.unsafe_ptr(),
+        Int32(n_cols),
+        Float32(1.0),
+        Int32(1),
+        grid_dim=((n_cols + MATRIX_ELEM_TPB - 1) // MATRIX_ELEM_TPB, 1, 1),
+        block_dim=(MATRIX_ELEM_TPB, 1, 1),
+    )
+    ctx.synchronize()
+    trace.record_device[DType.float32](ctx, tag + ".S", s, n_cols)
+    trace.record_device[DType.float32](ctx, tag + ".V", v, n_cols * n_cols)
+
+    if gen_left_vec:
+        # U <- A V. `svd.cuh:155-168`, CUBLAS_OP_N / CUBLAS_OP_N. `gemm_nt`
+        # computes `x . y^T`, so `y` is `V^T`, which `gather_columns_kernel`
+        # wrote alongside `V`. Under IDENTICAL the pinned one-thread-per-
+        # cell product (row 28); under FAST the vendor matmul.
+        gemm_nt(ctx, u, a, vt, n_rows, n_cols, n_cols)
+        ctx.synchronize()
+        # U /= S per column, |S| < 1e-10 LEAVES THE COLUMN AS IS
+        # (`return_zero` defaulted false at `svd.cuh:169`).
+        ctx.enqueue_function[matrix_vector_binary_div_skip_zero_kernel](
+            u.unsafe_ptr(),
+            s.unsafe_ptr(),
+            Int32(n_rows),
+            Int32(n_cols),
+            Int32(0),
+            grid_dim=((n_rows * n_cols + MATRIX_ELEM_TPB - 1) // MATRIX_ELEM_TPB, 1, 1),
+            block_dim=(MATRIX_ELEM_TPB, 1, 1),
+        )
+        ctx.synchronize()
+        trace.record_device[DType.float32](ctx, tag + ".U", u, n_rows * n_cols)
+
+    # `[[mojo-buffer-freed-at-last-use]]`: keep every scratch alive past the
+    # last synchronize that waits on a kernel reading it.
+    _ = cov^
+    _ = v_raw^
+    _ = vt^
+    _ = s_raw^
+    _ = info_buf^
+    _ = d_order^

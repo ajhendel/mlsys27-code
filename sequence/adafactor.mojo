@@ -1,0 +1,429 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 the authors. Part of anonlib, DOI-WITHHELD
+"""Adafactor, as PyTorch 2.5 states it (`torch/optim/_adafactor.py`,
+`_single_tensor_adafactor`): relative step alpha = max(eps2, RMS(p)) rho_t,
+rho_t = min(lr, 1/sqrt(t)); decoupled weight decay; for a matrix the
+factored second moment row_var (mean over columns of g^2) and col_var (mean
+over rows), each lerped toward the new mean with weight t^beta2_decay, the
+estimate row_var col_var / max(mean(row_var), eps1); for a vector the full
+second moment; the update g / sqrt(max(estimate, eps1^2)) scaled by
+1 / max(1, RMS(update) / d). One tensor per call; each row, column and
+mean reduction is one thread's ascending loop, and under IDENTICAL the two
+whole-tensor norms are the blocked order (AF_NORM_BLOCK below). torch's
+norms are sqrt(sum of squares), squared back where the reference squares
+them, and its lerp is torch's two-branch formula."""
+from sequence.ops import FP, Args, add, fma3, ld, lerp, mul, st, sub, sumsq_fold
+from std.memory import bitcast
+from std.sys.compile import is_defined
+from checks.numerics import GLOBAL_NUMERIC_MODE, NUMERIC_IDENTICAL, ftz, identical_div, identical_mul_add, identical_rsqrt, identical_sqrt
+
+
+# NI54 V subarm, default OFF: column second moments use consecutive absolute
+# 64-row fma leaves, then ascending add of live leaf totals from +0.0. The
+# sqrt/square/division/lerp remain outside the fold exactly as before. Host
+# and all GPU columns share this graph; launch slab width cannot change it.
+# Rows <=64 still go through the explicit +0 leaf merge in this version.
+# This is not a quality claim: full neural optimizer trajectories are pending.
+comptime AF_COL_CHUNK_FOLD = (
+    GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL
+    and is_defined["ANONLIB_IDN_AF_COL_CHUNK_FOLD"]()
+    and not is_defined["ANONLIB_IDN_ALL_OFF"]()
+)
+comptime AF_COL_LEAF = 64
+
+
+def af_col_canonical_sumsq(p: FP, col: Int, rows: Int, stride: Int) -> Float32:
+    var total = Float32(0.0)
+    var lo = 0
+    while lo < rows:
+        var leaf = Float32(0.0)
+        for row in range(lo, min(rows, lo + AF_COL_LEAF)):
+            var g = ld(p, row * stride + col)
+            leaf = fma3(g, g, leaf)
+        total = add(total, leaf)
+        lo += AF_COL_LEAF
+    return total
+
+
+@always_inline
+def div(a: Float32, b: Float32) -> Float32:
+    return ftz(identical_div(a, b))
+
+
+@always_inline
+def _sumsq(p: FP, start: Int, n: Int, stride: Int) -> Float32:
+    return sumsq_fold(p, start, n, stride)
+
+
+# ------------------------------------------------------------------ FAST norms
+#: FAST only (lane/sequence-apple2, 2026-09-28): a long sum of squares in
+#: two passes, SUMSQ_THREADS strided partials (thread t folds elements t,
+#: t + T, t + 2T, ..., so a simdgroup's loads are contiguous) and then one
+#: thread adds the partials in order. A different order from IDENTICAL's one
+#: ascending chain, so FAST only; its error against a float64 sum is lower
+#: (T short chains instead of one of length n). IDENTICAL never launches it.
+comptime SUMSQ_THREADS = 4096
+
+
+def op_chunk_sumsq(t: Int, a: Args):
+    """Partial t of a segment: p1[i2 + t] = sum of p0[i3 + t + k T]^2 over
+    k, T = i1 threads, i0 the segment length."""
+    var n = a.i0
+    var T = a.i1
+    var cnt = (n - t + T - 1) // T if t < n else 0
+    st(a.p1, a.i2 + t, sumsq_fold(a.p0, a.i3 + t, cnt, T))
+
+
+@always_inline
+def _psum(p: FP, n: Int) -> Float32:
+    """The partials p[0:n] added in order."""
+    var s = Float32(0.0)
+    for k in range(n):
+        s = add(s, ld(p, k))
+    return s
+
+
+# ------------------------------------------------------------------ IDENTICAL blocked norms
+#: lane hr-adafactor (2026-10-02, docs/plans/HOST_ROUTE_REMOVAL.md): under
+#: IDENTICAL a whole-tensor sum of squares of more than AF_NORM_BLOCK values
+#: is THE BLOCKED ORDER (the author's approved fold contract of Oct 1, the one
+#: x_linear's row folds take): the tensor is cut into fixed blocks of
+#: AF_NORM_BLOCK consecutive values, each block's squares are folded
+#: ascending from zero by one chain of fmas (`sumsq_fold`), one block per
+#: GPU thread (`op_af_blk_sumsq`), and the block partials are then added
+#: ascending from zero (`af_fold_parts`). The order is fixed by the element
+#: count alone, so the host walks the same chains and every column gets the
+#: same bits. A tensor of at most AF_NORM_BLOCK values is one block: the one
+#: chain it always was, unchanged bits. Larger tensors get new bits (the
+#: one ascending chain over the whole tensor was a serial walk the GPU ran
+#: at memory latency, or the host route folded it).
+comptime AF_NORM_BLOCK = 4096
+#: partials loaded ahead of the ascending adds
+comptime AF_PART_STAGE = 16
+
+
+def op_af_blk_sumsq(t: Int, a: Args):
+    """Block t: p1[t] = sum of p0[t B + k]^2, k ascending from zero over the
+    block's min(B, i0 - t B) values; i0 numel, i1 B (= AF_NORM_BLOCK)."""
+    var B = a.i1
+    var lo = t * B
+    st(a.p1, t, sumsq_fold(a.p0, lo, min(B, a.i0 - lo), 1))
+
+
+@always_inline
+def af_fold_parts(p: FP, n: Int) -> Float32:
+    """The partials p[0:n] added ascending from zero, AF_PART_STAGE loaded
+    ahead of the adds (the same adds in the same order as `_psum`)."""
+    var s = Float32(0.0)
+    var k = 0
+    while k + AF_PART_STAGE <= n:
+        var v = SIMD[DType.float32, AF_PART_STAGE]()
+        comptime for j in range(AF_PART_STAGE):
+            v[j] = ld(p, k + j)
+        comptime for j in range(AF_PART_STAGE):
+            s = add(s, v[j])
+        k += AF_PART_STAGE
+    while k < n:
+        s = add(s, ld(p, k))
+        k += 1
+    return s
+
+
+@always_inline
+def _sumsq_or_parts(p: FP, start: Int, n: Int, parts: FP, n_parts: Int) -> Float32:
+    """No partials (n_parts == 0): the one-thread fold. FAST with partials:
+    their ordered sum. IDENTICAL with partials (Adafactor's blocked norms;
+    LAMB never passes them under IDENTICAL): the block partials of
+    op_af_blk_sumsq added ascending."""
+    comptime if GLOBAL_NUMERIC_MODE != NUMERIC_IDENTICAL:
+        if n_parts > 0:
+            return _psum(parts, n_parts)
+    else:
+        if n_parts > 0:
+            return af_fold_parts(parts, n_parts)
+    return _sumsq(p, start, n, 1)
+
+
+def op_af_alpha(t: Int, a: Args):
+    """One thread: p1[1] = max(eps2, ||p0|| / sqrt(numel)) rho.
+    i0 numel; f0 eps2, f1 rho; FAST: p2 the i2 partials of op_chunk_sumsq."""
+    af_alpha_tail(a, _sumsq_or_parts(a.p0, 0, a.i0, a.p2, a.i2))
+
+
+@always_inline
+def af_alpha_tail(a: Args, ss: Float32):
+    """op_af_alpha from ||p0||^2 = ss (sequence/coop.mojo folds it too)."""
+    var n = a.i0
+    var rms = div(ftz(identical_sqrt(ss)), ftz(identical_sqrt(Float32(n))))
+    # torch's max(eps2, rms): eps2 unless rms > eps2 (a NaN rms gives eps2).
+    # Spelled `max`, not `rms if rms > eps2 else eps2`: Apple's Metal
+    # compiler drops this WHOLE kernel (no store lands, not even one before
+    # the compare) when a float compare-and-select takes a value from
+    # portable_sqrtf over the _sumsq loop; bisected on the M3 Ultra
+    # (sequence/checks/af_order_probe.mojo; ~/anonlib-evidence/sequence/
+    # adafactor_metal/dbgops*.txt). `max` is exact, so the bits are unchanged.
+    var m = max(rms, a.f0)
+    st(a.p1, 1, mul(m, a.f1))
+
+
+def op_af_row(t: Int, a: Args):
+    """Row t of grad p0 [R, C]: p1[t] = lerp(p1[t], ||g_t||^2 / C, f0); i0 C."""
+    af_row_tail(a, t, _sumsq(a.p0, t * a.i0, a.i0, 1))
+
+
+@always_inline
+def af_row_tail(a: Args, t: Int, ss: Float32):
+    """op_af_row from the row's ||g_t||^2 = ss (sequence/coop.mojo folds it too)."""
+    var C = a.i0
+    var nrm = ftz(identical_sqrt(ss))
+    st(a.p1, t, lerp(ld(a.p1, t), div(mul(nrm, nrm), Float32(C)), a.f0))
+
+
+def op_af_col(t: Int, a: Args):
+    """Column t: p1[t] = lerp(p1[t], ||g_:,t||^2 / R, f0); i0 R, i1 C."""
+    var R = a.i0
+    var ss: Float32
+    comptime if AF_COL_CHUNK_FOLD:
+        ss = af_col_canonical_sumsq(a.p0, t, R, a.i1)
+    else:
+        ss = _sumsq(a.p0, t, R, a.i1)
+    var nrm = ftz(identical_sqrt(ss))
+    st(a.p1, t, lerp(ld(a.p1, t), div(mul(nrm, nrm), Float32(R)), a.f0))
+
+
+def op_af_rmean(t: Int, a: Args):
+    """One thread: p1[2] = max(mean(p0[0:R]), eps1); i0 R, f0 eps1."""
+    var s = Float32(0.0)
+    for k in range(a.i0):
+        s = add(s, ld(a.p0, k))
+    af_rmean_tail(a, s)
+
+
+@always_inline
+def af_rmean_tail(a: Args, s: Float32):
+    """op_af_rmean from sum(p0[0:R]) = s (sequence/coop.mojo folds it too)."""
+    var m = div(s, Float32(a.i0))
+    # max(mean, eps1) spelled `max` for the Metal compiler fault on a float
+    # compare-and-select over a reduction's value (see op_af_alpha); exact,
+    # and eps1 > 0, so no signed-zero tie.
+    st(a.p1, 2, max(m, a.f0))
+
+
+@always_inline
+def _upd(v: Float32, g: Float32, eps1sq: Float32) -> Float32:
+    var c = max(v, eps1sq)
+    return mul(ftz(identical_rsqrt(c)), g)
+
+
+def op_af_update_mat(t: Int, a: Args):
+    """p4[r, c] = rsqrt(max(row[r] col[c] / p3[2], eps1^2)) g[r, c]; i0 C,
+    f0 eps1^2. p0 grad, p1 row_var, p2 col_var, p3 scalars."""
+    var C = a.i0
+    var r = t // C
+    var c = t - r * C
+    var ve = div(mul(ld(a.p1, r), ld(a.p2, c)), ld(a.p3, 2))
+    st(a.p4, t, _upd(ve, ld(a.p0, t), a.f0))
+
+
+def op_af_vec(t: Int, a: Args):
+    """p1[t] = lerp(p1[t], g^2, f0); p2[t] = rsqrt(max(p1[t], f1)) g."""
+    var g = ld(a.p0, t)
+    var v = lerp(ld(a.p1, t), mul(g, g), a.f0)
+    st(a.p1, t, v)
+    st(a.p2, t, _upd(v, g, a.f1))
+
+
+def op_af_denom(t: Int, a: Args):
+    """One thread: p1[3] = -p1[1] / max(1, ||p0|| / (sqrt(numel) d));
+    i0 numel, f0 d; FAST: p2 the i2 partials of op_chunk_sumsq."""
+    af_denom_tail(a, _sumsq_or_parts(a.p0, 0, a.i0, a.p2, a.i2))
+
+
+@always_inline
+def af_denom_tail(a: Args, ss: Float32):
+    """op_af_denom from ||p0||^2 = ss."""
+    var n = a.i0
+    var r = div(ftz(identical_sqrt(ss)), mul(ftz(identical_sqrt(Float32(n))), a.f0))
+    # max(1, rms / d) spelled `max` (the Metal fault of op_af_alpha: this
+    # kernel is the same shape, a compare-and-select on sqrt over _sumsq);
+    # exact, a NaN ratio still gives 1.
+    var den = max(r, Float32(1.0))
+    st(a.p1, 3, div(-ld(a.p1, 1), den))
+
+
+def op_af_apply(t: Int, a: Args):
+    """p0[t] += p1[t] p2[3]."""
+    st(a.p0, t, fma3(ld(a.p1, t), ld(a.p2, 3), ld(a.p0, t)))
+
+
+# TOMBSTONE (lane/postmerge-act-5, 2026-10-09: -D ANONLIB_IDN_AF_VEC_FUSED (Adafactor fused vector step)): op_af_vfuse / op_af_vfin
+# was NOISE: NV 13.671 -> 13.738 ms (1.00x, nv2 v1010/v1012), AMD 8.620 -> 8.186 ms (0.95x, a1141/a1143), avg 0.98x, digest aa99a3dc unchanged. Deleted with sequence/af_fused.mojo; recoverable at main 0a7b206f1.
+
+
+# ------------------------------------------------------------------ LAMB
+def op_seg_sumsq(t: Int, a: Args):
+    """Segment t of p0 (offsets p1[t] .. p1[t + 1], as floats):
+    p2[t] = its sum of squares, ascending. FAST (i0 != 0): the ordered sum
+    of its partials, p3[t SUMSQ_THREADS ...], min(SUMSQ_THREADS, e - s) of them."""
+    var s = Int(a.p1.unsafe_load(t))
+    var e = Int(a.p1.unsafe_load(t + 1))
+    var np = min(SUMSQ_THREADS, e - s) if a.i0 != 0 else 0
+    st(a.p2, t, _sumsq_or_parts(a.p0, s, e - s, a.p3 + t * SUMSQ_THREADS, np))
+
+
+def op_lamb_upd(t: Int, a: Args):
+    """m = b1 m + beta3 g; v = b2 v + (1 - b2) g g; u = (m / bc1) /
+    (sqrt(v) / sqrt(bc2) + eps) (+ wd p). p0 param, p1 grad, p2 m, p3 v,
+    p4 u; f1 b1, f2 b2, f3 eps, f4 wd, f5 bc1, f6 sqrt(bc2), f7 beta3.
+    i0 != 0: the global gradient-norm clip, the coefficient c = p5[0]
+    (op_lamb_clip): g = g / c when c > 1, op_divs's statement (it ran as
+    its own launch over the gradient before; the same division, no bit
+    moves)."""
+    var g = ld(a.p1, t)
+    if a.i0 != 0:
+        var c = ld(a.p5, 0)
+        if c > Float32(1.0):
+            g = div(g, c)
+    var m = fma3(a.f1, ld(a.p2, t), mul(a.f7, g))
+    var v = fma3(a.f2, ld(a.p3, t), mul(mul(sub(Float32(1.0), a.f2), g), g))
+    st(a.p2, t, m)
+    st(a.p3, t, v)
+    var den = add(div(ftz(identical_sqrt(v)), a.f6), a.f3)
+    var u = div(div(m, a.f5), den)
+    if a.f4 != Float32(0.0):
+        u = fma3(a.f4, ld(a.p0, t), u)
+    st(a.p4, t, u)
+
+
+def op_lamb_ratio(t: Int, a: Args):
+    """Segment t: p3[t] = ||p|| / ||u|| (1 where either is 0; at most 1
+    when i0 & 1, timm's trust_clip). p0 param, p1 u, p2 offsets. FAST
+    (i1 != 0): p4 / p5 the partials of p / u, as op_seg_sumsq's."""
+    var s = Int(a.p2.unsafe_load(t))
+    var e = Int(a.p2.unsafe_load(t + 1))
+    var np = min(SUMSQ_THREADS, e - s) if a.i1 != 0 else 0
+    lamb_ratio_tail(a, t, _sumsq_or_parts(a.p0, s, e - s, a.p4 + t * SUMSQ_THREADS, np),
+                    _sumsq_or_parts(a.p1, s, e - s, a.p5 + t * SUMSQ_THREADS, np))
+
+
+@always_inline
+def lamb_ratio_tail(a: Args, t: Int, pss: Float32, uss: Float32):
+    """op_lamb_ratio from ||p||^2 = pss and ||u||^2 = uss of segment t."""
+    var wn = ftz(identical_sqrt(pss))
+    var gn = ftz(identical_sqrt(uss))
+    var r = Float32(1.0)
+    if wn > Float32(0.0) and gn > Float32(0.0):
+        r = div(wn, gn)
+    if (a.i0 & 1) != 0 and r > Float32(1.0):
+        r = Float32(1.0)
+    st(a.p3, t, r)
+
+
+def op_lamb_apply(t: Int, a: Args):
+    """p0[t] = p0[t] - lr (u[t] ratio): p1 u, p2 ratios, i0 the segment of
+    this launch, f0 lr."""
+    var r = ld(a.p2, a.i0)
+    st(a.p0, t, fma3(-a.f0, mul(ld(a.p1, t), r), ld(a.p0, t)))
+
+
+# ------------------------------------------------------------------ LAMB, every tensor in one launch
+#: lane gap-optimizers (2026-10-02). LAMB's per-tensor norms (the gradient
+#: norms of the global clip, the parameter and update norms of the trust
+#: ratio) in the blocked order of the Adafactor norms above, for every
+#: tensor of the step in ONE launch, under FAST and IDENTICAL alike: each
+#: tensor is cut into blocks of AF_NORM_BLOCK consecutive values from its
+#: own start, each block's squares folded ascending from zero by one chain
+#: of fmas (`sumsq_fold`, one block per GPU thread), and a tensor's block
+#: partials then added ascending from zero (`af_fold_parts`). A tensor of
+#: at most AF_NORM_BLOCK values is one block, the one chain it always was
+#: (its bits do not move); larger tensors get new bits (one GPU thread
+#: walked the whole tensor before, at memory latency). The order is fixed
+#: by the tensor sizes alone, so the host binding walks the same chains.
+#:
+#: THE TABLE (`tab`, a float32 buffer holding int32 bit patterns, read raw
+#: and never through `ld`, whose flush would zero them): tab[0 .. nt] the
+#: element offsets of the nt tensors (tab[nt] = n), tab[nt + 1 .. 2 nt + 1]
+#: their first block indices (tab[2 nt + 1] = the block count). Offsets are
+#: exact integers to 2^31 (the float offsets the per-tensor ops read capped
+#: a step at 2^24 values, which refused the board's 16,777,216-value lane).
+
+
+@always_inline
+def lamb_ti(tab: FP, i: Int) -> Int:
+    """tab[i] as the int32 it holds."""
+    return Int(bitcast[DType.int32](tab.unsafe_load(i)))
+
+
+@always_inline
+def lamb_seg_of(tab: FP, base: Int, nt: Int, x: Int) -> Int:
+    """The k in [0, nt) with tab[base + k] <= x < tab[base + k + 1] (the
+    starts rise strictly), by bisection."""
+    var lo = 0
+    var hi = nt - 1
+    while lo < hi:
+        var mid = (lo + hi + 1) // 2
+        if lamb_ti(tab, base + mid) <= x:
+            lo = mid
+        else:
+            hi = mid - 1
+    return lo
+
+
+@always_inline
+def lamb_seg_sum(parts: FP, tab: FP, nt: Int, k: Int) -> Float32:
+    """Tensor k's sum of squares from its block partials: the one block's
+    chain itself, or the partials added ascending from zero."""
+    var b0 = lamb_ti(tab, nt + 1 + k)
+    var nb = lamb_ti(tab, nt + 2 + k) - b0
+    if nb == 1:
+        return ld(parts, b0)
+    return af_fold_parts(parts + b0, nb)
+
+
+def op_lamb_blk(t: Int, a: Args):
+    """Block t of the step (over every tensor): p3[t] = the sum of squares
+    of p0's values in it, ascending from zero; with i1 != 0 also p4[t] from
+    p1 over the same values. p2 the table, i0 nt, i2 B (= AF_NORM_BLOCK)."""
+    var nt = a.i0
+    var B = a.i2
+    var k = lamb_seg_of(a.p2, nt + 1, nt, t)
+    var lo = lamb_ti(a.p2, k) + (t - lamb_ti(a.p2, nt + 1 + k)) * B
+    var cnt = min(B, lamb_ti(a.p2, k + 1) - lo)
+    st(a.p3, t, sumsq_fold(a.p0, lo, cnt, 1))
+    if a.i1 != 0:
+        st(a.p4, t, sumsq_fold(a.p1, lo, cnt, 1))
+
+
+def op_lamb_segfold(t: Int, a: Args):
+    """Tensor t: p2[t] = its sum of squares from the block partials p0;
+    p1 the table, i0 nt."""
+    st(a.p2, t, lamb_seg_sum(a.p0, a.p1, a.i0, t))
+
+
+def op_lamb_clip(t: Int, a: Args):
+    """The global gradient-norm clip coefficient, one cell: ||g|| = the
+    norm of the per-tensor norms sqrt(p0[k]), k ascending (timm's
+    torch.norm(torch.stack(norms))), and p1[0] = ||g|| / f0 (max_grad_norm);
+    i0 nt. The host statements of the step it replaces (which downloaded
+    the per-tensor sums and folded them there), verbatim."""
+    var gs = Float32(0.0)
+    for k in range(a.i0):
+        var nk = ftz(identical_sqrt(ld(a.p0, k)))
+        gs = ftz(identical_mul_add(nk, nk, gs))
+    st(a.p1, 0, ftz(identical_div(ftz(identical_sqrt(gs)), a.f0)))
+
+
+def op_lamb_trust(t: Int, a: Args):
+    """Tensor t's trust ratio from the block partials of p (p0) and u (p1):
+    p3[t] = ||p|| / ||u|| (`lamb_ratio_tail`); p2 the table, i0 the
+    trust_clip bit (bit 0), i1 nt."""
+    lamb_ratio_tail(a, t, lamb_seg_sum(a.p0, a.p2, a.i1, t), lamb_seg_sum(a.p1, a.p2, a.i1, t))
+
+
+def op_lamb_apply_all(t: Int, a: Args):
+    """op_lamb_apply over every tensor in one launch: element t's tensor k
+    from the table, then p0[t] = p0[t] - lr (u[t] ratio[k]), the same
+    statement. p1 u, p2 ratios, p3 the table, i0 nt, f0 lr."""
+    var k = lamb_seg_of(a.p3, 0, a.i0, t)
+    var r = ld(a.p2, k)
+    st(a.p0, t, fma3(-a.f0, mul(ld(a.p1, t), r), ld(a.p0, t)))

@@ -1,0 +1,287 @@
+#!/bin/sh
+. "$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/build_defines.sh"  # ANONLIB_BUILD_DEFINES -> $ANONLIB_BUILD_DEFINE_FLAGS (compile line)
+# Build the time-series CPython extension (Holt-Winters + the KPSS test) into
+# python/anonlib/_anonlib_tsa.so. Run from anywhere; requires pixi.
+#
+# NEW 2026-08-24 (DEVIATIONS 900-909). Structured after
+# bindings/build_estimators.sh, which is the script that learned the two
+# lessons below the hard way. They are restated rather than referenced,
+# because the failure they describe is silent and someone editing THIS file
+# needs to see it here.
+#
+# 1. DO NOT SET `MACOSX_DEPLOYMENT_TARGET` IN THE ENVIRONMENT. It suppresses
+#    ahead-of-time Metal compilation entirely: `mojo build` writes an empty
+#    134-byte metallib per kernel and embeds nothing, so the extension imports
+#    cleanly and dies at the first launch with "Failed to create Metal
+#    function". Measured by build_estimators.sh on a cold cache, one variable,
+#    same file and flags:
+#
+#        MACOSX_DEPLOYMENT_TARGET=11.0 set       0 AIR blobs
+#        MACOSX_DEPLOYMENT_TARGET unset        141 AIR blobs
+#
+#    The compiler cache is what made every earlier measurement of this
+#    disagree: `.mojo_cache` is content-addressed and its key does NOT
+#    include the deployment target, so ONE poisoned build serves empty
+#    metallibs to every later build whatever ITS flags are. If this script
+#    ever reports 0 blobs, clear $MODULAR_HOME/cache/.mojo_cache before
+#    believing anything else.
+#
+#    The floor is passed to the LINKER instead, which stamps
+#    LC_BUILD_VERSION exactly as the environment variable would while the
+#    Metal compile step never sees it.
+#
+# 2. A BUILD WITHOUT A GATE SHIPS WHATEVER CAME OUT. build_estimators.sh
+#    printed "built ..." and exited 0 for hours over a kernel-less artifact.
+#    Two gates are here: an AIR-blob floor as a cheap pre-filter, and a real
+#    LAUNCH of one kernel from each lane in this extension. Only the second
+#    one proves anything; every broken build in that bug's history imported
+#    fine.
+set -eu
+
+here=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+cd "$here"
+
+mkdir -p python/anonlib
+
+MACOS_FLOOR="11.0"
+
+# NOT EXPORTED, DELIBERATELY -- see (1) above. Unset it if the caller had it
+# set, because inheriting it from an outer shell reproduces the bug silently.
+unset MACOSX_DEPLOYMENT_TARGET
+
+if [ "$(uname)" = "Darwin" ]; then
+    MACOS_SDK=$(xcrun --sdk macosx --show-sdk-version)
+else
+    MACOS_SDK=""  # linux arm (E1): no Mach-O, no Metal SDK
+fi
+LINK_FLAGS="-Xlinker -platform_version -Xlinker macos -Xlinker $MACOS_FLOOR -Xlinker $MACOS_SDK"
+[ "$(uname)" = "Darwin" ] || LINK_FLAGS=""
+
+tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/anonlib-tsa.XXXXXX")
+trap 'rm -rf "$tmpdir"' EXIT INT TERM
+out="$tmpdir/_anonlib_tsa.so"
+
+# `--target-cpu apple-m1` is the oldest Apple silicon: `mojo build` otherwise
+# defaults to whatever chip ran the compiler, and a host-built wheel SIGILLs on
+# older Macs at the instruction, inside the extension, with no diagnostic a
+# user can act on. arm64 Mach-O `cpusubtype` stays ARM64_ALL whatever -mcpu
+# was, so such a wheel LOOKS portable to any header-reading check.
+#
+# `--target-accelerator metal:1` is kept from the sibling scripts.
+# shellcheck disable=SC2086
+# THE LINUX x86-64 CPU BASELINE. Without it `mojo build` targets WHATEVER
+# CHIP THE BUILD BOX HAS, and on 2026-08-30 that shipped a 0.3.0 wheel whose
+# HOST code used AVX-512. It died with SIGILL on an L40 whose host was an AMD
+# EPYC 7773X, a Zen 3 part with no AVX-512, inside `cluster::estimator::
+# kmeans_fit`, on
+#
+#     vandps 0x6d7ee(%rip){1to4},%xmm2,%xmm2
+#
+# where `{1to4}` is an EVEX embedded broadcast. There is no `cpuid` dispatch
+# anywhere in these binaries, so it is unconditional. That breaks every AMD
+# Zen 1, 2 and 3 host, most Intel consumer parts and every Xeon before
+# Skylake-SP, which together are a large share of GPU servers. The GPU was
+# never involved; the selector had correctly chosen sm_80 for that sm_89
+# device.
+#
+# macOS has pinned `--target-cpu apple-m1` since 0.1.0 AND gates the result
+# with `packaging/isa_baseline.py`. Linux had NEITHER. That is the whole bug.
+#
+# x86-64-v3 is AVX2, FMA, BMI2 and SSE4.2, so Haswell 2013 and Zen 1 2017
+# onward, and it EXCLUDES AVX-512. Anything modern enough to hold a supported
+# GPU clears it.
+#
+# aarch64 Linux keeps the empty flags it always had, because an x86 CPU name
+# is meaningless there and its host CPU is not the variable that broke.
+TARGET_FLAGS="--target-cpu apple-m1 --target-accelerator metal:1"
+if [ "$(uname)" != "Darwin" ]; then
+    case "$(uname -m)" in
+        x86_64) TARGET_FLAGS="--target-cpu ${ANONLIB_LINUX_CPU:-x86-64-v3}" ;;
+        *)      TARGET_FLAGS="" ;;   # linux arm: host cpu + its GPU
+    esac
+fi
+# ANONLIB_GPU_ARCHS: ONE GPU architecture a LINUX set is compiled for
+# (sm_80, gfx942, ...). Until 2026-08-30 ONLY bindings/build.sh read this
+# variable, so a leg that set it built ONE binding for the asked-for
+# architecture and every other binding for the build box's own device (the
+# A40 leg's 27-sm_86 read-back, bench/results/wheels/LEGS_2026-08-30.md).
+# The compiler takes EXACTLY ONE name (a comma list is rejected);
+# packaging/linux/build_sets.sh reads the architecture back out of every
+# binary and refuses a set that disagrees with what was asked.
+if [ -n "${ANONLIB_GPU_ARCHS:-}" ] && [ "$(uname)" != "Darwin" ]; then
+    case "$ANONLIB_GPU_ARCHS" in *,*)
+        echo "ANONLIB_GPU_ARCHS='$ANONLIB_GPU_ARCHS': the compiler takes EXACTLY ONE architecture (measured 2026-08-30); run one build per architecture" >&2
+        exit 2 ;;
+    esac
+    TARGET_FLAGS="$TARGET_FLAGS --target-accelerator $ANONLIB_GPU_ARCHS"
+    echo "!! ANONLIB_GPU_ARCHS=$ANONLIB_GPU_ARCHS (--target-accelerator); read the architecture back out of the built .so"
+fi
+# Explicit kernel-matrix column: ANONLIB_TARGET_COLUMN=apple|nvidia|amd|amd_rdna
+COLUMN_DEFINE=""
+# THE NUMERIC MODE IS A BUILD DEFINE, NOT A SOURCE FLIP.
+# ANONLIB_NUMERIC_MODE=identical compiles with -D ANONLIB_NUMERIC_IDENTICAL=1
+# (checks/numerics.mojo reads it through is_defined, the same shape as the
+# column define) and lands the binary under python/anonlib/identical/.
+#
+# NOTE FOR WHOEVER WIRES THE PACKAGE. python/anonlib/_backend.py's `_MODULES`
+# tuple and `_build_script` map do NOT list `_anonlib_tsa`; that file is not
+# this work's to edit. Until it does, `_backend.select()` will not install the
+# identical build of this extension under the canonical module name, so
+# `python/anonlib/_tsa_impl.py` carries its own mode-aware loader that reads
+# `_backend.requested_mode()` and refuses BY NAME rather than silently falling
+# back to the fast binary. Adding the two lines to `_backend.py` makes that
+# fallback loader dead code, which is the right end state.
+# TWO TIERS (2026-09-25, reversing DEVIATION 2490 for classical ML): this
+# binding builds IDENTICAL (the default, bitwise across vendors) or FAST
+# (per-vendor speed, same quality, no bit promise).
+MODE_DEFINE=""
+OUTDIR="python/anonlib"
+if [ "${ANONLIB_NUMERIC_MODE:-identical}" = "identical" ]; then
+    MODE_DEFINE="-D ANONLIB_NUMERIC_IDENTICAL=1"
+    OUTDIR="python/anonlib/identical"
+    mkdir -p "$OUTDIR"
+    export ANONLIB_SKIP_BUILD_GATE=1
+elif [ "${ANONLIB_NUMERIC_MODE:-identical}" != "fast" ]; then
+    echo "ANONLIB_NUMERIC_MODE must be fast or identical, got '$ANONLIB_NUMERIC_MODE'" >&2
+    exit 2
+fi
+if [ -n "${ANONLIB_TARGET_COLUMN:-}" ]; then
+    COLUMN_DEFINE="-D ANONLIB_COLUMN_$(printf %s "$ANONLIB_TARGET_COLUMN" | tr '[:lower:]' '[:upper:]')"
+fi
+# shellcheck disable=SC2086
+pixi run mojo build -j "${ANONLIB_COMPILE_JOBS:-2}" --emit shared-lib ${ANONLIB_MOJO_BUILD_FLAGS:-} ${ANONLIB_BUILD_DEFINE_FLAGS:-} \
+    $TARGET_FLAGS $COLUMN_DEFINE $MODE_DEFINE \
+    $LINK_FLAGS \
+    -I . -I bindings \
+    bindings/_anonlib_tsa.mojo \
+    -o "$out"
+
+air_blobs() {
+    strings -a "$1" \
+        | grep -oE '[0-9A-Za-z_]+_[0-9a-f]{16}(air|llvm[.]|[0-9]+[.][0-9]+air64)' \
+        | sed -E -e 's/(air|llvm[.]|[0-9]+[.][0-9]+air64)$//' \
+        | sed -e 's/^_gpu_shared_mem//' -e 's/^0//' \
+        | sort -u
+}
+
+# The gates below import the python package, so during a from-scratch
+# multi-binding build (a fresh linux box, E1) they fail on the siblings'
+# not-yet-built .so files; and the AIR/otool checks are Mach-O-only. The
+# caller that sets this owns end-to-end verification.
+# THE BINARY CHECKS RUN EVEN WHEN THE SMOKE CANNOT (2026-09-19).
+#
+# This script used to `export ANONLIB_SKIP_BUILD_GATE=1` for itself on the
+# identical tier, and the skip below then turned off ALL
+# THREE checks. So the gate that exists because a ZERO-KERNEL ARTIFACT
+# shipped for hours ran only on `fast` builds -- never on the identical ones
+# whose cross-vendor claim is the entire product.
+#
+# Only the kernel-launch smoke needs the rest of the package (it imports
+# anonlib, which during a multi-binding build reaches siblings that are not
+# built yet). The AIR blob floor is `strings` on the artifact and the minos
+# check is `otool`; neither imports anything, both cost milliseconds, and
+# both catch exactly the failure that shipped. They run here unconditionally
+# on Darwin, and only the smoke is skipped.
+if [ "$(uname)" = "Darwin" ]; then
+
+    # A FLOOR, NOT A PROOF. The failure this guards against is an artifact with
+    # zero kernels; the failure the smoke test guards against is an artifact that
+    # imports and dies at the first launch.
+    #
+    # Measured IDENTICAL on the M4, 2026-09-20: four AIR blobs (one
+    # Holt-Winters and three TSA). The older floor of five came from a
+    # different numeric tier and was never exercised on IDENTICAL until
+    # the binary checks became unconditional. Fresh fit/forecast and
+    # KPSS/select_d calls passed with these exact four blobs.
+    count=$(air_blobs "$out" | wc -l | tr -d ' ')
+    if [ "$count" -lt 4 ]; then
+        printf 'FAILED: %s AIR blobs, want at least 4 (IDENTICAL measured 2026-09-20).\n' "$count" >&2
+        printf 'If this is 0, check MACOSX_DEPLOYMENT_TARGET in the environment\n' >&2
+        printf 'and then $MODULAR_HOME/cache/.mojo_cache for empty 134-byte\n' >&2
+        printf 'metallibs -- one poisoned build serves them to every later one.\n' >&2
+        exit 1
+    fi
+
+    got=$(otool -l "$out" | awk '/LC_BUILD_VERSION/{f=1} f && /minos/{print $2; exit}')
+    if [ "$got" != "$MACOS_FLOOR" ]; then
+        printf 'FAILED: minos is %s, want %s.\n' "$got" "$MACOS_FLOOR" >&2
+        exit 1
+    fi
+
+    # THE REAL GATE: import and LAUNCH a kernel from EACH LANE in this extension.
+    # These are THIS extension's kernels and nobody else's -- a copied smoke test
+    # from a sibling script would pass over a broken artifact here.
+    #
+    #   ExponentialSmoothing.fit  reaches hw_transpose, conv1d, season_mean,
+    #                             batched_ls_solver and the BFGS optimizer kernel
+    #   .forecast                 reaches holtwinters_seasonal_forecast
+    #   kpss_test                 reaches batched_diff, series_sum, center,
+    #                             s2B_accumulation, cumsum_by_series and
+    #                             kpss_stationarity_check
+    #   select_d                  reaches the same set, twice, through the host loop
+fi
+
+if [ -n "${ANONLIB_SKIP_BUILD_GATE:-}" ] || [ "$(uname)" != "Darwin" ]; then
+    mv "$out" "$OUTDIR/_anonlib_tsa.so"
+    echo "built $OUTDIR/_anonlib_tsa.so (kernel-launch smoke skipped; binary checks ran)"
+    exit 0
+fi
+
+ANONLIB_SMOKE_SO="$out" python3 - <<'PY'
+import os, shutil, sys, tempfile
+tmp = tempfile.mkdtemp()
+pkg = os.path.join(tmp, "anonlib")
+shutil.copytree("python/anonlib", pkg,
+                ignore=shutil.ignore_patterns("__pycache__"))
+shutil.copyfile(os.environ["ANONLIB_SMOKE_SO"],
+                os.path.join(pkg, "_anonlib_tsa.so"))
+sys.path.insert(0, tmp)
+import numpy as np
+
+# THROUGH THE PYTHON WRAPPER, NOT THE RAW BINDING. The extension's entry
+# points take bare addresses plus a packed `params` list, so a hand-rolled
+# call here would encode that ABI a second time and drift from it.
+# `_tsa_impl` is imported by module path rather than from the package's
+# export list, because re-exporting these names is the operator's call and
+# this gate must not depend on it having been made.
+from anonlib import _tsa_impl
+
+rng = np.random.default_rng(0)
+
+# Holt-Winters: n >= start_periods * seasonal_periods is their rule, so
+# n = 24 with seasonal_periods = 4 and start_periods = 2 clears it.
+t = np.arange(24, dtype=np.float32)
+endog = np.stack([
+    10.0 + 0.5 * t + 2.0 * np.sin(t * (np.pi / 2.0)),
+    20.0 - 0.3 * t + 1.0 * np.cos(t * (np.pi / 2.0)),
+]).astype(np.float32)
+es = _tsa_impl.ExponentialSmoothing(
+    endog, seasonal="additive", seasonal_periods=4, start_periods=2, ts_num=2
+).fit()
+fc = np.asarray(es.forecast(3))  # anonlib Arrays are NumPy-free
+# (h, ts_num), which is cuML's own orientation for the index=None,
+# ts_num > 1 case (holtwinters.pyx:420 returns forecasted_points[:, :h].T).
+assert fc.shape == (3, 2), fc.shape
+assert np.isfinite(fc).all(), fc
+assert np.asarray(es.level_).shape == (2, 24 - 4), es.level_.shape
+
+# KPSS: an AR(1) around a mean is stationary, a random walk is not. The
+# assertion is on the SHAPES and finiteness, not on the two verdicts:
+# this is a build gate, and the verdicts belong to tsa/checks/
+# stationarity_check.mojo, which asserts them against an oracle.
+n_obs = 120
+ar = np.zeros(n_obs, dtype=np.float32)
+for i in range(1, n_obs):
+    ar[i] = np.float32(0.5) * ar[i - 1] + np.float32(rng.standard_normal())
+rw = np.cumsum(rng.standard_normal(n_obs)).astype(np.float32)
+y = np.stack([ar, rw], axis=1)          # (n_obs, batch), cuML's layout
+flags = np.asarray(_tsa_impl.kpss_test(y, d=1))
+assert flags.shape == (2,), flags.shape
+d = np.asarray(_tsa_impl.select_d(y, D=0, s=0))
+assert d.shape == (2,) and ((d >= 0) & (d <= 2)).all(), d
+
+print("  smoke: holtwinters fit + forecast and kpss_test + select_d each launched")
+PY
+
+mv "$out" "$OUTDIR/_anonlib_tsa.so"
+echo "built $OUTDIR/_anonlib_tsa.so ($count AIR blobs, minos $MACOS_FLOOR)"

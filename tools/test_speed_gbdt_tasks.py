@@ -1,0 +1,446 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 the authors. Part of anonlib, DOI-WITHHELD
+"""The GBDT task lanes of the benchmark board (ranking, multiclass,
+categorical): planning per vendor, the lane configs, the quality functions and
+the loaders on tiny data. numpy only; no library is fitted here.
+
+    .pixi/envs/test/bin/python -m pytest tools/test_speed_gbdt_tasks.py
+"""
+import os
+import sys
+import types
+
+import numpy as np
+import pytest
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+
+import bench_board as bb                 # noqa: E402
+import speed_gbdt_arm as spec            # noqa: E402
+import speed_gbdt_rank as rank           # noqa: E402
+
+TASKS = ("gbdt-rank-yetirank", "gbdt-rank-pairlogit", "gbdt-multiclass", "gbdt-categorical")
+
+
+# --- planning ----------------------------------------------------------------
+
+def test_task_lanes_known_to_driver_and_board():
+    assert bb.TREE_TASK_LANES == TASKS + ("gbdt-ordered",)
+    for lane in TASKS:
+        assert lane in spec.LANE_NAMES and lane in spec.TASK_LANES
+        assert spec.LANE_DEFAULT_DATASET[lane] in spec.TASK_LANES[lane]["datasets"]
+        for driver_ds in bb.TREE_TASK_DATASETS[lane].values():
+            assert driver_ds in spec.TASK_LANES[lane]["datasets"], (lane, driver_ds)
+            assert driver_ds in spec.DATASET_STORE_KEYS, driver_ds
+
+
+@pytest.mark.parametrize("vendor", bb.VENDORS)
+def test_task_rosters_per_vendor(vendor):
+    races = bb.plan_races(vendor, bb.modes_for(vendor), ["trees"], list(TASKS))
+    ids = sorted(r["id"] for r in races)
+    assert ids == sorted([
+        "trees/gbdt-categorical/taxi/rows=full",
+        "trees/gbdt-multiclass/istella/rows=full",
+        "trees/gbdt-multiclass/taxi/rows=full",
+        "trees/gbdt-rank-pairlogit/istella/rows=full",
+        "trees/gbdt-rank-yetirank/istella/rows=full"])
+    for r in races:
+        opp = r["opponents"]
+        libs = {o.split("-")[0] for o in opp}
+        # FAIRNESS FIX (2026-10-13 audit): these task algorithms now
+        # explicitly refuse XGBoost and LightGBM; only CatBoost matches.
+        want = {"catboost"}
+        assert libs == want, (vendor, r["id"], opp)
+        if vendor == "apple":
+            assert r["our_arms"] == {"ours": "identical", "ours-ab": "fast"}
+            assert all(o.endswith("-cpu") for o in opp)
+        else:
+            own = "ours-catboost-gpu" if vendor == "nvidia" and r["lane"] == "gbdt-categorical" else "ours"
+            assert r["our_arms"] == {own: "identical"}
+        if vendor == "nvidia":
+            assert all(not o.endswith("-cpu") for o in opp)
+        if vendor == "amd":
+            assert opp == ["catboost-cpu"]
+    # every arm the board plans is one the driver builds for that lane
+    for r in races:
+        cfg = spec.lane_config(r["lane"], "shipped")
+        built = [n for names, _ in spec.opponent_builders(r["lane"], cfg, None, ["cpu", "gpu"])
+                 for n in names]
+        assert set(r["opponents"]) <= set(built), (r["id"], r["opponents"], built)
+
+
+def test_task_lanes_follow_requested_datasets_and_map_driver_names():
+    races = bb.plan_races("apple", ["fast", "identical"], ["trees"], list(TASKS), ["taxi"])
+    assert sorted(r["lane"] for r in races) == ["gbdt-categorical", "gbdt-multiclass"]
+    ctx = {"python": "py", "tree_driver": "drv", "vendor": "apple", "rounds": 2,
+           "arm_budget_s": 1, "race_deadline_s": 1}
+    want = {("gbdt-categorical", "taxi"): "taxicat", ("gbdt-multiclass", "taxi"): "taximc",
+            ("gbdt-multiclass", "istella"): "istellamc",
+            ("gbdt-rank-yetirank", "istella"): "istellarank"}
+    for (lane, ds), drv in want.items():
+        race = bb.plan_races("apple", ["fast", "identical"], ["trees"], [lane], [ds])[0]
+        cmd, env = bb.tree_cmd(ctx, race)
+        assert cmd[cmd.index("--dataset") + 1] == drv
+        assert "--ours-ab" in cmd and env["ANONLIB_NUMERIC_MODE"] == "identical"
+    # the original lanes keep the board dataset as the driver's
+    race = bb.plan_races("apple", ["fast", "identical"], ["trees"], ["rf"], ["istella"])[0]
+    assert bb.tree_cmd(ctx, race)[0][5:7] == ["--dataset", "istella"]
+
+
+def test_ranking_needs_the_rank_side_file():
+    races = bb.plan_races("nvidia", ["identical"], ["trees"], ["gbdt-rank-yetirank"])
+    assert bb.race_data_keys(races[0]) == ["istella", "istella-rank"]
+    assert bb.R2_KEYS["istella-rank"] == "gbm-bench/istella/istella_rank.npz"
+    pins = open(os.path.join(os.path.dirname(HERE), "bench", "results", "dataset_store",
+                             "manifest.tsv")).read()
+    assert "gbm-bench/istella/istella_rank.npz\t" in pins
+    races = bb.plan_races("nvidia", ["identical"], ["trees"], ["gbdt-multiclass"])
+    assert all(bb.race_data_keys(r) == [r["dataset"]] for r in races)
+
+
+def test_dry_run_lists_task_races_and_rank_data(capsys):
+    assert bb.main(["--dry-run", "--vendor", "amd", "--families", "trees",
+                    "--lanes", ",".join(TASKS)]) == 0
+    text = capsys.readouterr().out
+    assert "data istella-rank" in text and "gbm-bench/istella/istella_rank.npz" in text
+    assert "TOTAL races=5 cells=10" in text
+    assert "INFER cells=20" in text
+
+
+# --- configs -----------------------------------------------------------------
+
+@pytest.mark.parametrize("lane", TASKS)
+def test_task_config_shares_the_gbdt_knobs_and_names_mismatches(lane):
+    base = spec.lane_config("gbdt-symmetric", "shipped")
+    cfg = spec.lane_config(lane, "shipped")
+    for k in ("learning_rate", "l2", "borders", "seed"):
+        assert cfg[k] == base[k], k
+    # gbm-bench's values where it has the task (multiclass, binary); the ranking
+    # lanes, which it lacks, keep 100 trees at depth 6 and 64 leaves
+    want = ((base["n_estimators"], base["max_depth"], base["max_leaves"]) if cfg.get("harness")
+            else (100, 6, 64))
+    task = spec.TASK_LANES[lane]
+    if task["grow_policy"] == "Lossguide":
+        # FAIRNESS FIX (2026-10-13 audit): a Lossguide lane keeps the leaf budget and lifts the
+        # depth, so the budget (not a full 2 ** depth tree) stops each tree. Results raced
+        # before this change were wrong for this lane; apply extra scrutiny.
+        want = (want[0], spec.LOSSGUIDE_MAX_DEPTH, want[2])
+        assert cfg["max_leaves"] < 2 ** cfg["max_depth"], lane
+    assert (cfg["n_estimators"], cfg["max_depth"], cfg["max_leaves"]) == want, lane
+    assert cfg["loss"] == task["loss"] and cfg["task"] == task["task"]
+    assert cfg["objectives"]["anonlib"] == task["loss"]
+    assert cfg["mismatches"], lane
+    for line in cfg["mismatches"]:
+        # one line each, and short enough that FSPEED-NOTE (240) carries it whole
+        assert "\n" not in line and "=" not in line and len(line) <= 240, line
+    if task["grow_policy"] == "SymmetricTree":
+        assert cfg["xgboost_grow_policy"] == "depthwise" and cfg["lightgbm_leafwise"]
+    else:
+        assert "xgboost_grow_policy" not in cfg
+
+
+def test_objectives_per_library():
+    o = {l: spec.TASK_LANES[l]["objectives"] for l in TASKS}
+    assert o["gbdt-rank-yetirank"] == {"anonlib": "YetiRank", "catboost": "YetiRank",
+                                       "xgboost": "rank:ndcg", "lightgbm": "lambdarank"}
+    assert o["gbdt-rank-pairlogit"] == {"anonlib": "PairLogit", "catboost": "PairLogit",
+                                        "xgboost": "rank:pairwise"}
+    assert o["gbdt-multiclass"]["xgboost"] == "multi:softprob"
+    assert o["gbdt-multiclass"]["lightgbm"] == "multiclass"
+    assert spec.TASK_LANES["gbdt-categorical"]["grow_policy"] == "Lossguide"
+    # the original lanes are untouched
+    assert "loss" not in spec.lane_config("gbdt-lossguide", "shipped")
+
+
+def test_fairness_fix_20261013_tree_lane_settings():
+    """FAIRNESS FIX (2026-10-13 audit): the split score and growth each lane races are the
+    ones every one of its arms can run. Results raced before this change were wrong for these
+    lanes; apply extra scrutiny."""
+    dw = spec.lane_config("gbdt-depthwise", "shipped")
+    assert dw["score_function"] == "NewtonL2" and dw["min_child_hessian"] == 0.0
+    lg = spec.lane_config("gbdt-lossguide", "shipped")
+    assert lg["score_function"] == "NewtonL2" and lg["max_depth"] == spec.LOSSGUIDE_MAX_DEPTH
+    assert lg["max_leaves"] < 2 ** lg["max_depth"]
+    cat = spec.lane_config("gbdt-categorical", "shipped")
+    assert cat["score_function"] == "L2" and cat["min_child_hessian"] is None
+    assert spec._catboost_cpu_refusal(cat) is None
+    for cfg in (dw, lg):
+        assert spec._catboost_cpu_refusal(cfg) is not None
+    for lane in ("gbdt-symmetric", "gbdt-multiclass", "gbdt-ordered"):
+        assert spec.lane_config(lane, "shipped")["score_function"] == "Cosine", lane
+    # a different categorical algorithm is refused by name, before any import
+    for fn in (spec.xgboost_arms, spec.lightgbm_arms):
+        with pytest.raises(RuntimeError, match="CATEGORICAL-ALGORITHM"):
+            fn("gbdt-categorical", cat, types.SimpleNamespace(cat_idx=spec.TAXI_CAT_COLUMNS), ["gpu"])
+
+
+def test_fairness_fix_20261013_second_pass_refusals():
+    """FAIRNESS FIX (2026-10-13 audit, second pass): opponents that run another algorithm or
+    other settings than ours are refused by name before any import. Results raced before this
+    change were wrong for these lanes; apply extra scrutiny."""
+    plain = types.SimpleNamespace(cat_idx=None)
+    for lane in ("gbdt-lossguide", "gbdt-multiclass", "rf", "et"):
+        with pytest.raises(RuntimeError, match="MIN-CHILD|ROW-SAMPLING"):
+            spec.lightgbm_arms(lane, spec.lane_config(lane, "shipped"), plain, ["cpu"])
+    with pytest.raises(RuntimeError, match="DIFFERENT-GROWER"):
+        spec.xgboost_arms("gbdt-multiclass", spec.lane_config("gbdt-multiclass", "shipped"),
+                          plain, ["cpu"])
+    for lane in ("gbdt-rank-yetirank", "gbdt-rank-pairlogit"):
+        with pytest.raises(RuntimeError, match="DIFFERENT-ALGORITHM"):
+            spec.xgboost_rank_arms(lane, spec.lane_config(lane, "shipped"), None, ["cpu"])
+    with pytest.raises(RuntimeError, match="DIFFERENT-ALGORITHM"):
+        spec.lightgbm_rank_arms("gbdt-rank-yetirank", spec.lane_config("gbdt-rank-yetirank",
+                                                                       "shipped"), None, ["cpu"])
+    with pytest.raises(RuntimeError, match="DIFFERENT-ALGORITHM"):
+        spec.sklearn_forest_arm("rf", spec.lane_config("rf", "shipped"), plain)
+
+
+# --- quality functions -------------------------------------------------------
+
+def test_ndcg_matches_the_rank_driver():
+    rng = np.random.default_rng(7)
+    qid = np.repeat(np.arange(40), rng.integers(1, 30, size=40))
+    grades = rng.integers(0, 5, size=qid.size).astype(np.float32)
+    grades[qid == 3] = 0                                  # a query with nothing relevant
+    scores = np.round(rng.normal(size=qid.size), 1)       # ties on purpose
+    b = spec.query_bounds(qid)
+    assert np.array_equal(b, rank.query_starts(qid))
+    for k in (5, 10):
+        assert spec.ndcg_at(k, b, grades, scores) == pytest.approx(
+            rank.ndcg_at(k, b, grades, scores), abs=1e-15)
+    # rank's own hand-worked example
+    y = np.array([3, 0, 1, 0, 0], dtype=np.float32)
+    bb_ = spec.query_bounds(np.array([1, 1, 1, 2, 2]))
+    assert spec.ndcg_at(10, bb_, y, np.array([3.0, 1.0, 2.0, 0.0, 0.0])) == 1.0
+
+
+def test_map_by_hand():
+    b = spec.query_bounds(np.array([0, 0, 0, 0, 1, 1, 2]))
+    grades = np.array([2, 0, 1, 0, 0, 0, 3], dtype=np.float32)
+    scores = np.array([0.9, 0.8, 0.7, 0.1, 0.5, 0.4, 1.0])
+    # q0: relevant at ranks 1 and 3 -> (1 + 2/3) / 2; q1: none relevant -> 1; q2: 1
+    want = ((1.0 + 2.0 / 3.0) / 2.0 + 1.0 + 1.0) / 3.0
+    assert spec.mean_average_precision(b, grades, scores) == pytest.approx(want)
+    # a tie is broken pessimistically: the relevant document goes last
+    tie = spec.mean_average_precision(spec.query_bounds(np.array([0, 0])),
+                                      np.array([1, 0], dtype=np.float32), np.array([0.5, 0.5]))
+    assert tie == pytest.approx(0.5)
+    names = [m for m, _ in spec.ranking_metrics(b, grades, scores)]
+    assert names == ["ndcg10", "ndcg5", "map"]
+
+
+def test_mlogloss_and_multiclass_scoring():
+    y = np.array([0, 2, 1, 2], dtype=np.float32)
+    p = np.array([[0.7, 0.2, 0.1], [0.1, 0.1, 0.8], [0.3, 0.4, 0.3], [0.0, 1.0, 0.0]])
+    want = -(np.log(0.7) + np.log(0.8) + np.log(0.4) + np.log(1e-15)) / 4
+    assert spec.mlogloss(y, p) == pytest.approx(want)
+
+    class M(object):
+        def predict_proba(self, X):
+            return p
+
+    d = spec.Data("t", np.zeros((4, 2)), np.zeros((4, 2)), y, y, "multiclass", 3)
+    out = spec.score_sklearn_like(M(), d)
+    assert [m for m, _, _ in out] == ["mlogloss", "accuracy"]
+    assert out[0][2] is p or np.array_equal(out[0][2], p)       # the hash covers the matrix
+    assert out[1][1] == pytest.approx(0.75)
+
+
+def test_score_ranking_hashes_the_scores():
+    d = spec.Data("r", np.zeros((4, 1)), np.zeros((4, 1)), np.zeros(4),
+                  np.array([1, 0, 0, 2], dtype=np.float32), "ranking", 0)
+    d.bounds_test = spec.query_bounds(np.array([5, 5, 9, 9]))
+    out = spec.score_ranking([0.2, 0.1, 0.3, 0.4], d)
+    assert [m for m, _, _ in out] == ["ndcg10", "ndcg5", "map"]
+    assert out[0][1] == 1.0 and out[0][2].dtype == np.float64
+    assert out[1][2] is None and out[2][2] is None
+
+
+# --- fit equivalence on multiclass --------------------------------------------
+
+def test_fit_verdict_divides_per_class_trees(capsys, monkeypatch):
+    shapes = {"ours": dict(library="anonlib", trees=100, leaves=6400, source="x"),
+              "catboost-cpu": dict(library="catboost", trees=100, leaves=6400, source="x"),
+              "xgboost-cpu": dict(library="xgboost", trees=400, leaves=25000, source="x")}
+
+    class A(object):
+        def __init__(self, name):
+            self.name, self.library = name, shapes[name]["library"]
+
+    monkeypatch.setattr(spec, "model_shape", lambda arm, model: dict(shapes[arm.name]))
+    arms = [A(n) for n in shapes]
+    cfg = dict(n_estimators=100, task="multiclass", n_classes=4)
+    out = spec.check_fit_equivalence("gbdt-multiclass", arms, {n: object() for n in shapes}, cfg)
+    text = capsys.readouterr().out
+    assert out["xgboost-cpu"]["trees"] == 100 and out["xgboost-cpu"]["trees_raw"] == 400
+    assert out["xgboost-cpu"]["leaves"] == 6250
+    assert "FSPEED-REFUSED" not in text and "verdict=COMPARABLE" in text
+    assert "per_class=trees and leaves divided by n_classes 4" in text
+
+
+# --- loaders on tiny data -----------------------------------------------------
+
+@pytest.fixture
+def tiny_data(tmp_path, monkeypatch):
+    rng = np.random.default_rng(7)
+    n = 400
+    x = rng.normal(size=(n, 16)).astype(np.float32)
+    x[:, 0] = rng.choice([1.0, 2.0, 6.0], size=n)
+    x[:, 3] = rng.choice([-1.0, 1.0, 2.0, 99.0], size=n)
+    x[:, 4] = rng.choice([-1.0, 0.0, 1.0], size=n)
+    x[:, 5] = rng.integers(1, 266, size=n)
+    x[:, 6] = rng.integers(1, 266, size=n)
+    fare = rng.uniform(5, 50, size=n).astype(np.float32)
+    tip = (fare * rng.uniform(0, 0.4, size=n)).astype(np.float32)
+    card = rng.random(n) < 0.8
+    (tmp_path / "taxi").mkdir()
+    np.savez(tmp_path / "taxi" / "taxi_speed.npz", x=x, fare=fare, tip=tip, card=card)
+    qtr = np.repeat(np.array([30, 10, 20, 11, 50]), [60, 40, 50, 30, 20])
+    qte = np.repeat(np.array([7, 3, 9]), [25, 25, 30])
+    (tmp_path / "istella").mkdir()
+    np.savez(tmp_path / "istella" / "istella_speed.npz",
+             x_train=rng.normal(size=(qtr.size, 5)).astype(np.float32),
+             r_train=rng.integers(0, 5, size=qtr.size).astype(np.float32),
+             x_test=rng.normal(size=(60, 5)).astype(np.float32),
+             r_test=rng.integers(0, 5, size=60).astype(np.float32))
+    np.savez(tmp_path / "istella" / "istella_rank.npz", qid_train=qtr, qid_test=qte,
+             x_test=rng.normal(size=(qte.size, 5)).astype(np.float32),
+             r_test=rng.integers(0, 5, size=qte.size).astype(np.float32))
+    monkeypatch.setenv("GBM_BENCH_DATA", str(tmp_path))
+    monkeypatch.setattr(spec, "TAXI_N_TEST", 50)
+    return tmp_path
+
+
+def test_taxi_multiclass_refines_the_binary_label(tiny_data):
+    b = spec.load_dataset("taxi", "shipped")
+    m = spec.load_dataset("taximc", "shipped")
+    assert m.task == "multiclass" and m.n_classes == 4 and m.name == "taximc"
+    assert np.array_equal((m.y_train >= 1).astype(np.float32), b.y_train)
+    assert np.array_equal(m.X_train, b.X_train)
+    assert set(np.unique(m.y_train)) <= {0.0, 1.0, 2.0, 3.0}
+
+
+def test_taxi_categorical_codes_are_dense_in_train(tiny_data):
+    b = spec.load_dataset("taxi", "shipped")
+    c = spec.load_dataset("taxicat", "shipped")
+    assert c.cat_idx == spec.TAXI_CAT_COLUMNS and c.task == "binary"
+    assert np.array_equal(c.y_train, b.y_train)
+    for j in range(16):
+        if j in c.cat_idx:
+            k = np.unique(c.X_train[:, j])
+            assert np.array_equal(k, np.arange(k.size, dtype=np.float32)), j
+            assert c.X_test[:, j].max() <= k.size          # k is the unknown bucket
+        else:
+            assert np.array_equal(c.X_train[:, j], b.X_train[:, j])
+
+
+def test_istella_multiclass_and_ranking(tiny_data):
+    mc = spec.load_dataset("istellamc", "shipped")
+    assert mc.task == "multiclass" and mc.n_classes == 5
+    r = spec.load_dataset("istellarank", "shipped")
+    assert r.task == "ranking" and r.name == "istellarank"
+    assert list(r.group_sizes) == [60, 40, 50, 30, 20]
+    assert list(np.unique(r.qid_train_seq)) == [0, 1, 2, 3, 4]
+    assert np.all(np.diff(r.qid_train_seq.astype(np.int64)) >= 0)   # XGBoost's order
+    assert list(r.bounds_test) == [0, 25, 50, 80]
+    capped = spec.load_dataset("istellarank", "shipped", rows_cap=120)
+    assert capped.X_train.shape[0] == 100                 # cut at a query boundary
+
+
+def test_ordered_lane_is_catboost_only_on_the_symmetric_grower():
+    cfg = spec.lane_config("gbdt-ordered", "shipped")
+    base = spec.lane_config("gbdt-symmetric", "shipped")
+    assert cfg["boosting_type"] == "Ordered" and base["boosting_type"] == "Plain"
+    assert cfg["grow_policy"] == "SymmetricTree" and cfg["score_function"] == "Cosine"
+    for k in ("n_estimators", "max_depth", "learning_rate", "l2", "borders", "seed", "max_leaves"):
+        assert cfg[k] == base[k], k
+    assert "xgboost_grow_policy" not in cfg
+    for v in bb.VENDORS:
+        assert bb.TREE_OPPONENTS[v]["gbdt-ordered"] == bb.TREE_OPPONENTS[v]["gbdt-symmetric"]
+    assert spec.task_names(spec.TASK_LANES["gbdt-ordered"]) == ("binary", "regression")
+
+
+# --- XGBoost's GPU arm needs this vendor's GPU backend ------------------------
+
+class _FakeXgb:
+    __version__ = "3.2.0"
+
+    def __init__(self, info):
+        self._info = info
+
+    def build_info(self):
+        return dict(self._info)
+
+
+@pytest.mark.parametrize("vendor,info,refused", [
+    ("amd", {"USE_CUDA": True, "USE_HIP": None}, True),     # the PyPI wheel on do-amd, 2026-09-29
+    ("amd", {"USE_CUDA": False, "USE_HIP": True}, False),   # a ROCm build
+    ("nvidia", {"USE_CUDA": True}, False),
+    ("nvidia", {"USE_CUDA": False}, True),
+    (None, {"USE_CUDA": True}, True),
+])
+def test_xgboost_gpu_refuses_without_the_vendor_backend(monkeypatch, capsys, vendor, info, refused):
+    """device='cuda' on a build without this GPU's backend trains on the CPU
+    without an error; the GPU arm must refuse by name instead of timing it."""
+    monkeypatch.setattr(spec, "accel_vendor", lambda: vendor)
+    fake = _FakeXgb(info)
+    assert (spec._xgb_gpu_refusal(fake) is not None) is refused
+    monkeypatch.setitem(sys.modules, "xgboost", fake)
+    # This unit checks backend refusal; the separate prebin test covers
+    # CatBoost border preparation and the shared matrix/hash contract.
+    monkeypatch.setattr(spec, "prebinned_data", lambda lane, data, cfg: data)
+    cfg = {"xgboost_grow_policy": "depthwise", "grow_policy": "Depthwise"}
+    arms = spec.xgboost_arms("gbdt-depthwise", cfg, types.SimpleNamespace(cat_idx=None, X_train=np.zeros((2, 1)), X_test=np.zeros((1, 1))), ["cpu", "gpu"])
+    names = [a.name for a in arms]
+    out = capsys.readouterr().out
+    assert "xgboost-cpu" in names
+    assert ("xgboost-gpu" in names) is not refused
+    assert ("FSPEED-REFUSED lane=gbdt-depthwise arm=xgboost-gpu" in out) is refused
+    # FAIRNESS FIX (2026-10-13 audit): XGBRanker is refused by name on the ranking lanes
+    # (depthwise trees with LambdaMART or sampled pairs against oblivious YetiRank/PairLogit).
+    with pytest.raises(RuntimeError, match="DIFFERENT-ALGORITHM"):
+        spec.xgboost_rank_arms("gbdt-rank-yetirank", {}, None, ["cpu", "gpu"])
+
+
+def test_prebinned_input_is_one_block_for_both_arms_of_the_xgboost_pairing():
+    # smoke-fixes r13 (the author 2026-10-14, DECISIONS.md decision 1): gbdt-depthwise/-lossguide give
+    # the XGBoost pairing (ours-prebinned / ours-gain0 and xgboost-*) the same GreedyLogSum bin ids,
+    # once per dataset, with the bins' sha256 in the read-back record; CatBoost keeps the raw rows
+    pytest.importorskip("catboost")
+    rng = np.random.default_rng(0)
+    x = np.round(rng.normal(size=(4000, 3)) * 50).astype(np.float32)
+    x[:, 2] = 1.0
+    xt = np.round(rng.normal(size=(500, 3)) * 50).astype(np.float32)
+    y = (rng.random(4000) > .5).astype(np.float32)
+    d = spec.Data("toy", x, xt, y, (rng.random(500) > .5).astype(np.float32), "binary")
+    cfg = spec.lane_config("gbdt-lossguide", "shipped")
+    pb = spec.prebinned_data("gbdt-lossguide", d, cfg)
+    assert spec.prebinned_data("gbdt-lossguide", d, cfg) is pb              # once per dataset
+    assert d.X_train is x and pb.X_train is not x and pb.y_train is y
+    assert pb.input_binning.startswith(spec.PREBIN_RECORD % 254) and pb.bins_sha256 in pb.input_binning
+    assert all(len(np.unique(pb.X_train[:, f])) <= 255 for f in range(3)) and set(np.unique(pb.X_train[:, 2])) == {0.0}
+    again = spec.prebinned_data("gbdt-lossguide", spec.Data("toy", x.copy(), xt.copy(), y, d.y_test, "binary"), cfg)
+    assert again.bins_sha256 == pb.bins_sha256
+    arm = spec.attach_input(spec.Arm("xgboost-gpu", lambda: types.SimpleNamespace(), None, None), pb)
+    assert arm.data is pb and arm.make()._board_input_binning == pb.input_binning
+    with pytest.raises(RuntimeError, match="NAN-INPUT"):
+        xn = x.copy()
+        xn[0, 0] = np.nan
+        spec.prebinned_data("gbdt-lossguide", spec.Data("toy", xn, xt, y, d.y_test, "binary"), cfg)
+
+
+@pytest.mark.parametrize('lane', ['gbdt-rank-pairlogit', 'gbdt-rank-yetirank'])
+def test_querywise_recipe_explicitly_selects_supported_pointwise_searcher(lane):
+    cfg = spec.lane_config(lane, 'shipped')
+    assert cfg['use_pointwise_searcher'] is True
+    assert cfg['data_partition'] == 'DocParallel'
+    assert cfg['leaf_estimation_method'] == 'Newton'
+    assert cfg['random_strength'] == 1.0
+    assert cfg['boosting_type'] == 'Plain'
+    gpu = spec.catboost_tree_params(cfg, 'GPU')
+    assert gpu['data_partition'] == 'DocParallel'
+    assert 'data_partition' not in spec.catboost_tree_params(cfg, 'CPU')
+    # This repair changes only the searcher, not the existing workload.
+    assert (cfg['n_estimators'], cfg['max_depth']) == (100, 6)
+    assert 'border_build_max_samples' not in cfg

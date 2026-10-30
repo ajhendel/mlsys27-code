@@ -1,0 +1,508 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 the authors. Part of anonlib, DOI-WITHHELD
+"""THE AUTOGRAD SMOKE ENTRIES (2026-10-19, lane ag-bench): does the tape start on this vendor.
+
+Eleven "does it start" entries per vendor (metal, nvidia, amd), 5 s each, nothing timed:
+
+  autograd-gradients     autograd/checks/gpu.mojo, the gradient suite on the vendor's GPU (every
+                         case prints PASS and its digest; the digests equal the CPU column's).
+  autograd-mlp-identity  autograd/checks/mlp_gpu.mojo, the MLP tape fits against the hand-written
+                         trainer on the GPU (run_mlp_cases).
+  autograd-fit-smoke     tests/test_autograd_smoke.py through the installed bindings: a tiny MLP
+                         and a tiny LSTM fit on the default (tape) path, finite losses, the
+                         expected-digest file present.
+  autograd-public        python/anonlib/tests/test_autograd_public.py: the docs' Sequential and
+                         ops.Session examples run verbatim; PUBLIC_DIGEST lines in its log.
+  autograd-sequential-smoke
+                         (2026-10-19, lane ag-board-twins) the board's sequential-fit recipe in
+                         miniature through the installed bindings: anonlib.Sequential linear,
+                         relu, linear(1), BCE with logits, Adam, one fit and predict_proba on a
+                         seeded 256 x 8 set; finite probabilities, a SMOKE_DIGEST line (params_).
+  autograd-session-smoke (2026-10-19, lane ag-board-twins) the board's ops-session-step in
+                         miniature: one Session(record=True) step (linear, relu, linear, softmax
+                         cross-entropy, backward, the SGD update with the session's ops); finite
+                         loss and gradients, a SMOKE_DIGEST line (the gradients).
+  causal-lm-generate-smoke
+                         (2026-10-19, lane ag-inference-board) the board's causal-lm-generate lanes
+                         in miniature: a seeded two-layer checkpoint in the byte-LM format (no final
+                         norm, the 162M's layout) written to a temporary directory, CausalLM.load and
+                         greedy generate(prompt, 4); ids in the vocabulary, the prompt echoed, a
+                         SMOKE_DIGEST line (the new ids).
+  sequential-predict-smoke
+                         (2026-10-19, lane ag-inference-board) the board's sequential-predict lane in
+                         miniature: a tiny Sequential fit, then predict_proba inside the board's
+                         untimed memory pass (its NVML / KFD counters); finite probabilities, a
+                         SMOKE_DIGEST line (the probabilities) and the memory figures read.
+  autograd-higher        (2026-10-19, lane ag-ho-checks) autograd/checks/higher_gpu.mojo, the
+                         higher-order suite (create_graph, second and third backward) on the
+                         vendor's GPU; one HIGHER_DIGEST line per case.
+  import-model-smoke     (2026-10-20, lane ag-import-docs) anonlib.import_model of the tests' tiny
+                         Conv/Relu/MaxPool/Flatten/Gemm ONNX fixture, written in process to a
+                         temporary directory, then one Program.run; finite logits of the
+                         expected shape, a SMOKE_DIGEST line (the logits).
+  import-torch-smoke     (2026-10-20, lane ag-torch-twins) anonlib.import_model of a torch.export
+                         ExportedProgram: a tiny nn.Module (linear, layer norm, linear: the shared
+                         fixture's shapes and weights) exported in process, then one Program.run;
+                         prints `RUN torch <version>` and a SMOKE_DIGEST line, or `SKIPPED no torch
+                         (<reason>)` and exits 0 when torch is missing (ANONLIB_REQUIRE_TORCH=1 makes
+                         that a failure). The row's status reads `SKIPPED` then, never `ok`.
+  real-model-smoke       (2026-10-20, lane ag-real-models) tools/real_model_import.py in miniature:
+                         torchvision's squeezenet1_1 with its published weights, torch.export at a
+                         1 x 3 x 64 x 64 input, import_model, one Program.run; finite (1, 1000)
+                         logits and a SMOKE_DIGEST line, or SMOKE_REFUSED lines naming each node.
+
+A check binary is built ONCE per vendor by the orchestrator (`build-commands` prints the lines; this
+tool never builds), then `run` starts each entry with a 5 s timer:
+
+    python3 tools/autograd_smoke.py build-commands --vendor nvidia --mojo MOJO --bin-dir DIR
+    python3 tools/autograd_smoke.py run --vendor nvidia --bin-dir DIR --python PY --out FILE.json
+
+A row is `ok` (exited 0 inside its timer), `STARTED` (still running at the timer: it started, no
+verdict), `failed` (non-zero exit, with its last lines) or `not built` (no binary: refused by name,
+never a pass); a probe that prints a `SKIPPED <reason>` line reads `SKIPPED` (never silence, never
+`ok`). tools/apple_smoke_set.py lists these entries beside its derived lanes and
+tools/gate_smoke_box.py runs them after the board smoke on NVIDIA and AMD.
+"""
+import argparse
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+VENDORS = ("metal", "nvidia", "amd")
+#: the author, 2026-10-14: smoke is a 5 s "does it start"
+TIMEOUT_S = 5
+#: the vendor column define a GPU check is built with (bindings/build_byte_lm.sh's rule)
+COLUMN_DEFINE = {"metal": [], "nvidia": ["-D", "ANONLIB_COLUMN_NVIDIA"], "amd": ["-D", "ANONLIB_COLUMN_AMD"]}
+ENTRIES = (
+    {"name": "autograd-gradients", "source": "autograd/checks/gpu.mojo",
+     "what": "the autograd gradient suite on the vendor's GPU, one PASS line and digest per case"},
+    {"name": "autograd-mlp-identity", "source": "autograd/checks/mlp_gpu.mojo",
+     "what": "the MLP tape fits against the hand-written trainer on the vendor's GPU"},
+    {"name": "autograd-fit-smoke", "pytest": "tests/test_autograd_smoke.py",
+     "what": "a tiny MLP and LSTM fit through the installed bindings' default path"},
+    {"name": "autograd-public", "pytest": "python/anonlib/tests/test_autograd_public.py", "pytest_args": ["-s"],
+     "what": "the public Sequential and ops.Session examples of the docs, PUBLIC_DIGEST lines"},
+    # 2026-10-19 (lane ag-board-twins): the two board lanes of the public tape API, in miniature
+    {"name": "autograd-sequential-smoke", "probe": "sequential",
+     "what": "a tiny Sequential fit + predict_proba (the sequential-fit board lane) through the installed bindings"},
+    {"name": "autograd-session-smoke", "probe": "session",
+     "what": "one tiny ops.Session(record=True) step (the ops-session-step board lane) through the installed bindings"},
+    # 2026-10-19 (lane ag-inference-board): the inference board lanes, in miniature
+    {"name": "causal-lm-generate-smoke", "probe": "generate",
+     "what": "CausalLM.load + greedy generate of a tiny byte-LM checkpoint (the causal-lm-generate board lanes)"},
+    {"name": "sequential-predict-smoke", "probe": "predict",
+     "what": "a tiny Sequential predict_proba inside the board's memory pass (the sequential-predict board lane)"},
+    # 2026-10-19 (lane ag-ho-checks): higher-order gradients, docs/plans/AUTOGRAD_HIGHER_ORDER.md section 6
+    {"name": "autograd-higher", "source": "autograd/checks/higher_gpu.mojo",
+     "what": "the higher-order gradient suite (create_graph) on the vendor's GPU, HIGHER_DIGEST lines"},
+    # 2026-10-20 (lane ag-import-docs): model import, docs/plans/MODEL_IMPORT.md
+    {"name": "import-model-smoke", "probe": "import",
+     "what": "anonlib.import_model of a tiny ONNX file written in process, then one Program.run"},
+    # 2026-10-20 (lane ag-torch-twins): the torch.export source of the importer; RUN or SKIPPED, never silent
+    {"name": "import-torch-smoke", "probe": "import-torch",
+     "what": "anonlib.import_model of a tiny torch.export ExportedProgram, then one Program.run (SKIPPED without torch)"},
+    # 2026-10-20 (lane ag-real-models): a real pretrained model, tools/real_model_import.py in miniature
+    {"name": "real-model-smoke", "probe": "real-model",
+     "what": "torchvision squeezenet1_1 (published weights) exported at 1x3x64x64, imported, one Program.run"},
+)
+
+
+def _probe_digest(arrays):
+    import hashlib
+    import numpy as np
+    h = hashlib.sha256()
+    for a in arrays:
+        h.update(np.ascontiguousarray(a, dtype=np.float32).tobytes())
+    return h.hexdigest()[:16]
+
+
+def probe_sequential():
+    """autograd-sequential-smoke: does Sequential fit + predict_proba start and give finite probabilities."""
+    import numpy as np
+    import anonlib
+    rng = np.random.default_rng(7)
+    X = rng.standard_normal((256, 8), dtype=np.float32)
+    y = (X[:, 0] + 0.5 * X[:, 1] > 0).astype(np.float32)       # the fixture's labels (no runtime math)
+    model = anonlib.Sequential().linear(16).relu().linear(1)
+    model.compile(loss="bce_with_logits", optimizer="adam", lr=1e-2, beta1=0.9, beta2=0.999, eps=1e-8,
+                  weight_decay=0.0, schedule="constant", tol=0.0, n_iter_no_change=0)
+    model.fit(X, y, epochs=1, batch_size=64, shuffle=True, seed=7)
+    proba = np.asarray(model.predict_proba(X))
+    if proba.shape != (256, 2) or not np.isfinite(proba).all() or not np.isfinite(model.params_).all():
+        print("SMOKE_FAIL sequential proba shape %s finite %s" % (proba.shape, bool(np.isfinite(proba).all())))
+        return 1
+    print("SMOKE_DIGEST sequential params %s vendor %s mode %s" % (_probe_digest([model.params_]),
+                                                                   anonlib.vendor(), anonlib.numeric_mode()))
+    return 0
+
+
+def probe_session():
+    """autograd-session-smoke: does one recorded ops.Session step start and give finite gradients."""
+    import numpy as np
+    import anonlib
+    from anonlib import ops
+    rng = np.random.default_rng(7)
+    X = rng.standard_normal((32, 8)).astype(np.float32)
+    codes = rng.integers(0, 3, (32, 1)).astype(np.float32)
+    init = [rng.uniform(-0.3, 0.3, s).astype(np.float32) for s in ((8, 16), (1, 16), (16, 3), (1, 3))]
+    with ops.Session(record=True) as s:
+        x, c = s.tensor(X), s.tensor(codes)
+        ps = [s.tensor(p, requires_grad=True) for p in init]
+        logits = s.linear(s.relu(s.linear(x, ps[0], ps[1])), ps[2], ps[3])
+        loss = s.cross_entropy(logits, c)
+        s.backward(loss)
+        value = s.scalar(loss)
+        grads = [s.grad(p) for p in ps]
+        updated = [s.numpy(s.sub(s.detach(p), s.scale(s.tensor(g), 0.05))) for p, g in zip(ps, grads)]
+    finite = np.isfinite(value) and all(np.isfinite(a).all() for a in grads + updated)
+    if not finite:
+        print("SMOKE_FAIL session loss %r finite %s" % (value, finite))
+        return 1
+    print("SMOKE_DIGEST session grads %s loss %.6f vendor %s mode %s"
+          % (_probe_digest(grads), value, anonlib.vendor(), anonlib.numeric_mode()))
+    return 0
+
+
+def probe_generate():
+    """causal-lm-generate-smoke: does CausalLM load a byte-LM checkpoint (no final norm) and generate greedily."""
+    import json as _json
+    import tempfile
+    import numpy as np
+    import anonlib
+    from anonlib.models import CausalLM
+    from anonlib.models.safetensors import write_safetensors
+    rng = np.random.default_rng(7)
+    L, D, H, F, V = 2, 32, 2, 64, 64
+    cfg = {"format": "anonlib.byte-lm", "n_layers": L, "d_model": D, "n_heads": H, "n_kv": H, "head_dim": D // H,
+           "intermediate": F, "vocab_size": V, "max_position_embeddings": 64, "rope_theta": 10000.0,
+           "rms_norm_eps": 1e-6, "positional_encoding": "rotary", "rope_pairing": "rotate_half", "norm": "rmsnorm",
+           "norm_placement": "pre-norm, no final norm", "mlp": "swiglu", "bias": False, "tie_word_embeddings": False}
+    shapes = {"embed": (V, D), "lm_head": (V, D)}
+    for i in range(L):              # the fixture's tensor names (no runtime math)
+        shapes.update({"block%d.norm1_w" % i: (D,), "block%d.norm2_w" % i: (D,), "block%d.w_q" % i: (D, D),
+                       "block%d.w_k" % i: (D, D), "block%d.w_v" % i: (D, D), "block%d.w_o" % i: (D, D),
+                       "block%d.w_gate" % i: (F, D), "block%d.w_up" % i: (F, D), "block%d.w_down" % i: (D, F)})
+    tensors = {}
+    for name, shape in shapes.items():
+        a = (np.ones(shape, dtype=np.float32) if name.endswith("_w") and len(shape) == 1
+             else rng.uniform(-0.1, 0.1, shape).astype(np.float32))
+        tensors[name] = ("F32", shape, a.tobytes())
+    prompt = rng.integers(0, V, (1, 8)).astype(np.int32)
+    with tempfile.TemporaryDirectory() as d:
+        with open(os.path.join(d, "config.json"), "w") as fh:
+            _json.dump(cfg, fh)
+        write_safetensors(os.path.join(d, "model.safetensors"), tensors)
+        lm = CausalLM.load(d, weight_format="float32", numeric_profile="fp32_v1")
+        out = np.asarray(lm.generate(prompt, 4))
+    ok = out.shape == (1, 12) and np.array_equal(out[:, :8], prompt) and out.min() >= 0 and out.max() < V
+    if not ok:
+        print("SMOKE_FAIL generate shape %s ids %s" % (out.shape, out.tolist()))
+        return 1
+    print("SMOKE_DIGEST generate ids %s vendor %s mode %s" % (
+        _probe_digest([out[:, 8:].astype(np.float32)]), anonlib.vendor(), anonlib.numeric_mode()))
+    return 0
+
+
+def probe_predict():
+    """sequential-predict-smoke: does a Sequential predict_proba run inside the board's untimed memory pass."""
+    import numpy as np
+    import anonlib
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import bench_board_neural as bbn
+    rng = np.random.default_rng(7)
+    X = rng.standard_normal((256, 8), dtype=np.float32)
+    y = (X[:, 0] - 0.5 * X[:, 2] > 0).astype(np.float32)       # the fixture's labels (no runtime math)
+    dm = bbn.DeviceMemory()
+    before = dm.read()
+    model = anonlib.Sequential().linear(16).relu().linear(1)
+    model.compile(loss="bce_with_logits", optimizer="adam", lr=1e-2, beta1=0.9, beta2=0.999, eps=1e-8,
+                  weight_decay=0.0, schedule="constant", tol=0.0, n_iter_no_change=0)
+    model.fit(X, y, epochs=1, batch_size=64, shuffle=True, seed=7)
+    resident = bbn._mem_delta(before, dm.read())
+    got = {}
+
+    def predict():
+        got["proba"] = np.asarray(model.predict_proba(X))
+    mem = bbn.memory_pass(dm, resident, predict)
+    proba = got.get("proba")
+    if proba is None or proba.shape != (256, 2) or not np.isfinite(proba).all():
+        print("SMOKE_FAIL predict proba %s" % (None if proba is None else proba.shape,))
+        return 1
+    print("SMOKE_DIGEST predict proba %s peak_bytes %s process_peak_bytes %s vendor %s mode %s" % (
+        _probe_digest([proba]), json.dumps(mem.get("peak_bytes"), sort_keys=True), mem.get("process_peak_bytes"),
+        anonlib.vendor(), anonlib.numeric_mode()))
+    return 0
+
+
+
+def probe_import():
+    """import-model-smoke: does an ONNX import start and its Program run. The fixture (Conv, Relu,
+    MaxPool, Flatten, Gemm) is written by the tests' own encoder, loaded by path because the wheel ships
+    no tests, into a temporary directory; no onnx or torch."""
+    import importlib.util
+    import tempfile
+    import numpy as np
+    import anonlib
+    spec = importlib.util.spec_from_file_location(
+        "smoke_onnx_fixture", ROOT / "python" / "anonlib" / "tests" / "_onnx_fixture.py")
+    fx = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = fx      # its dataclasses resolve their module by name
+    spec.loader.exec_module(fx)
+    with tempfile.TemporaryDirectory() as tmp:
+        fixture = fx.write_fixture("conv_relu_maxpool_flatten_gemm", tmp)
+        model = anonlib.import_model(fixture.path, shapes={"x": (4, 3, 8, 8)})
+        x = np.random.default_rng(7).standard_normal((4, 3, 8, 8), dtype=np.float32)
+        y = np.asarray(model.run(x))
+    if y.shape != (4, 10) or not np.isfinite(y).all():
+        print("SMOKE_FAIL import output %s finite %s" % (y.shape, bool(np.isfinite(y).all())))
+        return 1
+    print("SMOKE_DIGEST import logits %s vendor %s mode %s"
+          % (_probe_digest([y]), anonlib.vendor(), anonlib.numeric_mode()))
+    return 0
+
+
+def _load_onnx_fixture():
+    """The tests' fixture module, loaded by path (the wheel ships no tests)."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "smoke_onnx_fixture", ROOT / "python" / "anonlib" / "tests" / "_onnx_fixture.py")
+    fx = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = fx      # its dataclasses resolve their module by name
+    spec.loader.exec_module(fx)
+    return fx
+
+
+def probe_import_torch():
+    """import-torch-smoke: does a torch.export import start and its Program run. The module is the
+    shared linear_layernorm_linear fixture (x [4, 6] -> Linear 5 -> LayerNorm -> Linear 3) rebuilt as
+    an nn.Sequential holding the fixture's weights, exported at batch 4. Prints RUN or SKIPPED, always."""
+    import tempfile
+    import numpy as np
+    try:
+        import torch
+        import torch.export  # noqa: F401
+    except Exception as exc:  # torch absent, or too old for torch.export
+        print("SKIPPED no torch (%s: %s)" % (type(exc).__name__, str(exc)[:160]), flush=True)
+        if os.environ.get("ANONLIB_REQUIRE_TORCH") == "1":
+            print("SMOKE_FAIL import-torch ANONLIB_REQUIRE_TORCH=1 and torch does not import")
+            return 1
+        return 0
+    import anonlib
+    print("RUN torch %s" % torch.__version__, flush=True)
+    fx = _load_onnx_fixture()
+    with tempfile.TemporaryDirectory() as tmp:
+        f = fx.write_fixture("linear_layernorm_linear", tmp)
+    I = {k: torch.frombuffer(bytearray(v.data), dtype=torch.float32).reshape(v.shape).clone()
+         for k, v in f.initializers.items()}
+    fc1, ln, fc2 = torch.nn.Linear(6, 5), torch.nn.LayerNorm(5, eps=1e-5), torch.nn.Linear(5, 3)
+    with torch.no_grad():
+        fc1.weight.copy_(I["w1"]); fc1.bias.copy_(I["b1"])
+        ln.weight.copy_(I["ln_scale"]); ln.bias.copy_(I["ln_bias"])
+        fc2.weight.copy_(I["w2"]); fc2.bias.copy_(I["b2"])
+    module = torch.nn.Sequential(fc1, ln, fc2).eval()
+    x = np.random.default_rng(7).standard_normal((4, 6), dtype=np.float32)
+    ep = torch.export.export(module, (torch.from_numpy(x),))
+    model = anonlib.import_model(ep)
+    y = model.run(x)
+    y = np.asarray(y[0] if isinstance(y, (list, tuple)) else y)
+    if y.shape != (4, 3) or not np.isfinite(y).all():
+        print("SMOKE_FAIL import-torch output %s finite %s" % (y.shape, bool(np.isfinite(y).all())))
+        return 1
+    print("SMOKE_DIGEST import-torch logits %s vendor %s mode %s"
+          % (_probe_digest([y]), anonlib.vendor(), anonlib.numeric_mode()))
+    return 0
+
+
+def probe_real_model():
+    """real-model-smoke: does a real pretrained model start through the importer. torchvision's
+    squeezenet1_1 with its published weights, exported by tools/real_model_import.py's own source step
+    at a tiny 1 x 3 x 64 x 64 input, imported and run once; a refusal prints its nodes and counts as
+    started (the import ran and named what it cannot run)."""
+    import importlib.util
+    import numpy as np
+    import anonlib
+    from anonlib.importers import UnsupportedModel
+    spec = importlib.util.spec_from_file_location("real_model_import", ROOT / "tools" / "real_model_import.py")
+    rm = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(rm)
+    try:
+        import torch  # noqa: F401
+        import torchvision  # noqa: F401
+    except ImportError as exc:
+        print("SMOKE_FAIL real-model torch or torchvision is not installed (%s)" % exc)
+        return 1
+    model = dict(rm.MODELS["squeezenet1_1"], input=(lambda b: (1, 3, 64, 64), "image"))
+    ep, shapes, arrays, _ = rm.source_torchvision(model, 1, 7, {})
+    try:
+        prog = anonlib.import_model(ep, shapes=shapes)
+    except UnsupportedModel as e:
+        for name, op, why in e.problems:
+            print("SMOKE_REFUSED real-model squeezenet1_1 %s %s: %s" % (op, name, why))
+        return 0
+    y = np.asarray(prog.run(*arrays))
+    if y.shape != (1, 1000) or not np.isfinite(y).all():
+        print("SMOKE_FAIL real-model output %s finite %s" % (y.shape, bool(np.isfinite(y).all())))
+        return 1
+    print("SMOKE_DIGEST real-model squeezenet1_1 %s vendor %s mode %s"
+          % (_probe_digest([y]), anonlib.vendor(), anonlib.numeric_mode()))
+    return 0
+
+
+PROBES = {"sequential": probe_sequential, "session": probe_session, "generate": probe_generate,
+          "predict": probe_predict, "import": probe_import, "import-torch": probe_import_torch,
+          "real-model": probe_real_model}
+
+
+def _skipped_line(log, offset=0):
+    """The first `SKIPPED <reason>` line a probe printed after `offset` (the log appends), or None."""
+    try:
+        with open(log, "rb") as fh:
+            fh.seek(offset)
+            text = fh.read().decode(errors="replace")
+        for line in text.splitlines():
+            if line.startswith("SKIPPED "):
+                return line[:300]
+    except OSError:
+        pass
+    return None
+
+
+def binary(bin_dir, entry, vendor):
+    return Path(bin_dir) / ("%s-%s" % (entry["name"], vendor))
+
+
+def build_commands(vendor, mojo, bin_dir, target=None):
+    """The `mojo build` line of every check entry for `vendor` (IDENTICAL, the vendor's column define)."""
+    out = []
+    for e in ENTRIES:
+        if "source" not in e:
+            continue
+        cmd = [mojo, "build", "-j", "1", "-D", "ANONLIB_NUMERIC_IDENTICAL=1"] + COLUMN_DEFINE[vendor]
+        if target:
+            cmd += ["--target-accelerator", target]
+        cmd += ["-I", str(ROOT), str(ROOT / e["source"]), "-o", str(binary(bin_dir, e, vendor))]
+        out.append(cmd)
+    return out
+
+
+def _tail(path, n=6, width=300):
+    try:
+        lines = [l for l in Path(path).read_text(errors="replace").splitlines() if l.strip()]
+    except OSError:
+        return []
+    return [l[:width] for l in lines[-n:]]
+
+
+def start(cmd, log, timeout, env=None, cwd=None):
+    """(status, rc, seconds): ok / STARTED / failed for one bounded start; the process group is
+    killed at the timer."""
+    t0 = time.time()
+    with open(log, "ab", buffering=0) as stream:
+        proc = subprocess.Popen(cmd, stdout=stream, stderr=subprocess.STDOUT, start_new_session=True,
+                                env=env, cwd=cwd)
+        try:
+            rc = proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            rc = None
+            for sig in (signal.SIGTERM, signal.SIGKILL):
+                try:
+                    os.killpg(proc.pid, sig)
+                except ProcessLookupError:
+                    break
+                try:
+                    proc.wait(timeout=2)
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
+    seconds = round(time.time() - t0, 2)
+    if rc is None:
+        return "STARTED", None, seconds
+    return ("ok" if rc == 0 else "failed"), rc, seconds
+
+
+def run(vendor, bin_dir, python, out, timeout=TIMEOUT_S):
+    logs = Path(out).with_suffix("")
+    logs.mkdir(parents=True, exist_ok=True)
+    rows = []
+    for e in ENTRIES:
+        log = logs / ("%s-%s.log" % (e["name"], vendor))
+        row = {"name": e["name"], "vendor": vendor, "what": e["what"], "timeout_s": timeout, "log": str(log)}
+        if "source" in e:
+            exe = binary(bin_dir, e, vendor)
+            if not exe.is_file():
+                row.update(status="not built", detail="no %s (tools/autograd_smoke.py build-commands)" % exe)
+                rows.append(row)
+                continue
+            cmd = [str(exe)]
+            env = None
+        elif "probe" in e:
+            # through the installed bindings: `python` is the wheel's environment, nothing on PYTHONPATH
+            cmd = [python, str(Path(__file__).resolve()), "probe", e["probe"]]
+            env = dict(os.environ)
+            env.pop("PYTHONPATH", None)
+        else:
+            cmd = ([python, "-m", "pytest", "-q", "-x", "-p", "no:cacheprovider"] + e.get("pytest_args", [])
+                   + [str(ROOT / e["pytest"])])
+            env = dict(os.environ, ANONLIB_AUTOGRAD_SMOKE_OUT=str(logs / ("fit-digests-%s.json" % vendor)))
+        offset = log.stat().st_size if log.exists() else 0
+        status, rc, seconds = start(cmd, log, timeout, env=env, cwd=str(ROOT))
+        row.update(command=cmd, status=status, rc=rc, seconds=seconds)
+        if status == "ok" and "probe" in e:
+            skipped = _skipped_line(log, offset)
+            if skipped:
+                row.update(status="SKIPPED", detail=skipped)
+                status = "SKIPPED"
+        if status == "failed":
+            row["tail"] = _tail(log)
+        rows.append(row)
+        print("AUTOGRAD-SMOKE vendor=%s entry=%s status=%s seconds=%s" % (vendor, e["name"], status, seconds),
+              flush=True)
+    doc = {"schema": "anonlib-autograd-smoke/1", "vendor": vendor, "rows": rows,
+           "counts": {s: sum(1 for r in rows if r["status"] == s) for s in sorted({r["status"] for r in rows})}}
+    tmp = str(out) + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(doc, fh, indent=1, sort_keys=True)
+    os.replace(tmp, out)
+    bad = [r for r in rows if r["status"] in ("failed", "not built")]
+    return 1 if bad else 0
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    b = sub.add_parser("build-commands", help="print the check binaries' build lines (never builds)")
+    b.add_argument("--vendor", required=True, choices=VENDORS)
+    b.add_argument("--mojo", default="mojo")
+    b.add_argument("--bin-dir", required=True)
+    b.add_argument("--target-accelerator", default=None, help="e.g. sm_89 or gfx942 for a cross build")
+    r = sub.add_parser("run", help="start every entry once with its 5 s timer")
+    r.add_argument("--vendor", required=True, choices=VENDORS)
+    r.add_argument("--bin-dir", required=True)
+    r.add_argument("--python", default=sys.executable)
+    r.add_argument("--out", required=True)
+    r.add_argument("--timeout", type=float, default=TIMEOUT_S)
+    sub.add_parser("list", help="the entries, one line each")
+    pr = sub.add_parser("probe", help="one installed-bindings probe (what the probe entries start)")
+    pr.add_argument("kind", choices=sorted(PROBES))
+    a = ap.parse_args(argv)
+    if a.cmd == "list":
+        for e in ENTRIES:
+            print("%-26s %s" % (e["name"], e.get("source") or e.get("pytest") or "probe " + e["probe"]))
+        return 0
+    if a.cmd == "probe":
+        return PROBES[a.kind]()
+    if a.cmd == "build-commands":
+        for cmd in build_commands(a.vendor, a.mojo, a.bin_dir, a.target_accelerator):
+            print(" ".join(cmd))
+        return 0
+    return run(a.vendor, a.bin_dir, a.python, a.out, a.timeout)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

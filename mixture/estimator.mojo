@@ -1,0 +1,1910 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 the authors. Part of anonlib, DOI-WITHHELD
+"""The host-visible `GaussianMixture` surface, and the EM loop that drives it.
+
+Wired since 2026-09-14: `bindings/_anonlib_mixture.mojo` (built by
+`bindings/build_mixture.sh`) calls this file, and
+`python/anonlib/mixture.py` exposes it as `anonlib.GaussianMixture`.
+This file is the entry that binding reaches, shaped like
+`kde/estimator.mojo::kde_score_samples_host` and
+`cholesky/estimator.mojo::cholesky_factor_host`.
+
+THERE IS NO UPSTREAM AND THIS FILE IS WHERE THAT MATTERS MOST
+--------------------------------------------------------------
+cuML has no Gaussian mixture model at `upstream/cuml-v26.08.00` (`265b9da`),
+verified: no `gmm` directory, no `mixture` module, and the only occurrence of
+`gaussian_mixture` anywhere in the tree is in
+`python/cuml/cuml_accel_tests/upstream/scikit-learn/xfail-list.yaml`, marking
+two scikit-learn tests FLAKY UNDER `cuml.accel` -- which is a record that
+cuML does NOT accelerate the estimator and falls through to scikit-learn.
+cuVS (`6ba2ce2`) and RAFT (`ebf9268`) have none either. **So
+`CONTRIBUTING.md` (Algorithms and references) has no settled GPU answer to point at for this lane, because
+there is nothing to copy.**
+
+What governs instead: `sklearn/mixture/_gaussian_mixture.py` and `_base.py`
+define the SEMANTICS and are the ORACLE, and they are never the design
+source. **Every parameter this file accepts means exactly what
+scikit-learn's parameter of that name means, or is named differently.**
+`mixture/README.md` carries the mapping as a table and it is the contract; a
+parameter that quietly meant something else would make every comparison
+against scikit-learn a comparison of two different estimators.
+
+THE SURFACE, AND WHY IT IS SHAPED LIKE THIS
+---------------------------------------------
+1. **`GaussianMixtureModel` carries `n_iter` and `converged`.** Not for
+   diagnostics: the iteration count is a DATA-DEPENDENT output driven by a
+   float comparison, it is the first thing two vendors can disagree about,
+   and it is on the identity card. A model that did not carry it could not
+   be compared with another model.
+2. **`GaussianMixtureModel` carries `lower_bound`, the mean log likelihood
+   the loop stopped at.** Same argument: it is the quantity the convergence
+   test compared.
+3. **A COLLAPSED COMPONENT RAISES.** `gaussian_mixture_fit` does not return
+   a model with a reset component and it does not return a model with a flag
+   set. DEVIATION 1723; `mixture/README.md`'s hazard 2.
+4. **Nothing here takes a threads-per-block argument that reaches a number.**
+   The tuning arguments exist so `check_launch_invariance` can drive them,
+   and every one of them is SCHEDULING: block shape and grid shape are free
+   in both modes (`checks/numerics.mojo::free_block_shape`). The NUMERIC
+   parameters -- the fold directions, the row-max rule, `GMM_LOG_2PI`,
+   `GMM_TEN_EPS`, the Cholesky's `NB` -- are not arguments at all.
+
+A caller that keeps its data ON THE DEVICE across many fits should call
+`mixture/checks/estep.mojo::gmm_e_step` and `mstep.mojo::gmm_m_step`
+directly and keep its own `DeviceBuffer`s. This entry is the one-shot form,
+which is what the gates and the card use.
+"""
+
+# DEVIATION 2486: bulk host staging; stream/lifetime boundaries unchanged.
+from bindings.hostptr import copy_f32
+from std.atomic import Atomic
+from std.memory import bitcast
+from max.gpu.host import DeviceBuffer, DeviceContext
+from core.neural_context import neural_ctx
+from checks.numerics import GLOBAL_NUMERIC_MODE as _CTX_MODE, NUMERIC_IDENTICAL as _CTX_IDENTICAL
+
+#: ONE process-lifetime DeviceContext for every device entry of this binding
+#: (`core/neural_context.mojo`). A context per call ran the M2 Pro out of Metal
+#: command queues: later calls in a process REFUSED or returned output the
+#: device never wrote (x-neighbors-svc-multiclass BATCH_MOVED, gp-optimize,
+#: steward 1790601762837). Same kernels, same order, each entry still
+#: synchronizes before it returns, so no bit moves.
+comptime _CTX_NAME = "MojoMixtureContextIdentical" if _CTX_MODE == _CTX_IDENTICAL else "MojoMixtureContextFast"
+
+
+def _binding_ctx() raises -> DeviceContext:
+    return neural_ctx[_CTX_NAME]()
+
+from cholesky.checks.potrf import CHOL_ELEM_TPB, CHOL_PANEL_TPB
+from cholesky.checks.trsm import CHOL_SOLVE_TPB
+from cluster.estimator import kmeans_fit
+from cluster.impl.kmeans_params import (
+    INIT_KMEANS_PLUS_PLUS,
+    METRIC_L2_EXPANDED,
+)
+from core.identity_trace import IdentityTrace
+from std.os import getenv
+from std.sys.compile import is_defined
+from std.time import perf_counter_ns
+from core.philox import philox4x32_10
+from mixture.checks.estep import (
+    GMM_COMP_TPB,
+    GMM_ELEM_TPB,
+    GMM_PROFILE,
+    GMM_ROW_TPB,
+    gmm_estep_gemm_workspace_floats,
+    gmm_estep_scratch_floats,
+    gmm_convergence_change,
+    gmm_converged,
+    gmm_iter_prefix,
+    gmm_n_parameters,
+    gmm_neg_inf,
+    gmm_predict_labels,
+)
+from mixture.multi_gpu import gmm_e_step_dispatch
+from mixture.checks.sample import (
+    GMM_SAMPLE_TPB,
+    gmm_sample_components,
+    gmm_sample_kernel,
+)
+from mixture.checks.gmm_sabotage import (
+    GMM_SAB_NONE,
+    GMM_SAB_TOL_ULP,
+    gmm_ulp_down,
+)
+from mixture.checks.mstep import (
+    GmmMStepRun,
+    gmm_chol_dwork_floats,
+    gmm_chol_workspace_floats,
+    gmm_m_step,
+    gmm_mstep_gemm_workspace_floats,
+    gmm_mstep_scratch_floats,
+    gmm_precision_cholesky,
+    resp_exp_kernel,
+)
+from checks.numerics import GLOBAL_NUMERIC_MODE, NUMERIC_IDENTICAL, ftz, numeric_mode_name
+from checks.numerics import identical_div, identical_log
+from std.gpu import block_dim, block_idx, thread_idx
+
+
+# ===========================================================================
+# THE PARAMETER VOCABULARY
+# ===========================================================================
+
+#: `covariance_type="full"`. The only one this lane implements, and the one
+#: with the arithmetic intensity that justifies it: `d^2` FLOPs per point per
+#: component, against `d` for the other three.
+comptime COV_FULL = 0
+#: `covariance_type="tied"`. REFUSED BY NAME.
+comptime COV_TIED = 1
+#: `covariance_type="diag"`. REFUSED BY NAME.
+comptime COV_DIAG = 2
+#: `covariance_type="spherical"`. REFUSED BY NAME.
+comptime COV_SPHERICAL = 3
+
+#: `init_params="kmeans"`. THE ONE TO SHIP. Runs
+#: `cluster/estimator.mojo::kmeans_fit`, which is identity certified in its
+#: own lane, and one-hots the labels exactly as `_base.py:120-127` does.
+comptime INIT_KMEANS = 0
+#: **DEVIATION 3133.** The `oversampling_factor` the `kmeans` initialization
+#: hands `kmeans_fit`: `0.0`, the classic sequential greedy k-means++ seeding
+#: (scikit-learn's `KMeans` default, and the `kmeans-classic-pp` identity
+#: lane), never the k-means|| default of 2.0. `gmm_initial_resp_host` explains why.
+#: `mixture/host/gmm_host_oracle.mojo` passes the same constant.
+comptime GMM_KMEANS_OVERSAMPLING = Float64(0.0)
+#: `init_params="random"`. POSITION-MAPPED Philox draws, normalized per row.
+#: DEVIATION 1733.
+comptime INIT_RANDOM = 1
+#: `init_params="k-means++"`. REFUSED BY NAME.
+comptime INIT_KMEANS_PP = 2
+#: `init_params="random_from_data"`. REFUSED BY NAME.
+comptime INIT_RANDOM_FROM_DATA = 3
+
+#: **NUMERIC. DEVIATION 1733.** `2^-24` as float32 bits, the scale that turns
+#: a 24-bit Philox draw into a uniform on `[0, 1)`. Written as bits and
+#: bitcast for the reason every constant in this lane is:
+#: `[[mojo-string-float-roundtrip]]`. The mapping
+#: `Float32(u >> 8) * 2^-24` is EXACT at every input -- `u >> 8` is below
+#: `2^24` so it converts with no rounding, and the multiply is by a power of
+#: two -- so there is no libm, no division and nothing to pin beyond this
+#: constant.
+comptime GMM_TWO_POW_M24_BITS: UInt32 = 0x33800000
+
+
+def covariance_type_from_name(name: String) raises -> Int:
+    """scikit-learn's `covariance_type` string, or a refusal BY NAME.
+
+    The three refusals name the parameter, name the value, and say what it
+    would cost to add it -- because "not supported" without a reason is a
+    message that makes a user guess whether they are holding it wrong.
+    """
+    if name == "full":
+        return COV_FULL
+    if name == "tied":
+        raise Error(
+            "GaussianMixture: covariance_type='tied' is NOT IMPLEMENTED."
+            " scikit-learn shares ONE d x d covariance across every"
+            " component (_gaussian_mixture.py:200-227), which is one"
+            " Cholesky per iteration rather than n_components of them and a"
+            " different M-step accumulation. It is a smaller lane than this"
+            " one, not a subset of it: the collapse decision (DEVIATION"
+            " 1723) becomes global, so a single ill-conditioned component"
+            " fails the whole fit, and that is a different identity"
+            " argument. mixture/NOT_IMPLEMENTED.tsv carries it"
+        )
+    if name == "diag":
+        raise Error(
+            "GaussianMixture: covariance_type='diag' is NOT IMPLEMENTED."
+            " scikit-learn stores n_components x d variances and computes"
+            " the log probability without any Cholesky at all"
+            " (_gaussian_mixture.py:539-544, precisions = precisions_chol"
+            " ** 2). That path has d FLOPs per point per component instead"
+            " of d^2, so it is BANDWIDTH bound where this lane is compute"
+            " bound, and ROADMAP.md's argument for opening the lane does not"
+            " apply to it. mixture/NOT_IMPLEMENTED.tsv carries it"
+        )
+    if name == "spherical":
+        raise Error(
+            "GaussianMixture: covariance_type='spherical' is NOT IMPLEMENTED."
+            " One variance per component (_gaussian_mixture.py:545-552),"
+            " which is k-means with a soft assignment and a variance."
+            " cluster/ already ships the hard-assignment half, identity"
+            " certified. mixture/NOT_IMPLEMENTED.tsv carries it"
+        )
+    raise Error(
+        "GaussianMixture: covariance_type='"
+        + name
+        + "' is not one of scikit-learn's four ('full', 'tied', 'diag',"
+        " 'spherical'). Only 'full' is implemented here"
+    )
+
+
+def init_params_from_name(name: String) raises -> Int:
+    """scikit-learn's `init_params` string, or a refusal BY NAME."""
+    if name == "kmeans":
+        return INIT_KMEANS
+    if name == "random":
+        return INIT_RANDOM
+    if name == "k-means++":
+        raise Error(
+            "GaussianMixture: init_params='k-means++' is NOT IMPLEMENTED."
+            " scikit-learn calls sklearn.cluster.kmeans_plusplus and"
+            " one-hots the CHOSEN INDICES rather than a full assignment"
+            " (_base.py:148-155), so it needs the seeding routine's own"
+            " draw sequence to be reproducible on three vendors."
+            " cluster/checks/plus_plus.mojo is cuVS's k-means++ and its"
+            " draw order is cuVS's, not scikit-learn's, so wiring it here"
+            " would give a DIFFERENT initialization under a scikit-learn"
+            " parameter name -- which mixture/README.md's semantics table"
+            " forbids. init_params='kmeans' is the supported one"
+        )
+    if name == "random_from_data":
+        raise Error(
+            "GaussianMixture: init_params='random_from_data' is NOT IMPLEMENTED."
+            " scikit-learn draws n_components row indices WITHOUT"
+            " REPLACEMENT (_base.py:140-147), which is a rejection loop"
+            " whose consumed-draw count depends on the data. That is a"
+            " reproducibility question of its own and this lane has not"
+            " answered it. init_params='random' is the position-mapped"
+            " alternative (DEVIATION 1733)"
+        )
+    raise Error(
+        "GaussianMixture: init_params='"
+        + name
+        + "' is not one of scikit-learn's four ('kmeans', 'k-means++',"
+        " 'random', 'random_from_data'). 'kmeans' and 'random' are"
+        " implemented here"
+    )
+
+
+@fieldwise_init
+struct GmmParams(Copyable, ImplicitlyCopyable, Movable):
+    """scikit-learn's `GaussianMixture.__init__` parameters, rung 1.
+
+    Defaults are SCIKIT-LEARN'S, stated rather than quietly matched, because
+    a default that differs is a comparison of two estimators:
+    `covariance_type="full"`, `tol=1e-3`, `reg_covar=1e-6`, `max_iter=100`,
+    `init_params="kmeans"`.
+
+    **`n_init` IS NOT A FIELD, AND `warm_start` IS NOT A FIELD.** DEVIATION
+    1734: `n_init > 1` picks the best restart by a FLOAT COMPARISON of lower
+    bounds (`_base.py:282`), which is a second data-dependent branch on top
+    of the convergence test and would need its own identity argument and its
+    own tie rule; `warm_start` makes the fit depend on the object's history
+    rather than on its inputs. Both are refused BY ABSENCE -- there is no
+    field to set -- and `mixture/NOT_IMPLEMENTED.tsv` carries them. scikit-learn's
+    `n_init` default is 1 and its `warm_start` default is False, so the
+    shipped behavior matches the shipped defaults.
+
+    `means_init`, `weights_init` and `precisions_init` are absent for the
+    same reason and are also in `NOT_IMPLEMENTED.tsv`.
+    """
+
+    var n_components: Int
+    var covariance_type: Int
+    var tol: Float32
+    var reg_covar: Float32
+    var max_iter: Int
+    var init_params: Int
+    var random_state: UInt64
+
+    @staticmethod
+    def default() -> Self:
+        """scikit-learn's defaults, exactly."""
+        return Self(
+            1,
+            COV_FULL,
+            Float32(1.0e-3),
+            Float32(1.0e-6),
+            100,
+            INIT_KMEANS,
+            UInt64(0),
+        )
+
+
+@fieldwise_init
+struct GaussianMixtureModel(Movable):
+    """A fitted model. Everything a caller must not recompute for itself,
+    plus the two fields that make two fits comparable."""
+
+    var n_components: Int
+    var n_features: Int
+
+    var weights: List[Float32]
+    """`weights_`, `n_components`."""
+
+    var means: List[Float32]
+    """`means_`, `n_components x n_features` row-major."""
+
+    var covariances: List[Float32]
+    """`covariances_`, `n_components x n_features x n_features` row-major
+    per component. INCLUDES `reg_covar` on the diagonal, exactly as
+    scikit-learn's does."""
+
+    var precisions_cholesky: List[Float32]
+    """`precisions_cholesky_`, `(L_k^{-1})^T` per component, UPPER
+    triangular. Carried rather than recomputed because `predict`,
+    `predict_proba` and `score_samples` all need it and each recomputation
+    would be another Cholesky and another `log` fold."""
+
+    var log_det_chol: List[Float32]
+    """`_compute_log_det_cholesky`'s answer, `n_components`. DEVIATION 1726
+    computes it from `chol_logdet` and a caller must not re-derive it from
+    the diagonal above; the two are the same number and not the same bits."""
+
+    var n_iter: Int
+    """`n_iter_`. **PART OF THE IDENTITY CARD.** A data-dependent count
+    driven by a float comparison; see `mixture/README.md`'s hazard 1."""
+
+    var converged: Bool
+    """`converged_`. False means the loop ran out of iterations, which
+    scikit-learn reports as a `ConvergenceWarning`. DEVIATION 1746: Mojo has
+    no warning channel, so this is a FIELD and `mixture_main.mojo` prints
+    it. It is never a raise, because scikit-learn returns a usable model in
+    that case and so does this."""
+
+    var lower_bound: Float32
+    """`lower_bound_`, the mean log likelihood the loop stopped at. The
+    quantity the convergence test compared."""
+
+
+# ===========================================================================
+# VALIDATION: EVERY REFUSAL BY NAME, BEFORE ANY LAUNCH
+# ===========================================================================
+
+
+def gmm_hex32(v: Float32) -> String:
+    """A float32 as eight hex digits. Every refusal that names a VALUE names
+    its bits, because `[[mojo-string-float-roundtrip]]`: a decimal in an
+    error message cannot be trusted to be the number that caused it."""
+    comptime DIGITS = "0123456789abcdef"
+    var u = bitcast[DType.uint32](v)
+    var out = String("0x")
+    for i in range(8):
+        var nib = Int((u >> UInt32(28 - 4 * i)) & UInt32(0xF))
+        out += String(DIGITS[byte=nib])
+    return out
+
+
+def gmm_validate_params(params: GmmParams, n_samples: Int) raises:
+    """`_check_parameters` plus `_parameter_constraints`
+    (`_base.py:56-70`, `_gaussian_mixture.py:800-834`), every refusal BY
+    NAME. DEVIATION 1738.
+
+    The `n_components > n_samples` refusal is this lane's and not
+    scikit-learn's: they let it through and fail later inside the k-means
+    initialization with a message about `n_clusters`. Refusing here names the
+    parameter the caller set.
+    """
+    if params.covariance_type != COV_FULL:
+        raise Error(
+            "GaussianMixture: only covariance_type='full' is implemented"
+            " (got type id "
+            + String(params.covariance_type)
+            + "). See covariance_type_from_name for what each of the other"
+            " three would cost and mixture/NOT_IMPLEMENTED.tsv for the record"
+        )
+    if (
+        params.init_params != INIT_KMEANS
+        and params.init_params != INIT_RANDOM
+    ):
+        raise Error(
+            "GaussianMixture: init_params id "
+            + String(params.init_params)
+            + " is not implemented; only 'kmeans' and 'random' are. See"
+            " init_params_from_name for why 'k-means++' and"
+            " 'random_from_data' are refused rather than approximated"
+        )
+    if params.n_components < 1:
+        raise Error(
+            "GaussianMixture: n_components must be at least 1, got "
+            + String(params.n_components)
+        )
+    if params.n_components > n_samples:
+        raise Error(
+            "GaussianMixture: n_components="
+            + String(params.n_components)
+            + " exceeds n_samples="
+            + String(n_samples)
+            + ". Every component would need at least one point to have a"
+            " covariance at all, so the fit is guaranteed to collapse"
+            " (DEVIATION 1723) and refusing here names the parameter the"
+            " caller set rather than failing later inside the"
+            " initialization"
+        )
+    if params.max_iter < 0:
+        raise Error(
+            "GaussianMixture: max_iter must be at least 0, got "
+            + String(params.max_iter)
+            + ". Zero is legal and means initialization only, which is"
+            " scikit-learn's behavior (DEVIATION 1745)"
+        )
+    if params.tol != params.tol:
+        raise Error("GaussianMixture: tol is NaN; refused by name")
+    if params.tol < Float32(0.0):
+        raise Error(
+            "GaussianMixture: tol must be non-negative, got "
+            + gmm_hex32(params.tol)
+        )
+    if params.reg_covar != params.reg_covar:
+        raise Error("GaussianMixture: reg_covar is NaN; refused by name")
+    if params.reg_covar < Float32(0.0):
+        raise Error(
+            "GaussianMixture: reg_covar must be non-negative, got "
+            + gmm_hex32(params.reg_covar)
+        )
+    var big = bitcast[DType.float32](UInt32(0x7F800000))
+    if params.reg_covar == big:
+        raise Error(
+            "GaussianMixture: reg_covar is +inf; refused by name"
+        )
+    if params.tol == big:
+        raise Error(
+            "GaussianMixture: tol is +inf; every fit would 'converge' at"
+            " iteration 1 and the iteration count would stop being a"
+            " function of the data. Refused by name"
+        )
+
+
+def gmm_validate_shape(
+    x: List[Float32], n_samples: Int, n_features: Int
+) raises:
+    """The shape of `X` (lane cpu3-core: the NaN / infinity scan below moved
+    to the device, `gmm_validate_data_device`, run right after the upload).
+
+    No NaN and no infinity in `X`, refused BY NAME with the CELL and the
+    BITS. DEVIATION 1738.
+
+    scikit-learn's `validate_data` refuses non-finite input the same way
+    (`_base.py:236`), so this is their semantics and not an addition. What is
+    this lane's is the reason it happens BEFORE ANY UPLOAD: every stage of
+    this fit is a recorded card stage, and **a COMPUTED NaN carries the
+    vendor's payload** -- Apple `0x7fc00000`, NVIDIA `0x7fffffff`, AMD
+    `0xffc00000`, all three measured (IDENTITY_PATHS row 39, FACT 2) -- so a
+    NaN that reaches `gmm.iterNNN.mahal` makes three vendors' cards disagree
+    while every arithmetic decision in them matched.
+    """
+    if n_samples < 1:
+        raise Error(
+            "GaussianMixture: X must have at least one row, got "
+            + String(n_samples)
+        )
+    if n_features < 1:
+        raise Error(
+            "GaussianMixture: X must have at least one column, got "
+            + String(n_features)
+        )
+    if len(x) != n_samples * n_features:
+        raise Error(
+            "GaussianMixture: X holds "
+            + String(len(x))
+            + " floats, "
+            + String(n_samples)
+            + " x "
+            + String(n_features)
+            + " needs "
+            + String(n_samples * n_features)
+        )
+
+
+def gmm_bad_row_kernel(
+    x: MutPointer[Float32, MutAnyOrigin],
+    n_in: Int32,
+    d_in: Int32,
+    bad_row: MutPointer[Int32, MutAnyOrigin],
+):
+    """One thread per row: a NaN or an infinity anywhere in row i folds i
+    into `bad_row` by atomic min, so the LOWEST such row wins whatever the
+    thread schedule (the host scan's first cell is in that row)."""
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if i >= Int(n_in):
+        return
+    var d = Int(d_in)
+    for f in range(d):
+        var u = bitcast[DType.uint32](x.unsafe_load(i * d + f)) & UInt32(0x7FFFFFFF)
+        if u >= UInt32(0x7F800000):
+            _ = Atomic[DType.int32].min(bad_row, Int32(i))
+            return
+
+
+def gmm_bad_col_kernel(
+    x: MutPointer[Float32, MutAnyOrigin],
+    row_in: Int32,
+    d_in: Int32,
+    bad_col: MutPointer[Int32, MutAnyOrigin],
+):
+    """One thread per feature of row `row_in`: the lowest non-finite column
+    by atomic min (the host scan's first cell of that row)."""
+    var f = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    var d = Int(d_in)
+    if f >= d:
+        return
+    var u = bitcast[DType.uint32](x.unsafe_load(Int(row_in) * d + f)) & UInt32(0x7FFFFFFF)
+    if u >= UInt32(0x7F800000):
+        _ = Atomic[DType.int32].min(bad_col, Int32(f))
+
+
+def gmm_validate_data_device(
+    ctx: DeviceContext,
+    mut dx: DeviceBuffer[DType.float32],
+    n_samples: Int,
+    n_features: Int,
+) raises:
+    """The NaN / infinity refusal on the uploaded `X`
+    (lane cpu3-core: no host scan of X). The first non-finite cell in row
+    order is found on the device (the lowest row, then its lowest column),
+    one word at a time comes back, and the same messages are raised. It
+    runs right after the upload and before any card records the input or
+    any stage reads it, so a NaN still reaches no card stage (DEVIATION
+    1738)."""
+    var d_bad = ctx.enqueue_create_buffer[DType.int32](2)
+    var h = List[Int32](length=2, fill=GMM_INIT_NO_BAD_ROW)
+    ctx.enqueue_copy(dst_buf=d_bad, src_ptr=h.unsafe_ptr())
+    ctx.enqueue_function[gmm_bad_row_kernel](
+        dx.unsafe_ptr(),
+        Int32(n_samples),
+        Int32(n_features),
+        d_bad.unsafe_ptr(),
+        grid_dim=((n_samples + GMM_INIT_TPB - 1) // GMM_INIT_TPB, 1, 1),
+        block_dim=(GMM_INIT_TPB, 1, 1),
+    )
+    ctx.enqueue_copy(dst_ptr=h.unsafe_ptr(), src_buf=d_bad)
+    ctx.synchronize()
+    if h[0] == GMM_INIT_NO_BAD_ROW:
+        _ = d_bad^
+        return
+    var row = Int(h[0])
+    ctx.enqueue_function[gmm_bad_col_kernel](
+        dx.unsafe_ptr(),
+        Int32(row),
+        Int32(n_features),
+        d_bad.unsafe_ptr() + 1,
+        grid_dim=((n_features + GMM_INIT_TPB - 1) // GMM_INIT_TPB, 1, 1),
+        block_dim=(GMM_INIT_TPB, 1, 1),
+    )
+    ctx.enqueue_copy(dst_ptr=h.unsafe_ptr(), src_buf=d_bad)
+    ctx.synchronize()
+    var col = Int(h[1])
+    var hv = List[Float32](length=1, fill=Float32(0))
+    var cell = dx.create_sub_buffer[DType.float32](row * n_features + col, 1)
+    ctx.enqueue_copy(dst_ptr=hv.unsafe_ptr(), src_buf=cell)
+    ctx.synchronize()
+    _ = cell^
+    _ = d_bad^
+    var v = hv[0]
+    var u = bitcast[DType.uint32](v) & UInt32(0x7FFFFFFF)
+    if u > UInt32(0x7F800000):
+        raise Error(
+            "GaussianMixture: X contains NaN at row "
+            + String(row)
+            + " column "
+            + String(col)
+            + "; refused by name before any stage reads it (DEVIATION 1738)"
+        )
+    raise Error(
+        "GaussianMixture: X contains an infinity at row "
+        + String(row)
+        + " column "
+        + String(col)
+        + " ("
+        + gmm_hex32(v)
+        + "); refused by name before any stage reads it (DEVIATION 1738)"
+    )
+
+
+def gmm_log_weights_kernel(
+    w: MutPointer[Float32, MutAnyOrigin],
+    k_in: Int32,
+    dst: MutPointer[Float32, MutAnyOrigin],
+):
+    """One thread per component: `_safe_log` of its weight (the portable
+    `identical_log`, the words the host loop wrote)."""
+    var k = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if k < Int(k_in):
+        dst.unsafe_store(k, _safe_log(w.unsafe_load(k)))
+
+
+def _upload_log_weights(
+    ctx: DeviceContext, weights: List[Float32], ncomp: Int
+) raises -> DeviceBuffer[DType.float32]:
+    """The device log weights of a fitted model: the weights go up, the
+    logs are taken on the device (lane cpu3-core: no host loop)."""
+    var dw = _upload(ctx, weights)
+    var dlw = ctx.enqueue_create_buffer[DType.float32](ncomp)
+    ctx.enqueue_function[gmm_log_weights_kernel](
+        dw.unsafe_ptr(),
+        Int32(ncomp),
+        dlw.unsafe_ptr(),
+        grid_dim=((ncomp + GMM_INIT_TPB - 1) // GMM_INIT_TPB, 1, 1),
+        block_dim=(GMM_INIT_TPB, 1, 1),
+    )
+    ctx.synchronize()
+    _ = dw^
+    return dlw^
+
+
+# ===========================================================================
+# THE INITIAL RESPONSIBILITIES
+# ===========================================================================
+
+
+# Lane cluster-apple3, OPT-IN while unproven (`-D ANONLIB_GMM_INIT_FILL=1`):
+# the one-hot start and its logs written by fills and the two constants taken
+# once, the same value in every cell as the per-cell appends and logs. Host
+# code, every mode and column.
+comptime GMM_INIT_FILL = is_defined["ANONLIB_GMM_INIT_FILL"]()
+
+
+def gmm_initial_resp_host(
+    ctx: DeviceContext,
+    x: List[Float32],
+    n_samples: Int,
+    n_features: Int,
+    params: GmmParams,
+) raises -> List[Float32]:
+    """`_initialize_parameters` (`_base.py:105-157`): the `n x K` matrix the
+    first M-step is handed.
+
+    **`init_params="kmeans"`: `cluster/estimator.mojo::kmeans_fit`, ONE-HOT.**
+    `_base.py:120-127` runs `KMeans(n_clusters=K, n_init=1,
+    random_state=...)` and sets `resp[arange(n), labels] = 1`. This runs
+    `kmeans_fit` at `n_init=1`, `init=INIT_KMEANS_PLUS_PLUS` with
+    `oversampling_factor=0.0` (the CLASSIC greedy k-means++ seeding, which is
+    scikit-learn's `KMeans` default), `metric=METRIC_L2_EXPANDED`,
+    `max_iter=300`, `tol=1e-4` -- scikit-learn's `KMeans` defaults -- and
+    one-hots the same way.
+
+    **DEVIATION 3133 (2026-09-26): `oversampling_factor=0.0`, NOT
+    `kmeans_fit`'s default 2.0.** The default is cuVS's and selects the
+    SCALABLE k-means|| seeding (`detail/kmeans.cuh:910-915`), which is not
+    the seeding scikit-learn's `KMeans` runs. Until this date the GMM took
+    that default while this docstring called it scikit-learn's, and on
+    real data with few-valued columns (the taxi reg block, 2,000 to 20,000
+    rows) the k-means|| start left one cluster holding 70 to 95% of the
+    rows beside several of 1 to 7 rows. Those tiny components are rank
+    deficient, `reg_covar = 1e-6` is below float32's rounding of their
+    covariance, and scikit-learn's OWN EM started from those labels
+    refused ("ill-defined empirical covariance") or scored held-out rows
+    at -8e4 exactly as ours did; started from its own greedy k-means++
+    labels it fitted. The classic seeding is the `kmeans-classic-pp`
+    identity lane's, already certified on every column, so no new
+    arithmetic enters: the INITIAL LABELS change, and with them every
+    `init_params="kmeans"` bit downstream (the `gmm`, `gmm-sample` and
+    `par-gmm` lanes' references move; the `random` lanes do not). **The k-means is not re-implemented and its identity is not this
+    lane's claim**; `cluster/` owns it, `pixi run check-kmeans-identity` is
+    its gate, and `mixture/README.md`'s WHAT THIS LANE REUSES RATHER THAN
+    REWRITES names the entry point.
+
+    **`init_params="random"`: POSITION-MAPPED Philox. DEVIATION 1733.**
+    `_base.py:128-134` draws `n x K` uniforms from a `RandomState` STREAM and
+    normalizes each row. A stream is an ORDER, and an order is the one thing
+    three vendors cannot be made to agree on for free. So each cell's draw is
+    a pure function of ITS OWN POSITION: `philox4x32_10` with the counter set
+    from `(i, k)` and the key from `random_state`, taking word 0. Same
+    counter, same key, same word, same bits, on every vendor and at every
+    launch -- and it is not scikit-learn's draw, which is why the README's
+    semantics table marks `random` as MEANING-COMPATIBLE (a uniform Dirichlet
+    -like row) and BIT-DIFFERENT from theirs.
+
+    The uniform mapping is `Float32(u >> 8) * 2^-24`, which is EXACT: `u >> 8`
+    is below `2^24` so it converts without rounding, and `2^-24` is a power
+    of two. No libm, no division, nothing to pin.
+
+    A row whose draws are all zero has no normalizer and RAISES rather than
+    producing a NaN row: it cannot happen at any seed anyone will use
+    (probability `2^-24K`) and a guard that is cheap and names itself is
+    better than a NaN in a certified stage.
+    """
+    var ncomp = params.n_components
+    var resp = List[Float32]()
+
+    if params.init_params == INIT_KMEANS:
+        var hx = ctx.enqueue_create_host_buffer[DType.float32](
+            n_samples * n_features
+        )
+        var hc = ctx.enqueue_create_host_buffer[DType.float32](
+            ncomp * n_features
+        )
+        var hl = ctx.enqueue_create_host_buffer[DType.uint32](n_samples)
+        ctx.synchronize()
+        copy_f32(x.unsafe_ptr(), hx.unsafe_ptr(), n_samples * n_features)
+        var res = kmeans_fit(
+            ctx,
+            hx.unsafe_ptr(),
+            n_samples,
+            n_features,
+            ncomp,
+            hc.unsafe_ptr(),
+            hl.unsafe_ptr(),
+            hx.unsafe_ptr(),
+            0,
+            max_iter=300,
+            tol=1.0e-4,
+            seed=params.random_state,
+            n_init=1,
+            init=INIT_KMEANS_PLUS_PLUS,
+            metric=METRIC_L2_EXPANDED,
+            # DEVIATION 3133: the classic greedy k-means++ seeding, which is
+            # scikit-learn's KMeans default; kmeans_fit's 2.0 is cuVS's
+            # k-means|| and gave degenerate one-row components on real data.
+            oversampling_factor=GMM_KMEANS_OVERSAMPLING,
+        )
+        _ = res
+        comptime if GMM_INIT_FILL:
+            # the one-hot rows: a zero fill and one store per row (the same
+            # n x K values as n x K appends)
+            resp = List[Float32](length=n_samples * ncomp, fill=Float32(0.0))
+            for i in range(n_samples):
+                var lab = Int(hl.unsafe_ptr().unsafe_load(i))
+                if lab >= 0 and lab < ncomp:
+                    resp[i * ncomp + lab] = Float32(1.0)
+        else:
+            for i in range(n_samples):
+                var lab = Int(hl.unsafe_ptr().unsafe_load(i))
+                for k in range(ncomp):
+                    resp.append(Float32(1.0) if k == lab else Float32(0.0))
+        _ = hx^
+        _ = hc^
+        _ = hl^
+        return resp^
+
+    # INIT_RANDOM
+    var key = SIMD[DType.uint32, 2](
+        UInt32(params.random_state & 0xFFFFFFFF),
+        UInt32((params.random_state >> 32) & 0xFFFFFFFF),
+    )
+    for i in range(n_samples):
+        var row = List[Float32]()
+        var s = Float32(0.0)
+        for k in range(ncomp):
+            var ctr = SIMD[DType.uint32, 4](
+                UInt32(i & 0xFFFFFFFF),
+                UInt32((i >> 32) & 0xFFFFFFFF),
+                UInt32(k),
+                UInt32(0),
+            )
+            var draw = philox4x32_10(ctr, key)
+            var u = Float32(Int(draw[0] >> UInt32(8))) * bitcast[
+                DType.float32
+            ](GMM_TWO_POW_M24_BITS)
+            row.append(u)
+            s = ftz(s + u)
+        if not (s > Float32(0.0)):
+            raise Error(
+                "GaussianMixture: init_params='random' produced a row of"
+                " responsibilities summing to "
+                + gmm_hex32(s)
+                + " at row "
+                + String(i)
+                + ", which has no normalizer. At any seed a caller will"
+                " use this cannot happen; it is refused by name rather"
+                " than divided through to a NaN, because gmm.init.resp is"
+                " a certified card stage and a computed NaN carries the"
+                " vendor's payload (IDENTITY_PATHS row 39)"
+            )
+        for k in range(ncomp):
+            resp.append(ftz(row[k] / s))
+    return resp^
+
+
+# ===========================================================================
+# THE INITIAL RESPONSIBILITIES, ON THE DEVICE (fam2-cluster, 2026-10-04)
+# ===========================================================================
+
+#: Every mode and column (lane cpu3-core: was IDENTICAL only, behind
+#: IDN_GMM_INIT_DEVICE / IDN_GMM_PROBA_DEVICE / IDN_GMM_SCORE_DEVICE, now the
+#: one route): the `n x K` initial responsibilities and their logs are
+#: WRITTEN ON THE DEVICE (`gmm_initial_resp_device`: the k-means labels go up
+#: as `n` words and one launch writes both matrices, or one launch draws,
+#: normalizes and logs every row: the same Philox counters and key, the
+#: same ascending `ftz` row sum, one correctly rounded division and the
+#: portable log per cell, the values of `gmm_initial_resp_host`);
+#: `predict_proba` takes its exponential on the device (`resp_exp_kernel`,
+#: `ftz(identical_exp(ftz(v)))` per cell, `_exp_resp`'s words); `score`
+#: reads the scoring E-step's device mean (`_gmm_score_device`, the order
+#: of `gmm_meanll_host`). Same words as the host forms, so no bit moves.
+
+#: IDENTICAL, every column: the mean log likelihood's copy to the host is
+#: enqueued right after the E-step instead of at the end of the iteration,
+#: so it rides the drain the precision Cholesky already pays to read its
+#: pivot flags and the iteration's last synchronize finds an empty queue.
+#: With `IDN_GMM_FUSED_CHOL` that is one working drain an EM iteration. The
+#: same value is read (nothing between the E-step and the read writes
+#: `meanll`). `-D ANONLIB_IDN_GMM_ONE_DRAIN_OFF=1` restores the late copy.
+# I21 2026-10-06 legacy_both_off LOSS on both vendors, source 5b467815b51b:
+# generated COV_FULL fits k=9, rows/features=10000/17,10001/18,32769/9,
+# both-OFF/incumbent time ratios AMD 2.051/1.913/1.471 and NVIDIA L40S
+# 2.140/2.221/1.705. This arm restores BOTH the component Cholesky chain
+# and the late meanll copy below; its timing cannot isolate this drain
+# control. Isolated one_drain_off, same freeze/cases, OFF/ON ratios AMD
+# 0.987/1.000/1.010 (mixed near-neutral) and NVIDIA 1.010/1.020/1.532
+# (losses). This arm retains fused Cholesky and only moves the meanll copy
+# from after E-step to after M-step/Cholesky, before the final synchronize.
+# All six isolated and six combined rollback executions converged=True,
+# rc=0; one excluded same-context fit and one scored fit per binary.
+# Retain ON: the small AMD first-case gain does not offset the NVIDIA losses.
+# Retain the existing ON default. Prior identity evidence reused without
+# revalidation; synthetic caller results do not qualify full-board changes.
+# Evidence: experiments/performance_ideas/measurements/20261006/index.json.
+comptime IDN_GMM_ONE_DRAIN = (
+    GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL
+    and not (
+        is_defined["ANONLIB_IDN_GMM_ONE_DRAIN_OFF"]()
+        or is_defined["ANONLIB_IDN_ALL_OFF"]()
+    )
+)
+
+comptime GMM_INIT_TPB = 256
+#: lane/review-fixes: the largest Int32, so `Atomic.min` keeps the LOWEST
+#: failing row whatever the thread schedule (the error text is deterministic)
+comptime GMM_INIT_NO_BAD_ROW = Int32(2147483647)
+
+
+def gmm_init_onehot_kernel(
+    resp0: MutPointer[Float32, MutAnyOrigin],
+    loginit: MutPointer[Float32, MutAnyOrigin],
+    labels: MutPointer[UInt32, MutAnyOrigin],
+    cells_in: Int32,
+    ncomp_in: Int32,
+    log_one: Float32,
+):
+    """One thread per cell `(i, k)`: `resp0 = 1` where `k` is row i's
+    k-means label and `0` elsewhere; `loginit` is `_safe_log` of that:
+    `log_one` (taken once on the host, the value every such cell had) or
+    `-inf`. A label outside `[0, K)` leaves the row all zero, as the host
+    loop did."""
+    var idx = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if idx >= Int(cells_in):
+        return
+    var ncomp = Int(ncomp_in)
+    var i = idx // ncomp
+    var k = idx - i * ncomp
+    if k == Int(labels.unsafe_load(i)):
+        resp0.unsafe_store(idx, Float32(1.0))
+        loginit.unsafe_store(idx, log_one)
+    else:
+        resp0.unsafe_store(idx, Float32(0.0))
+        loginit.unsafe_store(
+            idx, bitcast[DType.float32](UInt32(0xFF800000))
+        )
+
+
+def gmm_init_random_kernel(
+    resp0: MutPointer[Float32, MutAnyOrigin],
+    loginit: MutPointer[Float32, MutAnyOrigin],
+    bad_row: MutPointer[Int32, MutAnyOrigin],
+    n_in: Int32,
+    ncomp_in: Int32,
+    key_lo: Int32,
+    key_hi: Int32,
+):
+    """One thread per row: DEVIATION 1733's position-mapped Philox draws,
+    the ascending `ftz` row sum, then each cell `ftz(u / s)` and its
+    `_safe_log`. The draws are recomputed for the second walk (a pure
+    function of the position), so no per-row storage is needed. A row with
+    no normalizer folds its index into `bad_row` by atomic min (the lowest
+    such row wins) and writes nothing."""
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if i >= Int(n_in):
+        return
+    var ncomp = Int(ncomp_in)
+    var key = SIMD[DType.uint32, 2](
+        key_lo.cast[DType.uint32](), key_hi.cast[DType.uint32]()
+    )
+    var scale = bitcast[DType.float32](GMM_TWO_POW_M24_BITS)
+    var s = Float32(0.0)
+    for k in range(ncomp):
+        var ctr = SIMD[DType.uint32, 4](
+            UInt32(i & 0xFFFFFFFF),
+            UInt32((i >> 32) & 0xFFFFFFFF),
+            UInt32(k),
+            UInt32(0),
+        )
+        var draw = philox4x32_10(ctr, key)
+        var u = Float32(Int(draw[0] >> UInt32(8))) * scale
+        s = ftz(s + u)
+    if not (s > Float32(0.0)):
+        _ = Atomic[DType.int32].min(bad_row, Int32(i))
+        return
+    for k in range(ncomp):
+        var ctr = SIMD[DType.uint32, 4](
+            UInt32(i & 0xFFFFFFFF),
+            UInt32((i >> 32) & 0xFFFFFFFF),
+            UInt32(k),
+            UInt32(0),
+        )
+        var draw = philox4x32_10(ctr, key)
+        var u = Float32(Int(draw[0] >> UInt32(8))) * scale
+        var v = ftz(identical_div(u, s))
+        resp0.unsafe_store(i * ncomp + k, v)
+        if v == Float32(0.0):
+            loginit.unsafe_store(
+                i * ncomp + k, bitcast[DType.float32](UInt32(0xFF800000))
+            )
+        else:
+            loginit.unsafe_store(
+                i * ncomp + k, ftz(identical_log(ftz(v)))
+            )
+
+
+def gmm_initial_resp_device(
+    ctx: DeviceContext,
+    x: List[Float32],
+    n_samples: Int,
+    n_features: Int,
+    params: GmmParams,
+    mut dresp0: DeviceBuffer[DType.float32],
+    mut dloginit: DeviceBuffer[DType.float32],
+) raises:
+    """`gmm_initial_resp_host` and the log of it, written into two `n x K` device
+    buffers (every mode, lane cpu3-core). See `gmm_initial_resp_host` for what the
+    values are; this is the same values without the host lists."""
+    var ncomp = params.n_components
+    var cells = n_samples * ncomp
+    if params.init_params == INIT_KMEANS:
+        var hx = ctx.enqueue_create_host_buffer[DType.float32](
+            n_samples * n_features
+        )
+        var hc = ctx.enqueue_create_host_buffer[DType.float32](
+            ncomp * n_features
+        )
+        var hl = ctx.enqueue_create_host_buffer[DType.uint32](n_samples)
+        ctx.synchronize()
+        copy_f32(x.unsafe_ptr(), hx.unsafe_ptr(), n_samples * n_features)
+        var res = kmeans_fit(
+            ctx,
+            hx.unsafe_ptr(),
+            n_samples,
+            n_features,
+            ncomp,
+            hc.unsafe_ptr(),
+            hl.unsafe_ptr(),
+            hx.unsafe_ptr(),
+            0,
+            max_iter=300,
+            tol=1.0e-4,
+            seed=params.random_state,
+            n_init=1,
+            init=INIT_KMEANS_PLUS_PLUS,
+            metric=METRIC_L2_EXPANDED,
+            # DEVIATION 3133, as in `gmm_initial_resp_host`.
+            oversampling_factor=GMM_KMEANS_OVERSAMPLING,
+        )
+        _ = res
+        var dlabels = ctx.enqueue_create_buffer[DType.uint32](n_samples)
+        ctx.enqueue_copy(dst_buf=dlabels, src_ptr=hl.unsafe_ptr())
+        ctx.enqueue_function[gmm_init_onehot_kernel](
+            dresp0.unsafe_ptr(),
+            dloginit.unsafe_ptr(),
+            dlabels.unsafe_ptr(),
+            Int32(cells),
+            Int32(ncomp),
+            _safe_log(Float32(1.0)),
+            grid_dim=((cells + GMM_INIT_TPB - 1) // GMM_INIT_TPB, 1, 1),
+            block_dim=(GMM_INIT_TPB, 1, 1),
+        )
+        ctx.synchronize()
+        _ = dlabels^
+        _ = hx^
+        _ = hc^
+        _ = hl^
+        return
+
+    # INIT_RANDOM
+    var d_bad = ctx.enqueue_create_buffer[DType.int32](1)
+    var h_bad = ctx.enqueue_create_host_buffer[DType.int32](1)
+    h_bad.unsafe_ptr().unsafe_store(0, GMM_INIT_NO_BAD_ROW)
+    ctx.enqueue_copy(dst_buf=d_bad, src_ptr=h_bad.unsafe_ptr())
+    ctx.enqueue_function[gmm_init_random_kernel](
+        dresp0.unsafe_ptr(),
+        dloginit.unsafe_ptr(),
+        d_bad.unsafe_ptr(),
+        Int32(n_samples),
+        Int32(ncomp),
+        UInt32(params.random_state & 0xFFFFFFFF).cast[DType.int32](),
+        UInt32((params.random_state >> 32) & 0xFFFFFFFF).cast[DType.int32](),
+        grid_dim=((n_samples + GMM_INIT_TPB - 1) // GMM_INIT_TPB, 1, 1),
+        block_dim=(GMM_INIT_TPB, 1, 1),
+    )
+    ctx.enqueue_copy(dst_ptr=h_bad.unsafe_ptr(), src_buf=d_bad)
+    ctx.synchronize()
+    var bad = h_bad.unsafe_ptr().unsafe_load(0)
+    _ = d_bad^
+    _ = h_bad^
+    if bad != GMM_INIT_NO_BAD_ROW:
+        raise Error(
+            "GaussianMixture: init_params='random' produced a row of"
+            " responsibilities with no positive sum at row "
+            + String(Int(bad))
+            + ", which has no normalizer. At any seed a caller will"
+            " use this cannot happen; it is refused by name rather"
+            " than divided through to a NaN, because gmm.init.resp is"
+            " a certified card stage and a computed NaN carries the"
+            " vendor's payload (IDENTITY_PATHS row 39)"
+        )
+
+
+def _gmm_init_resp_buffer(
+    ctx: DeviceContext, cells: Int
+) raises -> DeviceBuffer[DType.float32]:
+    """The device `resp0`: an empty `n x K` buffer for
+    `gmm_initial_resp_device` to fill."""
+    return ctx.enqueue_create_buffer[DType.float32](cells)
+
+
+# ===========================================================================
+# THE FIT
+# ===========================================================================
+
+
+def _upload(
+    ctx: DeviceContext, values: List[Float32]
+) raises -> DeviceBuffer[DType.float32]:
+    var n = len(values)
+    var buf = ctx.enqueue_create_buffer[DType.float32](n)
+    var host = ctx.enqueue_create_host_buffer[DType.float32](n)
+    copy_f32(values.unsafe_ptr(), host.unsafe_ptr(), n)
+    ctx.enqueue_copy(dst_buf=buf, src_ptr=host.unsafe_ptr())
+    ctx.synchronize()
+    _ = host^
+    return buf^
+
+
+def _download(
+    ctx: DeviceContext, mut buf: DeviceBuffer[DType.float32], n: Int
+) raises -> List[Float32]:
+    # the copy engine writes the list's own words (no host copy loop)
+    var out = List[Float32](length=n, fill=Float32(0))
+    if n > 0:
+        var view = buf.create_sub_buffer[DType.float32](0, n)
+        ctx.enqueue_copy(dst_ptr=out.unsafe_ptr(), src_buf=view)
+        ctx.synchronize()
+        _ = view^
+    return out^
+
+
+def gaussian_mixture_fit(
+    x: List[Float32],
+    n_samples: Int,
+    n_features: Int,
+    params: GmmParams,
+    elem_tpb: Int = GMM_ELEM_TPB,
+    row_tpb: Int = GMM_ROW_TPB,
+    comp_tpb: Int = GMM_COMP_TPB,
+    solve_tpb: Int = CHOL_SOLVE_TPB,
+    panel_tpb: Int = CHOL_PANEL_TPB,
+    chol_elem_tpb: Int = CHOL_ELEM_TPB,
+    sabotage: Int = GMM_SAB_NONE,
+    card_prefix: String = "gmm",
+    trace_path: String = "",
+) raises -> GaussianMixtureModel:
+    """`GaussianMixture(...).fit(X)`, host in and host out, one shot.
+
+    `trace_path` empty means READ THE ENVIRONMENT (`ANONLIB_IDENTITY_TRACE`),
+    which is what `mixture/mixture_main.mojo` wants; a non-empty value points
+    the card at an explicit file and IGNORES the environment, which is what
+    the checks want. `core/identity_trace.mojo::IdentityTrace.to_path` says
+    why: "a check whose behavior depends on whether the operator happens to
+    have ANONLIB_IDENTITY_TRACE exported is a check that passes or fails
+    for reasons outside itself."
+
+    `_base.py::fit_predict:241-311` with `n_init = 1` and
+    `warm_start = False`, in scikit-learn's order:
+
+        validate; initialize (resp -> moments -> precision Cholesky)
+        for it in 1..max_iter:
+            prev = lower_bound
+            E-step; M-step; precision Cholesky
+            lower_bound = mean log likelihood
+            if abs(lower_bound - prev) < tol: converged; STOP
+
+    **THE CONVERGENCE TEST IS ON THE HOST AND THAT COSTS ONE DRAIN PER
+    ITERATION.** `meanll` is read back so `abs(change) < tol` is decided by
+    one float32 comparison in one place, on a value the card has already
+    hashed. The alternative -- a device-side test writing a flag -- would put
+    the decision behind a kernel launch where nothing can hash it, and
+    `CONTRIBUTING.md` (Algorithms and references) records that this repository has already
+    invented one on-device convergence test, cited a line range that was
+    actually a function signature, and been wrong: cuVS's own k-means loop
+    syncs at `detail/kmeans.cuh:491` and tests on the HOST at `:492`. The
+    drain is deliberate and `mixture/README.md`'s WHAT IS OWED prices it.
+
+    **A COLLAPSED COMPONENT RAISES.** DEVIATION 1723. The error names the
+    iteration, the component and LAPACK's `info`, and mirrors
+    scikit-learn's own message.
+
+    THE CARD, and its ORDER is the product rather than its length:
+
+        <prefix>.input                          X as uploaded
+        <prefix>.init.resp                      the initial responsibilities
+        <prefix>.init.{resp,nk,weights,means,covariances}
+        <prefix>.init.compKKK.{cholesky,precchol}   per component
+        <prefix>.init.logdet
+        <prefix>.iterNNN.{mahal,wlp,rowmax,lse,logresp,meanll}
+        <prefix>.iterNNN.{resp,nk,weights,means,covariances}
+        <prefix>.iterNNN.compKKK.{cholesky,precchol}
+        <prefix>.iterNNN.logdet
+        <prefix>.iterNNN.change                 the convergence quantity
+        <prefix>.niter                          [n_iter, converged, max_iter]
+    """
+    gmm_validate_shape(x, n_samples, n_features)
+    var ctx = _binding_ctx()
+    var dx = _upload(ctx, x)
+    gmm_validate_data_device(ctx, dx, n_samples, n_features)
+    gmm_validate_params(params, n_samples)
+
+    var n = n_samples
+    var d = n_features
+    var ncomp = params.n_components
+    var dd = d * d
+
+    var trace: IdentityTrace
+    if trace_path == "":
+        trace = IdentityTrace()
+    else:
+        trace = IdentityTrace.to_path(trace_path)
+    trace.header(
+        "gmm: profile="
+        + GMM_PROFILE
+        + " n="
+        + String(n)
+        + " d="
+        + String(d)
+        + " n_components="
+        + String(ncomp)
+        + " tol="
+        + gmm_hex32(params.tol)
+        + " reg_covar="
+        + gmm_hex32(params.reg_covar)
+        + " max_iter="
+        + String(params.max_iter)
+        + " init="
+        + String(params.init_params)
+        + " seed="
+        + String(params.random_state)
+    )
+
+    var st_i0 = Int(perf_counter_ns())
+    var st_i1 = Int(perf_counter_ns())
+
+    trace.record_device(ctx, card_prefix + ".input", dx, n * d)
+
+    var logresp = ctx.enqueue_create_buffer[DType.float32](n * ncomp)
+    var resp = ctx.enqueue_create_buffer[DType.float32](n * ncomp)
+    var mahal = ctx.enqueue_create_buffer[DType.float32](n * ncomp)
+    var wlp = ctx.enqueue_create_buffer[DType.float32](n * ncomp)
+    var rowmax = ctx.enqueue_create_buffer[DType.float32](n)
+    var lse = ctx.enqueue_create_buffer[DType.float32](n)
+    var meanll = ctx.enqueue_create_buffer[DType.float32](1)
+    var nk = ctx.enqueue_create_buffer[DType.float32](ncomp)
+    var weights = ctx.enqueue_create_buffer[DType.float32](ncomp)
+    var log_weights = ctx.enqueue_create_buffer[DType.float32](ncomp)
+    var log_det_chol = ctx.enqueue_create_buffer[DType.float32](ncomp)
+    var means = ctx.enqueue_create_buffer[DType.float32](ncomp * d)
+    var cov = ctx.enqueue_create_buffer[DType.float32](ncomp * dd)
+    # lane apple-holes: the covariance's float-float residual
+    # (mixture/checks/mstep.mojo GMM_FAST_FF_COV; FAST + Apple reads it)
+    var cov_lo = ctx.enqueue_create_buffer[DType.float32](max(ncomp * dd, 1))
+    var cov_lo_addr = Int(cov_lo.unsafe_ptr())
+    var chol_l = ctx.enqueue_create_buffer[DType.float32](ncomp * dd)
+    var linv = ctx.enqueue_create_buffer[DType.float32](ncomp * dd)
+    var prec = ctx.enqueue_create_buffer[DType.float32](ncomp * dd)
+    var escratch = ctx.enqueue_create_buffer[DType.float32](
+        gmm_estep_scratch_floats(n, d)
+    )
+    var mscratch = ctx.enqueue_create_buffer[DType.float32](
+        gmm_mstep_scratch_floats(n, d, ncomp)
+    )
+    # ONE gemm workspace, sized for the LARGEST plan any of the four products
+    # could reach. `identical_gemm_into`'s docstring records that sizing for
+    # one plan and letting the dispatcher pick another is an out-of-bounds
+    # write a small shape will not show you.
+    var need_gws = gmm_estep_gemm_workspace_floats(n, d)
+    var mg = gmm_mstep_gemm_workspace_floats(n, d, ncomp)
+    if mg > need_gws:
+        need_gws = mg
+    var gws = ctx.enqueue_create_buffer[DType.float32](need_gws)
+    var cws = ctx.enqueue_create_buffer[DType.float32](
+        gmm_chol_workspace_floats(d)
+    )
+    var dwork = ctx.enqueue_create_buffer[DType.float32](
+        gmm_chol_dwork_floats(d)
+    )
+    ctx.synchronize()
+
+    # ---- initialization -------------------------------------------------
+    # `_initialize` is handed `resp`, not `log_resp` (`_base.py:157`), and
+    # `gmm_m_step` takes logs -- so the logs are formed here, on the device
+    # (`gmm_initial_resp_device`), from a one-hot or a normalized uniform. It
+    # is the one place in the fit a `log` of a value we already had is
+    # taken, and it is exact for the one-hot case (`log(1) = +0.0`,
+    # `log(0) = -inf`, and `exp` of those is `1` and `+0.0` again).
+    var st_on = getenv("ANONLIB_STAGE_TIMES") == "1"
+    var st_i2 = Int(perf_counter_ns())
+    var st_i3 = Int(perf_counter_ns())
+    var dloginit = _gmm_init_resp_buffer(ctx, n * ncomp)
+    var dresp0 = _gmm_init_resp_buffer(ctx, n * ncomp)
+    gmm_initial_resp_device(ctx, x, n, d, params, dresp0, dloginit)
+    # `.resp0` and not `.resp`: `gmm_m_step` records `<tag>.resp` for
+    # `exp(log_resp)` and `IdentityTrace._emit` RAISES on a duplicate tag
+    # (its uniqueness invariant), so the INITIAL responsibilities and the
+    # first M-step's recomputed ones have to name themselves apart. They are
+    # also different quantities -- one is the initialization's input, the
+    # other is a round trip through `log` and `exp` -- and a card that gave
+    # them one name would hide that.
+    trace.record_device(
+        ctx, card_prefix + ".init.resp0", dresp0, n * ncomp
+    )
+
+    gmm_m_step(
+        ctx, dx, dloginit, resp, nk, weights, log_weights, means, cov,
+        mscratch, gws, n, d, ncomp, params.reg_covar, True, trace,
+        card_prefix + ".init", elem_tpb, comp_tpb, sabotage, cov_lo_addr,
+    )
+    var pre = gmm_precision_cholesky(
+        ctx, cov, chol_l, linv, prec, log_det_chol, cws, dwork, d, ncomp,
+        trace, card_prefix + ".init", elem_tpb, solve_tpb, panel_tpb,
+        chol_elem_tpb, sabotage, cov_lo_addr,
+    )
+    if pre.info != 0:
+        raise Error(_collapse_message(0, pre, params))
+
+    var lower_bound = gmm_neg_inf()
+    var n_iter = 0
+    var converged = False
+    var hll = ctx.enqueue_create_host_buffer[DType.float32](1)
+    ctx.synchronize()
+
+    # ANONLIB_STAGE_TIMES=1: drain around each EM phase and print the
+    # totals (a diagnostic; the drains make it a different program).
+    if st_on:
+        var now = Int(perf_counter_ns())
+        print(
+            "GMM_INIT_TIMES resp0_ms=" + String((st_i1 - st_i0) // 1000000) + " buffers_ms="
+            + String((st_i2 - st_i1) // 1000000) + " loginit_ms=" + String((st_i3 - st_i2) // 1000000)
+            + " upload_mstep_chol_ms=" + String((now - st_i3) // 1000000)
+        )
+    var st_e = 0
+    var st_m = 0
+    var st_c = 0
+    var st_t = 0
+    for it in range(1, params.max_iter + 1):
+        var tag = gmm_iter_prefix(card_prefix, it)
+        var prev = lower_bound
+
+        if st_on:
+            ctx.synchronize()
+            st_t = Int(perf_counter_ns())
+        gmm_e_step_dispatch(
+            ctx, dx, means, prec, linv, log_det_chol, log_weights,
+            escratch, gws, mahal, wlp, rowmax, lse, logresp, meanll,
+            n, d, ncomp, trace, tag, elem_tpb, row_tpb, sabotage,
+        )
+        comptime if IDN_GMM_ONE_DRAIN:
+            # The E-step wrote `meanll` and nothing later in the iteration
+            # touches it: start its trip home now, so the precision
+            # Cholesky's one drain (the pivot flags) brings it too.
+            ctx.enqueue_copy(dst_ptr=hll.unsafe_ptr(), src_buf=meanll)
+        if st_on:
+            ctx.synchronize()
+            var now = Int(perf_counter_ns())
+            st_e += now - st_t
+            st_t = now
+        gmm_m_step(
+            ctx, dx, logresp, resp, nk, weights, log_weights, means, cov,
+            mscratch, gws, n, d, ncomp, params.reg_covar, False, trace,
+            tag, elem_tpb, comp_tpb, sabotage, cov_lo_addr,
+        )
+        if st_on:
+            ctx.synchronize()
+            var now = Int(perf_counter_ns())
+            st_m += now - st_t
+            st_t = now
+        var p2 = gmm_precision_cholesky(
+            ctx, cov, chol_l, linv, prec, log_det_chol, cws, dwork, d,
+            ncomp, trace, tag, elem_tpb, solve_tpb, panel_tpb,
+            chol_elem_tpb, sabotage, cov_lo_addr,
+        )
+        if p2.info != 0:
+            raise Error(_collapse_message(it, p2, params))
+        if st_on:
+            ctx.synchronize()
+            st_c += Int(perf_counter_ns()) - st_t
+
+        # THE ONE DRAIN PER ITERATION. See this function's docstring.
+        comptime if not IDN_GMM_ONE_DRAIN:
+            ctx.enqueue_copy(dst_ptr=hll.unsafe_ptr(), src_buf=meanll)
+        ctx.synchronize()
+        lower_bound = hll.unsafe_ptr().unsafe_load(0)
+
+        var change = gmm_convergence_change(lower_bound, prev)
+        var compared = change
+        if sabotage == GMM_SAB_TOL_ULP:
+            # ARM. THE MOST IMPORTANT ONE IN THE LANE. The value compared
+            # against `tol` is moved ONE ULP toward zero. No parameter and no
+            # probability changes; only whether the loop stops.
+            compared = gmm_ulp_down(change)
+        var one = List[Float32]()
+        one.append(change)
+        trace.record_list_f32(tag + ".change", one)
+
+        n_iter = it
+        if gmm_converged(compared, params.tol):
+            converged = True
+            break
+
+    if st_on:
+        print(
+            "GMM_STAGE_TIMES iters=" + String(n_iter) + " estep_ms="
+            + String(st_e // 1000000) + " mstep_ms=" + String(st_m // 1000000)
+            + " chol_ms=" + String(st_c // 1000000)
+        )
+    var card = List[Int32]()
+    card.append(Int32(n_iter))
+    card.append(Int32(1) if converged else Int32(0))
+    card.append(Int32(params.max_iter))
+    trace.record_list_i32(card_prefix + ".niter", card)
+
+    var out_w = _download(ctx, weights, ncomp)
+    var out_m = _download(ctx, means, ncomp * d)
+    var out_c = _download(ctx, cov, ncomp * dd)
+    var out_p = _download(ctx, prec, ncomp * dd)
+    var out_l = _download(ctx, log_det_chol, ncomp)
+
+    _ = dx^
+    _ = dloginit^
+    _ = dresp0^
+    _ = logresp^
+    _ = resp^
+    _ = mahal^
+    _ = wlp^
+    _ = rowmax^
+    _ = lse^
+    _ = meanll^
+    _ = nk^
+    _ = weights^
+    _ = log_weights^
+    _ = log_det_chol^
+    _ = means^
+    _ = cov^
+    _ = cov_lo^
+    _ = chol_l^
+    _ = linv^
+    _ = prec^
+    _ = escratch^
+    _ = mscratch^
+    _ = gws^
+    _ = cws^
+    _ = dwork^
+    _ = hll^
+    # DEVIATION 1946: the context dies LAST, after every value built on it.
+    _ = ctx^
+
+    return GaussianMixtureModel(
+        ncomp, d, out_w^, out_m^, out_c^, out_p^, out_l^, n_iter,
+        converged, lower_bound,
+    )
+
+
+def _safe_log(v: Float32) -> Float32:
+    """`log` of an initial responsibility, which is `0` or `1` for a one-hot
+    and strictly inside `(0, 1)` for the uniform initialization.
+
+    `identical_log(+0.0)` is `-inf`, which is the mathematically right value
+    and is what `exp` turns back into `+0.0` on the first M-step. It is
+    written through this helper rather than inline so the one-hot case's
+    `-inf` is visibly INTENDED: an `-inf` appearing in `gmm.init.resp`'s
+    successor stage is otherwise the kind of thing a reader spends an
+    afternoon on.
+    """
+    from checks.numerics import identical_log
+
+    if v == Float32(0.0):
+        return bitcast[DType.float32](UInt32(0xFF800000))
+    return ftz(identical_log(ftz(v)))
+
+
+def _collapse_message(
+    it: Int, run: GmmMStepRun, params: GmmParams
+) -> String:
+    """The refusal a collapsed component produces. **DEVIATION 1723.**
+
+    scikit-learn's own wording is kept because it is the message a user has
+    already read somewhere else, and the three things it tells them to try
+    are the three things that actually work. What is added is the ITERATION,
+    the COMPONENT and LAPACK's `info` -- the address of the failure -- and
+    the sentence about why the component is not reset.
+    """
+    var where = String("initialization")
+    if it > 0:
+        where = String("EM iteration ") + String(it)
+    return (
+        "GaussianMixture: fitting the mixture model failed because some"
+        " components have ill-defined empirical covariance (for instance"
+        " caused by singleton or collapsed samples). Try to decrease the"
+        " number of components, increase reg_covar, or scale the input"
+        " data. FAILED AT "
+        + where
+        + ", COMPONENT "
+        + String(run.failed_component)
+        + ", LAPACK info="
+        + String(run.info)
+        + " (the leading minor of order "
+        + String(run.info)
+        + " of that component's covariance is not positive definite)."
+        " reg_covar was "
+        + gmm_hex32(params.reg_covar)
+        + ". THE COMPONENT IS NOT RESET AND THE FIT IS NOT CONTINUED"
+        " (DEVIATION 1723): the pivot decision is pinned in both halves by"
+        " cholesky/checks/potrf.mojo's DEVIATION 1634, so this refusal"
+        " is identical on every vendor -- and a silent reset would turn a"
+        " decision that is identical into a value that is not, which is"
+        " the worst outcome this lane can produce"
+    )
+
+
+# ===========================================================================
+# SCORING AGAINST A FITTED MODEL
+# ===========================================================================
+
+
+def gaussian_mixture_score_samples(
+    model: GaussianMixtureModel,
+    x: List[Float32],
+    n_samples: Int,
+    elem_tpb: Int = GMM_ELEM_TPB,
+    row_tpb: Int = GMM_ROW_TPB,
+    card_prefix: String = "gmm.score",
+    trace_path: String = "",
+) raises -> List[Float32]:
+    """`score_samples(X)`, `_base.py:356-373`: `logsumexp_k` of the weighted
+    log probabilities, one value per row.
+
+    **ONE POINT SCORED ALONE MUST EQUAL THE SAME POINT INSIDE A BATCH**, and
+    that is a property of the arithmetic rather than an assertion: the
+    Mahalanobis fold is per row, the logsumexp is per row, and no quantity in
+    this function is computed across rows. There is no per-batch
+    normalization anywhere and there cannot be one, which is what DEVIATION
+    1739 records and `check_launch_invariance` measures.
+    """
+    var d = model.n_features
+    var ncomp = model.n_components
+    gmm_validate_shape(x, n_samples, d)
+
+    var ctx = _binding_ctx()
+    # **DISABLED UNLESS ASKED, and this is the opposite default from
+    # `gaussian_mixture_fit`.** A scoring entry is called in a LOOP -- once
+    # per point by `check_launch_invariance`'s alone-versus-batch arm -- and
+    # every call records the same six tags, which `IdentityTrace._emit`
+    # refuses as a duplicate. So an environment variable cannot be allowed to
+    # turn the card on here; a caller that wants a scoring card names the
+    # file and takes responsibility for calling once.
+    var trace: IdentityTrace
+    if trace_path == "":
+        trace = IdentityTrace.disabled()
+    else:
+        trace = IdentityTrace.to_path(trace_path)
+    var dx = _upload(ctx, x)
+    gmm_validate_data_device(ctx, dx, n_samples, d)
+    var dmeans = _upload(ctx, model.means)
+    var dprec = _upload(ctx, model.precisions_cholesky)
+    var dlogdet = _upload(ctx, model.log_det_chol)
+    var dlw = _upload_log_weights(ctx, model.weights, ncomp)
+    # `linv` is only read by GMM_SAB_VENDOR_MATMUL, which no scoring path
+    # drives, so the precision buffer stands in for it rather than a second
+    # allocation. Stated because a reader will check.
+
+    var mahal = ctx.enqueue_create_buffer[DType.float32](n_samples * ncomp)
+    var wlp = ctx.enqueue_create_buffer[DType.float32](n_samples * ncomp)
+    var rowmax = ctx.enqueue_create_buffer[DType.float32](n_samples)
+    var lse = ctx.enqueue_create_buffer[DType.float32](n_samples)
+    var logresp = ctx.enqueue_create_buffer[DType.float32](
+        n_samples * ncomp
+    )
+    var meanll = ctx.enqueue_create_buffer[DType.float32](1)
+    var escratch = ctx.enqueue_create_buffer[DType.float32](
+        gmm_estep_scratch_floats(n_samples, d)
+    )
+    var gws = ctx.enqueue_create_buffer[DType.float32](
+        gmm_estep_gemm_workspace_floats(n_samples, d)
+    )
+    ctx.synchronize()
+
+    gmm_e_step_dispatch(
+        ctx, dx, dmeans, dprec, dprec, dlogdet, dlw, escratch, gws,
+        mahal, wlp, rowmax, lse, logresp, meanll, n_samples, d, ncomp,
+        trace, card_prefix, elem_tpb, row_tpb, GMM_SAB_NONE,
+    )
+    var out = _download(ctx, lse, n_samples)
+    _ = dx^
+    _ = dmeans^
+    _ = dprec^
+    _ = dlogdet^
+    _ = dlw^
+    _ = mahal^
+    _ = wlp^
+    _ = rowmax^
+    _ = lse^
+    _ = logresp^
+    _ = meanll^
+    _ = escratch^
+    _ = gws^
+    # DEVIATION 1946: the context dies LAST, after every value built on it.
+    _ = ctx^
+    return out^
+
+
+def gaussian_mixture_predict_proba(
+    model: GaussianMixtureModel,
+    x: List[Float32],
+    n_samples: Int,
+    elem_tpb: Int = GMM_ELEM_TPB,
+    row_tpb: Int = GMM_ROW_TPB,
+    card_prefix: String = "gmm.proba",
+    trace_path: String = "",
+) raises -> List[Float32]:
+    """`predict_proba(X)`, `_base.py:414-432`: `exp(log_resp)`, `n x K`.
+
+    Computed as `exp` of the log responsibilities and never as a normalized
+    ratio of probabilities, which is scikit-learn's route and is the only one
+    that survives a point far from every component: the ratio's numerator and
+    denominator both underflow and the quotient is `0/0`.
+    """
+    var d = model.n_features
+    var ncomp = model.n_components
+    gmm_validate_shape(x, n_samples, d)
+
+    var ctx = _binding_ctx()
+    # **DISABLED UNLESS ASKED, and this is the opposite default from
+    # `gaussian_mixture_fit`.** A scoring entry is called in a LOOP -- once
+    # per point by `check_launch_invariance`'s alone-versus-batch arm -- and
+    # every call records the same six tags, which `IdentityTrace._emit`
+    # refuses as a duplicate. So an environment variable cannot be allowed to
+    # turn the card on here; a caller that wants a scoring card names the
+    # file and takes responsibility for calling once.
+    var trace: IdentityTrace
+    if trace_path == "":
+        trace = IdentityTrace.disabled()
+    else:
+        trace = IdentityTrace.to_path(trace_path)
+    var dx = _upload(ctx, x)
+    gmm_validate_data_device(ctx, dx, n_samples, d)
+    var dmeans = _upload(ctx, model.means)
+    var dprec = _upload(ctx, model.precisions_cholesky)
+    var dlogdet = _upload(ctx, model.log_det_chol)
+    var dlw = _upload_log_weights(ctx, model.weights, ncomp)
+
+    var mahal = ctx.enqueue_create_buffer[DType.float32](n_samples * ncomp)
+    var wlp = ctx.enqueue_create_buffer[DType.float32](n_samples * ncomp)
+    var rowmax = ctx.enqueue_create_buffer[DType.float32](n_samples)
+    var lse = ctx.enqueue_create_buffer[DType.float32](n_samples)
+    var logresp = ctx.enqueue_create_buffer[DType.float32](
+        n_samples * ncomp
+    )
+    var resp = ctx.enqueue_create_buffer[DType.float32](n_samples * ncomp)
+    var meanll = ctx.enqueue_create_buffer[DType.float32](1)
+    var escratch = ctx.enqueue_create_buffer[DType.float32](
+        gmm_estep_scratch_floats(n_samples, d)
+    )
+    var gws = ctx.enqueue_create_buffer[DType.float32](
+        gmm_estep_gemm_workspace_floats(n_samples, d)
+    )
+    ctx.synchronize()
+
+    gmm_e_step_dispatch(
+        ctx, dx, dmeans, dprec, dprec, dlogdet, dlw, escratch, gws,
+        mahal, wlp, rowmax, lse, logresp, meanll, n_samples, d, ncomp,
+        trace, card_prefix, elem_tpb, row_tpb, GMM_SAB_NONE,
+    )
+    # fam2-cluster: the exponential on the device (`resp_exp_kernel`, the
+    # M-step's own kernel: `ftz(identical_exp(ftz(v)))` per cell, the words
+    # `_exp_resp` writes on the host), then one download.
+    var cells = n_samples * ncomp
+    ctx.enqueue_function[resp_exp_kernel](
+        logresp.unsafe_ptr(),
+        resp.unsafe_ptr(),
+        Int32(n_samples),
+        Int32(ncomp),
+        grid_dim=((cells + elem_tpb - 1) // elem_tpb, 1, 1),
+        block_dim=(elem_tpb, 1, 1),
+    )
+    var out = _download(ctx, resp, cells)
+    _ = dx^
+    _ = dmeans^
+    _ = dprec^
+    _ = dlogdet^
+    _ = dlw^
+    _ = mahal^
+    _ = wlp^
+    _ = rowmax^
+    _ = lse^
+    _ = logresp^
+    _ = resp^
+    _ = meanll^
+    _ = escratch^
+    _ = gws^
+    # DEVIATION 1946: the context dies LAST, after every value built on it.
+    _ = ctx^
+    return out^
+
+
+def _exp_resp(v: Float32) -> Float32:
+    """`exp` of a log responsibility, on the HOST, through the same helper
+    the device kernel uses.
+
+    `predict_proba` is the one entry that returns probabilities rather than
+    logs, and its exponential is taken here rather than on the device because
+    the values are already on their way to the host. `identical_exp` and
+    `ftz` all the same, so the answer is the same bits `resp_exp_kernel`
+    would have produced -- otherwise a caller comparing `predict_proba`
+    against a card's `resp` stage would find a difference with no cause.
+    """
+    from checks.numerics import identical_exp
+
+    return ftz(identical_exp(ftz(v)))
+
+
+def gaussian_mixture_predict(
+    model: GaussianMixtureModel,
+    x: List[Float32],
+    n_samples: Int,
+    elem_tpb: Int = GMM_ELEM_TPB,
+    row_tpb: Int = GMM_ROW_TPB,
+    card_prefix: String = "gmm.predict",
+    trace_path: String = "",
+) raises -> List[Int32]:
+    """`predict(X)`, `_base.py:395-412`: `argmax_k` of the weighted log
+    probabilities. Ties go to the LOWEST component index, which is
+    `xp.argmax`'s documented rule and `argmax_kernel`'s."""
+    var d = model.n_features
+    var ncomp = model.n_components
+    gmm_validate_shape(x, n_samples, d)
+
+    var ctx = _binding_ctx()
+    # **DISABLED UNLESS ASKED, and this is the opposite default from
+    # `gaussian_mixture_fit`.** A scoring entry is called in a LOOP -- once
+    # per point by `check_launch_invariance`'s alone-versus-batch arm -- and
+    # every call records the same six tags, which `IdentityTrace._emit`
+    # refuses as a duplicate. So an environment variable cannot be allowed to
+    # turn the card on here; a caller that wants a scoring card names the
+    # file and takes responsibility for calling once.
+    var trace: IdentityTrace
+    if trace_path == "":
+        trace = IdentityTrace.disabled()
+    else:
+        trace = IdentityTrace.to_path(trace_path)
+    var dx = _upload(ctx, x)
+    gmm_validate_data_device(ctx, dx, n_samples, d)
+    var dmeans = _upload(ctx, model.means)
+    var dprec = _upload(ctx, model.precisions_cholesky)
+    var dlogdet = _upload(ctx, model.log_det_chol)
+    var dlw = _upload_log_weights(ctx, model.weights, ncomp)
+
+    var mahal = ctx.enqueue_create_buffer[DType.float32](n_samples * ncomp)
+    var wlp = ctx.enqueue_create_buffer[DType.float32](n_samples * ncomp)
+    var rowmax = ctx.enqueue_create_buffer[DType.float32](n_samples)
+    var lse = ctx.enqueue_create_buffer[DType.float32](n_samples)
+    var logresp = ctx.enqueue_create_buffer[DType.float32](
+        n_samples * ncomp
+    )
+    var meanll = ctx.enqueue_create_buffer[DType.float32](1)
+    var labels = ctx.enqueue_create_buffer[DType.int32](n_samples)
+    var escratch = ctx.enqueue_create_buffer[DType.float32](
+        gmm_estep_scratch_floats(n_samples, d)
+    )
+    var gws = ctx.enqueue_create_buffer[DType.float32](
+        gmm_estep_gemm_workspace_floats(n_samples, d)
+    )
+    ctx.synchronize()
+
+    gmm_e_step_dispatch(
+        ctx, dx, dmeans, dprec, dprec, dlogdet, dlw, escratch, gws,
+        mahal, wlp, rowmax, lse, logresp, meanll, n_samples, d, ncomp,
+        trace, card_prefix, elem_tpb, row_tpb, GMM_SAB_NONE,
+    )
+    gmm_predict_labels(
+        ctx, wlp, labels, n_samples, ncomp, trace, card_prefix, row_tpb
+    )
+    var out = List[Int32](length=n_samples, fill=Int32(0))
+    ctx.enqueue_copy(dst_ptr=out.unsafe_ptr(), src_buf=labels)
+    ctx.synchronize()
+    _ = dx^
+    _ = dmeans^
+    _ = dprec^
+    _ = dlogdet^
+    _ = dlw^
+    _ = mahal^
+    _ = wlp^
+    _ = rowmax^
+    _ = lse^
+    _ = logresp^
+    _ = meanll^
+    _ = labels^
+    _ = escratch^
+    _ = gws^
+    # DEVIATION 1946: the context dies LAST, after every value built on it.
+    _ = ctx^
+    return out^
+
+
+def gaussian_mixture_score(
+    model: GaussianMixtureModel, x: List[Float32], n_samples: Int
+) raises -> Float32:
+    """`score(X)`, `_base.py:375-393`: the mean of `score_samples`.
+
+    The scoring E-step's device mean, folded in the chunked levels of
+    `mixture/meanll_order.mojo` (`gmm_meanll_host`'s order), one word read
+    back (`_gmm_score_device`).
+    """
+    return _gmm_score_device(model, x, n_samples)
+
+
+def _gmm_score_device(
+    model: GaussianMixtureModel, x: List[Float32], n_samples: Int
+) raises -> Float32:
+    """`score(X)` read from the device (fam2-cluster): the scoring E-step already folds `mean(lse)`
+    into its `meanll` scalar in the chunked levels of
+    `mixture/meanll_order.mojo`, which are the words `gmm_meanll_host`
+    writes from the downloaded rows. So ONE float comes back instead of n,
+    and no host fold runs. `gaussian_mixture_score_samples`' setup, kept
+    in step with it."""
+    var d = model.n_features
+    var ncomp = model.n_components
+    gmm_validate_shape(x, n_samples, d)
+
+    var ctx = _binding_ctx()
+    var trace = IdentityTrace.disabled()
+    var dx = _upload(ctx, x)
+    gmm_validate_data_device(ctx, dx, n_samples, d)
+    var dmeans = _upload(ctx, model.means)
+    var dprec = _upload(ctx, model.precisions_cholesky)
+    var dlogdet = _upload(ctx, model.log_det_chol)
+    var dlw = _upload_log_weights(ctx, model.weights, ncomp)
+
+    var mahal = ctx.enqueue_create_buffer[DType.float32](n_samples * ncomp)
+    var wlp = ctx.enqueue_create_buffer[DType.float32](n_samples * ncomp)
+    var rowmax = ctx.enqueue_create_buffer[DType.float32](n_samples)
+    var lse = ctx.enqueue_create_buffer[DType.float32](n_samples)
+    var logresp = ctx.enqueue_create_buffer[DType.float32](
+        n_samples * ncomp
+    )
+    var meanll = ctx.enqueue_create_buffer[DType.float32](1)
+    var escratch = ctx.enqueue_create_buffer[DType.float32](
+        gmm_estep_scratch_floats(n_samples, d)
+    )
+    var gws = ctx.enqueue_create_buffer[DType.float32](
+        gmm_estep_gemm_workspace_floats(n_samples, d)
+    )
+    ctx.synchronize()
+
+    gmm_e_step_dispatch(
+        ctx, dx, dmeans, dprec, dprec, dlogdet, dlw, escratch, gws,
+        mahal, wlp, rowmax, lse, logresp, meanll, n_samples, d, ncomp,
+        trace, "gmm.score", GMM_ELEM_TPB, GMM_ROW_TPB, GMM_SAB_NONE,
+    )
+    var h = ctx.enqueue_create_host_buffer[DType.float32](1)
+    ctx.enqueue_copy(dst_ptr=h.unsafe_ptr(), src_buf=meanll)
+    ctx.synchronize()
+    var out = h.unsafe_ptr().unsafe_load(0)
+    _ = h^
+    _ = dx^
+    _ = dmeans^
+    _ = dprec^
+    _ = dlogdet^
+    _ = dlw^
+    _ = mahal^
+    _ = wlp^
+    _ = rowmax^
+    _ = lse^
+    _ = logresp^
+    _ = meanll^
+    _ = escratch^
+    _ = gws^
+    # DEVIATION 1946: the context dies LAST, after every value built on it.
+    _ = ctx^
+    return out
+
+
+def gaussian_mixture_bic(
+    model: GaussianMixtureModel, x: List[Float32], n_samples: Int
+) raises -> Float32:
+    """`bic(X)`, `_gaussian_mixture.py:959-980`:
+
+        -2 * score(X) * n_samples + n_parameters * log(n_samples)
+
+    `identical_log` on `Float32(n_samples)` rather than a host `math.log`
+    (IDENTITY_PATHS row 18's class), and the products through
+    `identical_mul` so no codegen contracts them into the sum. The parameter
+    COUNT is integer arithmetic (`gmm_oracle.mojo::n_parameters`), where
+    scikit-learn divides by `2.0` in float and casts.
+    """
+    from checks.numerics import identical_log, identical_mul
+
+    var sc = gaussian_mixture_score(model, x, n_samples)
+    var p = gmm_n_parameters(model.n_features, model.n_components)
+    var a = ftz(
+        identical_mul(
+            Float32(-2.0), ftz(identical_mul(sc, Float32(n_samples)))
+        )
+    )
+    var b = ftz(
+        identical_mul(
+            Float32(p), ftz(identical_log(Float32(n_samples)))
+        )
+    )
+    return ftz(a + b)
+
+
+def gaussian_mixture_aic(
+    model: GaussianMixtureModel, x: List[Float32], n_samples: Int
+) raises -> Float32:
+    """`aic(X)`, `_gaussian_mixture.py:982-998`:
+
+        -2 * score(X) * n_samples + 2 * n_parameters
+    """
+    from checks.numerics import identical_mul
+
+    var sc = gaussian_mixture_score(model, x, n_samples)
+    var p = gmm_n_parameters(model.n_features, model.n_components)
+    var a = ftz(
+        identical_mul(
+            Float32(-2.0), ftz(identical_mul(sc, Float32(n_samples)))
+        )
+    )
+    return ftz(a + ftz(identical_mul(Float32(2.0), Float32(p))))
+
+
+def gaussian_mixture_sample(
+    model: GaussianMixtureModel,
+    n_samples: Int,
+    seed: UInt64,
+    mut labels: List[Int32],
+) raises -> List[Float32]:
+    """`sample(n_samples)`, scikit-learn `_base.py` `BaseMixture.sample`:
+    `n_samples x n_features` float32 rows grouped by component ascending,
+    and `labels` (length `n_samples`) filled with each row's component.
+
+    The counts come from `mixture/checks/sample.mojo::gmm_sample_components`
+    on the host (DEVIATION 2791: position-mapped Philox categorical draws,
+    integer tallies), and every row is one thread of `gmm_sample_kernel`
+    (DEVIATION 2791's Box-Muller normals, DEVIATION 2792's forward
+    substitution through the fitted `precisions_cholesky`)."""
+    var d = model.n_features
+    var k = model.n_components
+    var rows = gmm_sample_components(model.weights, k, n_samples, seed)
+    var ctx = _binding_ctx()
+    var dmeans = _upload(ctx, model.means)
+    var dprec = _upload(ctx, model.precisions_cholesky)
+    var dcomp = ctx.enqueue_create_buffer[DType.int32](n_samples)
+    var dx = ctx.enqueue_create_buffer[DType.float32](n_samples * d)
+    # the components go up from the tally list itself; `labels` takes it
+    ctx.enqueue_copy(dst_buf=dcomp, src_ptr=rows.unsafe_ptr())
+    ctx.synchronize()
+    labels = rows.copy()
+    ctx.enqueue_function[gmm_sample_kernel](
+        dx.unsafe_ptr(),
+        dcomp.unsafe_ptr(),
+        dmeans.unsafe_ptr(),
+        dprec.unsafe_ptr(),
+        Int32(n_samples),
+        Int32(d),
+        UInt32(seed & 0xFFFFFFFF).cast[DType.int32](),
+        UInt32((seed >> 32) & 0xFFFFFFFF).cast[DType.int32](),
+        grid_dim=((n_samples + GMM_SAMPLE_TPB - 1) // GMM_SAMPLE_TPB, 1, 1),
+        block_dim=(GMM_SAMPLE_TPB, 1, 1),
+    )
+    ctx.synchronize()
+    var out = _download(ctx, dx, n_samples * d)
+    _ = rows^
+    _ = dcomp^
+    _ = dmeans^
+    _ = dprec^
+    _ = dx^
+    # DEVIATION 1946: the context dies LAST, after every value built on it.
+    _ = ctx^
+    return out^
+
+
+def gmm_mode_name() -> String:
+    """The build's tier, from `numeric_mode_name()`."""
+    return numeric_mode_name()

@@ -1,0 +1,15 @@
+diff --git a/x_metrics/par.mojo b/x_metrics/par.mojo
+index 4e441ae51..24dbb37da 100644
+--- a/x_metrics/par.mojo
++++ b/x_metrics/par.mojo
+@@ -265,8 +265,8 @@ def sort_key_unit(t: Int, f: FP, q: IP):
+         var lo = UInt64(UInt32(p(q, 4)))
+         var hi = UInt64(UInt32(p(q, 5)))
+         var z = splitmix_pair(i, Int((hi << 32) | lo))
+-        kh = UInt32(z >> 32)
+-        kl = UInt32(z & 0xFFFFFFFF)
++        kh = ~UInt32(z >> 32)  # SABOTAGE 6108
++        kl = ~UInt32(z & 0xFFFFFFFF)
+     stu(f, B + t, kh)
+     stu(f, B + N + t, kl)
+     sti(f, B + 2 * N + t, i)

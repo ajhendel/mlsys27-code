@@ -1,0 +1,410 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 the authors. Part of anonlib.
+"""Cooperative CPU/GPU admission, compatible with the legacy slot directories.
+
+All new participants serialize metadata updates with flock. Lease directories
+are published with their PID already inside; live legacy owners are respected.
+A monotonic ticket counter gives FIFO order even while an older job is running.
+
+CAPACITY, NOT A FIXED COUNT (2026-09-26). The slot count is a CEILING sized to
+the machine: `MAC_SLOTS` when set, else half its logical cores (`slot_count`;
+5 on the 10-core M4 this was written on, which is what the fixed default was).
+Under the ceiling a CPU job is admitted only while the machine has room: the
+1-minute load average plus the job stays under ANONLIB_SLOT_LOAD_FRACTION
+(default 0.8) of the logical cores, and available memory stays above
+ANONLIB_SLOT_MIN_FREE_GB (default 4; a Mojo compile takes several GB). The
+Metal job is exempt from the load test (it is the priority job and one core)
+but not from the memory floor, and keeps its lock. When none of our slots is
+held, one job is admitted whatever the readings, and one CPU job whenever no
+other CPU job holds a slot (the Metal holder does not count), so a machine
+busy with work outside the slots still makes progress. ANONLIB_SLOT_CAPACITY=0 turns the
+readings off and leaves the plain slot count. The readings change WHEN a job
+starts, never what it computes: every job still runs with one thread.
+"""
+import argparse
+from contextlib import contextmanager
+import fcntl
+import json
+import math
+import os
+from pathlib import Path
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+
+
+def alive(pid, group=False):
+    try:
+        (os.killpg if group else os.kill)(int(pid), 0)
+        return True
+    except (ValueError, TypeError, ProcessLookupError):
+        return False
+    except PermissionError:
+        return True
+
+
+def read(path, default=""):
+    try:
+        return path.read_text().strip()
+    except FileNotFoundError:
+        return default
+
+
+def slot_count(env=os.environ):
+    """The slot ceiling every tool shares: MAC_SLOTS when set, else half the
+    logical cores (at least 1)."""
+    value = env.get("MAC_SLOTS")
+    if value:
+        return int(value)
+    return max(1, (os.cpu_count() or 2) // 2)
+
+
+def load_average():
+    return os.getloadavg()[0]
+
+
+def available_bytes():
+    """Memory a new job can take without pushing others out: MemAvailable on
+    Linux; on macOS the kernel's own free-memory percentage
+    (kern.memorystatus_level, the number `memory_pressure` prints) of
+    hw.memsize. Free plus inactive pages alone undercounts: on a 16 GB M4 under
+    load it read 2.6 GB where the kernel reported 40% (6.4 GB), because it
+    ignores what the compressor can give back. None when it cannot be read."""
+    try:
+        if sys.platform == "darwin":
+            def sysctl(name):
+                return int(subprocess.run(["sysctl", "-n", name], capture_output=True,
+                                          text=True, timeout=5).stdout.strip())
+            return sysctl("kern.memorystatus_level") * sysctl("hw.memsize") // 100
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            if line.startswith("MemAvailable:"):
+                return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+        return None
+    return None
+
+
+class Scheduler:
+    def __init__(self, env=os.environ, loadavg=load_average, available=available_bytes):
+        self.base = Path(env.get("ANONLIB_MAC_SLOT_BASE", "/tmp/anonlib-mac-slot"))
+        self.metal = Path(env.get("ANONLIB_METAL_LOCK", "/tmp/anonlib-metal-slot"))
+        self.queue = Path(env.get("ANONLIB_METAL_QUEUE", "/tmp/anonlib-metal-queue"))
+        self.count = slot_count(env)
+        if self.count < 1:
+            raise ValueError("MAC_SLOTS must be positive")
+        self.capacity = env.get("ANONLIB_SLOT_CAPACITY", "1") != "0"
+        self.cores = os.cpu_count() or 1
+        self.load_limit = float(env.get("ANONLIB_SLOT_LOAD_FRACTION", "0.8")) * self.cores
+        self.min_free = float(env.get("ANONLIB_SLOT_MIN_FREE_GB", "4")) * 2**30
+        self.loadavg, self.available = loadavg, available
+        self.why = ""
+        self.queue.mkdir(parents=True, exist_ok=True)
+        self.slots = [Path(f"{self.base}.{i}") for i in range(1, self.count + 1)]
+        self.token = uuid.uuid4().hex
+        self.ticket = None
+        self.held = []
+
+    @contextmanager
+    def guard(self):
+        # Never unlink the guard: unlinking lets waiters lock different inodes.
+        with (self.queue / ".guard").open("a") as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            yield
+
+    def stale(self, path):
+        if not path.exists():
+            return False
+        pid = read(path / "pid")
+        if not pid:
+            # An old shell creates the directory before writing its PID.
+            # Give it a publication grace period, never steal a fresh lock.
+            return time.time() - path.stat().st_mtime > 60
+        return not alive(pid) and not alive(read(path / "pgid"), group=True)
+
+    def reap(self):
+        for path in self.slots + [self.metal] + list(self.queue.glob("t[0-9]*")):
+            if self.stale(path):
+                shutil.rmtree(path)
+
+    def publish(self, path, command):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        stage = Path(tempfile.mkdtemp(prefix=".slot-publish-", dir=path.parent))
+        try:
+            for key, value in {"pid": os.getpid(), "token": self.token,
+                               "since": time.strftime("%H:%M:%S"),
+                               "what": f"{Path.cwd()} :: {' '.join(command)}"}.items():
+                (stage / key).write_text(str(value) + "\n")
+            # An existing legacy directory, including an empty unpublished
+            # one, must not be replaced by rename on POSIX.
+            if path.exists():
+                return False
+            try:
+                os.rename(stage, path)
+            except OSError:
+                if path.exists():
+                    return False
+                raise
+            return True
+        finally:
+            if stage.exists():
+                shutil.rmtree(stage)
+
+    def enqueue(self, command):
+        with self.guard():
+            self.reap()
+            live = [int(p.name[1:]) for p in self.queue.glob("t[0-9]*") if p.name[1:].isdigit()]
+            counter = self.queue / ".next"
+            n = max(int(read(counter, "0")), max(live, default=-1) + 1)
+            counter.write_text(str(n + 1))
+            self.ticket = self.queue / f"t{n}"
+            if not self.publish(self.ticket, command):
+                raise RuntimeError("ticket publication raced a legacy scheduler; retry")
+
+    def room(self, metal, slots):
+        """Whether the machine has room for this job now; `why` says what it
+        waits on. Called under the guard, after the reap."""
+        self.why = ""
+        if not self.capacity:
+            return True
+        held = [p for p in self.slots if p.exists()]
+        gpu = read(self.metal / "token") if self.metal.exists() else None
+        if not held or (not metal and gpu and all(read(p / "token") == gpu for p in held)):
+            # Always admit one: a GPU job when nothing is held, a CPU job when
+            # no other CPU job is (the GPU holder is one core), so load from
+            # outside the slots (Photos analysis, Spotlight) cannot stall a pass.
+            return True
+        if not metal:
+            load = self.loadavg()
+            if load + slots > self.load_limit:
+                self.why = f"load {load:.1f} + {slots} > {self.load_limit:.1f}"
+                return False
+        free = self.available()
+        if free is not None and free < self.min_free:
+            self.why = f"available memory {free / 2**30:.1f} GB < {self.min_free / 2**30:.1f} GB"
+            return False
+        return True
+
+    def attempt(self, metal, command, slots=1):
+        """Take one slot (and the Metal lock when `metal`), or `slots` CPU
+        slots at once for a job that runs that many single-threaded workers
+        (the macOS release build, `--slots`). All or nothing: a partial take
+        is released before returning False. Under the slot count the job
+        also needs room (`room`)."""
+        with self.guard():
+            self.reap()
+            if not self.room(metal, slots):
+                return False
+            if slots > 1:
+                if metal:
+                    raise ValueError("a Metal job takes one slot")
+                free = [p for p in self.slots if not p.exists()][:slots]
+                if len(free) < slots:
+                    return False
+                for path in free:
+                    if not self.publish(path, command):
+                        for taken in self.held:
+                            if read(taken / "token") == self.token:
+                                shutil.rmtree(taken)
+                        self.held = []
+                        return False
+                    self.held.append(path)
+                return True
+            free = next((p for p in self.slots if not p.exists()), None)
+            if free is None:
+                return False
+            if metal:
+                tickets = sorted((int(p.name[1:]), p) for p in self.queue.glob("t[0-9]*")
+                                 if p.name[1:].isdigit())
+                if not tickets or tickets[0][1] != self.ticket or self.metal.exists():
+                    return False
+            if not self.publish(free, command):
+                return False
+            self.held.append(free)
+            if metal:
+                if not self.publish(self.metal, command):
+                    if read(free / "token") == self.token:
+                        shutil.rmtree(free)
+                    self.held.remove(free)
+                    return False
+                self.held.append(self.metal)
+                shutil.rmtree(self.ticket)
+                self.ticket = None
+            return True
+
+    def mark_env(self, env):
+        """Tell the child it is running UNDER the slot (2026-09-19).
+
+        Without this a GPU run cannot tell `the lock is held by me` from `the
+        lock is held by SOMEONE ELSE and I am running anyway` -- and the
+        second is the hazard: concurrent Metal on one M4 returns NaN,
+        constant and zero output that still hashes stably. The token is the
+        slot's own, so a stale variable inherited from an unrelated shell
+        cannot impersonate a held slot.
+        """
+        env["ANONLIB_SLOT_TOKEN"] = self.token
+        return env
+
+
+    def child_started(self, pgid):
+        with self.guard():
+            for path in self.held:
+                (path / "pgid").write_text(str(pgid))
+
+    def _release(self):
+        for path in self.held + ([self.ticket] if self.ticket else []):
+            if read(path / "token") == self.token:
+                shutil.rmtree(path)
+        self.held = []
+        self.ticket = None
+
+    def release(self):
+        with self.guard():
+            self._release()
+
+    def status(self):
+        with self.guard():
+            for path in self.slots + [self.metal]:
+                print(f"{path.name}: pid {read(path / 'pid')} since {read(path / 'since')} :: "
+                      f"{read(path / 'what')}" if path.exists() else f"{path.name}: free")
+            tickets = sorted((int(p.name[1:]), p) for p in self.queue.glob("t[0-9]*")
+                             if p.name[1:].isdigit())
+            for n, path in tickets:
+                print(f"ticket {n}: pid {read(path / 'pid')} :: {read(path / 'what')}")
+
+
+def stop_group(child):
+    if child is None:
+        return
+    try:
+        os.killpg(child.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
+        child.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        pass
+    # Descendants may survive their direct parent: retire the whole lease.
+    try:
+        os.killpg(child.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    child.wait()
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--timeout", type=float, default=0, help="execution seconds, excluding queue wait; 0 is unlimited")
+    ap.add_argument("--wait-timeout", type=float, default=0)
+    ap.add_argument("--deadline", type=float, default=0, help="shared monotonic deadline; 0 disables it")
+    ap.add_argument("--poll", type=float, default=0.25)
+    ap.add_argument("--timing-json")
+    ap.add_argument("--slots", type=int, default=1,
+                    help="run mode only: hold this many CPU slots and let the child run that many "
+                         "single-threaded build jobs (ANONLIB_BUILD_JOBS); every other pin stays 1")
+    ap.add_argument("mode", choices=("run", "metal", "cuda", "hip", "status"))
+    ap.add_argument("command", nargs=argparse.REMAINDER)
+    args = ap.parse_args(argv)
+    if (any(not math.isfinite(v) for v in (args.timeout, args.wait_timeout, args.poll, args.deadline))
+            or args.timeout < 0 or args.wait_timeout < 0 or args.deadline < 0 or args.poll <= 0):
+        ap.error("timeouts must be finite and nonnegative and poll must be finite and positive")
+    scheduler = Scheduler()
+    if args.slots < 1 or (args.slots > 1 and args.mode != "run"):
+        ap.error("--slots must be positive, and above 1 only in run mode")
+    if args.slots > scheduler.count:
+        ap.error(f"--slots {args.slots} exceeds the {scheduler.count} Mac slots")
+    if args.mode == "status":
+        scheduler.status()
+        return 0
+    if not args.command:
+        ap.error("a command is required")
+    if args.command[0] == "--":
+        args.command.pop(0)
+    started = time.monotonic()
+    admitted = None
+    child = None
+    code = 1
+    def interrupted(signum, frame):
+        raise KeyboardInterrupt(signum)
+    previous = {s: signal.signal(s, interrupted) for s in (signal.SIGINT, signal.SIGTERM)}
+    try:
+        if args.mode in ("metal", "cuda", "hip"):
+            scheduler.enqueue(args.command)
+        last_log = -60.0
+        while True:
+            now = time.monotonic()
+            if args.deadline and now >= args.deadline:
+                print("mac_slot: total run budget exhausted", file=sys.stderr, flush=True)
+                code = 124
+                return code
+            if scheduler.attempt(args.mode in ("metal", "cuda", "hip"), args.command, args.slots):
+                break
+            waited = now - started
+            if args.wait_timeout and waited >= args.wait_timeout:
+                code = 124
+                return code
+            if waited - last_log >= 30:
+                print(f"mac_slot: waiting {waited:.1f}s for {args.mode} capacity"
+                      + (f" ({scheduler.why})" if scheduler.why else ""), file=sys.stderr, flush=True)
+                last_log = waited
+            time.sleep(min(args.poll, max(0, args.deadline - time.monotonic()))
+                       if args.deadline else args.poll)
+        admitted = time.monotonic()
+        print(f"mac_slot: admitted after {admitted - started:.3f}s", file=sys.stderr, flush=True)
+        env = dict(os.environ, OMP_NUM_THREADS="1", OPENBLAS_NUM_THREADS="1",
+                   VECLIB_MAXIMUM_THREADS="1", ANONLIB_CPU_THREADS="1",
+                   ANONLIB_COMPILE_JOBS="1", ANONLIB_BUILD_JOBS=str(args.slots),
+                   MODULAR_THREAD_BUSY_WAIT_US="0")
+        # --slots N (2026-09-21): N slots held, N single-worker builds. The
+        # macOS release build under one slot compiled its 61 extensions one
+        # after another (0.8.13: 2370 s of compile in a 2666 s run); see
+        # packaging/macos/build_release_wheel.sh for the measurement.
+        remaining = args.deadline - time.monotonic() if args.deadline else None
+        if remaining is not None and remaining <= 0:
+            code = 124
+            return code
+        limit = min(args.timeout, remaining) if args.timeout and remaining is not None else (remaining or args.timeout or None)
+        scheduler.mark_env(env)   # the child can now tell it holds the slot
+        # THE GPU JOB IS NOT BACKGROUND WORK (2026-09-21). A Metal pass is
+        # bound by host to device synchronisation, so its one host thread
+        # waiting behind other CPU work idles the only GPU. The 0.8.12 Apple
+        # pass ran the same 232 cells, same order, same commit, in 360 s and
+        # then 232 s thirteen minutes later, the ordered GBDT lanes up to 2.4x
+        # slower in the first run, which is what host contention on a nice-19
+        # process looks like. CPU slots stay at
+        # nice 19; the holder of the GPU lock runs at normal priority. The
+        # thread and job pins above are unchanged, so it still uses one core.
+        niceness = "0" if args.mode in ("metal", "cuda", "hip") else "19"
+        child = subprocess.Popen(["nice", "-n", niceness, *args.command], env=env, start_new_session=True)
+        scheduler.child_started(child.pid)
+        try:
+            code = child.wait(timeout=limit)
+            if code < 0:
+                code = 128 - code
+        except subprocess.TimeoutExpired:
+            print(f"mac_slot: execution exceeded available budget ({limit}s)", file=sys.stderr, flush=True)
+            code = 124
+    except KeyboardInterrupt as exc:
+        code = 128 + (exc.args[0] if exc.args else signal.SIGINT)
+    finally:
+        for s in previous:
+            signal.signal(s, signal.SIG_IGN)
+        stop_group(child)
+        scheduler.release()
+        ended = time.monotonic()
+        timing = dict(wait_seconds=(admitted or ended) - started,
+                      run_seconds=ended - admitted if admitted else 0, exit_code=code)
+        print("mac_slot: " + json.dumps(timing), file=sys.stderr, flush=True)
+        if args.timing_json:
+            Path(args.timing_json).write_text(json.dumps(timing) + "\n")
+        for s, handler in previous.items():
+            signal.signal(s, handler)
+    return code
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,270 @@
+"""Small synthetic release-admission tests; main agent alone executes these."""
+import base64
+import copy
+import csv
+import hashlib
+import io
+import json
+from pathlib import Path
+import tempfile
+import unittest
+from unittest.mock import patch
+import zipfile
+
+import check_linux_release_qualification as gate
+
+
+def write_json(path, value):
+    path.write_text(json.dumps(value))
+
+
+def make_wheel(root, vendors=('hip', 'cuda'), omit=None, corrupt=False):
+    root.mkdir(parents=True, exist_ok=True)
+    wrapper = root / 'python/anonlib/__init__.py'
+    wrapper.parent.mkdir(parents=True, exist_ok=True)
+    wrapper.write_text('# current wrapper\n')
+    files = {'anonlib/__init__.py': wrapper.read_bytes()}
+    for vendor in vendors:
+        arch = 'gfx942' if vendor == 'hip' else 'sm_89'
+        for mode in gate.surface.MODES:
+            prefix = f'anonlib/{vendor}/{arch}/' + (mode + '/' if mode != 'fast' else '')
+            for binding in gate.surface.expected_bindings(mode):
+                name = prefix + binding + '.so'
+                if name != omit:
+                    files[name] = name.encode()
+    record = 'anonlib-0.6.0.dist-info/RECORD'
+    rows = io.StringIO()
+    writer = csv.writer(rows)
+    for name, data in sorted(files.items()):
+        digest = base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b'=').decode()
+        writer.writerow([name, 'sha256=' + digest, len(data)])
+    writer.writerow([record, '', ''])
+    files[record] = rows.getvalue().encode()
+    if corrupt:
+        files['anonlib/__init__.py'] += b'# not in RECORD\n'
+    wheel = root / 'anonlib-0.6.0-py3-none-manylinux_2_28_x86_64.whl'
+    with zipfile.ZipFile(wheel, 'w') as archive:
+        for name, data in files.items():
+            archive.writestr(name, data)
+    return wheel
+
+
+class ReleaseAdmissionTests(unittest.TestCase):
+    def test_complete_dual_wheel_record_and_inventory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            wheel = make_wheel(root)
+            extensions, sets = gate.inspect_wheel(wheel, root)
+            per_arch = sum(len(gate.surface.expected_bindings(m)) for m in gate.surface.MODES)
+            self.assertEqual(len(extensions), 2 * per_arch)
+            self.assertEqual(len(sets), 2 * len(gate.surface.MODES))  # 2 arches x {fast, identical}
+            self.assertEqual(sorted(sets.values()), sorted(len(gate.surface.expected_bindings(m))
+                                                           for m in gate.surface.MODES for _ in 'ab'))
+
+    def test_vendor_candidates_missing_modes_and_corrupt_record_refuse(self):
+        cases = [dict(vendors=('hip',)), dict(vendors=('cuda',)),
+                 dict(omit='anonlib/hip/gfx942/identical/_anonlib_gbdt.so'),
+                 dict(corrupt=True)]
+        for options in cases:
+            with self.subTest(options=options), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                wheel = make_wheel(root, **options)
+                with self.assertRaises(ValueError):
+                    gate.inspect_wheel(wheel, root)
+
+    def test_native_inventory_catches_added_source_but_excludes_release_tools(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'a.mojo').write_text('native')
+            (root / 'tools').mkdir()
+            (root / 'tools/linux_surface_qualification.sh').write_text('qualification')
+            first = gate.native_inventory(root)
+            (root / 'tools/check_linux_release_qualification.py').write_text('admission only')
+            (root / 'archive').mkdir()
+            (root / 'archive/old.mojo').write_text('old')
+            self.assertEqual(gate.native_inventory(root), first)
+            (root / 'new.mojo').write_text('new native code')
+            self.assertNotEqual(gate.native_inventory(root), first)
+
+    def vendor_fixture(self, root):
+        wheel = make_wheel(root)
+        extensions, sets = gate.inspect_wheel(wheel, root)
+        inventory = gate.native_inventory(root)
+        wheel_sha = gate.digest_file(wheel)
+        source_sha = gate.inventory_digest(inventory)
+        out = root / 'qualification/hip'
+        out.mkdir(parents=True)
+        proof = {'schema': 'anonlib.linux.build-provenance.v1', 'complete': True,
+                 'action': 'build', 'build_exit': 0, 'source_commit': 'a' * 40,
+                 'source_inventory': inventory, 'source_sha256': source_sha,
+                 'extensions': {'anonlib/' + p: h for p, h in extensions.items()
+                                if p.startswith('hip/')}}
+        write_json(out / 'build-provenance.json', proof)
+        audit = {'sha256': wheel_sha, 'qualification_vendor': 'hip',
+                 'advertised_vendors': ['cuda', 'hip'], 'extension_hashes': extensions,
+                 'sets': sets, 'source_sha256': source_sha,
+                 'build_provenance_sha256': gate.digest_file(out / 'build-provenance.json')}
+        write_json(out / 'wheel-audit.json', audit)
+        records = {}
+        package = '/vanished/qualification/venv/lib/python3.11/site-packages/anonlib'
+        for surface, mode in sorted(gate.surface.expected_jobs(audit)):
+            for code in (gate.surface.MODES[mode],):
+                name = surface + '-' + mode
+                prefix = 'hip/gfx942/' + (mode + '/' if mode != 'fast' else '')
+                bindings = {}
+                for binding in gate.surface.expected_bindings(mode):
+                    member = prefix + binding + '.so'
+                    bindings[binding] = {'path': package + '/' + member,
+                                         'sha256': extensions[member], 'mode_code': code}
+                installed = {'vendor': 'hip', 'mode': mode, 'wheel_sha256': wheel_sha,
+                             'package': package + '/__init__.py', 'installed_bindings': bindings}
+                path = out / (name + '.installed.json')
+                write_json(path, installed)
+                records[name] = gate.digest_file(path)
+                if surface == 'umap-quality':
+                    write_json(out / (name + '.json'), {})
+        qualification = {'vendor': 'hip', 'wheel_sha256': wheel_sha,
+                         'source_sha256': source_sha, 'installed_records': records}
+        return out, qualification, wheel_sha, inventory, extensions, sets
+
+    def test_all_installed_records_and_identical_quality_rechecked(self):
+        # DEVIATION 2490: UMAP quality is an identical-only job, rechecked once.
+        with tempfile.TemporaryDirectory() as directory:
+            out, qualification, *args = self.vendor_fixture(Path(directory))
+            with patch.object(gate.surface, 'retained', return_value=(qualification, {})), \
+                    patch.object(gate.surface, 'check_quality') as quality:
+                gate.check_vendor(out, 'hip', *args)
+                self.assertEqual(quality.call_count, 1)
+
+    def test_runtime_architecture_requires_device_and_selection_in_every_job(self):
+        # Use the full release-linux3 inert fixture (DEVIATION 2290, 2490): 11
+        # jobs (smoke in three tiers, eight identical-only) and 17 IDENTICAL bindings.
+        # Re-seal mutated evidence so this checks actual architecture admission,
+        # not merely stale hashes. Neither this fixture nor gate loads natives.
+        from test_release061_end_to_end import fixture, seal_evidence
+        for target in ('smoke-fast', 'byte-lm-identical'):
+            for defect in (None, 'device_architecture', 'selected_architecture', 'architecture_override_absent'):
+                with self.subTest(target=target, defect=defect), tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    wheel, qualification = fixture(root)
+                    out = qualification / 'hip/gfx942'
+                    if defect:
+                        path = out / (target + '.installed.json')
+                        row = json.loads(path.read_text())
+                        row[defect] = False if defect == 'architecture_override_absent' else 'gfx90a'
+                        write_json(path, row)
+                        seal_evidence(out)
+                    extensions, sets = gate.inspect_wheel(wheel, root, flat_python=True, byte_lm=True)
+                    args = (out, 'hip', gate.digest_file(wheel), gate.native_inventory(root), extensions, sets)
+                    if defect:
+                        with self.assertRaisesRegex(ValueError, 'claimed native architecture'):
+                            gate.check_vendor(*args, arch='gfx942')
+                    else:
+                        result = gate.check_vendor(*args, arch='gfx942')
+                        self.assertEqual(len(result['installed_records']), 10)  # smoke x 2 modes, 7 identical surfaces, byte-lm
+
+    def test_stale_hash_inventory_and_missing_job_refuse(self):
+        for defect in ('wheel', 'native', 'missing_job', 'build_proof'):
+            with self.subTest(defect=defect), tempfile.TemporaryDirectory() as directory:
+                out, qualification, wheel_sha, inventory, extensions, sets = self.vendor_fixture(Path(directory))
+                if defect == 'wheel':
+                    qualification['wheel_sha256'] = 'b' * 64
+                elif defect == 'native':
+                    inventory = inventory + [['new.mojo', 'b' * 64]]
+                elif defect == 'missing_job':
+                    qualification['installed_records'].pop('ordered-rmse-identical')
+                else:
+                    (out / 'build-provenance.json').write_text('{}')
+                with patch.object(gate.surface, 'retained', return_value=(qualification, {})), \
+                        patch.object(gate.surface, 'check_quality'), self.assertRaises(ValueError):
+                    gate.check_vendor(out, 'hip', wheel_sha, inventory, extensions, sets)
+
+    def test_hopper_driver_capability_matches_only_its_supported_binary(self):
+        import test_release061_end_to_end as end_to_end
+        cases = [('sm_90a', 'sm_90', True), ('sm_90a', 'sm_90a', True),
+                 ('sm_90a', 'sm_89', False), ('sm_90a', 'sm_90b', False),
+                 ('sm_89', 'sm_89a', False), ('sm_89', 'sm_90', False)]
+        for arch, device, accepted in cases:
+            with self.subTest(arch=arch, device=device), tempfile.TemporaryDirectory() as directory, \
+                    patch.object(end_to_end, 'ARCHES', frozenset({'cuda/sm_89', 'cuda/sm_90a', 'hip/gfx942'})):
+                root = Path(directory)
+                wheel, qualification = end_to_end.fixture(root)
+                out = qualification / 'cuda' / arch
+                for path in out.glob('*.installed.json'):
+                    row = json.loads(path.read_text())
+                    row['device_architecture'] = device
+                    write_json(path, row)
+                end_to_end.seal_evidence(out)
+                extensions, sets = gate.inspect_wheel(wheel, root, flat_python=True, byte_lm=True)
+                args = (out, 'cuda', gate.digest_file(wheel), gate.native_inventory(root), extensions, sets)
+                if accepted:
+                    result = gate.check_vendor(*args, arch=arch)
+                    self.assertEqual(len(result['installed_records']), 10)  # smoke x 2 modes, 7 identical surfaces, byte-lm
+                else:
+                    with self.assertRaisesRegex(ValueError, 'claimed native architecture'):
+                        gate.check_vendor(*args, arch=arch)
+
+    def test_nonidentical_job_binding_cannot_hide_behind_success_manifest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            out, qualification, *args = self.vendor_fixture(Path(directory))
+            path = out / 'smoke-fast.installed.json'
+            installed = json.loads(path.read_text())
+            installed['installed_bindings']['_anonlib_gbdt']['mode_code'] = 1
+            write_json(path, installed)
+            qualification['installed_records']['smoke-fast'] = gate.digest_file(path)
+            with patch.object(gate.surface, 'retained', return_value=(qualification, {})), \
+                    patch.object(gate.surface, 'check_quality'), self.assertRaises(ValueError):
+                gate.check_vendor(out, 'hip', *args)
+
+    def test_nested_corpus_fingerprint_required_and_current(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            out = root / 'qualification'
+            out.mkdir()
+            snapshot = {}
+            for case in gate.surface.CORPUS_CASES:
+                corpus = root / 'mamba/corpus' / case
+                corpus.mkdir(parents=True)
+                for name in ('x.f32', 'reference.f64'):
+                    path = corpus / name
+                    path.write_bytes(b'fixture')
+                    snapshot[path.relative_to(root).as_posix()] = gate.digest_file(path)
+            record = out / 'qualification-sources.json'
+            write_json(record, snapshot)
+            gate.check_corpora(out, root)
+            for case in gate.surface.CORPUS_CASES[1:]:
+                missing = {p: h for p, h in snapshot.items()
+                           if not p.startswith('mamba/corpus/' + case + '/')}
+                write_json(record, missing)
+                with self.subTest(case=case), self.assertRaises(ValueError):
+                    gate.check_corpora(out, root)
+            write_json(record, snapshot)
+            (root / 'mamba/corpus/mamba3/m3_base_b2_l4_d32/reference.f64').write_bytes(b'changed')
+            with self.assertRaises(ValueError):
+                gate.check_corpora(out, root)
+
+    def test_comparators_are_recomputed_and_failure_refuses(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            wheel = make_wheel(root)
+            for fail in (False, True):
+                with self.subTest(fail=fail), patch.object(gate, 'check_vendor'), \
+                        patch.object(gate, 'check_corpora'), \
+                        patch.object(gate.surface, 'compare', return_value={'status': 'PASSED'}) as umap, \
+                        patch.object(gate.compare_ordered_python, 'compare', return_value={
+                            'status': 'FAILED' if fail else 'PASSED'}) as ordered:
+                    for vendor in ('hip', 'cuda'):
+                        out = root / 'qualification' / vendor
+                        out.mkdir(parents=True, exist_ok=True)
+                        write_json(out / 'qualification.json', {})
+                    if fail:
+                        with self.assertRaises(ValueError):
+                            gate.check(wheel, root / 'qualification', root)
+                    else:
+                        self.assertEqual(gate.check(wheel, root / 'qualification', root)['jobs_per_vendor'], 9)  # smoke x 2 modes, 7 identical surfaces (no byte-lm off the release profile)
+                    umap.assert_called_once()
+                    ordered.assert_called_once()
+
+
+if __name__ == '__main__':
+    unittest.main()

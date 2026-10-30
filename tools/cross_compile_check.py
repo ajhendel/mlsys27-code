@@ -1,0 +1,549 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 the authors. Part of anonlib, DOI-WITHHELD
+"""Cross-compile the changed Linux bindings on the Mac BEFORE a release rents a
+GPU box (2026-09-25).
+
+    pixi run cross-compile-check                         # vs the last v* tag
+    python3 tools/cross_compile_check.py --ref v0.8.15 [--limit 3] [--archs sm_89]
+    python3 tools/cross_compile_check.py --only _anonlib_svm --tiers fast
+    python3 tools/cross_compile_check.py --ref v0.8.22 --list-json plan.json   # the job list only
+    python3 tools/cross_compile_check.py --summarize results/ --plan plan.json  # merge job results
+
+NOT RUN BY THE RELEASE since 2026-10-13 (the author): GitHub's free runners have no
+GPU, so this only catches NVIDIA/AMD-only compile errors and never checks bits;
+the release's own NVIDIA/AMD build legs hit the same compile error within
+minutes on a $1-4/h box, so the extra step and wait per release aren't worth
+it. The release does not run it; this stays a manual tool.
+
+ON GITHUB, BY HAND. .github/workflows/cross-compile-check.yml runs the
+same selection (--list-json, one source of truth) and then one standard
+runner per binding x tier x arch (--only/--tiers/--archs), in parallel;
+--summarize merges their result files into one verdict table. The local
+task is unchanged. Opt-in --keep-artifacts DIR is a Linux diagnostic route:
+it runs the existing binding build script with one compiler worker and the
+portable host baseline, and retains complete compiler logs, source bytes,
+exit status, the native binary and its resolved runtime closure. It does
+not install, publish, or claim GPU/identity/release qualification.
+
+WHY. 0.8.19's `fast` svm binding never finished compiling for NVPTX or AMDGPU:
+every Linux leg sat on it for more than 33 minutes and was killed by its build
+bound. The Mac reproduces it (`mojo build --target-accelerator sm_89` needs no
+NVIDIA device), so the leg's rental bought nothing a local compile could not
+have said first.
+
+WHAT IT BUILDS. The bindings whose identity inputs changed between --ref and
+--head, read the way tools/release_reuse.py reads them: the Mojo import
+closure of the file each build script compiles, plus the script and
+pixi.toml/pixi.lock (`bincache.source_digest` over `git archive` of each
+commit). Each changed binding is compiled once per requested accelerator and
+per tier it ships in on Linux (packaging/linux/pack_wheel.py `tier_names`),
+with the flags the release build sets for that tier and column: the tier
+define and `-D ANONLIB_COLUMN_NVIDIA|AMD`, `--target-accelerator <arch>`,
+`-j 1`, `--emit shared-lib`, from the WORKING TREE. Host bindings are not a
+cross compile and are skipped. The host CPU is the Mac's; the GPU half, which
+is what hung, is the Linux target's.
+
+ONE AT A TIME. The Mac runs one Mojo compile at a time; so does this.
+
+VERDICTS, one line per job:
+  PASS     the compiler exited 0 and wrote the library
+  FAIL     the compiler exited non-zero (the first error lines follow)
+  TIMEOUT  still running at --timeout seconds (default CROSS_COMPILE_SECONDS in
+           tools/release_limits.sh); the process group is killed
+  STALLED  the compiler's CPU time did not advance for --stall seconds. The
+           0.8.19 svm hang is exactly this: 30 s of CPU, then the main thread
+           asleep on a semaphore with no worker running. Waiting out the
+           full timeout on it proves nothing more. --stall 0 disables it.
+Exit status is 0 only when every job PASSes; a selection that cannot be read
+(a build script whose compile line is not literal) refuses by name, it never
+widens to "build everything".
+"""
+import argparse
+import hashlib
+import platform
+import re
+import tarfile
+import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "tools"))
+import release_limits  # noqa: E402
+
+TIER_DEFINES = {
+    "identical": ["-D", "ANONLIB_NUMERIC_IDENTICAL=1"],
+    "fast": [],
+}
+DEFAULT_ARCHS = ("sm_89", "sm_80", "gfx942")  # sm_80: the PTX slot of anonlib-nvidia
+
+
+def column_of(arch):
+    return "NVIDIA" if arch.startswith("sm_") else "AMD"
+
+
+# ---------------------------------------------------------------- selection
+def changed_scripts(ref_facts, head_facts):
+    """{script: reason} for every build script whose closure differs, is new,
+    or cannot be read at head. Pure: facts are tools/release_reuse.tree_facts
+    dicts."""
+    out = {}
+    for script, cur in sorted(head_facts["closures"].items()):
+        prev = ref_facts["closures"].get(script)
+        if cur is None:
+            continue  # no such build script at head
+        if prev is None:
+            out[script] = "new at head"
+        elif prev.get("digest") != cur.get("digest") or prev.get("scope") != cur.get("scope"):
+            changed = sorted(set(cur.get("sources", [])) ^ set(prev.get("sources", [])))
+            out[script] = "closure changed" + (f" ({len(changed)} files added/removed)" if changed else "")
+    return out
+
+
+def linux_rows():
+    """[(name, script, tier)] for every non-host binding the Linux sets ship,
+    from the same list the pack reads."""
+    import release_reuse
+    seen, rows = set(), []
+    for b in release_reuse.bindings(release_reuse.LINUX):
+        if b.host:
+            continue
+        key = (b.name, b.script, b.tier)
+        if key not in seen:
+            seen.add(key)
+            rows.append(key)
+    return rows
+
+
+def plan_jobs(scripts, rows, archs, tiers=None, only=None, limit=0):
+    """[(name, script, tier, arch)] in a stable order: bindings by name, then
+    arch, then tier as the Linux lists order them. `limit` caps BINDINGS,
+    not jobs."""
+    names = []
+    for name, script, _tier in rows:
+        if script in scripts and name not in names and (not only or name in only):
+            names.append(name)
+    names.sort()
+    if limit:
+        names = names[:limit]
+    jobs = []
+    for name in names:
+        for arch in archs:
+            for rname, script, tier in rows:
+                if rname == name and (not tiers or tier in tiers):
+                    jobs.append((name, script, tier, arch))
+    return jobs
+
+
+def compile_cmd(mojo, root_file, incs, tier, arch, out):
+    cmd = list(mojo) + ["build", "-j", "1", "--emit", "shared-lib", "--target-accelerator", arch]
+    cmd += TIER_DEFINES[tier] + ["-D", "ANONLIB_COLUMN_" + column_of(arch)]
+    if tier == "identical":
+        # experiment switch sets for an integration compile (2026-10-07): space
+        # separated NAME[=V] list; empty for a release
+        for d in os.environ.get("ANONLIB_XCC_EXTRA_DEFINES", "").split():
+            cmd += ["-D", d]
+    for inc in incs:
+        cmd += ["-I", str(inc)]
+    return cmd + [str(root_file), "-o", str(out)]
+
+
+# ---------------------------------------------------------------- running
+def group_cpu_seconds(pgid):
+    """Summed CPU time of a process group (ps TIME column), or None."""
+    try:
+        o = subprocess.run(["ps", "-g", str(pgid), "-o", "time="], capture_output=True, text=True,
+                           timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    total = 0.0
+    for tok in o.split():
+        v = 0.0
+        for part in tok.replace("-", ":").split(":"):
+            try:
+                v = v * 60 + float(part)
+            except ValueError:
+                return None
+        total += v
+    return total
+
+
+def run_one(cmd, out, timeout, stall, cwd=ROOT, poll=2.0, cpu_probe=group_cpu_seconds, clock=time.monotonic,
+            sleep=time.sleep, retain=None, env=None):
+    """(verdict, seconds, log_tail). The compiler runs in its own process
+    group so a kill takes every child with it."""
+    retain = Path(retain) if retain else None
+    if retain:
+        retain.mkdir(parents=True, exist_ok=True)
+    log = (retain / "build.log").open("w+") if retain else tempfile.TemporaryFile(mode="w+")
+    record = dict(command=list(map(str, cmd)), cwd=str(cwd), complete=False,
+                  exit_status=None, verdict="STARTED", output=str(out))
+    if retain:
+        (retain / "execution.json").write_text(json.dumps(record, indent=2) + "\n")
+    t0 = clock()
+    try:
+        p = subprocess.Popen(cmd, cwd=str(cwd), stdout=log, stderr=subprocess.STDOUT,
+                             start_new_session=True, env=env)
+    except OSError as exc:
+        log.write(str(exc) + "\n")
+        log.close()
+        if retain:
+            record.update(verdict="FAIL", error=str(exc))
+            (retain / "execution.json").write_text(json.dumps(record, indent=2) + "\n")
+        raise
+    last_cpu, last_move = -1.0, t0
+    verdict = None
+    while verdict is None:
+        rc = p.poll()
+        now = clock()
+        if rc is not None:
+            verdict = "PASS" if rc == 0 and Path(out).is_file() else "FAIL"
+            break
+        if now - t0 >= timeout:
+            verdict = "TIMEOUT"
+            break
+        if stall:
+            cpu = cpu_probe(p.pid)
+            if cpu is not None and cpu > last_cpu + 0.5:
+                last_cpu, last_move = cpu, now
+            elif cpu is not None and now - last_move >= stall:
+                verdict = "STALLED"
+                break
+        sleep(poll)
+    if p.poll() is None:
+        try:
+            os.killpg(p.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        p.wait()
+    secs = clock() - t0
+    if retain:
+        record.update(complete=True, exit_status=p.returncode, verdict=verdict,
+                      seconds=round(secs, 3), output_exists=Path(out).is_file())
+        (retain / "execution.json").write_text(json.dumps(record, indent=2) + "\n")
+    log.seek(0)
+    text = log.read()
+    log.close()
+    tail = [ln for ln in text.splitlines() if "error" in ln][:6] if verdict == "FAIL" else []
+    if verdict == "FAIL" and not tail:
+        tail = text.splitlines()[-6:]
+    if verdict == "STALLED":
+        tail = [f"compiler CPU flat at {max(last_cpu, 0):.0f} s for {stall:.0f} s"]
+    return verdict, secs, tail
+
+
+
+def file_sha(path):
+    h = hashlib.sha256()
+    with Path(path).open("rb") as fh:
+        for block in iter(lambda: fh.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def retain_sources(root, script, directory):
+    """Capture actual imported source bytes before invoking the compiler."""
+    import bincache
+    directory.mkdir(parents=True, exist_ok=True)
+    identity, files = bincache.source_digest(root, str(root / "bindings" / script), [])
+    records = []
+    with tarfile.open(directory / "source.tar.gz", "w:gz", dereference=True) as archive:
+        for rel in sorted(files):
+            path = root / rel
+            archive.add(path, arcname=rel, recursive=False)
+            records.append(dict(path=rel, sha256=file_sha(path), bytes=path.stat().st_size))
+    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root, capture_output=True,
+                          text=True, check=True).stdout.strip()
+    diff = subprocess.run(["git", "diff", "--binary", "HEAD", "--", *sorted(files)],
+                          cwd=root, capture_output=True, check=True).stdout
+    (directory / "source-working-tree.patch").write_bytes(diff)
+    record = dict(source_commit=head, source_working_tree_changed=bool(diff), closure=identity, files=records,
+                  archive_sha256=file_sha(directory / "source.tar.gz"),
+                  tooling_path=str(Path(__file__).resolve()), tooling_sha256=file_sha(__file__))
+    (directory / "source.json").write_text(json.dumps(record, indent=2) + "\n")
+    shutil.copy2(__file__, directory / "cross_compile_check.py")
+    return record
+
+
+def retained_build_command(root, script, name, tier, arch):
+    """Use the existing release binding script, without installing/publishing."""
+    column = column_of(arch).lower()
+    overrides = dict(ANONLIB_NUMERIC_MODE=tier, ANONLIB_TARGET_COLUMN=column,
+                     ANONLIB_GPU_ARCHS=arch, ANONLIB_COMPILE_JOBS="1",
+                     ANONLIB_LINUX_CPU="x86-64-v3", ANONLIB_SKIP_BUILD_GATE="1")
+    if tier == "identical":
+        overrides["ANONLIB_BUILD_DEFINES"] = ",".join(
+            os.environ.get("ANONLIB_XCC_EXTRA_DEFINES", "").split())
+    output = root / "python/anonlib" / ("" if tier == "fast" else tier) / (name + ".so")
+    return ["bash", "-x", str(root / "bindings" / script)], output, overrides
+
+
+def retain_linkage(binary, root, directory):
+    """Keep linkage diagnostics and actual resolved runtime bytes for transfer."""
+    env = os.environ.copy()
+    envlib = root / ".pixi/envs/default/lib"
+    env["LD_LIBRARY_PATH"] = str(envlib) + (":" + env["LD_LIBRARY_PATH"] if env.get("LD_LIBRARY_PATH") else "")
+    reports = {}
+    for name, cmd in (("dynamic", ["readelf", "-d", str(binary)]),
+                      ("symbol-versions", ["readelf", "--version-info", str(binary)]),
+                      ("ldd", ["ldd", str(binary)])):
+        result = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=60)
+        text = result.stdout + result.stderr
+        (directory / (name + ".log")).write_text(text)
+        reports[name] = dict(command=cmd, exit_status=result.returncode)
+        if name == "ldd":
+            runtime = directory / "runtime"
+            runtime.mkdir(exist_ok=True)
+            libraries = []
+            for line in text.splitlines():
+                match = re.search(r"(?:=>\s+|^\s*)(/\S+)\s+\(", line)
+                if match:
+                    load_path = Path(match.group(1))
+                    source = load_path.resolve()
+                    # Keep the loader-visible basename, even when it was a
+                    # symlink to a versioned library in the compiler env.
+                    dest = runtime / load_path.name
+                    if dest.exists() and file_sha(dest) != file_sha(source):
+                        raise RuntimeError("runtime basename collision: " + str(source))
+                    shutil.copy2(source, dest)
+                    libraries.append(dict(path=str(source), retained=str(dest.relative_to(directory)),
+                                          sha256=file_sha(dest), bytes=dest.stat().st_size))
+            reports[name].update(runtime=libraries, unresolved=[line.strip() for line in text.splitlines()
+                                                                if "not found" in line],
+                                 lookup_library_path=env["LD_LIBRARY_PATH"])
+    (directory / "linkage.json").write_text(json.dumps(reports, indent=2) + "\n")
+    if reports["ldd"]["exit_status"] != 0 or reports["ldd"]["unresolved"]:
+        raise RuntimeError("runtime closure incomplete; see linkage.json and ldd.log")
+    return reports
+
+
+# ---------------------------------------------------------------- GitHub matrix
+def job_key(name, tier, arch):
+    return f"{name}-{tier}-{arch}"
+
+
+def write_matrix(path, ref, jobs):
+    """{ref, count, include: [{name, script, tier, arch, key}]}: the matrix the
+    workflow fans out, from plan_jobs (the same selection the local run uses)."""
+    include = [dict(name=n, script=s, tier=t, arch=x, key=job_key(n, t, x)) for n, s, t, x in jobs]
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    Path(path).write_text(json.dumps(dict(ref=ref, count=len(include), include=include), indent=1) + "\n")
+    return include
+
+
+def max_rss_mb(time_file):
+    """GNU `time -v` "Maximum resident set size (kbytes)" in MB, or None."""
+    try:
+        for ln in Path(time_file).read_text().splitlines():
+            if "Maximum resident set size" in ln:
+                return round(int(ln.rsplit(":", 1)[1]) / 1024)
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def summarize(plan, results_dir, summary_md=""):
+    """One verdict per planned job from the result files (`--json` output,
+    one per job, anywhere under results_dir, a GNU time -v file beside each).
+    A planned job with no result is MISSING (its runner died before writing
+    one). Exit 0 only when every planned job PASSed."""
+    planned = json.loads(Path(plan).read_text())["include"] if plan else []
+    got = {}
+    for f in sorted(Path(results_dir).rglob("*.json")):
+        try:
+            doc = json.loads(f.read_text())
+        except (OSError, ValueError):
+            continue
+        for r in doc.get("results", []):
+            r = dict(r, max_rss_mb=max_rss_mb(f.parent / "time.txt"))
+            got[job_key(r["name"], r["tier"], r["arch"])] = r
+    keys = [p["key"] for p in planned] or sorted(got)
+    rows = []
+    for k in keys:
+        r = got.get(k)
+        if r is None:
+            p = next(p for p in planned if p["key"] == k)
+            r = dict(name=p["name"], tier=p["tier"], arch=p["arch"], verdict="MISSING", seconds=None,
+                     detail=["no result: the job died before writing one (see its log)"], max_rss_mb=None)
+        rows.append(r)
+    bad = [r for r in rows if r["verdict"] != "PASS"]
+    lines = ["| verdict | binding | tier | arch | seconds | max RSS MB |", "|---|---|---|---|---|---|"]
+    for r in rows:
+        lines.append(f"| {r['verdict']} | {r['name']} | {r['tier']} | {r['arch']} | "
+                     f"{'' if r['seconds'] is None else r['seconds']} | {r.get('max_rss_mb') or ''} |")
+        print(f"  {r['verdict']:8s} {r['name']:34s} {r['tier']:13s} {r['arch']:7s} "
+              f"{'' if r['seconds'] is None else r['seconds']:>7} s  rss {r.get('max_rss_mb') or '?'} MB")
+    head = (f"cross-compile-check: {len(rows) - len(bad)} of {len(rows)} PASS"
+            + ("" if not bad else "; NOT PASS: " + ", ".join(
+                f"{r['name']} {r['tier']} {r['arch']} {r['verdict']}" for r in bad)))
+    print(head)
+    for r in bad:
+        for ln in r.get("detail") or []:
+            print(f"    {r['name']} {r['tier']} {r['arch']}: {ln[:240]}")
+    if summary_md:
+        with open(summary_md, "a") as fh:
+            fh.write("## Cross-compile check\n\n" + head + "\n\n" + "\n".join(lines) + "\n")
+            if bad:
+                fh.write("\n### Not passed\n\n")
+                for r in bad:
+                    fh.write(f"- **{r['name']} {r['tier']} {r['arch']}**: {r['verdict']}\n")
+                    for ln in r.get("detail") or []:
+                        fh.write(f"  - `{ln[:240]}`\n")
+    if not rows:
+        print("cross-compile-check: nothing was planned")
+    return 1 if bad else 0
+
+
+# ---------------------------------------------------------------- main
+def last_tag(root=ROOT):
+    return subprocess.run(["git", "-C", str(root), "describe", "--tags", "--abbrev=0", "--match", "v*"],
+                          capture_output=True, text=True, check=True).stdout.strip()
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("--ref", default="", help="compare against this commit or tag (default: the last v* tag)")
+    ap.add_argument("--head", default="HEAD", help="the commit whose changes select (the WORKING TREE is compiled)")
+    ap.add_argument("--source-root", default="", help="frozen source checkout when tooling is checked out separately")
+    ap.add_argument("--keep-artifacts", default="", help="Linux only: retain full logs, source, native binaries and runtime bytes here; use the binding's build script")
+    ap.add_argument("--archs", default=",".join(DEFAULT_ARCHS))
+    ap.add_argument("--tiers", default="", help="comma list; default every tier the Linux lists ship")
+    ap.add_argument("--only", default="", help="comma list of binding names (still must be changed)")
+    ap.add_argument("--limit", type=int, default=0, help="at most this many bindings (0: all)")
+    ap.add_argument("--timeout", type=float, default=float(release_limits.get("CROSS_COMPILE_SECONDS")))
+    ap.add_argument("--stall", type=float, default=240.0, help="seconds of flat compiler CPU = STALLED (0: off)")
+    ap.add_argument("--mojo", default="pixi run mojo", help="the compiler command")
+    ap.add_argument("--cache", default="", help="identity cache (default <evidence>/release/identities)")
+    ap.add_argument("--json", default="", help="write the results here")
+    ap.add_argument("--dry-run", action="store_true", help="print the jobs, compile nothing")
+    ap.add_argument("--list-json", default="",
+                    help="write the selected jobs as a GitHub Actions matrix to this file, compile nothing")
+    ap.add_argument("--summarize", default="",
+                    help="merge the per-job result files under this directory against --plan; no selection")
+    ap.add_argument("--plan", default="", help="the --list-json file --summarize checks for completeness")
+    ap.add_argument("--summary-md", default="", help="--summarize also appends a markdown table here")
+    a = ap.parse_args(argv)
+    if a.summarize:
+        return summarize(a.plan, a.summarize, a.summary_md)
+
+    import bincache
+    import release_reuse
+    root = Path(a.source_root).resolve() if a.source_root else ROOT
+    keep = Path(a.keep_artifacts).resolve() if a.keep_artifacts else None
+    if keep and a.mojo != "pixi run mojo":
+        raise SystemExit("--keep-artifacts uses the canonical binding build script; --mojo override is not supported")
+    if keep and sys.platform != "linux" and not a.dry_run and not a.list_json:
+        raise SystemExit("--keep-artifacts executes Linux binding build scripts; use a Linux CPU runner")
+    ev = Path(os.environ.get("ANONLIB_EVIDENCE_ROOT", os.path.expanduser("~/anonlib-evidence")))
+    cache = Path(a.cache) if a.cache else ev / "release" / "identities"
+    ref = a.ref or last_tag(root)
+    print(f"cross-compile-check: {ref} .. {a.head} (working tree compiled), archs {a.archs}, "
+          f"timeout {a.timeout:.0f} s, stall {a.stall:.0f} s")
+    fact_args = dict(root=root) if a.source_root else {}
+    scripts = changed_scripts(release_reuse.facts_for_commit(ref, cache, **fact_args),
+                              release_reuse.facts_for_commit(a.head, cache, **fact_args))
+    rows = linux_rows()
+    shipped = {s for _n, s, _t in rows}
+    for script, why in sorted(scripts.items()):
+        if script in shipped:
+            print(f"  changed  bindings/{script}: {why}")
+    archs = [x for x in a.archs.split(",") if x]
+    jobs = plan_jobs(scripts, rows, archs, tiers=set(filter(None, a.tiers.split(","))),
+                     only=set(filter(None, a.only.split(","))), limit=a.limit)
+    if not jobs:
+        print("no changed Linux GPU binding: nothing to cross-compile")
+        if a.list_json:
+            write_matrix(a.list_json, ref, [])
+        return 0
+    plans = {}
+    for script in sorted({j[1] for j in jobs}):
+        plans[script] = bincache.script_plan(root, str(root / "bindings" / script), [])
+    unreadable = [s for s, pl in plans.items() if pl is None or len(pl[0]) != 1]
+    if unreadable:
+        for s in unreadable:
+            print(f"REFUSED: bindings/{s}: its compile line cannot be read literally (one root .mojo); "
+                  f"fix the script or tools/bincache.py script_plan, nothing was compiled")
+        return 2
+    if a.list_json:
+        write_matrix(a.list_json, ref, jobs)
+        print(f"cross-compile-check: {len(jobs)} job(s) written to {a.list_json}")
+        return 0
+    mojo = a.mojo.split()
+    results = []
+    scratch = Path(tempfile.mkdtemp(prefix="anonlib-xcc-"))
+    try:
+        for name, script, tier, arch in jobs:
+            roots, incs, _shells = plans[script]
+            out = scratch / f"{name}-{tier}-{arch}.so"
+            cmd = compile_cmd(mojo, roots[0].relative_to(root),
+                              [os.path.relpath(i, root) for i in incs], tier, arch, out)
+            retained = keep / job_key(name, tier, arch) if keep else None
+            overrides = {}
+            if keep:
+                cmd, out, overrides = retained_build_command(root, script, name, tier, arch)
+            if a.dry_run:
+                print(f"  would    {name:34s} {tier:13s} {arch:7s} {' '.join(cmd)}")
+                if keep:
+                    print("           environment " + json.dumps(overrides, sort_keys=True))
+                continue
+            if retained:
+                if retained.exists():
+                    raise SystemExit(f"retention directory already exists; preserve it and choose a new path: {retained}")
+                source = retain_sources(root, script, retained)
+                # An old successful output must never satisfy a failed build.
+                if out.exists():
+                    raise SystemExit(f"refusing to overwrite existing binding: {out}; use a fresh frozen source checkout")
+                (retained / "build-config.json").write_text(json.dumps(dict(
+                    name=name, tier=tier, arch=arch, environment=overrides,
+                    inherited_build_environment={key: os.environ[key] for key in (
+                        "MODULAR_HOME", "PIXI_PROJECT_MANIFEST", "ANONLIB_EXTRA_DEFINES",
+                        "ANONLIB_MOJO_BUILD_FLAGS", "ANONLIB_BUILD_EXTRA_DEFINES") if key in os.environ},
+                    source_commit=source["source_commit"], platform=platform.platform(),
+                    qualification="raw diagnostic candidate; not a release or GPU pass"), indent=2) + "\n")
+            child_env = dict(os.environ, **overrides) if retained else None
+            verdict, secs, tail = run_one(cmd, out, a.timeout, a.stall, cwd=root,
+                                          retain=retained, env=child_env)
+            if retained and out.is_file():
+                binary = retained / (name + ".so")
+                shutil.copy2(out, binary)
+                (retained / "binary.json").write_text(json.dumps(dict(
+                    source=str(out), retained=binary.name, bytes=binary.stat().st_size,
+                    sha256=file_sha(binary)), indent=2) + "\n")
+                try:
+                    retain_linkage(binary, root, retained)
+                except (OSError, subprocess.SubprocessError, RuntimeError) as exc:
+                    (retained / "retention-error.txt").write_text(str(exc) + "\n")
+                    verdict = "RETENTION_FAILED"
+                    tail = [str(exc)]
+            print(f"  {verdict:8s} {name:34s} {tier:13s} {arch:7s} {secs:7.1f} s", flush=True)
+            for ln in tail:
+                print(f"           {ln[:240]}")
+            result = dict(name=name, script=script, tier=tier, arch=arch, verdict=verdict,
+                          seconds=round(secs, 1), detail=tail)
+            if retained:
+                result["evidence"] = str(retained)
+            results.append(result)
+            if not retained:
+                out.unlink(missing_ok=True)
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+    if a.dry_run:
+        return 0
+    bad = [r for r in results if r["verdict"] != "PASS"]
+    print(f"cross-compile-check: {len(results) - len(bad)} PASS, {len(bad)} not "
+          f"({', '.join(sorted({r['verdict'] for r in bad})) or 'none'})")
+    if a.json:
+        Path(a.json).parent.mkdir(parents=True, exist_ok=True)
+        Path(a.json).write_text(json.dumps(dict(ref=ref, head=a.head, results=results), indent=1) + "\n")
+    return 1 if bad else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

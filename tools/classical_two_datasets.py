@@ -1,0 +1,3603 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 the authors. Part of anonlib, DOI-WITHHELD
+"""Classical lanes on the two benchmark datasets (CONTRIBUTING.md (Performance claims), DEVIATION 2570): OUR IDENTICAL arm beside scikit-learn on every
+CPU core and a torch GPU arm, interleaved round by round, quality beside
+every cell.
+
+    python3 tools/classical_two_datasets.py prep --data DIR \\
+        [--lanes kmeans,pca,ols,knn,kde,svc] [--datasets taxi,istella]
+    python3 tools/classical_two_datasets.py race --data DIR --out DIR \\
+        --lane kmeans --dataset taxi \\
+        --ours-python "pixi run python3" --theirs-python /root/ctd-venv/bin/python
+    python3 tools/classical_two_datasets.py summary --out DIR
+
+This is THE timing path for kmeans, pca, ols, knn, kde and svc from
+2026-09-11. The splitmix64 fixtures of `bench/bench_main.mojo`,
+`bench/speed/classical_speed_main.mojo`, `tools/speed_cuml_arm.py` and
+`bench/bench_sklearn.py` stay as correctness and smoke fixtures; a timing or a
+default flip quotes this file's two real datasets only.
+
+THE DATA (prep, untimed, once per box)
+======================================
+Read through the trees harness's own loaders, `tools/speed_gbdt_arm.py::
+load_taxi` and `::load_istella` (their NumPy caches, built by `--download`),
+and for kNN through `tools/knn_datasets.py::real_block` (DEVIATION 2524), so
+no decoding is duplicated and the column selection is the trees lane's
+`TAXI_NUMERIC`. Every block is written ONCE as an uncompressed `.npz` plus a
+JSON record (shapes, sha256 of every array, rows taken, what was cleaned),
+and every arm of every round reads those same bytes.
+
+    block   lanes            taxi (11 numeric columns)       Istella-S (220)
+    big     kmeans pca ols   train rows [0, 4,000,000)        train split, all
+                             eval: the 500,000 test rows      2,043,304 rows
+                                                              eval: 500,000 test
+    knn     knn              real_block: index [0, 400,000), queries
+                             [400,000, 404,000), k = 10
+    kde     kde              100,000 fit rows, 2,000 queries, stride-sampled
+    svc     svc              10,000 fit rows, 10,000 eval rows, stride-sampled
+
+THE SHAPES, one line each:
+  kmeans, pca, ols  4,000,000 rows is section 9's shape; Istella-S stops at
+                    its cached train split, 2,043,304 rows (the cache holds
+                    train plus 500,000 test rows; the 3.4M count includes the
+                    validation file, which the trees cache does not decode).
+  knn               DEVIATION 2524's shape, unchanged.
+  kde               the score is O(n_train x n_query x d) with no fit, so
+                    2e8 kernel evaluations is where our device time is the
+                    pairwise kernel and not the launch, and it is the largest
+                    shape at which scikit-learn's single-threaded tree score
+                    (rtol = atol = 0, no pruning) finishes six rounds inside
+                    one lease.
+  svc               SMO work grows with n^2 kernel rows; at 10,000 rows the
+                    kernel rows are the cost on the device, and scikit-learn's
+                    single-threaded libsvm finishes six fits inside one lease.
+
+WHAT IS CLEANED, IDENTICALLY FOR EVERY ARM:
+  * Istella's missing-value sentinel (float32 max, `_decode_letor`) becomes
+    0.0 in every block. A float32-max cell overflows a squared distance or a
+    Gram entry to inf on EVERY library, so leaving it would time inf
+    arithmetic. The count replaced is in the record (0 means no-op). Taxi's
+    -1 missing marker is finite and stays.
+  * kde and svc are STANDARDIZED with the fit rows' float64 column mean and
+    standard deviation (a zero deviation divides by 1). A Gaussian kernel on
+    raw Istella columns spanning seven orders of magnitude is exp(-huge) = 0
+    for every pair; any user scales first. kmeans, pca, ols and knn run on the
+    raw columns (knn exactly as DEVIATION 2524 reads them).
+  * kde's bandwidth is Scott's rule on the standardized fit rows,
+    n ** (-1 / (d + 4)); svc's gamma is 1 / d (scikit-learn's 'scale' on
+    standardized data, and ours' 'auto').
+
+THE ARMS (0b-iii: only OUR IDENTICAL arm against the opponent's FAST arm)
+=========================================================================
+  ours          anonlib's public estimator under ANONLIB_NUMERIC_MODE=
+                identical, read back by `numeric_mode_used()`. Timed from a
+                host float32 array to host results: its upload is INSIDE the
+                clock, because the public call uploads.
+  sklearn-cpu   scikit-learn on every core as installed: no OMP_NUM_THREADS,
+                OPENBLAS_NUM_THREADS or MKL_NUM_THREADS, no n_jobs cap
+                (n_jobs=-1 where the estimator takes one). The ready record
+                names the BLAS and OpenMP pools threadpoolctl reports.
+  cuml-gpu      RAPIDS cuML on NVIDIA (the GPU library on the box is the
+                opponent, DEVIATION 2571): KMeans, PCA(svd_solver='full'),
+                LinearRegression(algorithm='eig'), NearestNeighbors(brute),
+                KernelDensity and SVC, output_type='cupy'. Their FAST arm:
+                inputs are cupy arrays uploaded BEFORE the clock (upload_ms in
+                the ready record), kNN and KDE fit before the clock (kneighbors
+                and score_samples timed), the clock ends at
+                cupy.cuda.runtime.deviceSynchronize().
+  torch-gpu     PyTorch on the box's GPU (ROCm on the MI325X, CUDA on NVIDIA),
+                written the way a competent user writes it: Lloyd iterations
+                with a chunked addmm assignment; PCA by covariance eigh; OLS
+                by torch.linalg.lstsq on centered data (on CUDA its only
+                driver is gels, QR without pivoting, which assumes full rank);
+                brute-force kNN by torch.cdist plus topk per 1024-query chunk.
+                Their FAST arm: the inputs are uploaded BEFORE the clock
+                (upload_ms is in the ready record), the clock ends at
+                torch.cuda.synchronize(). Not written for kde and svc.
+                FAIRNESS FIX (2026-10-13 audit): the kmeans and knn torch-gpu
+                arms are the harness's own algorithms, not a library's, and
+                are refused (REFUSED_ARMS); before, they were raced as the
+                GPU opponent on AMD and Apple. Results raced before this change
+                were wrong for those lanes; apply extra scrutiny.
+  torch-gpu-eigh  OLS only: centered normal equations through eigh with a
+                pseudo-inverse cutoff. FAIRNESS FIX (2026-10-13 audit): it and
+                the OLS torch-gpu arm are harness-written, not a library's
+                estimator, and are refused (REFUSED_ARMS); results raced with
+                them were wrong for this lane, apply extra scrutiny.
+
+INTERLEAVING. One worker process per arm holds the data and its library for
+the whole (lane, dataset); the conductor sends `round r` to each arm in turn,
+the order rotated every round, one warm-up (round 0, excluded) and
+`--rounds` timed rounds. A worker's protocol lines go to a duplicated file
+descriptor and its fd 1 is pointed at its log, so a library that prints
+cannot corrupt the protocol.
+
+QUALITY is computed HERE, in the conductor, from each arm's saved outputs,
+by one float64 NumPy function per lane, never by the libraries' own scorers:
+  kmeans  inertia of the final centroids over the fit rows, and n_iter
+  pca     explained-variance ratio of the 8 components over the fit rows
+  ols     R2 and RMSE on the eval rows
+  knn     tie-aware recall@10 against a float64 NumPy brute force computed
+          here (a neighbour counts when its float64 distance is within the
+          reference's 10th distance), distinct ids only
+  (kmeans inertia is also given as a ratio over ours)
+  kde     mean log-likelihood of the queries
+  svc     accuracy on the eval rows
+
+OUTPUT under --out: <lane>-<dataset>.json (every round, every hash, the
+ready records, quality, ratios), <lane>-<dataset>-<arm>.log (worker stderr),
+CTD lines on stdout, and `summary` writes summary.tsv. Ratios are OURS
+median / OPPONENT median per cell (below 1 means our median is lower); a
+ratio is never a sentence here.
+
+CTD-SPAN, one per arm, says what was INSIDE that arm's clock and what was
+outside it: `input_home` (a device-resident input was uploaded before the
+clock started), `upload_ms_untimed`, `fit_ms_untimed`, `pre_clock_fit`.
+For ours it also carries `upload_ms_separate`, a SEPARATE upload of the same
+input timed after each scored round outside every clock (`_ours_upload_probe`),
+and `fit_minus_upload_ms`, derived from the two medians: a kernel-only
+reading beside the whole-operation one. The scored clock's boundary is
+unchanged.
+CTD-RATIO carries a `span_asymmetry=` field naming every opponent whose clock
+covers less work than ours. Every term of it was already being recorded in the
+ready records and none of it used to reach the line a reader reads. Ours
+uploads and validates INSIDE its clock and the GPU opponents do not, which on
+Istella-S KDE is roughly 19.7 ms of host work at d = 220 (7.28 ms of it
+validation) against 36.9 ms of device entry -- an asymmetry that runs AGAINST
+us. Nothing is equalized: no work moves into or out of any clock and no ratio
+changes. The point is that a ratio spanning two different amounts of work
+cannot be read as like-for-like without saying so.
+
+knn and kde fit BEFORE the clock on EVERY arm, ours included (each worker fits
+its index or its density at construction and times kneighbors or
+score_samples), so `pre_clock_fit` is declared true on ours there too and
+`fit_before_its_clock` no longer marks those races. What remains marked is
+the device-resident input of the torch and cuML arms (their FAST arm, by the
+board's rule).
+
+NVIDIA'S VALUES (2026-09-29): every lane here has a cuML benchmark
+AlgorithmPair (tools/bench_board_harness.py CUML, rapidsai/cuml
+python/cuml/cuml/benchmark/algorithms.py at the recorded commit), and each
+parameter it sets explicitly is the value on EVERY arm: kmeans n_clusters=8,
+init='k-means++', max_iter=300, n_init=1 (oversampling_factor=0 on cuML and
+ours, the classic sequential seeding); pca n_components=10; knn
+n_neighbors=64 (scikit-learn algorithm='brute', n_jobs=-1); kde
+kernel='gaussian', bandwidth=1.0; dbscan eps=3, min_samples=2 (scikit-learn
+algorithm='brute'); svc kernel='rbf'. ols and hdbscan pass nothing. What the
+harness leaves at the libraries' defaults keeps the value below on every arm.
+
+SAME SEED, SAME TUNING PARAMETERS (2026-09-29): every arm gets seed 7 through
+its library's own argument and every parameter the libraries share is set
+explicitly; CONFIG names what cannot be matched. Each worker sends the
+read-back of what it constructed and `race` runs tools/bench_board_params.py's
+check before the first timed round; a refusal fails the race by name (exit 3,
+`params_refused` in the JSON).
+"""
+import argparse
+import hashlib
+import importlib.util
+import json
+import os
+import select
+import shlex
+import signal
+import statistics
+import subprocess
+import sys
+import time
+
+import numpy as np
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(HERE)
+
+LANES = ("kmeans", "pca", "ols", "knn", "kde", "svc", "dbscan", "hdbscan")
+DATASETS = ("taxi", "istella")
+#: Every arm a lane has. A leg names the ones it races with --arms (NVIDIA:
+#: ours, cuml-gpu and torch; AMD: ours, torch ROCm and scikit-learn on the CPU).
+ARMS = {
+    # FAIRNESS FIX (2026-10-13 audit): the kmeans and knn rosters listed
+    # `torch-gpu`, k-means (index_add_) and kNN (cdist + topk) that this harness
+    # writes from torch primitives, raced as if it were a library opponent (the
+    # only GPU opponent on AMD and Apple). It is removed from both rosters, and a
+    # leg that still names it gets a refusal with the reason (REFUSED_ARMS,
+    # `race`). Results raced before this change were wrong for this lane; apply
+    # extra scrutiny.
+    # FAIRNESS FIX (2026-10-13 audit, the author's correction): the harness
+    # arm is REPLACED where a library exists. `hipvs-gpu` is hipVS (AMD's port
+    # of cuVS, `pip install amd-hipvs`, the same `cuvs` Python API): its
+    # k-means (cuvs.cluster.kmeans) and brute-force kNN
+    # (cuvs.neighbors.brute_force) are the AMD GPU opponents, at the settings
+    # the NVIDIA cuML arms are pinned to. No maintained library k-means or kNN
+    # runs on the Apple GPU (MPS/Metal), so Apple keeps scikit-learn on the CPU.
+    # Results raced before this change were wrong for these lanes; apply extra
+    # scrutiny.
+    "kmeans": ("ours", "cuml-gpu", "hipvs-gpu", "sklearn-cpu"),
+    # FAIRNESS FIX (2026-10-13 audit): pca's torch-gpu arm (TorchPCA) is harness code, a
+    # covariance eigh written from torch ops, not a library's PCA, and was raced as an opponent.
+    # It is removed from the roster and refused (REFUSED_ARMS). Results raced before this change
+    # were wrong for this lane; apply extra scrutiny.
+    "pca": ("ours", "cuml-gpu", "sklearn-cpu"),
+    # FAIRNESS FIX (2026-10-13 audit): torch-gpu-eigh was OLS written by this harness from
+    # torch primitives (the centered normal equations, torch.linalg.eigh and a pseudo-inverse
+    # cutoff), raced as an opponent; it is refused (REFUSED_ARMS). torch-gpu stays: it is
+    # torch's own least-squares routine, torch.linalg.lstsq, with its driver pinned to 'gels'
+    # (QR, ours' algorithm class; the only GPU driver torch has); see TorchOLS. Results raced
+    # before this change were wrong for this lane; apply extra scrutiny.
+    "ols": ("ours", "cuml-gpu", "torch-gpu", "sklearn-cpu"),
+    "knn": ("ours", "cuml-gpu", "hipvs-gpu", "sklearn-cpu"),
+    "kde": ("ours", "cuml-gpu", "sklearn-cpu"),
+    "svc": ("ours", "cuml-gpu", "sklearn-cpu"),
+    # Lane linear-cluster-istella (2026-09-11): DBSCAN at 1,000,000 rows,
+    # measurement only. `cuml-gpu` is cuML's default eps search ('brute'),
+    # `cuml-gpu-rbc` its random ball cover.
+    # FAIRNESS FIX (2026-10-13 audit): ours ran algorithm='rbc' while the raced
+    # cuml-gpu arm ran 'brute' (cuml-gpu-rbc, the same algorithm as ours, was
+    # never raced: it overflows at 1,000,000 rows), so the two arms ran different
+    # neighbour searches. Ours now runs algorithm='brute', the algorithm of
+    # cuml-gpu and scikit-learn, and cuml-gpu-rbc leaves the roster (racing it
+    # beside ours' brute would be a different algorithm again; the parameter
+    # check refuses it). Results raced before this change were wrong for this
+    # lane; apply extra scrutiny.
+    # HDBSCAN: ours (anonlib.HDBSCAN, shipped since 0.8.x), cuML on NVIDIA,
+    # scikit-learn on the CPU, every arm with the SAME min_samples,
+    # min_cluster_size, metric and cluster selection (CumlHDBSCAN's).
+    "dbscan": ("ours", "cuml-gpu", "sklearn-cpu"),
+    "hdbscan": ("ours", "cuml-gpu", "sklearn-cpu"),
+}
+#: FAIRNESS FIX (2026-10-13 audit): arms that are not opponents, with the reason. race()
+#: drops one a caller still names (a CTD-REFUSED line and result["refused_arms"]), and the
+#: rest of the race runs. Results raced before this change were wrong for these lanes; apply
+#: extra scrutiny.
+REFUSED_ARMS = {
+    ("ols", "torch-gpu-eigh"): "harness-written: OLS assembled by this harness from torch ops "
+                               "(centered normal equations, torch.linalg.eigh, a pseudo-inverse "
+                               "cutoff); not a library's implementation",
+    # FAIRNESS FIX (2026-10-13 audit): TorchKMeans and TorchKNN below are this
+    # harness's own k-means and kNN, written from torch ops; they were raced as
+    # the GPU opponent on AMD and Apple. Refused now, never raced. Results raced
+    # before this change were wrong for these lanes; apply extra scrutiny.
+    ("kmeans", "torch-gpu"): "harness-written: k-means assembled by this harness from torch ops "
+                             "(greedy k-means++ plus Lloyd by addmm/argmin/index_add_), not a "
+                             "library's implementation; no library GPU k-means is installed on "
+                             "AMD or Apple, so those races have no GPU opponent",
+    ("knn", "torch-gpu"): "harness-written: brute-force kNN assembled by this harness from torch "
+                          "ops (torch.cdist plus topk per query chunk), not a library's "
+                          "implementation; no library GPU kNN is installed on AMD or Apple, so "
+                          "those races have no GPU opponent",
+    # FAIRNESS FIX (2026-10-13 audit): pca's torch-gpu arm was raced as an opponent; it is a
+    # covariance eigh this harness wrote (TorchPCA). Results raced before this change were wrong
+    # for this lane; apply extra scrutiny.
+    # Re-checked for a replacement (author's correction, same day): NVIDIA races cuML PCA
+    # (svd_solver='full' = COV_EIG_DQ, ours' covariance eigendecomposition). No library GPU PCA
+    # with this algorithm exists for AMD (ROCm-DS 26.03 has hipDF, hipMM, hipGRAPH, hipRAFT
+    # 1.0.0 whose Python API is common/random/sparse only, hipVS, dask-hip, hip-ucxx: no cuML
+    # port) or Apple (torch MPS has no linalg.eigh; MLX has no PCA), so there scikit-learn on the
+    # CPU is the only opponent.
+    ("pca", "torch-gpu"): "harness-written: PCA assembled by this harness from torch ops (mean, "
+                          "xc.T @ xc, torch.linalg.eigh); torch has no PCA estimator of this "
+                          "algorithm (torch.pca_lowrank is randomized, a different algorithm); "
+                          "NVIDIA races cuML PCA (the same algorithm), and AMD and Apple have no "
+                          "library GPU PCA (ROCm-DS 26.03 has no cuML port), so scikit-learn on "
+                          "the CPU is their opponent",
+}
+BLOCK_OF = {"kmeans": "big", "pca": "big", "ols": "big", "knn": "knn",
+            "kde": "kde", "svc": "svc", "dbscan": "dbscan", "hdbscan": "dbscan"}
+#: DBSCAN block rows and parameters. eps and min_samples come from the
+#: environment (ANONLIB_CTD_DBSCAN_<DATASET>="eps,min_samples"), the SAME
+#: value for every arm, chosen per dataset by the lane's rule and recorded in
+#: each race's arm info; the block itself is standardized like kde and svc.
+DBSCAN_ROWS = 1_000_000
+HDBSCAN_ROWS = 100_000
+
+BIG_ROWS = 4_000_000
+#: The board's one seed (tools/bench_board.py SEED), given to every arm through
+#: the library's own seed argument; an arm without one is named in CONFIG.
+SEED = 7
+#: cuML benchmark KMeans shared_args (tools/bench_board_harness.py): n_clusters=8,
+#: init='k-means++', max_iter=300, n_init=1; cuml_args oversampling_factor=0,
+#: which ours takes too (it is cuML's k-means: 0 is the classic sequential
+#: k-means++ seeding, scikit-learn's).
+KMEANS_K = 8
+KMEANS_ITER = 300
+KMEANS_INIT = "k-means++"
+KMEANS_OVERSAMPLING = 0.0
+#: One tol on every arm that takes one (the harness leaves it at the
+#: libraries' defaults). ours and cuML refuse tol <= 0 ("invalid parameter
+#: (tol<=0)"), so 0.0 cannot be the shared value.
+#: THE STOPPING RULE, THE SAME ON EVERY ARM: stop after the iteration whose
+#: total squared center shift sum_c ||c_new - c_old||^2 falls below KMEANS_TOL
+#: (an absolute threshold), or after KMEANS_ITER iterations. That is cuVS's
+#: rule (detail/kmeans.cuh: `if (sqrdNormError < params.tol) done = true`,
+#: inertia_check off by default, cuML exposes no switch) and ours (a
+#: transcription, cluster/impl/detail/kmeans_common.mojo check_convergence).
+#: scikit-learn's tol is RELATIVE (center_shift_tot <= tol * mean(var(X, axis=0)),
+#: sklearn/cluster/_kmeans.py _tolerance), so it is given
+#: KMEANS_TOL / mean(var(X, axis=0)) of the same fit rows (SkKMeans), which is
+#: the same absolute threshold.
+KMEANS_TOL = 1e-7
+#: cuML benchmark PCA shared_args n_components=10
+PCA_COMPONENTS = 10
+#: cuML benchmark NearestNeighbors shared_args n_neighbors=64
+KNN_K = 64
+#: cuML benchmark KernelDensity shared_args kernel='gaussian', bandwidth=1.0
+KDE_BANDWIDTH = 1.0
+#: cuML benchmark DBSCAN shared_args eps=3, min_samples=2 (cpu_args algorithm='brute')
+DBSCAN_EPS = 3.0
+DBSCAN_MIN_SAMPLES = 2
+KDE_TRAIN = 100_000
+KDE_QUERY = 2_000
+KDE_LEAF_SIZE = 40
+SVC_TRAIN = 10_000
+SVC_EVAL = 10_000
+SVC_C = 1.0
+SVC_TOL = 1e-3
+SVC_CACHE_MB = 2000.0
+SVC_DEGREE = 3
+SVC_COEF0 = 0.0
+SVC_MAX_ITER = -1
+#: Set explicitly on every SVC arm so the parameter audit compares like for like: cuML's SVC
+#: default is 'ovo' (pairwise decision columns); ours and scikit-learn's default 'ovr'. The
+#: fit is the same one-vs-one machines either way; only the multiclass decision_function differs.
+SVC_DFS = "ovo"
+TORCH_CHUNK_ROWS = 1 << 20
+TORCH_KNN_QUERY_CHUNK = 1024
+
+#: What every arm of a lane is set to and every mismatch that could not be
+#: removed, one line each (the classical2 driver's LANE_CONFIG shape). `race`
+#: writes it into the race JSON as `lane_config` and prints it as CTD-SETTINGS
+#: and CTD-MISMATCH lines. Rule: same seed and same value of every parameter
+#: both sides have; what exists on one side only, or cannot be matched, is
+#: named here with each side's value.
+CONFIG = {
+    "kmeans": {
+        "rows": "big block: 4,000,000 taxi rows or the Istella-S train split, raw",
+        "params": "n_clusters=8, init='k-means++', max_iter=300, n_init=1 (the cuML benchmark's "
+                  "KMeans), oversampling_factor=0 on ours and cuML (its cuml_args; the classic "
+                  "sequential seeding), tol=1e-7 (an absolute squared center shift on every "
+                  "arm; scikit-learn's relative tol rescaled to it), metric='euclidean', Lloyd; "
+                  "seed 7 (ours, scikit-learn and cuML random_state=7)",
+        "timed": "fit (the k-means++ seeding included on every arm)",
+        # FAIRNESS FIX (2026-10-13 audit): the stopping rule differed by arm:
+        # ours and cuML stop on an absolute squared center shift < 1e-7, while
+        # scikit-learn read tol=1e-7 as relative to the mean feature variance and
+        # the harness torch arm ran scikit-learn's rule (it ran 91 iterations to
+        # ours' 33 on AMD Istella). Now every arm stops on the same absolute
+        # threshold within the same max_iter=300 (KMEANS_TOL), n_iter is recorded
+        # for every arm with its ratio over ours, and the torch arm is refused
+        # (REFUSED_ARMS). Results raced before this change were wrong for this
+        # lane; apply extra scrutiny.
+        "mismatches": [
+            "k-means++: each library draws its own start from its own generator seeded 7, so "
+            "the starts differ and so may n_iter; scikit-learn greedy k-means++ (2 + log k "
+            "candidates per center), ours and cuML the sequential k-means++ of cuML "
+            "(oversampling_factor=0)",
+            "stopping rule, the same on every arm: total squared center shift below 1e-7 "
+            "(absolute) or max_iter=300. ours and cuML tol=1e-7 is that threshold (cuVS "
+            "kmeans.cuh sqrdNormError < tol; inertia_check off); scikit-learn's tol is relative "
+            "to mean(var(X)), so it gets 1e-7 / mean(var(X)) of the same rows (the same "
+            "absolute threshold; it also stops when no label changes, a zero shift). n_iter and "
+            "n_iter_over_ours are in every quality cell",
+            "algorithm: scikit-learn algorithm='lloyd'; ours and cuML have no such parameter "
+            "(Lloyd)",
+            "torch-gpu: refused, not an opponent (the harness's own k-means from torch ops); "
+            "hipvs-gpu (AMD): hipVS cuvs.cluster.kmeans, init_method='KMeansPlusPlus' with "
+            "oversampling_factor=0, tol=1e-7 under cuVS's rule, squared L2, no seed argument",
+        ],
+    },
+    "pca": {
+        "rows": "big block, raw",
+        "params": "n_components=10 (the cuML benchmark's PCA), whiten=False, random_state=7; "
+                  "ours and scikit-learn "
+                  "svd_solver='covariance_eigh'",
+        "timed": "fit",
+        "mismatches": [
+            "svd_solver: cuML has no 'covariance_eigh'; cuml-gpu runs svd_solver='full' (cuML's "
+            "COV_EIG_DQ: the eigendecomposition of the covariance, ours' algorithm)",
+            # FAIRNESS FIX (2026-10-13 audit): torch-gpu was a harness-written covariance eigh
+            # raced as an opponent; it is refused (TorchPCA). Results raced before this change
+            # were wrong for this lane; apply extra scrutiny.
+            "torch-gpu: refused (fairness audit 2026-10-13): torch has no PCA estimator of this "
+            "algorithm; the old arm was a covariance eigh our harness wrote from torch ops, not "
+            "an opponent (torch.pca_lowrank is a randomized method, a different algorithm)",
+            "random_state is read by none of the covariance solvers; set to 7 on every arm",
+        ],
+    },
+    "ols": {
+        "rows": "big block, raw; R2 and RMSE on the 500,000 eval rows",
+        "params": "fit_intercept=True",
+        "timed": "fit",
+        # FAIRNESS FIX (2026-10-13 audit): this said ours solved the normal equations by eig
+        # beside cuML algorithm='eig'; ours' IDENTICAL fit is a TSQR (no Gram), and cuML now
+        # races its QR solver. Results raced before this change were wrong for this lane; apply
+        # extra scrutiny.
+        "mismatches": [
+            "seed: no arm has a seed argument (closed-form fit)",
+            "solver (no parameter on ours): ours' IDENTICAL fit centers X and y and runs a blocked "
+            "Householder TSQR of [X | y], then the SVD of its small R with a pseudo-inverse "
+            "cutoff (python/anonlib/linear_model.py _ols_tsqr_centered; tall designs, at most "
+            "511 columns; the condition number is not squared); its FAST fit (Apple) solves the "
+            "equilibrated normal equations. cuML algorithm='qr' (geqrf, R x = Q^T y: the same "
+            "QR of the tall design, no rank cutoff); scikit-learn scipy lstsq gelsd (SVD)",
+            "torch-gpu: torch.linalg.lstsq(driver='gels') on the centered data, torch's own "
+            "least-squares routine (QR without pivoting, full rank assumed; the only driver "
+            "torch has on CUDA and ROCm; MPS has no lstsq, so Apple has no torch arm)",
+            "torch-gpu-eigh: refused, harness-written (REFUSED_ARMS)",
+            "scikit-learn positive=False and copy_X=True: parameters ours does not have",
+        ],
+    },
+    "knn": {
+        "rows": "knn block: 400,000 index rows, 4,000 queries, raw",
+        "params": "n_neighbors=64 (the cuML benchmark's NearestNeighbors), metric='euclidean', "
+                  "algorithm='brute' (ours, scikit-learn, cuML)",
+        "timed": "kneighbors; the fit (index) is before the clock on every arm",
+        "mismatches": [
+            "seed: no arm has a seed argument (exact search)",
+            "query_tile: ours only (tiling, results unchanged); n_jobs=-1: scikit-learn only",
+            # FAIRNESS FIX (2026-10-13 audit): torch-gpu (cdist + topk written by
+            # this harness) was the GPU opponent on AMD and Apple. Refused now
+            # (REFUSED_ARMS). Results raced before this change were wrong for
+            # this lane; apply extra scrutiny.
+            "torch-gpu: refused, not an opponent (the harness's own cdist + topk kNN); "
+            "hipvs-gpu (AMD): hipVS cuvs.neighbors.brute_force, built before the clock, "
+            "search timed",
+        ],
+    },
+    "kde": {
+        "rows": "kde block: 100,000 fit rows, 2,000 queries, standardized",
+        "params": "bandwidth=1.0, kernel='gaussian' (the cuML benchmark's KernelDensity), "
+                  "metric='euclidean' on every arm; "
+                  "ours and scikit-learn atol=0, rtol=0, algorithm='auto', leaf_size=40, "
+                  "breadth_first=True",
+        "timed": "score_samples; the fit is before the clock on every arm",
+        "mismatches": [
+            "seed: no arm has a seed argument (exact density)",
+            "cuML has no atol, rtol, algorithm, leaf_size or breadth_first (exact brute force)",
+        ],
+    },
+    "svc": {
+        "rows": "svc block: 10,000 fit rows, 10,000 eval rows, standardized",
+        "params": "C=1.0, kernel='rbf', gamma=1/d, tol=1e-3, degree=3, coef0=0.0, max_iter=-1, "
+                  "cache_size=2000 MB, class_weight=None",
+        "timed": "fit",
+        "mismatches": [
+            "seed: scikit-learn and cuML random_state=7 (read only with probability=True); "
+            "ours refuses random_state without probability=True, so ours stays None",
+            "cache_size=2000 on every arm; ours honors it only as the prediction buffer "
+            "(DEVIATION 871), so its training is unaffected",
+            "shrinking=True: scikit-learn only; nochange_steps=1000: ours and cuML only",
+        ],
+    },
+    "dbscan": {
+        "rows": "dbscan block: 1,000,000 rows, standardized",
+        "params": "eps=3, min_samples=2 (the cuML benchmark's DBSCAN) on every arm; "
+                  "metric='euclidean'",
+        "timed": "fit",
+        # FAIRNESS FIX (2026-10-13 audit): ours raced algorithm='rbc' against
+        # cuML's 'brute'. Every raced arm now runs 'brute'. Results raced before
+        # this change were wrong for this lane; apply extra scrutiny.
+        "mismatches": [
+            "seed: no arm has a seed argument (deterministic)",
+            "algorithm='brute' on every raced arm (ours, cuml-gpu, scikit-learn: the cuML "
+            "benchmark's cpu_args); ours' default 'rbc' is not raced, and cuml-gpu-rbc "
+            "(overflows at 1,000,000 rows) is not on the roster",
+            "leaf_size=30 and n_jobs=-1: scikit-learn only",
+        ],
+    },
+    "hdbscan": {
+        "rows": "the dbscan block's first 100,000 rows",
+        "params": "min_samples=10 (scikit-learn 11: the same core distance, the 10th neighbour "
+                  "besides the point), min_cluster_size=100, metric='euclidean', "
+                  "cluster_selection_method='eom', cluster_selection_epsilon=0.0, alpha=1.0, "
+                  "allow_single_cluster=False",
+        "timed": "fit",
+        "mismatches": [
+            "seed: no arm has a seed argument (deterministic)",
+            "max_cluster_size: ours and cuML 0, scikit-learn None (both mean no limit)",
+            # lane quality-fix-identical (2026-10-15): the taxi noise gap (ours 14.06% noise, cuML
+            # 13.10%, scikit-learn 14.22%; silhouette 0.0015 vs cuML 0.0120) traced to this; core
+            # distance, reachability, condensing, stability, EOM selection and labelling match cuML.
+            "spanning tree: ours and scikit-learn build the exact minimum spanning tree of the full "
+            "mutual-reachability graph; cuML builds it over the symmetrized (min_samples + 1)-NN "
+            "graph in mutual-reachability space and joins its components (cuVS "
+            "cluster/detail/single_linkage.cuh:75-135, mst.cuh cross_component_nn), an approximate "
+            "tree where groups of duplicate rows split that graph (taxi)",
+            "min_samples: ours and cuML 10, scikit-learn 11. The SAME k-th neighbour: cuML's "
+            "runner.h:68-80 (ours transcribes it) runs the k-NN at min_samples + 1 including the "
+            "point itself; scikit-learn's kneighbors(X, min_samples) counts the point itself "
+            "(its HDBSCAN Notes say so). tools/bench_board_params.py maps both to one canonical value",
+            # FAIRNESS FIX (2026-10-13 audit): cuML's k-NN graph builder was left
+            # at its library default (build_algo; 'brute_force' in 26.08, an
+            # exact k-NN as ours). It is now pinned to 'brute_force' explicitly so
+            # a default change cannot move cuML to approximate 'nn_descent'.
+            # Results raced before this change were wrong for this lane; apply
+            # extra scrutiny.
+            "k-NN graph: exact brute force on every arm; cuML build_algo='brute_force' pinned "
+            "(as ours); scikit-learn algorithm='brute' (FAIRNESS FIX 2026-10-13: it was 'auto', a "
+            "KD/ball tree), leaf_size=40 unused, n_jobs=-1",
+        ],
+    },
+}
+
+
+def construct_tolerant(cls, kw, info):
+    """`(cls(**kw), kw)`. A keyword this build of an OPPONENT library does not
+    take is dropped and named in info['params_not_in_this_build'] with the
+    value it would have had, never silently. Ours never goes through here: a
+    parameter our wheel refuses fails the arm by name."""
+    kw = dict(kw)
+    while True:
+        try:
+            return cls(**kw), kw
+        except TypeError as exc:
+            msg = str(exc)
+            bad = [k for k in kw if "'%s'" % k in msg]
+            if not bad:
+                raise
+            for k in bad:
+                info.setdefault("params_not_in_this_build", {})[k] = repr(kw.pop(k))
+
+_cq_spec = importlib.util.spec_from_file_location("cpu_quota", os.path.join(HERE, "cpu_quota.py"))
+_cq = importlib.util.module_from_spec(_cq_spec)
+_cq_spec.loader.exec_module(_cq)
+THREAD_ENV, cpu_quota_threads, apply_cpu_quota = _cq.THREAD_ENV, _cq.cpu_quota_threads, _cq.apply_cpu_quota
+
+
+# ---------------------------------------------------------------------------
+# Shared helpers
+# ---------------------------------------------------------------------------
+
+def _module(name):
+    """A tools/ module by file path (the trees harness and the kNN loader
+    import stdlib and numpy only at import time)."""
+    path = os.path.join(HERE, name + ".py")
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def sha256_array(a):
+    a = np.ascontiguousarray(a)
+    h = hashlib.sha256()
+    h.update(str(a.dtype).encode())
+    h.update(str(a.shape).encode())
+    h.update(a.data)
+    return h.hexdigest()
+
+
+def stride_rows(n, m):
+    """`m` evenly spaced row indices over [0, n), deterministic."""
+    m = min(m, n)
+    return (np.arange(m, dtype=np.int64) * n) // m
+
+
+def clean_sentinel(x):
+    """Istella's missing sentinel (float32 max) and any non-finite cell to
+    0.0, in a float32 C-contiguous copy. Returns (array, cells replaced)."""
+    x = np.array(x, dtype=np.float32, order="C", copy=True)
+    bad = ~np.isfinite(x) | (x >= np.finfo(np.float32).max)
+    count = int(bad.sum())
+    if count:
+        x[bad] = 0.0
+    return x, count
+
+
+def standardize(fit, *others):
+    """Column mean and standard deviation of `fit` in float64 (zero
+    deviation divides by 1), applied to `fit` and every other array,
+    returned as float32 C-contiguous arrays."""
+    f64 = fit.astype(np.float64)
+    mu = f64.mean(axis=0)
+    sd = f64.std(axis=0)
+    sd[sd == 0.0] = 1.0
+    out = [np.ascontiguousarray(((f64 - mu) / sd).astype(np.float32))]
+    for o in others:
+        out.append(np.ascontiguousarray(((o.astype(np.float64) - mu) / sd)
+                                        .astype(np.float32)))
+    return out
+
+
+def distinct_init_rows(x, k):
+    """`k` distinct rows of `x` for the k-means initial centroids: rows
+    c * (n // k), walking forward past a row equal to one already taken."""
+    n = x.shape[0]
+    step = max(1, n // k)
+    taken, rows = set(), []
+    for c in range(k):
+        i = c * step
+        while i < n and x[i].tobytes() in taken:
+            i += 1
+        if i >= n:
+            raise RuntimeError("fewer than %d distinct rows for the init" % k)
+        taken.add(x[i].tobytes())
+        rows.append(i)
+    return np.ascontiguousarray(x[rows]), rows
+
+
+def median(xs):
+    return float(statistics.median(xs)) if xs else None
+
+
+def _bp():
+    """tools/bench_board_params.py, the board's one parameter check."""
+    if HERE not in sys.path:
+        sys.path.insert(0, HERE)
+    import bench_board_params
+    return bench_board_params
+
+
+def _array_tag(a):
+    """An array-valued parameter (k-means' shared init rows) as its digest,
+    so two arms given the same rows compare equal and a different array does
+    not."""
+    return "array sha256:%s" % sha256_array(np.asarray(_to_host(a)))[:16]
+
+
+def params_record(obj):
+    """What a worker sends for its arm: BP.arm_record of the object it
+    constructed (or the declared dict of a function arm), array values given
+    as digests. An unreadable object sends an empty record, which the check
+    refuses by name (no seed read back)."""
+    BP = _bp()
+    if obj is None:
+        return {"__record__": True, "library": "?", "source": "no parameter object", "params": {}}
+    try:
+        rec = BP.arm_record(obj)
+        _lib, _src, raw = BP.read_params(obj)
+    except Exception as exc:  # noqa: BLE001
+        return {"__record__": True, "library": "?", "source": "unreadable (%r)" % (exc,),
+                "params": {}}
+    for k, v in raw.items():
+        if k in rec["params"] and getattr(v, "ndim", 0) >= 1 and hasattr(v, "shape"):
+            rec["params"][k] = _array_tag(v)
+    # ours takes k-means' shared rows as init='array' plus init_centroids; the
+    # opponents take the array as init. Both are the same rows.
+    if rec["library"] == "anonlib" and rec["params"].get("init") == "array" \
+            and isinstance(rec["params"].get("init_centroids"), str):
+        rec["params"]["init"] = rec["params"]["init_centroids"]
+    return rec
+
+
+def smoke_scorer_receipt(RSP, run, lane, dataset):
+    """--params-only --scorer-preflight: the scorer preflight's receipt, or a `refused` receipt naming the
+    failed check (with the reason text a timed race would refuse with). Never raises."""
+    try:
+        return run()
+    except RSP.ScorerUnavailable as exc:
+        why = str(exc)
+        why = why if why.startswith(RSP.SCORER_REFUSED) else RSP.SCORER_REFUSED + why
+        return {"lane": lane, "dataset": dataset, "status": "refused", "reason": why}
+
+
+def params_only_exit(result, workers, arms, lane_id, family, path):
+    """--params-only: every arm is constructed (its worker is ready) and its
+    parameters read back; write the check's report and each arm's info to
+    `path`, stop every worker, and return 0 before any warm-up. The board
+    keys its opponent store by this read-back (tools/bench_board_store.py)."""
+    BP = _bp()
+    records = {a: result["arms"][a].get("params_record") for a in arms
+               if workers[a].alive and result["arms"][a].get("params_record") is not None}
+    result["params_check"] = BP.check(lane_id, records, family=family) if records else None
+    result["params_only"] = True
+    for arm in arms:
+        w = workers[arm]
+        if w.alive:
+            w.kill("params_only", None)
+        try:
+            w.log.close()
+        except Exception:  # noqa: BLE001
+            pass
+    result["finished"] = now_utc()
+    with open(path, "w") as fh:
+        json.dump(result, fh, indent=2, sort_keys=True, default=str)
+    print("PARAMS-ONLY %s" % path, flush=True)
+    return 0
+
+
+def enforce_params(lane, family, records, result, tag):
+    """BP.enforce over the arms that came up. Returns the refusal text, or
+    None when every arm matched. The report goes into the race JSON either way."""
+    BP = _bp()
+    try:
+        result["params_check"] = BP.enforce(lane, records, family=family)
+        return None
+    except BP.ParamsRefused as exc:
+        result["params_check"] = BP.check(lane, records, family=family)
+        result["params_refused"] = str(exc)
+        print("%s-PARAMS-REFUSED lane=%s %s" % (tag, lane, exc), flush=True)
+        return str(exc)
+
+
+def now_utc():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+# ---------------------------------------------------------------------------
+# prep: the blocks, written once
+# ---------------------------------------------------------------------------
+
+def _taxi_numeric(harness, x):
+    cols = [harness.TAXI_FEATURES.index(c) for c in harness.TAXI_NUMERIC]
+    return np.ascontiguousarray(x[:, cols])
+
+
+def _write_block(data_dir, name, arrays, record):
+    path = os.path.join(data_dir, name + ".npz")
+    tmp = path + ".tmp.npz"
+    np.savez(tmp, **arrays)
+    os.replace(tmp, path)
+    record["arrays"] = {k: {"shape": list(v.shape), "dtype": str(v.dtype),
+                            "sha256": sha256_array(v)}
+                        for k, v in arrays.items()}
+    record["written"] = now_utc()
+    with open(os.path.join(data_dir, name + ".json"), "w") as fh:
+        json.dump(record, fh, indent=2, sort_keys=True, default=str)
+    print("CTD-PREP block=%s %s" % (name, " ".join(
+        "%s=%s" % (k, "x".join(str(s) for s in v.shape))
+        for k, v in arrays.items())), flush=True)
+
+
+def prep(args):
+    lanes = [l for l in args.lanes.split(",") if l]
+    datasets = [d for d in args.datasets.split(",") if d]
+    for l in lanes:
+        if l not in LANES:
+            raise SystemExit("unknown lane %r; choose from %s" % (l, LANES))
+    for d in datasets:
+        if d not in DATASETS:
+            raise SystemExit("unknown dataset %r; choose from %s" % (d, DATASETS))
+    os.makedirs(args.data, exist_ok=True)
+    harness = _module("speed_gbdt_arm")
+    blocks = sorted({BLOCK_OF[l] for l in lanes})
+    # --max-rows: the SMOKE shape (a harness bug costs minutes, not a lease).
+    # Every block is capped; a smoke block is never a timing row.
+    cap = int(args.max_rows) if args.max_rows else None
+    big_rows = min(BIG_ROWS, cap) if cap else BIG_ROWS
+    eval_cap = cap
+    knn_index = min(400_000, cap) if cap else 400_000
+    knn_queries = min(4_000, max(64, cap // 50)) if cap else 4_000
+    kde_train = min(KDE_TRAIN, cap) if cap else KDE_TRAIN
+    kde_query = min(KDE_QUERY, max(64, cap // 100)) if cap else KDE_QUERY
+    svc_train = min(SVC_TRAIN, max(256, cap // 10)) if cap else SVC_TRAIN
+    svc_eval = min(SVC_EVAL, max(256, cap // 10)) if cap else SVC_EVAL
+    for ds in datasets:
+        t0 = time.perf_counter()
+        base = {"dataset": ds, "data_root": harness.data_root(),
+                "rule": "CONTRIBUTING.md (Performance claims); DEVIATION 2570",
+                "smoke_max_rows": cap}
+        reg = None
+        if "big" in blocks or "kde" in blocks:
+            if ds == "taxi":
+                reg = harness.load_taxi("shipped", regression=True)
+                xtr = _taxi_numeric(harness, reg.X_train)
+                xte = _taxi_numeric(harness, reg.X_test)
+                loader = "speed_gbdt_arm.load_taxi('shipped', regression=True), TAXI_NUMERIC columns"
+            else:
+                reg = harness.load_istella("shipped", regression=True)
+                xtr, xte = reg.X_train, reg.X_test
+                loader = "speed_gbdt_arm.load_istella('shipped', regression=True)"
+            ytr = np.ascontiguousarray(reg.y_train, dtype=np.float32)
+            yte = np.ascontiguousarray(reg.y_test, dtype=np.float32)
+        if "big" in blocks:
+            n = min(big_rows, xtr.shape[0])
+            X, bad_x = clean_sentinel(xtr[:n])
+            n_eval = min(eval_cap, xte.shape[0]) if eval_cap else xte.shape[0]
+            Xq, bad_q = clean_sentinel(xte[:n_eval])
+            yte = yte[:n_eval]
+            init, init_rows = distinct_init_rows(X, KMEANS_K)
+            rec = dict(base, block="big", lanes=["kmeans", "pca", "ols"],
+                       loader=loader, fit_rows=[0, n],
+                       fit_rows_available=int(xtr.shape[0]),
+                       capped_below_4M=bool(n < BIG_ROWS),
+                       eval_rows="the loader's test split, all %d rows" % Xq.shape[0],
+                       target="fare_amount" if ds == "taxi" else "relevance grade 0..4",
+                       sentinel_cells_replaced={"X": bad_x, "Xq": bad_q},
+                       scaling="none",
+                       kmeans={"k": KMEANS_K, "max_iter": KMEANS_ITER,
+                               "init_rows": init_rows},
+                       pca={"n_components": PCA_COMPONENTS})
+            _write_block(args.data, "big-" + ds,
+                         {"X": X, "y": ytr[:n], "Xq": Xq, "yq": yte,
+                          "init": init}, rec)
+        if "dbscan" in blocks:
+            # Lane linear-cluster-istella: the first DBSCAN_ROWS train rows,
+            # sentinel cleaned, standardized by themselves (float64 mean and
+            # std), so one eps means the same thing on every column.
+            if ds == "taxi":
+                db_src = harness.load_taxi("shipped", regression=True)
+                db_x = _taxi_numeric(harness, db_src.X_train)
+                db_loader = "speed_gbdt_arm.load_taxi('shipped', regression=True), TAXI_NUMERIC columns"
+            else:
+                db_src = reg if reg is not None else harness.load_istella("shipped", regression=True)
+                db_x = db_src.X_train
+                db_loader = "speed_gbdt_arm.load_istella('shipped', regression=True)"
+            n_db = min(DBSCAN_ROWS, cap, db_x.shape[0]) if cap else min(DBSCAN_ROWS, db_x.shape[0])
+            Xd, bad_x = clean_sentinel(db_x[:n_db])
+            (Xd,) = standardize(Xd)
+            rec = dict(base, block="dbscan", lanes=["dbscan", "hdbscan"], loader=db_loader,
+                       fit_rows=[0, n_db], fit_rows_available=int(db_x.shape[0]),
+                       sentinel_cells_replaced={"X": bad_x},
+                       scaling="standardized by these rows (float64 mean and std)",
+                       dbscan={"rows": n_db,
+                               "params_env": "ANONLIB_CTD_DBSCAN_%s" % ds.upper()},
+                       hdbscan={"rows": min(HDBSCAN_ROWS, n_db)})
+            _write_block(args.data, "dbscan-" + ds, {"X": Xd}, rec)
+            db_src = db_x = Xd = None
+        if "kde" in blocks:
+            fit_idx = stride_rows(xtr.shape[0], kde_train)
+            q_idx = stride_rows(xte.shape[0], kde_query)
+            Xf, bad_x = clean_sentinel(xtr[fit_idx])
+            Xq, bad_q = clean_sentinel(xte[q_idx])
+            Xf, Xq = standardize(Xf, Xq)
+            d = Xf.shape[1]
+            bw = KDE_BANDWIDTH       # the cuML benchmark's KernelDensity bandwidth
+            rec = dict(base, block="kde", lanes=["kde"], loader=loader,
+                       fit_rows="stride sample of %d of the train split's %d rows" % (Xf.shape[0], xtr.shape[0]),
+                       query_rows="stride sample of %d of the test split's %d rows" % (Xq.shape[0], xte.shape[0]),
+                       sentinel_cells_replaced={"X": bad_x, "Xq": bad_q},
+                       scaling="standardized by the fit rows (float64 mean and std)",
+                       kde={"bandwidth": bw, "bandwidth_rule": "1.0, the cuML benchmark's (d=%d)" % d,
+                            "kernel": "gaussian", "metric": "euclidean"})
+            _write_block(args.data, "kde-" + ds, {"X": Xf, "Xq": Xq}, rec)
+        if "svc" in blocks:
+            if ds == "taxi":
+                clf = harness.load_taxi("shipped", regression=False)
+                ctr = _taxi_numeric(harness, clf.X_train)
+                cte = _taxi_numeric(harness, clf.X_test)
+                cy_tr, cy_te = clf.y_train, clf.y_test
+                cloader = "speed_gbdt_arm.load_taxi('shipped', regression=False) (card trips, tip >= 20%), TAXI_NUMERIC columns"
+            else:
+                if reg is None:
+                    reg = harness.load_istella("shipped", regression=True)
+                ctr, cte = reg.X_train, reg.X_test
+                cy_tr = (reg.y_train > 0).astype(np.float32)
+                cy_te = (reg.y_test > 0).astype(np.float32)
+                cloader = "speed_gbdt_arm.load_istella('shipped', regression=True), label relevance > 0"
+            fit_idx = stride_rows(ctr.shape[0], svc_train)
+            ev_idx = stride_rows(cte.shape[0], svc_eval)
+            Xf, bad_x = clean_sentinel(ctr[fit_idx])
+            Xq, bad_q = clean_sentinel(cte[ev_idx])
+            Xf, Xq = standardize(Xf, Xq)
+            y = np.ascontiguousarray(np.asarray(cy_tr)[fit_idx], dtype=np.float32)
+            yq = np.ascontiguousarray(np.asarray(cy_te)[ev_idx], dtype=np.float32)
+            if len(np.unique(y)) != 2:
+                raise RuntimeError("svc-%s: the fit rows do not hold both classes" % ds)
+            rec = dict(base, block="svc", lanes=["svc"], loader=cloader,
+                       fit_rows="stride sample of %d of %d train rows" % (Xf.shape[0], ctr.shape[0]),
+                       eval_rows="stride sample of %d of %d test rows" % (Xq.shape[0], cte.shape[0]),
+                       positive_fraction_fit=float(y.mean()),
+                       sentinel_cells_replaced={"X": bad_x, "Xq": bad_q},
+                       scaling="standardized by the fit rows (float64 mean and std)",
+                       svc={"C": SVC_C, "kernel": "rbf", "gamma": 1.0 / Xf.shape[1],
+                            "tol": SVC_TOL})
+            _write_block(args.data, "svc-" + ds, {"X": Xf, "y": y, "Xq": Xq, "yq": yq}, rec)
+        if "knn" in blocks:
+            knn_ds = _module("knn_datasets")
+            blk = knn_ds.real_block(ds, n_index=knn_index, n_queries=knn_queries)
+            index, bad_i = clean_sentinel(blk["index"])
+            queries, bad_q = clean_sentinel(blk["queries"])
+            src = {k: v for k, v in blk["source"].items()}
+            rec = dict(base, block="knn", lanes=["knn"],
+                       loader="knn_datasets.real_block(%r) (DEVIATION 2524)" % ds,
+                       index_rows=blk["index_rows"], query_rows=blk["query_rows"],
+                       real_block_sha256={"block": blk["sha256_block"],
+                                          "index": blk["sha256_index"],
+                                          "queries": blk["sha256_queries"]},
+                       real_block_source=src,
+                       sentinel_cells_replaced={"index": bad_i, "queries": bad_q},
+                       scaling="none", knn={"k": KNN_K})
+            _write_block(args.data, "knn-" + ds, {"index": index, "queries": queries}, rec)
+        reg = None
+        print("CTD-PREP dataset=%s seconds=%.1f" % (ds, time.perf_counter() - t0), flush=True)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# worker: one arm, one (lane, dataset), driven over a pipe
+# ---------------------------------------------------------------------------
+
+def _cpu_model():
+    try:
+        with open("/proc/cpuinfo") as fh:
+            for line in fh:
+                if line.startswith("model name"):
+                    return line.split(":", 1)[1].strip()
+    except OSError:
+        pass
+    import platform
+    return platform.processor() or platform.machine()
+
+
+def _host_info():
+    info = {"cpu_model": _cpu_model(), "os_cpu_count": os.cpu_count(),
+            "thread_env": {k: os.environ.get(k) for k in _cq.INHERITED_CAPS},
+            "cpu_resource_policy": os.environ.get("ANONLIB_BENCH_CPU_POLICY", "unrecorded")}
+    try:
+        info["sched_affinity_cpus"] = len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        info["sched_affinity_cpus"] = None
+    info["numpy"] = np.__version__
+    info["python"] = sys.version.split()[0]
+    return info
+
+
+#: "cuda" (CUDA or ROCm, both spelled torch.cuda) or "mps" (Apple silicon),
+#: set by `_torch_setup` in the worker that owns the torch arm.
+_TORCH_KIND = "cuda"
+
+
+def _torch_sync():
+    import torch
+    if _TORCH_KIND == "mps":
+        torch.mps.synchronize()
+    else:
+        torch.cuda.synchronize()
+
+
+def _to_host(a):
+    """Host NumPy copy of a torch tensor, cupy array, anonlib Array or
+    NumPy array."""
+    if hasattr(a, "detach"):
+        return a.detach().cpu().numpy()
+    if type(a).__module__.split(".")[0] == "cupy":
+        return a.get()
+    if hasattr(a, "copy_to_host"):
+        # cuVS/pylibraft device_ndarray: np.array() of it reads host garbage
+        # (measured 2026-09-27: every cuvs-gpu recall read ~0 through it)
+        return np.asarray(a.copy_to_host())
+    return np.array(a, copy=True)
+
+
+# ---- ours ----------------------------------------------------------------
+
+def _sibling(name):
+    """A tools/ module by path (tools/ is not a package)."""
+    spec = importlib.util.spec_from_file_location("ctd_" + name, os.path.join(HERE, name + ".py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+#: the block arrays each lane's scorer reads (quality() and infer_quality() below)
+SCORER_ARRAYS = {"kmeans": ("X",), "pca": ("X",), "ols": ("Xq", "yq"), "knn": ("index", "queries"),
+                 "hdbscan": ("X",), "svc": ("Xq", "yq")}
+
+
+def scorer_preflight(RSP, lane, ds, block, rec):
+    """The scorer preflight of one classical race (tools/race_scorer_preflight.py): the block loads and holds
+    the arrays the lane's scorer reads; on the supervised lanes the scorer scores the held-out labels as a
+    prediction (a self-test on a tiny slice: the first 1,000 rows). Raises RSP.ScorerUnavailable."""
+    pf = RSP.Preflight(lane, ds)
+    holder = {}
+
+    def load():
+        if smoke_staging() is not None:
+            # smoke-fixes r14 (2026-10-14; classical/dbscan istella STARTED in this load): the staged block
+            # (read_block_arrays), the same arrays and file list the npz gives
+            arrays = read_block_arrays(block + ".npz")
+            holder["data"] = {k: v for k, v in arrays.items() if k in SCORER_ARRAYS.get(lane, ())}
+            return sorted(arrays)
+        with np.load(block + ".npz") as z:
+            holder["data"] = {k: z[k] for k in z.files if k in SCORER_ARRAYS.get(lane, ())}
+            return sorted(z.files)
+    pf.check("reference data loads", load)
+    pf.check("reference data", lambda: RSP.require_arrays(holder["data"], SCORER_ARRAYS.get(lane, ())))
+    if lane in ("ols", "svc"):
+        def labels():
+            d = dict(holder["data"])
+            d["Xq"], d["yq"] = d["Xq"][:1000], d["yq"][:1000]
+            pred = d["yq"].astype(np.float64)
+            return RSP.self_test(lambda outs: infer_quality(lane, d, outs, {}), {"preflight": {"pred": pred}},
+                                 ("accuracy_eval", "r2_eval", "rmse_eval"))
+        pf.check("scorer self-test", labels)
+    return pf.done()
+
+
+def _probe():
+    """tools/bench_board_probe.py (memory per round, the our-CPU refusal)."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    import bench_board_probe
+    return bench_board_probe
+
+
+def _ours_module():
+    os.environ.setdefault("ANONLIB_NUMERIC_MODE", "identical")
+    import anonlib
+    return anonlib
+
+
+def _expected_ours_mode():
+    """The tier this `ours` worker was started for: `identical` for `ours`
+    and `ours-base`, `fast` for `ours-fast` (the Apple board's FAST arm,
+    tools/bench_board.py). `_worker_env` sets it; the readback must match."""
+    return os.environ.get("ANONLIB_NUMERIC_MODE", "identical").strip().lower()
+
+
+def _ours_info(ml, est):
+    info = {"library": "anonlib", "version": getattr(ml, "__version__", "unknown"),
+            "numeric_mode_env": os.environ.get("ANONLIB_NUMERIC_MODE")}
+    for name in ("numeric_mode_used", "vendor_used"):
+        try:
+            info[name] = getattr(est, name)()
+        except Exception as exc:  # noqa: BLE001
+            info[name] = "unavailable (%r)" % (exc,)
+    info["device"] = "gpu"
+    # Which anonlib answered: the installed wheel or an in-repo tree.
+    info["module_path"] = getattr(ml, "__file__", None)
+    # Ours fits INSIDE its clock: the public call is what is timed, upload and
+    # host validation included. Declared rather than left absent so
+    # `_span_facts` never has to guess it from prose (see the note there).
+    info["pre_clock_fit"] = False
+    want = _expected_ours_mode()
+    if info.get("numeric_mode_used") != want:
+        raise RuntimeError("ours is not %s: numeric_mode_used() = %r"
+                           % (want.upper(), info.get("numeric_mode_used"),))
+    return info
+
+
+def _ours_upload_probe(runner):
+    """A SEPARATE host-to-device upload of the arm's main input, timed on its
+    own and OUTSIDE the scored clock (lane/classical-structural, 2026-10-07).
+
+    Ours uploads inside its clock (`_span_facts`: `inside_clock =
+    host_to_device_upload,host_validation,call`) and the GPU opponents do
+    not, so the scored time has no kernel-only reading beside it. This takes
+    one: the same float32 words the public call uploads go up once more
+    through the resident-array binding (`x_cnn_res_upload`, an enqueue_copy
+    followed by a device synchronize), after the round's scored call and its
+    outputs are done, and the time is recorded as its own field
+    (`upload_separate`). NOTHING MOVES: the scored clock, its boundary and
+    the whole-operation clock are exactly what they were; this is a second
+    measurement beside them, not a split of them. `fit_minus_upload_ms` is
+    DERIVED from the two medians and says so. Device memory for the copy is
+    allocated and freed outside every clock. When the binding or the input is
+    not available the field says why instead of guessing."""
+    x = getattr(runner, "X", None)
+    if x is None:
+        x = getattr(runner, "index", None)
+    if x is None:
+        x = getattr(runner, "q", None)
+    if x is None:
+        return {"unavailable": "the arm holds no host input array"}
+    ml = getattr(runner, "ml", None)
+    if ml is None:
+        return {"unavailable": "the arm has no anonlib module"}
+    try:
+        b = ml._backend.binding("_anonlib_x_cnn", ml._backend.default_mode())
+    except Exception as exc:  # noqa: BLE001
+        return {"unavailable": "no resident-array binding: %r" % (exc,)}
+    a = np.ascontiguousarray(x, dtype=np.float32)  # glue: the words the fit uploads (already f32 C)
+    words = int(a.size)
+    if words <= 0:
+        return {"unavailable": "empty input"}
+    try:
+        h = int(b.x_cnn_res_alloc(words))
+    except Exception as exc:  # noqa: BLE001
+        return {"unavailable": "res_alloc failed: %r" % (exc,)}
+    try:
+        t0 = time.perf_counter()
+        b.x_cnn_res_upload(h, a.ctypes.data, words)
+        ms = (time.perf_counter() - t0) * 1000.0
+    finally:
+        try:
+            b.x_cnn_res_free(h)
+        except Exception:  # noqa: BLE001
+            pass
+    return {"ms": ms, "bytes": words * 4, "scope": "host_to_device_upload_separate",
+            "input": "X" if x is getattr(runner, "X", None) else ("index" if x is getattr(runner, "index", None) else "q"),
+            "outside_scored_clock": True}
+
+
+class OursKMeans:
+    def __init__(self, data, rec):
+        self.ml = _ours_module()
+        self.X, self.init = data["X"], data["init"]
+        self.est = None
+        self.params_obj = self.make()
+        self.info = _ours_info(self.ml, self.params_obj)
+        # The binding refuses tol = 0 with a plain Exception('invalid
+        # parameter (tol<=0)') (RunPod MI300X, 2026-09-11), so every arm now
+        # takes KMEANS_TOL instead of ours alone falling back to it.
+        self.info["config"] = ("anonlib.KMeans(n_clusters=%d, init=%r, n_init=1, max_iter=%d, "
+                               "oversampling_factor=0, tol=%g, metric='euclidean', random_state=%d)"
+                               % (KMEANS_K, KMEANS_INIT, KMEANS_ITER, KMEANS_TOL, SEED))
+
+    def make(self):
+        return self.ml.KMeans(n_clusters=KMEANS_K, init=KMEANS_INIT, n_init=1,
+                              max_iter=KMEANS_ITER, tol=KMEANS_TOL, metric="euclidean",
+                              oversampling_factor=KMEANS_OVERSAMPLING, random_state=SEED)
+
+    def call(self):
+        est = self.make()
+        est.fit(self.X)
+        self.est = est
+
+    def sync(self):
+        pass
+
+    def outputs(self):
+        return {"centers": np.array(self.est.cluster_centers_, dtype=np.float32),
+                "labels": np.array(self.est.labels_, dtype=np.int32),
+                "n_iter": np.array([int(self.est.n_iter_)], dtype=np.int64)}
+
+
+class OursPCA:
+    def __init__(self, data, rec):
+        self.ml = _ours_module()
+        self.X = data["X"]
+        self.est = None
+        self.params_obj = self.make()
+        self.info = _ours_info(self.ml, self.params_obj)
+
+    def make(self):
+        return self.ml.PCA(n_components=PCA_COMPONENTS, svd_solver="covariance_eigh",
+                           whiten=False, random_state=SEED)
+
+    def call(self):
+        est = self.make()
+        est.fit(self.X)
+        self.est = est
+
+    def sync(self):
+        pass
+
+    def outputs(self):
+        return {"components": np.array(self.est.components_, dtype=np.float32),
+                "explained_variance": np.array(self.est.explained_variance_, dtype=np.float32),
+                "mean": np.array(self.est.mean_, dtype=np.float32)}
+
+
+class OursOLS:
+    def __init__(self, data, rec):
+        self.ml = _ours_module()
+        self.X, self.y = data["X"], data["y"]
+        self.est = None
+        self.params_obj = self.ml.LinearRegression(fit_intercept=True)
+        self.info = _ours_info(self.ml, self.params_obj)
+
+    def call(self):
+        est = self.ml.LinearRegression(fit_intercept=True)
+        est.fit(self.X, self.y)
+        self.est = est
+
+    def sync(self):
+        pass
+
+    def outputs(self):
+        return {"coef": np.array(self.est.coef_, dtype=np.float64),
+                "intercept": np.array([float(self.est.intercept_)], dtype=np.float64)}
+
+
+class OursKNN:
+    def __init__(self, data, rec):
+        self.ml = _ours_module()
+        self.q = data["queries"]
+        self.nn = self.ml.NearestNeighbors(n_neighbors=KNN_K, metric="euclidean",
+                                           algorithm="brute", p=2)
+        self.nn.fit(data["index"])
+        self.index = data["index"]
+        self.out = None
+        self.info = _ours_info(self.ml, self.nn)
+        self.params_obj = self.nn
+        # Declared where it becomes true: our fit above runs before the clock,
+        # exactly as every opponent's kNN fit does; `kneighbors` alone is timed.
+        self.info["pre_clock_fit"] = True
+
+    def call(self):
+        self.out = self.nn.kneighbors(self.q)
+
+    def sync(self):
+        pass
+
+    def outputs(self):
+        dist, ind = self.out
+        return {"ind": np.array(ind, dtype=np.int64),
+                "dist": np.array(dist, dtype=np.float32)}
+
+
+class OursKDE:
+    def __init__(self, data, rec):
+        self.ml = _ours_module()
+        self.q = data["Xq"]
+        self.kd = self.ml.KernelDensity(bandwidth=KDE_BANDWIDTH, kernel="gaussian",
+                                        metric="euclidean", algorithm="auto", atol=0.0, rtol=0.0,
+                                        breadth_first=True, leaf_size=KDE_LEAF_SIZE)
+        self.kd.fit(data["X"])
+        self.X = data["X"]
+        self.scores = None
+        self.info = _ours_info(self.ml, self.kd)
+        self.params_obj = self.kd
+        # Our fit above is before the clock, as scikit-learn's tree build and
+        # cuML's fit are; `score_samples` alone is timed on every arm.
+        self.info["pre_clock_fit"] = True
+
+    def call(self):
+        self.scores = self.kd.score_samples(self.q)
+
+    def sync(self):
+        pass
+
+    def outputs(self):
+        return {"scores": np.array(self.scores, dtype=np.float64)}
+
+
+class OursSVC:
+    def __init__(self, data, rec):
+        self.ml = _ours_module()
+        self.X, self.y, self.Xq = data["X"], data["y"], data["Xq"]
+        self.gamma = float(rec["svc"]["gamma"])
+        self.est = None
+        probe = self.make()
+        # SVC calls `_svm_impl._extension`, not `_bind`, and carries no
+        # `_BINDING`, so the mixin's witness would read the BASE binding.
+        # Point it at the extension the fit actually calls.
+        probe._BINDING = "_anonlib_svm"
+        self.info = _ours_info(self.ml, probe)
+        self.params_obj = probe
+
+    def make(self):
+        # random_state stays None: ours refuses it without probability=True.
+        return self.ml.SVC(C=SVC_C, kernel="rbf", gamma=self.gamma, tol=SVC_TOL,
+                           degree=SVC_DEGREE, coef0=SVC_COEF0, max_iter=SVC_MAX_ITER,
+                           cache_size=SVC_CACHE_MB, class_weight=None,
+                           decision_function_shape=SVC_DFS)
+
+    def call(self):
+        est = self.make()
+        est.fit(self.X, self.y)
+        self.est = est
+
+    def sync(self):
+        pass
+
+    def outputs(self):
+        pred = self.est.predict(self.Xq)
+        return {"pred": np.array(pred, dtype=np.float64),
+                "n_support": np.array([int(self.est.n_support_)], dtype=np.int64)}
+
+
+# ---- scikit-learn ------------------------------------------------------------
+
+def _sklearn_info():
+    import scipy
+    import sklearn
+    # `pre_clock_fit` defaults to False for every scikit-learn arm and SkKDE
+    # overrides it, because its tree is built before the clock. Declared here
+    # so the field is present on EVERY ready record and its absence is an
+    # anomaly `_span_facts` can shout about rather than a case it must guess.
+    info = {"library": "scikit-learn", "version": sklearn.__version__,
+            "scipy": scipy.__version__, "device": "cpu",
+            "pre_clock_fit": False}
+    info.update(_host_info())
+    try:
+        from threadpoolctl import threadpool_info
+        pools = []
+        for p in threadpool_info():
+            pools.append({k: p.get(k) for k in ("user_api", "internal_api", "num_threads",
+                                                  "version", "threading_layer", "architecture")}
+                         | {"filepath": os.path.basename(str(p.get("filepath")))})
+        info["threadpools"] = pools
+    except Exception as exc:  # noqa: BLE001
+        info["threadpools"] = "unavailable (%r)" % (exc,)
+    return info
+
+
+def _sklearn_pools_touch():
+    """Load scikit-learn's BLAS and OpenMP pools before threadpool_info reads
+    them (a pool that has not been loaded is not listed)."""
+    import sklearn.cluster  # noqa: F401
+    import sklearn.utils.extmath  # noqa: F401
+    import scipy.linalg  # noqa: F401
+
+
+class SkKMeans:
+    def __init__(self, data, rec):
+        from sklearn.cluster import KMeans
+        _sklearn_pools_touch()
+        self.KMeans = KMeans
+        self.X, self.init = data["X"], data["init"]
+        self.est = None
+        self.info = _sklearn_info()
+        # FAIRNESS FIX (2026-10-13 audit): scikit-learn got tol=1e-7, which it
+        # reads as RELATIVE (center_shift_tot <= tol * mean(var(X, axis=0)),
+        # sklearn/cluster/_kmeans.py _tolerance), while ours and cuML stop on the
+        # ABSOLUTE squared shift < 1e-7: a different stopping rule. It now gets
+        # KMEANS_TOL / mean(var(X, axis=0)) of the same rows, computed here
+        # (outside the clock) with scikit-learn's own expression, so its
+        # absolute threshold is KMEANS_TOL as on ours and cuML. Results raced
+        # before this change were wrong for this lane; apply extra scrutiny.
+        mean_var = float(np.mean(np.var(self.X, axis=0)))
+        self.tol = KMEANS_TOL / mean_var if mean_var > 0.0 else KMEANS_TOL
+        self.info["tol_rule"] = ("absolute squared center shift < %g: scikit-learn tol = %g / "
+                                 "mean(var(X, axis=0)) = %g / %r = %r"
+                                 % (KMEANS_TOL, KMEANS_TOL, KMEANS_TOL, mean_var, self.tol))
+        self.info["config"] = ("KMeans(n_clusters=%d, init=%r, n_init=1, max_iter=%d, tol=%r "
+                               "(= %g / mean feature variance), algorithm='lloyd', random_state=%d)"
+                               % (KMEANS_K, KMEANS_INIT, KMEANS_ITER, self.tol, KMEANS_TOL, SEED))
+        self.params_obj = self.make()
+
+    def make(self):
+        return self.KMeans(n_clusters=KMEANS_K, init=KMEANS_INIT, n_init=1,
+                           max_iter=KMEANS_ITER, tol=self.tol, algorithm="lloyd",
+                           random_state=SEED)
+
+    def call(self):
+        est = self.make()
+        est.fit(self.X)
+        self.est = est
+
+    def sync(self):
+        pass
+
+    def outputs(self):
+        return {"centers": np.asarray(self.est.cluster_centers_, dtype=np.float32),
+                "labels": np.asarray(self.est.labels_, dtype=np.int32),
+                "n_iter": np.array([int(self.est.n_iter_)], dtype=np.int64)}
+
+
+class SkPCA:
+    def __init__(self, data, rec):
+        from sklearn.decomposition import PCA
+        _sklearn_pools_touch()
+        self.PCA = PCA
+        self.X = data["X"]
+        self.est = None
+        self.info = _sklearn_info()
+        self.info["config"] = ("PCA(n_components=8, svd_solver='covariance_eigh', whiten=False, "
+                               "random_state=%d)" % SEED)
+        self.params_obj = self.make()
+
+    def make(self):
+        return self.PCA(n_components=PCA_COMPONENTS, svd_solver="covariance_eigh", whiten=False,
+                        random_state=SEED)
+
+    def call(self):
+        est = self.make()
+        est.fit(self.X)
+        self.est = est
+
+    def sync(self):
+        pass
+
+    def outputs(self):
+        return {"components": np.asarray(self.est.components_, dtype=np.float32),
+                "explained_variance": np.asarray(self.est.explained_variance_, dtype=np.float32),
+                "mean": np.asarray(self.est.mean_, dtype=np.float32)}
+
+
+class SkOLS:
+    def __init__(self, data, rec):
+        from sklearn.linear_model import LinearRegression
+        _sklearn_pools_touch()
+        self.LR = LinearRegression
+        self.X, self.y = data["X"], data["y"]
+        self.est = None
+        self.info = _sklearn_info()
+        self.info["config"] = ("LinearRegression(fit_intercept=True, positive=False, copy_X=True) "
+                               "(scipy.linalg.lstsq, gelsd)")
+        self.params_obj = self.make()
+
+    def make(self):
+        return self.LR(fit_intercept=True, positive=False, copy_X=True)
+
+    def call(self):
+        est = self.make()
+        est.fit(self.X, self.y)
+        self.est = est
+
+    def sync(self):
+        pass
+
+    def outputs(self):
+        return {"coef": np.asarray(self.est.coef_, dtype=np.float64).ravel(),
+                "intercept": np.array([float(self.est.intercept_)], dtype=np.float64)}
+
+
+class SkKNN:
+    def __init__(self, data, rec):
+        from sklearn.neighbors import NearestNeighbors
+        _sklearn_pools_touch()
+        self.q = data["queries"]
+        self.nn = NearestNeighbors(n_neighbors=KNN_K, algorithm="brute", metric="euclidean", p=2,
+                                   n_jobs=-1)
+        self.nn.fit(data["index"])
+        self.out = None
+        self.info = _sklearn_info()
+        self.info["config"] = ("NearestNeighbors(n_neighbors=64, algorithm='brute', metric='euclidean', "
+                               "p=2, n_jobs=-1); fit before the clock, kneighbors timed")
+        self.info["pre_clock_fit"] = True
+        self.params_obj = self.nn
+
+    def call(self):
+        self.out = self.nn.kneighbors(self.q)
+
+    def sync(self):
+        pass
+
+    def outputs(self):
+        dist, ind = self.out
+        return {"ind": np.asarray(ind, dtype=np.int64),
+                "dist": np.asarray(dist, dtype=np.float32)}
+
+
+class SkKDE:
+    def __init__(self, data, rec):
+        from sklearn.neighbors import KernelDensity
+        _sklearn_pools_touch()
+        self.q = data["Xq"]
+        t0 = time.perf_counter()
+        self.kd = KernelDensity(bandwidth=KDE_BANDWIDTH, kernel="gaussian",
+                                metric="euclidean", algorithm="auto", rtol=0.0, atol=0.0,
+                                breadth_first=True, leaf_size=KDE_LEAF_SIZE)
+        self.kd.fit(data["X"])
+        fit_ms = (time.perf_counter() - t0) * 1000.0
+        self.scores = None
+        self.params_obj = self.kd
+        self.info = _sklearn_info()
+        self.info["config"] = ("KernelDensity(bandwidth=1.0, kernel='gaussian', metric='euclidean', "
+                               "algorithm='auto', rtol=0, atol=0, breadth_first=True, leaf_size=40); "
+                               "score_samples timed; single-threaded by design")
+        self.info["tree_fit_ms_untimed"] = fit_ms
+        # The tree above was built before the clock, which times
+        # `score_samples` alone. The magnitude is recorded beside it; the flag
+        # is the fact, and it is what `_span_facts` reads.
+        self.info["pre_clock_fit"] = True
+
+    def call(self):
+        self.scores = self.kd.score_samples(self.q)
+
+    def sync(self):
+        pass
+
+    def outputs(self):
+        return {"scores": np.asarray(self.scores, dtype=np.float64)}
+
+
+class SkSVC:
+    def __init__(self, data, rec):
+        from sklearn.svm import SVC
+        _sklearn_pools_touch()
+        self.SVC = SVC
+        self.X, self.y, self.Xq = data["X"], data["y"], data["Xq"]
+        self.gamma = float(rec["svc"]["gamma"])
+        self.est = None
+        self.info = _sklearn_info()
+        self.info["config"] = ("SVC(C=1.0, kernel='rbf', gamma=1/d, tol=1e-3, degree=3, coef0=0.0, "
+                               "max_iter=-1, cache_size=2000, shrinking=True, class_weight=None, "
+                               "random_state=%d, decision_function_shape='ovo'); fit timed; "
+                               "libsvm is single-threaded" % SEED)
+        self.params_obj = self.make()
+
+    def make(self):
+        return self.SVC(C=SVC_C, kernel="rbf", gamma=self.gamma, tol=SVC_TOL, degree=SVC_DEGREE,
+                        coef0=SVC_COEF0, max_iter=SVC_MAX_ITER, cache_size=SVC_CACHE_MB,
+                        shrinking=True, class_weight=None, random_state=SEED,
+                        decision_function_shape=SVC_DFS)
+
+    def call(self):
+        est = self.make()
+        est.fit(self.X, self.y)
+        self.est = est
+
+    def sync(self):
+        pass
+
+    def outputs(self):
+        return {"pred": np.asarray(self.est.predict(self.Xq), dtype=np.float64),
+                "n_support": np.array([int(np.sum(self.est.n_support_))], dtype=np.int64)}
+
+
+# ---- torch ---------------------------------------------------------------------
+
+def _torch_setup(arrays, probe_defers=False):
+    """Upload `arrays` (name -> host array) to the GPU before any clock.
+    Returns (torch, device, tensors, info).
+
+    probe_defers (smoke-fixes r16, 2026-10-14; classical kmeans/pca/ols on istella STARTED at 5 s on NVIDIA):
+    an arm whose constructor reads nothing from the uploaded tensors but their shapes passes True, and inside
+    the smoke's parameter probe (smoke_staging(): the smoke worker or its arm servers, which never run a
+    round) its arrays are not copied to the device: the tensors are CPU views of the same host arrays (the
+    same shapes and dtypes) and upload_ms_untimed is None. A timed worker uploads them exactly as before."""
+    import torch
+    global _TORCH_KIND
+    # Apple silicon: torch's GPU is MPS (tools/bench_board.py, the Apple
+    # column). The same arm, the same algorithm, written the same way; an op
+    # MPS lacks fails that arm by name at its warm-up, never silently on CPU.
+    if torch.cuda.is_available():
+        _TORCH_KIND = "cuda"
+        dev = torch.device("cuda")
+        dev_name = torch.cuda.get_device_name(0)
+    elif (getattr(torch.backends, "mps", None) is not None
+          and torch.backends.mps.is_available()):
+        _TORCH_KIND = "mps"
+        dev = torch.device("mps")
+        dev_name = "Apple MPS"
+    else:
+        raise RuntimeError("torch sees no CUDA, ROCm or MPS device; no GPU arm on this box")
+    # The board's seed through torch's own argument (no torch arm here draws a
+    # random number; it is set so every arm carries the same seed).
+    torch.manual_seed(SEED)
+    if probe_defers and smoke_staging() is not None:
+        tensors = {k: torch.from_numpy(np.ascontiguousarray(v)) for k, v in arrays.items()}
+        upload_ms = None
+    else:
+        _torch_sync()
+        t0 = time.perf_counter()
+        tensors = {k: torch.from_numpy(np.ascontiguousarray(v)).to(dev) for k, v in arrays.items()}
+        _torch_sync()
+        upload_ms = (time.perf_counter() - t0) * 1000.0
+    info = {"library": "torch", "version": torch.__version__,
+            "torch_version_hip": getattr(torch.version, "hip", None),
+            "torch_version_cuda": torch.version.cuda,
+            "torch_backend": _TORCH_KIND,
+            "device": "gpu", "device_name": dev_name,
+            "upload_ms_untimed": upload_ms, "seed": SEED,
+            # No torch arm fits before its clock; declared, not left absent.
+            "pre_clock_fit": False}
+    info.update(_host_info())
+    return torch, dev, tensors, info
+
+
+class TorchKMeans:
+    def __init__(self, data, rec):
+        self.torch, self.dev, t, self.info = _torch_setup({"X": data["X"], "init": data["init"]},
+                                                          probe_defers=True)
+        self.x, self.init = t["X"], t["init"]
+        self.ones = self.torch.ones(self.x.shape[0], device=self.dev, dtype=self.torch.float32)
+        self.info["config"] = ("greedy k-means++ (scikit-learn's rule, 2 + log k candidates, a "
+                               "generator seeded %d), then Lloyd up to %d iterations stopping by "
+                               "scikit-learn's rule (center shift <= tol x mean feature variance, "
+                               "tol=%g); assignment = chunked addmm(||c||^2, x, c.T, alpha=-2).argmin; "
+                               "update = index_add_" % (SEED, KMEANS_ITER, KMEANS_TOL))
+        self.c = None
+        self.labels = None
+        self.n_iter = 0
+        # Declared (a function, not an estimator): the values `call` really uses.
+        self.params_obj = {"__library__": "torch", "seed": SEED, "n_clusters": KMEANS_K,
+                           "init": KMEANS_INIT, "n_init": 1, "tol": KMEANS_TOL,
+                           "max_iter": KMEANS_ITER, "metric": "euclidean"}
+
+    def _sq_dist(self, x, xx, c):
+        """||x - c||^2 for every row and every column of c, chunked, clamped at 0."""
+        torch = self.torch
+        cc = (c * c).sum(dim=1)
+        out = torch.empty((x.shape[0], c.shape[0]), device=self.dev, dtype=torch.float32)
+        for s in range(0, x.shape[0], TORCH_CHUNK_ROWS):
+            e = min(s + TORCH_CHUNK_ROWS, x.shape[0])
+            out[s:e] = torch.addmm(cc.unsqueeze(0), x[s:e], c.T, beta=1.0, alpha=-2.0) \
+                .add_(xx[s:e, None]).clamp_(min=0.0)
+        return out
+
+    def _kmeans_pp(self, x, xx, k, gen):
+        """scikit-learn's greedy k-means++ (_kmeans_plusplus): the first center
+        uniform, then 2 + int(log k) candidates drawn by D^2 and the one that
+        lowers the potential most kept."""
+        import math
+        torch = self.torch
+        n = x.shape[0]
+        trials = 2 + int(math.log(k))
+        first = int(torch.randint(n, (1,), generator=gen, device=self.dev).item())
+        centers = [x[first]]
+        closest = self._sq_dist(x, xx, x[first:first + 1])[:, 0]
+        pot = closest.sum()
+        for _ in range(1, k):
+            r = torch.rand(trials, generator=gen, device=self.dev) * pot
+            cand = torch.searchsorted(torch.cumsum(closest, 0), r).clamp_(max=n - 1)
+            dc = torch.minimum(closest[:, None], self._sq_dist(x, xx, x[cand]))
+            pots = dc.sum(dim=0)
+            best = int(pots.argmin().item())
+            closest, pot = dc[:, best].contiguous(), pots[best]
+            centers.append(x[cand[best]])
+        return torch.stack(centers)
+
+    def call(self):
+        torch = self.torch
+        x = self.x
+        n, d = x.shape
+        gen = torch.Generator(device=self.dev)
+        gen.manual_seed(SEED)
+        xx = (x * x).sum(dim=1)
+        k = KMEANS_K
+        c = self._kmeans_pp(x, xx, k, gen)
+        # scikit-learn's absolute tolerance: tol x the mean feature variance
+        tol = KMEANS_TOL * float(x.var(dim=0, unbiased=False).mean().item())
+        labels = torch.empty(n, dtype=torch.long, device=self.dev)
+        it = 0
+        for it in range(1, KMEANS_ITER + 1):
+            c2 = (c * c).sum(dim=1)
+            for s in range(0, n, TORCH_CHUNK_ROWS):
+                e = min(s + TORCH_CHUNK_ROWS, n)
+                labels[s:e] = torch.addmm(c2.unsqueeze(0), x[s:e], c.T,
+                                          beta=1.0, alpha=-2.0).argmin(dim=1)
+            sums = torch.zeros((k, d), device=self.dev, dtype=torch.float32)
+            counts = torch.zeros(k, device=self.dev, dtype=torch.float32)
+            sums.index_add_(0, labels, x)
+            counts.index_add_(0, labels, self.ones)
+            new = torch.where((counts > 0)[:, None], sums / counts.clamp(min=1.0)[:, None], c)
+            shift = float(((new - c) ** 2).sum().item())
+            c = new
+            if shift <= tol:
+                break
+        self.c, self.labels, self.n_iter = c, labels, it
+
+    def sync(self):
+        _torch_sync()
+
+    def outputs(self):
+        return {"centers": _to_host(self.c).astype(np.float32),
+                "labels": _to_host(self.labels).astype(np.int32),
+                "n_iter": np.array([self.n_iter], dtype=np.int64)}
+
+
+class TorchPCA:
+    """REFUSED. FAIRNESS FIX (2026-10-13 audit): this arm was a covariance eigh our harness wrote
+    from torch ops (mean, xc.T @ xc, torch.linalg.eigh), raced as the torch-gpu PCA opponent. An
+    opponent must be a library's own implementation through its public API; torch has no PCA
+    estimator of this algorithm (torch.pca_lowrank is randomized, a different algorithm). The arm
+    is out of the pca roster, race() drops it by name (REFUSED_ARMS), and a worker started for it
+    refuses here. Results raced before this change were wrong for this lane; apply extra
+    scrutiny."""
+    REFUSED = ("REFUSED (fairness audit 2026-10-13): torch-gpu pca was harness-written (a "
+               "covariance eigh from torch ops), not a library opponent")
+
+    def __init__(self, data, rec):
+        raise RuntimeError(self.REFUSED)
+
+
+#: FAIRNESS FIX (2026-10-13 audit): torch.linalg.lstsq's driver was left at torch's default;
+#: it is pinned to 'gels' (QR, the class of ours' TSQR; the only driver torch has on CUDA and
+#: ROCm). Results raced before this change were wrong for this lane; apply extra scrutiny.
+TORCH_LSTSQ_DRIVER = "gels"
+
+
+class TorchOLS:
+    """torch.linalg.lstsq on centered data: torch's own least-squares routine
+    through its public API (the intercept by centering, as ours, cuML and
+    scikit-learn fit it). Driver 'gels' (QR without pivoting, full rank
+    assumed); the quality beside the cell says what that costs on Istella's
+    near-constant columns. MPS has no lstsq: the arm refuses there."""
+
+    def __init__(self, data, rec):
+        import torch
+        if not torch.cuda.is_available():
+            # FAIRNESS FIX (2026-10-13 audit): on Apple the arm failed at its warm-up
+            # (aten::linalg_lstsq is not implemented for MPS); it now refuses by name.
+            raise RuntimeError("REFUSED: torch.linalg.lstsq has no MPS implementation "
+                               "(aten::linalg_lstsq); no torch GPU least-squares routine here")
+        self.torch, self.dev, t, self.info = _torch_setup({"X": data["X"], "y": data["y"]}, probe_defers=True)
+        self.x, self.y = t["X"], t["y"]
+        self.info["config"] = ("xc = x - mean, yc = y - mean; torch.linalg.lstsq(xc, yc[:, None], "
+                               "driver=%r); intercept = ymean - xmean @ coef" % TORCH_LSTSQ_DRIVER)
+        self.info["lstsq_driver"] = TORCH_LSTSQ_DRIVER
+        self.coef = self.intercept = None
+        # smoke-fixes (2026-10-14; ols: "missing real library implementation read-back: torch-gpu"): the arm
+        # names the torch routine it calls, torch.linalg.lstsq (as bench_board_algos.py records its torch
+        # linalg arms), so the record carries torch's own implementation, not this driver.
+        self.params_obj = {"__library__": "torch", "__implementation__": torch.linalg.lstsq,
+                           "seed": SEED, "fit_intercept": True, "driver": TORCH_LSTSQ_DRIVER}
+
+    def call(self):
+        torch = self.torch
+        x, y = self.x, self.y
+        xm = x.mean(dim=0)
+        ym = y.mean()
+        sol = torch.linalg.lstsq(x - xm, (y - ym).unsqueeze(1),
+                                 driver=TORCH_LSTSQ_DRIVER).solution
+        coef = sol[: x.shape[1], 0]
+        self.coef = coef
+        self.intercept = ym - xm @ coef
+
+    def sync(self):
+        _torch_sync()
+
+    def outputs(self):
+        return {"coef": _to_host(self.coef).astype(np.float64),
+                "intercept": np.array([float(_to_host(self.intercept))], dtype=np.float64)}
+
+
+class TorchOLSEigh:
+    def __init__(self, data, rec):
+        self.torch, self.dev, t, self.info = _torch_setup({"X": data["X"], "y": data["y"]}, probe_defers=True)
+        self.x, self.y = t["X"], t["y"]
+        self.info["config"] = ("centered normal equations: G = xc.T @ xc, b = xc.T @ yc, "
+                               "torch.linalg.eigh(G), pseudo-inverse cutoff d * eps32 * max|eig|")
+        self.coef = self.intercept = None
+        self.params_obj = {"__library__": "torch", "seed": SEED, "fit_intercept": True}
+
+    def call(self):
+        torch = self.torch
+        x, y = self.x, self.y
+        xm = x.mean(dim=0)
+        ym = y.mean()
+        xc = x - xm
+        yc = y - ym
+        g = xc.T @ xc
+        b = xc.T @ yc
+        evals, evecs = torch.linalg.eigh(g)
+        cutoff = evals.abs().max() * float(g.shape[0]) * float(torch.finfo(torch.float32).eps)
+        inv = torch.where(evals.abs() > cutoff, 1.0 / evals, torch.zeros_like(evals))
+        coef = evecs @ (inv * (evecs.T @ b))
+        self.coef = coef
+        self.intercept = ym - xm @ coef
+
+    def sync(self):
+        _torch_sync()
+
+    def outputs(self):
+        return {"coef": _to_host(self.coef).astype(np.float64),
+                "intercept": np.array([float(_to_host(self.intercept))], dtype=np.float64)}
+
+
+class TorchKNN:
+    def __init__(self, data, rec):
+        self.torch, self.dev, t, self.info = _torch_setup({"index": data["index"],
+                                                           "queries": data["queries"]})
+        self.index, self.q = t["index"], t["queries"]
+        self.info["config"] = ("brute force: per 1024-query chunk torch.cdist(q, index) "
+                               "(default compute_mode) then topk(10, largest=False)")
+        self.ind = None
+        self.params_obj = {"__library__": "torch", "seed": SEED, "n_neighbors": KNN_K,
+                           "metric": "euclidean", "p": 2, "algorithm": "brute"}
+
+    def call(self):
+        torch = self.torch
+        q, index = self.q, self.index
+        nq = q.shape[0]
+        ind = torch.empty((nq, KNN_K), dtype=torch.long, device=self.dev)
+        for s in range(0, nq, TORCH_KNN_QUERY_CHUNK):
+            e = min(s + TORCH_KNN_QUERY_CHUNK, nq)
+            d = torch.cdist(q[s:e], index)
+            _vals, idx = torch.topk(d, KNN_K, dim=1, largest=False)
+            ind[s:e] = idx
+        self.ind = ind
+
+    def sync(self):
+        _torch_sync()
+
+    def outputs(self):
+        return {"ind": _to_host(self.ind).astype(np.int64)}
+
+
+# ---- cuML (DEVIATION 2571: the GPU library on the box is the opponent) ----------
+
+def _cupy_sync():
+    import cupy as cp
+    cp.cuda.runtime.deviceSynchronize()
+
+
+def _cuml_setup(arrays, library="cuml", probe_defers=False):
+    """Upload `arrays` to the GPU as cupy arrays before any clock. Returns
+    (tensors, info). `library` is the arm's library: "cuml" records cuML's
+    version; "cuvs" (cuVS on NVIDIA, hipVS on AMD) records cuvs' and imports
+    no cuML (FAIRNESS FIX 2026-10-13 audit: hipVS arms on AMD, which has no
+    cuML).
+
+    probe_defers (smoke-fixes r16, 2026-10-14; classical kmeans/pca/ols on istella STARTED at 5 s on NVIDIA,
+    the cuML arms' upload 1.2 s each in the earlier smoke): as _torch_setup's. Inside the smoke's parameter
+    probe the arrays an arm's constructor never reads stay the host arrays and upload_ms_untimed is None; a
+    timed worker uploads them exactly as before."""
+    import cupy as cp
+    if library == "cuml":
+        import cuml
+    else:
+        import cuvs as cuml   # noqa: F811 -- only its __version__ is read below
+    if probe_defers and smoke_staging() is not None:
+        dev = {k: np.ascontiguousarray(v) for k, v in arrays.items()}
+        upload_ms = None
+    else:
+        cp.cuda.runtime.deviceSynchronize()
+        t0 = time.perf_counter()
+        dev = {k: cp.asarray(np.ascontiguousarray(v)) for k, v in arrays.items()}
+        cp.cuda.runtime.deviceSynchronize()
+        upload_ms = (time.perf_counter() - t0) * 1000.0
+    try:
+        name = cp.cuda.runtime.getDeviceProperties(0)["name"]
+        name = name.decode() if isinstance(name, bytes) else str(name)
+    except Exception as exc:  # noqa: BLE001
+        name = "unavailable (%r)" % (exc,)
+    info = {"library": library, "version": getattr(cuml, "__version__", "unknown"),
+            "cupy": cp.__version__,
+            "cuda_runtime": cp.cuda.runtime.runtimeGetVersion(),
+            "cuda_driver_api": cp.cuda.runtime.driverGetVersion(),
+            "device": "gpu", "device_name": name, "upload_ms_untimed": upload_ms,
+            # False by default; CumlKNN and CumlKDE set it True after the fit
+            # they perform before the clock starts.
+            "pre_clock_fit": False}
+    info.update(_host_info())
+    return dev, info
+
+
+def _scalar(v):
+    return float(np.asarray(_to_host(v)).reshape(-1)[0]) if not isinstance(v, (int, float)) else float(v)
+
+
+class CumlKMeans:
+    def __init__(self, data, rec):
+        from cuml.cluster import KMeans
+        t, self.info = _cuml_setup({"X": data["X"], "init": data["init"]}, probe_defers=True)
+        self.x, self.init = t["X"], t["init"]
+        # cuVS refuses tol <= 0 ("RAFT failure ... invalid parameter (tol<=0)",
+        # H100 pod 22up9vbhj3tbeg, 2026-09-11), exactly as our binding does, so
+        # every arm takes KMEANS_TOL.
+        self.params_obj, self.kw = construct_tolerant(
+            KMeans, dict(n_clusters=KMEANS_K, init=KMEANS_INIT, n_init=1, max_iter=KMEANS_ITER,
+                         tol=KMEANS_TOL, oversampling_factor=KMEANS_OVERSAMPLING,
+                         random_state=SEED, output_type="cupy"), self.info)
+        self.KMeans = KMeans
+        self.info["config"] = ("cuml.cluster.KMeans(n_clusters=%d, init=%r, n_init=1, max_iter=%d, "
+                               "oversampling_factor=0, tol=%g, random_state=%d, output_type='cupy'); "
+                               "fit timed" % (KMEANS_K, KMEANS_INIT, KMEANS_ITER, KMEANS_TOL, SEED))
+        self.est = None
+
+    def call(self):
+        est = self.KMeans(**self.kw)
+        est.fit(self.x)
+        self.est = est
+
+    def sync(self):
+        _cupy_sync()
+
+    def outputs(self):
+        return {"centers": np.asarray(_to_host(self.est.cluster_centers_), dtype=np.float32),
+                "labels": np.asarray(_to_host(self.est.labels_), dtype=np.int32),
+                "n_iter": np.array([int(_scalar(self.est.n_iter_))], dtype=np.int64)}
+
+
+class CumlPCA:
+    def __init__(self, data, rec):
+        from cuml.decomposition import PCA
+        self.PCA = PCA
+        t, self.info = _cuml_setup({"X": data["X"]}, probe_defers=True)
+        self.x = t["X"]
+        self.params_obj, self.kw = construct_tolerant(
+            PCA, dict(n_components=PCA_COMPONENTS, svd_solver="full", whiten=False,
+                      random_state=SEED, output_type="cupy"), self.info)
+        self.info["config"] = ("cuml.decomposition.PCA(n_components=8, svd_solver='full', whiten=False, "
+                               "random_state=%d, output_type='cupy'); fit timed" % SEED)
+        self.est = None
+
+    def call(self):
+        est = self.PCA(**self.kw)
+        est.fit(self.x)
+        self.est = est
+
+    def sync(self):
+        _cupy_sync()
+
+    def outputs(self):
+        return {"components": np.asarray(_to_host(self.est.components_), dtype=np.float32),
+                "explained_variance": np.asarray(_to_host(self.est.explained_variance_), dtype=np.float32),
+                "mean": np.asarray(_to_host(self.est.mean_), dtype=np.float32).reshape(-1)}
+
+
+class CumlOLS:
+    def __init__(self, data, rec):
+        from cuml.linear_model import LinearRegression
+        self.LR = LinearRegression
+        t, self.info = _cuml_setup({"X": data["X"], "y": data["y"]}, probe_defers=True)
+        self.x, self.y = t["X"], t["y"]
+        # copy_X=True where the build takes it: fit_intercept centers the
+        # design matrix, and a centered device X would change every later round.
+        # FAIRNESS FIX (2026-10-13 audit): algorithm='eig' (normal equations, the condition
+        # number squared; R2 -11031 on Istella) raced ours' TSQR; 'qr' is cuML's QR solve of
+        # the same tall design. Results raced before this change were wrong for this lane;
+        # apply extra scrutiny.
+        self.kw = dict(algorithm="qr", fit_intercept=True, output_type="cupy")
+        try:
+            self.LR(copy_X=True, **self.kw)
+            self.kw["copy_X"] = True
+        except TypeError:
+            self.info["copy_X"] = "not a parameter of this build"
+        self.info["config"] = "cuml.linear_model.LinearRegression(%s); fit timed" % (
+            ", ".join("%s=%r" % kv for kv in sorted(self.kw.items())),)
+        self.params_obj = self.LR(**self.kw)
+        self.est = None
+
+    def call(self):
+        est = self.LR(**self.kw)
+        est.fit(self.x, self.y)
+        self.est = est
+
+    def sync(self):
+        _cupy_sync()
+
+    def outputs(self):
+        return {"coef": np.asarray(_to_host(self.est.coef_), dtype=np.float64).reshape(-1),
+                "intercept": np.array([_scalar(self.est.intercept_)], dtype=np.float64)}
+
+
+class CumlKNN:
+    def __init__(self, data, rec):
+        from cuml.neighbors import NearestNeighbors
+        t, self.info = _cuml_setup({"index": data["index"], "queries": data["queries"]})
+        self.q = t["queries"]
+        self.nn, _kw = construct_tolerant(
+            NearestNeighbors, dict(n_neighbors=KNN_K, algorithm="brute", metric="euclidean", p=2,
+                                   output_type="cupy"), self.info)
+        self.params_obj = self.nn
+        self.nn.fit(t["index"])
+        _cupy_sync()
+        # THE FACT, DECLARED AT THE PLACE IT BECOMES TRUE: the fit above ran
+        # before any clock, so this arm's timed region covers `kneighbors`
+        # alone. The config string below says so too, for a human; the flag is
+        # what `_span_facts` reads, so rewording that prose cannot silently
+        # turn this fact false.
+        self.info["pre_clock_fit"] = True
+        self.info["config"] = ("cuml.neighbors.NearestNeighbors(n_neighbors=64, algorithm='brute', "
+                               "metric='euclidean', output_type='cupy'); fit before the clock, kneighbors timed")
+        self.out = None
+
+    def call(self):
+        self.out = self.nn.kneighbors(self.q)
+
+    def sync(self):
+        _cupy_sync()
+
+    def outputs(self):
+        dist, ind = self.out
+        return {"ind": np.asarray(_to_host(ind), dtype=np.int64),
+                "dist": np.asarray(_to_host(dist), dtype=np.float32)}
+
+
+class HipvsKMeans:
+    """FAIRNESS FIX (2026-10-13 audit, the author's correction): the AMD GPU
+    k-means opponent was TorchKMeans, this harness's own k-means from torch
+    ops. It is replaced by a library: hipVS (AMD's port of cuVS, `pip install
+    amd-hipvs`, the same `cuvs` Python API), cuvs.cluster.kmeans, with the
+    settings the cuML arm is pinned to: n_clusters=8, k-means++ with
+    oversampling_factor=0 (the sequential seeding ours and cuML use),
+    max_iter=300, tol=1e-7 read by cuVS's own stopping rule (the squared
+    center shift, the rule ours transcribes), n_init=1, squared L2. Inputs go
+    to the device before the clock (the cuML arm's rule); fit is timed; labels
+    for the quality pass come from kmeans.predict after the clock. cuVS's
+    KMeansParams takes no seed. UNVERIFIED AT RUNTIME: no AMD box has run
+    this arm (2026-10-13). Results raced before this change were wrong for
+    this lane; apply extra scrutiny."""
+
+    def __init__(self, data, rec):
+        from cuvs.cluster import kmeans
+        self.kmeans = kmeans
+        t, self.info = _cuml_setup({"X": data["X"]}, library="cuvs", probe_defers=True)
+        self.info["library"] = "hipvs"
+        self.x = t["X"]
+        self.kw = dict(metric="sqeuclidean", n_clusters=KMEANS_K, init_method="KMeansPlusPlus",
+                       max_iter=KMEANS_ITER, tol=KMEANS_TOL, n_init=1,
+                       oversampling_factor=KMEANS_OVERSAMPLING)
+        self.params = kmeans.KMeansParams(**self.kw)
+        # Declared (a function call, not an estimator): the values `call` passes.
+        # FAIRNESS FIX (2026-10-13 audit): read the constructed parameter
+        # object's values, including its inactive hierarchy defaults, and
+        # preserve the actual library routine before JSON transport.
+        self.params_obj = {"__library__": "cuvs", "__implementation__": kmeans.fit,
+            **{key: getattr(self.params, key) for key in (
+                "n_clusters", "n_init", "max_iter", "tol", "oversampling_factor", "metric",
+                "init_method", "hierarchical", "hierarchical_n_iters")}}
+        self.info["config"] = ("cuvs.cluster.kmeans.fit(KMeansParams(%s), X) (hipVS); fit timed, "
+                               "labels by kmeans.predict after the clock"
+                               % ", ".join("%s=%r" % kv for kv in sorted(self.kw.items())))
+        self.out = None
+
+    def call(self):
+        self.out = self.kmeans.fit(self.params, self.x)
+
+    def sync(self):
+        _cupy_sync()
+
+    def outputs(self):
+        centroids, _inertia, n_iter = self.out
+        labels, _ = self.kmeans.predict(self.params, self.x, centroids)
+        return {"centers": np.asarray(_to_host(centroids), dtype=np.float32),
+                "labels": np.asarray(_to_host(labels), dtype=np.int32).reshape(-1),
+                "n_iter": np.array([int(n_iter)], dtype=np.int64)}
+
+
+class HipvsKNN:
+    """FAIRNESS FIX (2026-10-13 audit, the author's correction): the AMD GPU kNN
+    opponent was TorchKNN, this harness's cdist + topk. It is replaced by
+    hipVS's exact brute-force kNN (cuvs.neighbors.brute_force, AMD's port of
+    cuVS): the index is built before the clock, exactly as the cuML arm fits
+    before its clock, and search(index, queries, k=64) under metric='euclidean'
+    is timed. UNVERIFIED AT RUNTIME: no AMD box has run this arm (2026-10-13).
+    Results raced before this change were wrong for this lane; apply extra
+    scrutiny."""
+
+    def __init__(self, data, rec):
+        from cuvs.neighbors import brute_force
+        self.bf = brute_force
+        t, self.info = _cuml_setup({"index": data["index"], "queries": data["queries"]},
+                                   library="cuvs")
+        self.info["library"] = "hipvs"
+        self.q = t["queries"]
+        self.index = brute_force.build(t["index"], metric="euclidean")
+        _cupy_sync()
+        # Declared where it becomes true, as CumlKNN does: the build ran before the clock.
+        self.info["pre_clock_fit"] = True
+        self.info["config"] = ("cuvs.neighbors.brute_force.build(index, metric='euclidean') "
+                               "(hipVS) before the clock; search(index, queries, k=%d) timed" % KNN_K)
+        self.params_obj = {"__library__": "cuvs", "__implementation__": brute_force.search,
+                           "n_neighbors": KNN_K, "algorithm": "brute",
+                           "metric": "euclidean", "p": 2}
+        self.out = None
+
+    def call(self):
+        self.out = self.bf.search(self.index, self.q, KNN_K)
+
+    def sync(self):
+        _cupy_sync()
+
+    def outputs(self):
+        dist, ind = self.out
+        return {"ind": np.asarray(_to_host(ind), dtype=np.int64),
+                "dist": np.asarray(_to_host(dist), dtype=np.float32)}
+
+
+class CumlKDE:
+    def __init__(self, data, rec):
+        from cuml.neighbors import KernelDensity
+        t, self.info = _cuml_setup({"X": data["X"], "Xq": data["Xq"]})
+        self.q = t["Xq"]
+        self.kd = KernelDensity(bandwidth=KDE_BANDWIDTH, kernel="gaussian",
+                                metric="euclidean", output_type="cupy")
+        self.params_obj = self.kd
+        self.kd.fit(t["X"])
+        _cupy_sync()
+        # Declared where it becomes true: the fit above is outside the clock,
+        # which times `score_samples` alone. See CumlKNN.
+        self.info["pre_clock_fit"] = True
+        self.info["config"] = ("cuml.neighbors.KernelDensity(bandwidth=1.0, kernel='gaussian', "
+                               "metric='euclidean', output_type='cupy'); fit before the clock, score_samples timed")
+        self.scores = None
+
+    def call(self):
+        self.scores = self.kd.score_samples(self.q)
+
+    def sync(self):
+        _cupy_sync()
+
+    def outputs(self):
+        return {"scores": np.asarray(_to_host(self.scores), dtype=np.float64).reshape(-1)}
+
+
+class CumlSVC:
+    def __init__(self, data, rec):
+        from cuml.svm import SVC
+        self.SVC = SVC
+        t, self.info = _cuml_setup({"X": data["X"], "y": data["y"], "Xq": data["Xq"]})
+        self.x, self.y, self.xq = t["X"], t["y"], t["Xq"]
+        self.gamma = float(rec["svc"]["gamma"])
+        self.params_obj, self.kw = construct_tolerant(
+            SVC, dict(C=SVC_C, kernel="rbf", gamma=self.gamma, tol=SVC_TOL, degree=SVC_DEGREE,
+                      coef0=SVC_COEF0, max_iter=SVC_MAX_ITER, cache_size=SVC_CACHE_MB,
+                      class_weight=None, random_state=SEED, decision_function_shape=SVC_DFS,
+                      output_type="cupy"), self.info)
+        self.info["config"] = ("cuml.svm.SVC(C=1.0, kernel='rbf', gamma=1/d, tol=1e-3, degree=3, coef0=0.0, "
+                               "max_iter=-1, cache_size=2000, class_weight=None, random_state=%d, "
+                               "decision_function_shape='ovo', output_type='cupy'); fit timed" % SEED)
+        self.est = None
+
+    def call(self):
+        est = self.SVC(**self.kw)
+        est.fit(self.x, self.y)
+        self.est = est
+
+    def sync(self):
+        _cupy_sync()
+
+    def outputs(self):
+        pred = self.est.predict(self.xq)
+        return {"pred": np.asarray(_to_host(pred), dtype=np.float64).reshape(-1),
+                "n_support": np.array([int(np.asarray(_to_host(self.est.support_)).shape[0])],
+                                      dtype=np.int64)}
+
+
+def _cgroup_cpus():
+    """(CPUs the cgroup CPU quota allows, where it was read), or (None, reason).
+    A container can see every host CPU (os.cpu_count, sched_getaffinity) while
+    a CFS quota holds it to far fewer: a RunPod MI300X pod on 2026-09-11 saw
+    192 and was allowed 20.4."""
+    try:
+        with open("/sys/fs/cgroup/cpu.max") as fh:
+            quota, period = fh.read().split()[:2]
+        if quota != "max":
+            return float(quota) / float(period), "cgroup v2 cpu.max"
+    except (OSError, ValueError):
+        pass
+    for base in ("/sys/fs/cgroup/cpu", "/sys/fs/cgroup/cpu,cpuacct"):
+        try:
+            with open(base + "/cpu.cfs_quota_us") as fh:
+                quota = int(fh.read())
+            with open(base + "/cpu.cfs_period_us") as fh:
+                period = int(fh.read())
+            if quota > 0 and period > 0:
+                return quota / period, "cgroup v1 %s/cpu.cfs_quota_us" % base
+        except (OSError, ValueError):
+            pass
+    return None, "no cgroup CPU quota"
+
+
+class SkQuota:
+    """sklearn-cpu-quota: the same scikit-learn call, its BLAS and OpenMP pools
+    (and kNN's n_jobs) capped at the whole CPUs the cgroup quota allows. The
+    uncapped sklearn-cpu arm sizes its pools to every VISIBLE CPU, which on a
+    quota-limited container oversubscribes the quota; this arm is the
+    opponent's better configuration on such a box, and both are reported."""
+
+    def __init__(self, inner_cls, data, rec):
+        from threadpoolctl import threadpool_limits
+        self.limits = threadpool_limits
+        cpus, source = _cgroup_cpus()
+        self.cap = max(1, int(cpus)) if cpus else (os.cpu_count() or 1)
+        with self.limits(limits=self.cap):
+            self.inner = inner_cls(data, rec)
+            if hasattr(self.inner, "nn"):
+                self.inner.nn.set_params(n_jobs=self.cap)
+            self.info = _sklearn_info()
+        self.info["config"] = self.inner.info.get("config", "") + (
+            "; threadpool_limits(limits=%d) around construction and every call" % self.cap)
+        self.info["thread_cap"] = {"threads": self.cap, "quota_cpus": cpus, "source": source}
+        for k in ("tree_fit_ms_untimed", "pre_clock_fit"):
+            if k in self.inner.info:
+                self.info[k] = self.inner.info[k]
+        self.params_obj = getattr(self.inner, "params_obj", None)
+
+    def call(self):
+        with self.limits(limits=self.cap):
+            self.inner.call()
+
+    def sync(self):
+        pass
+
+    def outputs(self):
+        return self.inner.outputs()
+
+
+# ---- DBSCAN and HDBSCAN (lane linear-cluster-istella, measurement only) -------
+
+def _dbscan_params(ds):
+    """(eps, min_samples): the cuML benchmark's DBSCAN shared_args (eps=3,
+    min_samples=2), the same on every dataset and every arm."""
+    return DBSCAN_EPS, DBSCAN_MIN_SAMPLES
+
+
+class OursDBSCAN:
+    def __init__(self, data, rec):
+        self.ml = _ours_module()
+        self.X = data["X"]
+        self.eps, self.min_samples = _dbscan_params(rec["dataset"])
+        self.est = None
+        self.params_obj = self.make()
+        self.info = _ours_info(self.ml, self.params_obj)
+        self.info["config"] = ("anonlib.DBSCAN(eps=%r, min_samples=%d, metric='euclidean', "
+                               "algorithm='brute'); fit timed" % (self.eps, self.min_samples))
+
+    def make(self):
+        # FAIRNESS FIX (2026-10-13 audit): ours ran algorithm='rbc' (a random
+        # ball cover) while the raced cuml-gpu arm ran 'brute' (an all-pairs
+        # scan): different algorithms. Ours now runs 'brute', the algorithm of
+        # cuml-gpu and scikit-learn. Results raced before this change were wrong
+        # for this lane; apply extra scrutiny.
+        return self.ml.DBSCAN(eps=self.eps, min_samples=self.min_samples, metric="euclidean",
+                              algorithm="brute")
+
+    def call(self):
+        est = self.make()
+        est.fit(self.X)
+        self.est = est
+
+    def sync(self):
+        pass
+
+    def outputs(self):
+        return {"labels": np.array(self.est.labels_, dtype=np.int32).reshape(-1)}
+
+
+class CumlDBSCAN:
+    ALGO = "brute"
+
+    def __init__(self, data, rec):
+        from cuml.cluster import DBSCAN
+        self.DBSCAN = DBSCAN
+        t, self.info = _cuml_setup({"X": data["X"]})
+        self.x = t["X"]
+        self.eps, self.min_samples = _dbscan_params(rec["dataset"])
+        # FAIRNESS FIX (2026-10-13 audit): cuML ran calc_core_sample_indices=False
+        # (no core-sample pass) while ours computes core_sample_indices_ on every
+        # fit, so cuML's clock covered less work. It now runs True, its own
+        # default and ours' behaviour. Results raced before this change were
+        # wrong for this lane; apply extra scrutiny.
+        self.params_obj, self.kw = construct_tolerant(
+            DBSCAN, dict(eps=self.eps, min_samples=self.min_samples, metric="euclidean",
+                         algorithm=self.ALGO, calc_core_sample_indices=True, output_type="cupy"),
+            self.info)
+        self.info["config"] = ("cuml.cluster.DBSCAN(eps=%r, min_samples=%d, metric='euclidean', "
+                               "algorithm=%r, calc_core_sample_indices=True, output_type='cupy'); "
+                               "fit timed" % (self.eps, self.min_samples, self.ALGO))
+        self.est = None
+
+    def call(self):
+        est = self.DBSCAN(**self.kw)
+        est.fit(self.x)
+        self.est = est
+
+    def sync(self):
+        _cupy_sync()
+
+    def outputs(self):
+        return {"labels": np.asarray(_to_host(self.est.labels_), dtype=np.int32).reshape(-1)}
+
+
+class CumlDBSCANRbc(CumlDBSCAN):
+    ALGO = "rbc"
+
+
+class SkDBSCAN:
+    """sklearn.cluster.DBSCAN with the race's eps and min_samples on the same
+    1,000,000-row standardized block, on every core (n_jobs=-1; its default is
+    one). algorithm='brute', the cuML benchmark's cpu_args; a round can run
+    for hours, and the board's per-round limit then records the timeout."""
+
+    def __init__(self, data, rec):
+        from sklearn.cluster import DBSCAN
+        _sklearn_pools_touch()
+        self.DBSCAN = DBSCAN
+        self.X = data["X"]
+        self.eps, self.min_samples = _dbscan_params(rec["dataset"])
+        self.est = None
+        self.info = _sklearn_info()
+        self.info["config"] = ("sklearn.cluster.DBSCAN(eps=%r, min_samples=%d, metric='euclidean', "
+                               "algorithm='brute', n_jobs=-1); fit timed" % (self.eps, self.min_samples))
+        self.params_obj = self.make()
+
+    def make(self):
+        return self.DBSCAN(eps=self.eps, min_samples=self.min_samples, metric="euclidean",
+                           algorithm="brute", n_jobs=-1)
+
+    def call(self):
+        est = self.make()
+        est.fit(self.X)
+        self.est = est
+
+    def sync(self):
+        pass
+
+    def outputs(self):
+        return {"labels": np.asarray(self.est.labels_, dtype=np.int32).reshape(-1)}
+
+
+#: HDBSCAN: one setting for every arm, every parameter the libraries share
+#: set explicitly (max_cluster_size: 0 on ours and cuML, None on scikit-learn;
+#: both mean no limit).
+HDBSCAN_KW = dict(min_samples=10, min_cluster_size=100, metric="euclidean",
+                  cluster_selection_method="eom", cluster_selection_epsilon=0.0, alpha=1.0,
+                  allow_single_cluster=False)
+
+#: scikit-learn's HDBSCAN min_samples COUNTS THE POINT ITSELF
+#: (sklearn/cluster/_hdbscan/hdbscan.py: kneighbors(X, min_samples)[:, -1],
+#: and its Notes: "must be 1 greater than the value used in
+#: scikit-learn-contrib/hdbscan"); cuML's does not (cpp/src/hdbscan/runner.h
+#: :68-80 runs the k-NN at min_samples + 1, "consistent with
+#: scikit-learn-contrib"), and ours transcribes cuML. So the SAME core distance
+#: is scikit-learn's min_samples = ours + 1.
+SKLEARN_HDBSCAN_MIN_SAMPLES = HDBSCAN_KW["min_samples"] + 1
+SKLEARN_HDBSCAN_KW = dict(HDBSCAN_KW, min_samples=SKLEARN_HDBSCAN_MIN_SAMPLES)
+
+
+class CumlHDBSCAN:
+    MIN_SAMPLES = HDBSCAN_KW["min_samples"]
+    MIN_CLUSTER_SIZE = HDBSCAN_KW["min_cluster_size"]
+
+    def __init__(self, data, rec):
+        from cuml.cluster import HDBSCAN
+        self.HDBSCAN = HDBSCAN
+        n = int(rec.get("hdbscan", {}).get("rows", HDBSCAN_ROWS))
+        t, self.info = _cuml_setup({"X": data["X"][:n]})
+        self.x = t["X"]
+        # FAIRNESS FIX (2026-10-13 audit): build_algo (how cuML builds its k-NN
+        # graph) was left at the library default; it is pinned to 'brute_force',
+        # the exact k-NN ours uses ('nn_descent' would be approximate). Results
+        # raced before this change were wrong for this lane; apply extra scrutiny.
+        self.params_obj, self.kw = construct_tolerant(
+            HDBSCAN, dict(HDBSCAN_KW, max_cluster_size=0, build_algo="brute_force",
+                          output_type="cupy"), self.info)
+        self.info["config"] = ("cuml.cluster.HDBSCAN(%s) on the block's first %d rows; fit timed"
+                               % (", ".join("%s=%r" % kv for kv in sorted(self.kw.items())), n))
+        self.est = None
+
+    def call(self):
+        est = self.HDBSCAN(**self.kw)
+        est.fit(self.x)
+        self.est = est
+
+    def sync(self):
+        _cupy_sync()
+
+    def outputs(self):
+        return {"labels": np.asarray(_to_host(self.est.labels_), dtype=np.int32).reshape(-1)}
+
+
+class OursHDBSCAN:
+    """anonlib.HDBSCAN with the same settings on the same first rows."""
+    MIN_SAMPLES = CumlHDBSCAN.MIN_SAMPLES
+    MIN_CLUSTER_SIZE = CumlHDBSCAN.MIN_CLUSTER_SIZE
+
+    def __init__(self, data, rec):
+        self.ml = _ours_module()
+        n = int(rec.get("hdbscan", {}).get("rows", HDBSCAN_ROWS))
+        self.X = data["X"][:n]
+        self.est = None
+        self.params_obj = self.make()
+        self.info = _ours_info(self.ml, self.params_obj)
+        self.info["config"] = ("anonlib.HDBSCAN(%s, max_cluster_size=0) on the block's first %d rows; "
+                               "fit timed" % (", ".join("%s=%r" % kv for kv in sorted(HDBSCAN_KW.items())), n))
+
+    def make(self):
+        return self.ml.HDBSCAN(max_cluster_size=0, **HDBSCAN_KW)
+
+    def call(self):
+        est = self.make()
+        est.fit(self.X)
+        self.est = est
+
+    def sync(self):
+        pass
+
+    def outputs(self):
+        return {"labels": np.array(self.est.labels_, dtype=np.int32).reshape(-1)}
+
+
+class SkHDBSCAN:
+    """sklearn.cluster.HDBSCAN with the same settings, on every core
+    (n_jobs=-1: its default is ONE core, and every other scikit-learn arm
+    here runs on every core)."""
+    MIN_SAMPLES = CumlHDBSCAN.MIN_SAMPLES
+    MIN_CLUSTER_SIZE = CumlHDBSCAN.MIN_CLUSTER_SIZE
+
+    def __init__(self, data, rec):
+        from sklearn.cluster import HDBSCAN
+        _sklearn_pools_touch()
+        self.HDBSCAN = HDBSCAN
+        n = int(rec.get("hdbscan", {}).get("rows", HDBSCAN_ROWS))
+        self.X = data["X"][:n]
+        self.est = None
+        self.info = _sklearn_info()
+        self.info["config"] = ("sklearn.cluster.HDBSCAN(%s, max_cluster_size=None, n_jobs=-1, "
+                               "algorithm='brute') on the "
+                               "block's first %d rows; fit timed"
+                               % (", ".join("%s=%r" % kv for kv in sorted(SKLEARN_HDBSCAN_KW.items())), n))
+        self.params_obj = self.make()
+
+    def make(self):
+        # FAIRNESS FIX (2026-10-13 audit): scikit-learn ran algorithm='auto' (a
+        # KD/ball tree for the core distances and its tree-based MST) against
+        # ours' exact brute-force k-NN: a different neighbour search (the DBSCAN
+        # ruling). It now runs algorithm='brute'. Its brute path holds the full
+        # n x n distance matrix (100,000 rows: 80 GB in float64), so a host
+        # without that memory refuses the arm by name. Results raced before this
+        # change were wrong for this lane; apply extra scrutiny.
+        return self.HDBSCAN(max_cluster_size=None, n_jobs=-1, algorithm="brute",
+                            **SKLEARN_HDBSCAN_KW)
+
+    def call(self):
+        est = self.make()
+        est.fit(self.X)
+        self.est = est
+
+    def sync(self):
+        pass
+
+    def outputs(self):
+        return {"labels": np.asarray(self.est.labels_, dtype=np.int32).reshape(-1)}
+
+
+BUILDERS = {
+    ("dbscan", "ours"): OursDBSCAN, ("dbscan", "cuml-gpu"): CumlDBSCAN,
+    ("dbscan", "cuml-gpu-rbc"): CumlDBSCANRbc, ("dbscan", "sklearn-cpu"): SkDBSCAN,
+    ("hdbscan", "cuml-gpu"): CumlHDBSCAN,
+    ("hdbscan", "ours"): OursHDBSCAN, ("hdbscan", "sklearn-cpu"): SkHDBSCAN,
+    ("kmeans", "ours"): OursKMeans, ("kmeans", "sklearn-cpu"): SkKMeans, ("kmeans", "torch-gpu"): TorchKMeans,
+    ("kmeans", "cuml-gpu"): CumlKMeans,
+    ("kmeans", "hipvs-gpu"): HipvsKMeans, ("knn", "hipvs-gpu"): HipvsKNN,  # FAIRNESS FIX (2026-10-13 audit)
+    ("pca", "ours"): OursPCA, ("pca", "sklearn-cpu"): SkPCA, ("pca", "torch-gpu"): TorchPCA,
+    ("pca", "cuml-gpu"): CumlPCA,
+    ("ols", "ours"): OursOLS, ("ols", "sklearn-cpu"): SkOLS, ("ols", "torch-gpu"): TorchOLS,
+    ("ols", "torch-gpu-eigh"): TorchOLSEigh, ("ols", "cuml-gpu"): CumlOLS,
+    ("knn", "ours"): OursKNN, ("knn", "sklearn-cpu"): SkKNN, ("knn", "torch-gpu"): TorchKNN,
+    ("knn", "cuml-gpu"): CumlKNN,
+    ("kde", "ours"): OursKDE, ("kde", "sklearn-cpu"): SkKDE, ("kde", "cuml-gpu"): CumlKDE,
+    ("svc", "ours"): OursSVC, ("svc", "sklearn-cpu"): SkSVC, ("svc", "cuml-gpu"): CumlSVC,
+}
+# `ours-base`: OUR SAME estimator from a second Python tree
+# (ANONLIB_CTD_BASE_PY, a copy of `python/` holding the BEFORE bindings), so
+# a before/after A/B interleaves round by round in one race instead of two
+# races minutes apart (lane linear-cluster-speed f3de0b36, 2026-09-11; taken
+# here for the SVC before/after as well). It is never an opponent: ratios
+# against it are ours-vs-ours and are not quoted as one.
+for _lane in LANES:
+    # A lane without an `ours` arm has no before/after to interleave.
+    if (_lane, "ours") in BUILDERS:
+        BUILDERS[(_lane, "ours-base")] = BUILDERS[(_lane, "ours")]
+        # `ours-fast`: the SAME estimator in a worker started under
+        # ANONLIB_NUMERIC_MODE=fast (`_worker_env`), so the Apple board
+        # interleaves FAST beside IDENTICAL round by round in one race.
+        BUILDERS[(_lane, "ours-fast")] = BUILDERS[(_lane, "ours")]
+        # No `ours-cpu`: our CPU is never raced or timed (the author, Oct 2 2026).
+for _lane in LANES:
+    # Same for a lane with no scikit-learn arm: there is
+    # nothing to wrap in the CPU quota.
+    if (_lane, "sklearn-cpu") not in BUILDERS:
+        continue
+    BUILDERS[(_lane, "sklearn-cpu-quota")] = (
+        lambda data, rec, _c=BUILDERS[(_lane, "sklearn-cpu")]: SkQuota(_c, data, rec))
+    ARMS[_lane] = ARMS[_lane] + ("sklearn-cpu-quota",)
+
+
+def _digest(outputs):
+    h = hashlib.sha256()
+    for k in sorted(outputs):
+        h.update(k.encode())
+        h.update(np.ascontiguousarray(outputs[k]).data)
+    return h.hexdigest()[:16]
+
+
+# ---------------------------------------------------------------------------
+# inference (`race --infer`, OFF by default: without it nothing below runs and
+# the race's output and JSON are unchanged)
+# ---------------------------------------------------------------------------
+#
+# After the fit rounds, every arm of a lane with a public predict or transform
+# times it on the eval rows `Xq` with ITS OWN model from the last fit round
+# (the fit is not retimed): kmeans predict, pca transform, ols predict, svc
+# predict. kNN (kneighbors) and KDE (score_samples) already time inference as
+# their race; DBSCAN and HDBSCAN have no predict. The span is the fit's: ours
+# takes host rows and returns host results inside its clock; the torch and
+# cuML arms upload `Xq` BEFORE their clock (upload_ms_untimed) and their clock
+# ends at the device synchronize, exactly as their fit rounds do.
+
+INFER_LANES = ("kmeans", "pca", "ols", "svc")
+INFER_CALL = {"kmeans": "predict", "pca": "transform", "ols": "predict", "svc": "predict"}
+
+
+class _InferRunner:
+    def __init__(self, call, sync, outputs, desc, info=None):
+        self.call, self.sync, self.outputs, self.desc = call, sync, outputs, desc
+        self.info = info or {}
+
+
+def _torch_upload(runner, x):
+    t0 = time.perf_counter()
+    dev = runner.torch.from_numpy(np.ascontiguousarray(x)).to(runner.dev)
+    _torch_sync()
+    return dev, (time.perf_counter() - t0) * 1000.0
+
+
+def _cupy_upload(x):
+    import cupy as cp
+    t0 = time.perf_counter()
+    dev = cp.asarray(np.ascontiguousarray(x))
+    cp.cuda.runtime.deviceSynchronize()
+    return dev, (time.perf_counter() - t0) * 1000.0
+
+
+def infer_runner(lane, runner, data):
+    """The timed inference call for one fitted runner, or a RuntimeError
+    naming why this arm has none. Setup here (an upload) is untimed."""
+    if lane not in INFER_LANES:
+        raise RuntimeError("lane %s has no inference phase (its race already times "
+                           "inference, or its estimator has no predict)" % lane)
+    quota = runner if isinstance(runner, SkQuota) else None
+    inner = quota.inner if quota else runner
+    xq = data["Xq"]
+    out = {}
+    host_sync = (lambda: None)
+    kind = INFER_CALL[lane]
+
+    def keep(v):
+        out["v"] = v
+
+    if isinstance(inner, (OursKMeans, OursPCA, OursOLS, OursSVC, SkKMeans, SkPCA, SkOLS, SkSVC)):
+        est = inner.est
+        if est is None:
+            raise RuntimeError("no fitted estimator")
+        method = getattr(est, kind)
+        lib = "anonlib" if isinstance(inner, (OursKMeans, OursPCA, OursOLS, OursSVC)) else "sklearn"
+        def call(method=method):
+            if quota is None:
+                keep(method(xq))
+                return
+            with quota.limits(limits=quota.cap):
+                keep(method(xq))
+        desc = "%s %s.%s(Xq), host rows in, host result out" % (lib, type(est).__name__, kind)
+        return _InferRunner(call, host_sync, lambda: {"pred": _infer_host(lane, out["v"])}, desc)
+    if isinstance(inner, (TorchKMeans, TorchPCA, TorchOLS, TorchOLSEigh)):
+        torch = inner.torch
+        xd, up = _torch_upload(inner, xq)
+        info = {"upload_ms_untimed": up}
+        if isinstance(inner, TorchKMeans):
+            c = inner.c
+
+            def call():
+                c2 = (c * c).sum(dim=1)
+                n = xd.shape[0]
+                labels = torch.empty(n, dtype=torch.long, device=inner.dev)
+                for s in range(0, n, TORCH_CHUNK_ROWS):
+                    e = min(s + TORCH_CHUNK_ROWS, n)
+                    labels[s:e] = torch.addmm(c2.unsqueeze(0), xd[s:e], c.T,
+                                              beta=1.0, alpha=-2.0).argmin(dim=1)
+                keep(labels)
+            desc = "torch chunked addmm(||c||^2, Xq, c.T, alpha -2).argmin over the fitted centers"
+        elif isinstance(inner, TorchPCA):
+            comp, mean = inner.components, inner.mean
+            call = (lambda: keep((xd - mean) @ comp.T))
+            desc = "torch (Xq - mean) @ components.T"
+        else:
+            coef, icpt = inner.coef, inner.intercept
+            call = (lambda: keep(xd @ coef + icpt))
+            desc = "torch Xq @ coef + intercept"
+        return _InferRunner(call, _torch_sync, lambda: {"pred": _infer_host(lane, out["v"])},
+                            desc + "; Xq uploaded before the clock, which ends at the device synchronize",
+                            info)
+    if isinstance(inner, (CumlKMeans, CumlPCA, CumlOLS, CumlSVC)):
+        est = inner.est
+        if est is None:
+            raise RuntimeError("no fitted estimator")
+        if isinstance(inner, CumlSVC):
+            xd, up = inner.xq, None
+        else:
+            xd, up = _cupy_upload(xq)
+        method = getattr(est, kind)
+        call = (lambda: keep(method(xd)))
+        desc = ("cuml %s.%s(Xq on the device, output_type cupy); Xq uploaded before the clock, "
+                "which ends at the device synchronize" % (type(est).__name__, kind))
+        return _InferRunner(call, _cupy_sync, lambda: {"pred": _infer_host(lane, out["v"])}, desc,
+                            {"upload_ms_untimed": up})
+    raise RuntimeError("no inference call wired for %s" % type(inner).__name__)
+
+
+def _infer_host(lane, v):
+    """One dtype per lane on every arm, so outputs compare bit for bit."""
+    a = np.asarray(_to_host(v))
+    if lane == "kmeans":
+        return np.ascontiguousarray(a.reshape(-1), dtype=np.int32)
+    if lane == "svc":
+        return np.ascontiguousarray(a.reshape(-1), dtype=np.float64)
+    if lane == "ols":
+        return np.ascontiguousarray(a.reshape(-1), dtype=np.float32)
+    return np.ascontiguousarray(a, dtype=np.float32)
+
+
+def infer_quality(lane, data, infer_outs, fit_outs):
+    """Arm -> quality of its timed inference output: the lane's metric on the
+    eval rows, agreement with a float64 NumPy evaluation of the arm's OWN
+    fitted model, and agreement with ours (`bits_equal_vs_ours` is the FAST
+    against IDENTICAL check for `ours-fast`)."""
+    q = {}
+    Xq = data["Xq"].astype(np.float64)
+    for arm, o in infer_outs.items():
+        p = o["pred"]
+        f = fit_outs.get(arm) or {}
+        e = {}
+        try:
+            if lane == "kmeans" and "centers" in f:
+                C = f["centers"].astype(np.float64)
+                c2 = (C * C).sum(axis=1)
+                agree = total = 0.0
+                for s in range(0, Xq.shape[0], 250_000):
+                    xb = Xq[s:s + 250_000]
+                    d = np.maximum((xb * xb).sum(axis=1)[:, None] - 2.0 * (xb @ C.T) + c2[None, :], 0.0)
+                    dmin = d.min(axis=1)
+                    lab = p[s:s + 250_000].astype(np.int64)
+                    ok = (lab >= 0) & (lab < C.shape[0])
+                    got = np.where(ok, d[np.arange(d.shape[0]), np.clip(lab, 0, C.shape[0] - 1)], np.inf)
+                    agree += float((got <= dmin * (1.0 + 1e-6) + 1e-9).sum())
+                    total += float(np.where(ok, got, 0.0).sum())
+                e["eval_inertia"] = total
+                e["label_agreement_own_centers"] = agree / Xq.shape[0]
+            elif lane == "pca" and "components" in f:
+                ref = (Xq - f["mean"].astype(np.float64).reshape(-1)) @ f["components"].astype(np.float64).T
+                scale = float(np.max(np.abs(ref))) or 1.0
+                e["transform_max_rel_err_own_fp64"] = float(np.max(np.abs(p.astype(np.float64) - ref))) / scale
+            elif lane == "ols":
+                yq = data["yq"].astype(np.float64)
+                pr = p.astype(np.float64)
+                ss_tot = float(((yq - yq.mean()) ** 2).sum())
+                res = yq - pr
+                e["r2_eval"] = 1.0 - float((res * res).sum()) / ss_tot if ss_tot else None
+                e["rmse_eval"] = float(np.sqrt(float((res * res).sum()) / yq.shape[0]))
+                if "coef" in f:
+                    ref = Xq @ f["coef"].astype(np.float64).reshape(-1) + float(f["intercept"][0])
+                    scale = float(np.max(np.abs(ref))) or 1.0
+                    e["predict_max_rel_err_own_fp64"] = float(np.max(np.abs(pr - ref))) / scale
+            elif lane == "svc":
+                e["accuracy_eval"] = float((p == data["yq"].astype(np.float64)).mean())
+        except Exception as exc:  # noqa: BLE001
+            e["error"] = repr(exc)[:200]
+        ref = infer_outs.get("ours")
+        if ref is not None and arm != "ours":
+            r = ref["pred"]
+            same = r.shape == p.shape
+            e["bits_equal_vs_ours"] = bool(same and r.tobytes() == p.tobytes())
+            if same and lane in ("kmeans", "svc"):
+                e["agreement_vs_ours"] = float((r == p).mean())
+            elif same:
+                e["max_abs_diff_vs_ours"] = float(np.max(np.abs(r.astype(np.float64) - p.astype(np.float64)))) if p.size else 0.0
+        q[arm] = e
+    return q
+
+
+def worker_ready(args):
+    """The worker's ready stage: load the block, construct the arm, read its parameters back.
+    Returns (runner, data, rec, message): the ready message, or an error message with runner None.
+    The worker subprocess and the smoke's in-process probe (probe_ready) both run exactly this."""
+    block = os.path.join(args.data, "%s-%s" % (BLOCK_OF[args.lane], args.dataset))
+    try:
+        data = read_block_arrays(block + ".npz")    # smoke-fixes r14: once per smoke worker (read_block_arrays)
+        with open(block + ".json") as fh:
+            rec = json.load(fh)
+        runner = BUILDERS[(args.lane, args.arm)](data, rec)
+        # the parameters this arm really got, read back from what it constructed
+        params = params_record(getattr(runner, "params_obj", None))
+    except Exception as exc:  # noqa: BLE001
+        import traceback
+        traceback.print_exc()
+        return None, None, None, {"event": "error", "stage": "ready", "error": repr(exc)}
+    if isinstance(runner.info, dict):   # the arm's own library version and GPU (the store's key)
+        runner.info.update(_probe().library_identity(runner.info))
+    return runner, data, rec, {"event": "ready", "info": runner.info, "pid": os.getpid(), "params": params}
+
+
+def probe_ready(argv):
+    """The smoke's in-process parameter probe (tools/smoke_inproc.py): a worker's argv, its ready message."""
+    return worker_ready(build_parser().parse_args(argv))[3]
+
+
+def worker(args):
+    # The protocol gets its own descriptor; fd 1 becomes stderr (the log), so
+    # a library that prints cannot interleave with a protocol line.
+    proto = os.fdopen(os.dup(1), "w", buffering=1)
+    os.dup2(2, 1)
+    sys.stdout = sys.stderr
+
+    def say(obj):
+        proto.write(json.dumps(obj, sort_keys=True) + "\n")
+        proto.flush()
+
+    runner, data, rec, msg = worker_ready(args)
+    say(msg)
+    if runner is None:
+        return 1
+    # peak memory per round, reset and read OUTSIDE the clock
+    mem = _probe().MemProbe((runner.info or {}).get("device", "gpu"),
+        library=(runner.info or {}).get("library") or "?", arm=args.arm)
+    inf = None
+    for line in sys.stdin:
+        parts = line.split()
+        if not parts:
+            continue
+        if parts[0] == "round":
+            r = int(parts[1])
+            try:
+                mem.start()
+                whole_start = time.perf_counter()
+                whole_requested = os.environ.get("ANONLIB_BENCH_WHOLE_OPERATION") == "1"
+                if whole_requested:
+                    # Recreate per operation so constructor-side fit/preparation
+                    # (notably kNN/KDE) is included, on every scored arm equally.
+                    # Release the previous fitted device model before allocating
+                    # its replacement, avoiding a transient double allocation.
+                    runner = None
+                    runner = BUILDERS[(args.lane, args.arm)](data, rec)
+                    runner.sync()
+                preparation_ms = (time.perf_counter() - whole_start) * 1000.0
+                t0 = time.perf_counter()
+                runner.call()
+                runner.sync()
+                ms = (time.perf_counter() - t0) * 1000.0
+                outputs = runner.outputs()
+                runner.sync()
+                operation_ms = (time.perf_counter() - whole_start) * 1000.0
+                m = mem.stop()
+                digest = _digest(outputs)
+                from bench_board_state import scored_receipt
+                state_receipt = scored_receipt(outputs, runner) if r > 0 else None
+                # the separate upload clock (ours only), after every scored
+                # clock of this round has closed; see _ours_upload_probe
+                upload_sep = None
+                if (runner.info or {}).get("library") == "anonlib":
+                    upload_sep = _ours_upload_probe(runner)
+            except Exception as exc:  # noqa: BLE001
+                import traceback
+                traceback.print_exc()
+                say({"event": "error", "stage": "round %d" % r, "error": repr(exc)})
+                return 1
+            say({"event": "round", "round": r, "ms": ms, "digest": digest, "mem": m, "state_receipt": state_receipt,
+                 "upload_separate": upload_sep,
+                 "operation": {"ms": operation_ms, "preparation_ms": preparation_ms,
+                               "scope": "prepare-fit-consume" if whole_requested else "call-consume",
+                               "dataset_load_included": False,
+                               "fresh_process": False, "startup_probe_preparation_excluded": True}})
+        elif parts[0] == "infer":
+            # `race --infer` only. An inference failure is reported and the
+            # worker stays up: its fit outputs still have to be saved.
+            r = int(parts[1])
+            try:
+                if inf is None:
+                    inf = infer_runner(args.lane, runner, data)
+                mem.start()
+                t0 = time.perf_counter()
+                inf.call()
+                inf.sync()
+                ms = (time.perf_counter() - t0) * 1000.0
+                m = mem.stop()
+                digest = _digest(inf.outputs())
+            except Exception as exc:  # noqa: BLE001
+                import traceback
+                traceback.print_exc()
+                say({"event": "infer_error", "stage": "infer %d" % r, "error": repr(exc)})
+                continue
+            say({"event": "infer", "round": r, "ms": ms, "digest": digest,
+                 "call": inf.desc, "info": inf.info, "mem": m})
+        elif parts[0] == "infer_save":
+            try:
+                path = parts[1]
+                tmp = path + ".tmp.npz"
+                np.savez(tmp, **inf.outputs())
+                os.replace(tmp, path)
+                say({"event": "infer_saved", "path": path})
+            except Exception as exc:  # noqa: BLE001
+                say({"event": "infer_error", "stage": "infer_save", "error": repr(exc)})
+        elif parts[0] == "save":
+            try:
+                path = parts[1]
+                tmp = path + ".tmp.npz"
+                np.savez(tmp, **runner.outputs())
+                os.replace(tmp, path)
+                say({"event": "saved", "path": path, "info": runner.info})
+            except Exception as exc:  # noqa: BLE001
+                say({"event": "error", "stage": "save", "error": repr(exc)})
+                return 1
+        elif parts[0] == "quit":
+            say({"event": "bye"})
+            return 0
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# race: the conductor for one (lane, dataset)
+# ---------------------------------------------------------------------------
+
+class Worker:
+    def __init__(self, arm, cmd, env, log_path, cwd):
+        self.arm = arm
+        self.log = open(log_path, "w")
+        self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                     stderr=self.log, env=env, cwd=cwd,
+                                     start_new_session=True)
+        self.buf = b""
+        self.noise = []
+        self.alive = True
+        self.status = "ok"
+        self.error = None
+        self.info = None
+        self.read_failure = None
+
+    def send(self, text):
+        self.proc.stdin.write((text + "\n").encode())
+        self.proc.stdin.flush()
+
+    def read(self, seconds):
+        """One protocol object, or None at the deadline or at EOF. A line
+        that is not a JSON object (a launcher such as `pixi run` printing
+        before the interpreter owns fd 1) is kept in `noise` and skipped."""
+        started = time.monotonic()
+        deadline = started + seconds
+        self.read_failure = None
+        fd = self.proc.stdout.fileno()
+        while True:
+            while b"\n" not in self.buf:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    self.read_failure = {"reason": "deadline", "deadline_s": seconds,
+                                         "elapsed_s": time.monotonic() - started}
+                    return None
+                ready, _, _ = select.select([fd], [], [], min(left, 5.0))
+                if not ready:
+                    continue
+                chunk = os.read(fd, 65536)
+                if not chunk:
+                    self.read_failure = {"reason": "eof", "deadline_s": seconds,
+                                         "elapsed_s": time.monotonic() - started}
+                    return None
+                self.buf += chunk
+            line, self.buf = self.buf.split(b"\n", 1)
+            text = line.decode(errors="replace").strip()
+            if text.startswith("{"):
+                try:
+                    return json.loads(text)
+                except ValueError:
+                    pass
+            self.noise.append(text[:200])
+
+    def kill(self, status, error):
+        self.alive = False
+        self.status = status
+        self.error = error
+        try:
+            os.killpg(self.proc.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        try:
+            self.proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            pass
+
+    def close(self):
+        if self.alive:
+            try:
+                self.send("quit")
+                self.read(60)
+            except OSError:
+                pass
+        try:
+            self.proc.wait(timeout=60)
+        except subprocess.TimeoutExpired:
+            self.kill(self.status, self.error)
+        self.log.close()
+
+
+def smoke_staging():
+    """tools/smoke_inproc.py when this process is the campaign smoke's worker or one of its arm servers (they serve
+    the --params-only parameter probe only), else None: a timed worker returns None here without importing
+    anything, so it reads its block exactly as before."""
+    if os.environ.get("ANONLIB_SMOKE_IN_PROCESS") != str(os.getpid()):
+        return None
+    if HERE not in sys.path:
+        sys.path.insert(0, HERE)
+    import smoke_inproc
+    return smoke_inproc if smoke_inproc.in_process() else None
+
+
+def read_block_arrays(path):
+    """{name: C-contiguous array} of a block's npz: what every worker reads. Inside the smoke worker
+    (smoke-fixes r14, 2026-10-14; classical recipes on istella STARTED at 5 s in zipfile crc32 / read_array:
+    the conductor's scorer preflight and every arm re-read the same npz inside the recipe's timer) the file is
+    read once per process, pinned for the whole smoke (smoke_inproc.staged_npz, keyed by its path, size and
+    mtime), and every caller gets a new dict over the same arrays: the same values, so the same records."""
+    SI = smoke_staging()
+    if SI is not None:
+        return SI.staged_npz(path)
+    with np.load(path) as z:
+        return {k: np.ascontiguousarray(z[k]) for k in z.files}
+
+
+def stage_inputs(lane, dataset, data):
+    """The smoke worker's stage-data step for one classical recipe (tools/smoke_worker.py), outside every recipe's
+    timer: the lane's block, read into the process's pinned staged inputs. A no-op outside the smoke worker."""
+    if smoke_staging() is None:
+        return {"status": "not in the smoke worker"}
+    block = os.path.join(data, "%s-%s" % (BLOCK_OF[lane], dataset))
+    arrays = read_block_arrays(block + ".npz")
+    return {"status": "ok", "staged": ["block %s-%s" % (BLOCK_OF[lane], dataset)], "arrays": sorted(arrays)}
+
+
+def start_worker(arm, cmd, env, log_path, cwd, params_only=False):
+    """A race's worker for `arm`: a subprocess (Worker) as always, or inside the campaign smoke's worker
+    process an in-process stand-in that runs the same ready stage (tools/smoke_inproc.py; --params-only only)."""
+    if os.environ.get("ANONLIB_SMOKE_IN_PROCESS") == str(os.getpid()):
+        if HERE not in sys.path:
+            sys.path.insert(0, HERE)
+        import smoke_inproc
+        return smoke_inproc.start_worker(arm, cmd, env, log_path, cwd, params_only, Worker)
+    return Worker(arm, cmd, env, log_path, cwd)
+
+
+def _worker_env(arm, root):
+    env = dict(os.environ)
+    for k in THREAD_ENV:
+        env.pop(k, None)
+    apply_cpu_quota(env)
+    if arm in ("ours", "ours-base", "ours-fast"):
+        env["ANONLIB_NUMERIC_MODE"] = "fast" if arm == "ours-fast" else "identical"
+        tree = os.path.join(root, "python")
+        if arm == "ours-base":
+            tree = os.environ.get("ANONLIB_CTD_BASE_PY", "")
+            if not tree or not os.path.isdir(tree):
+                raise SystemExit("arm ours-base needs ANONLIB_CTD_BASE_PY, a python/ tree holding the before bindings")
+        elif os.environ.get("ANONLIB_BENCH_INSTALLED", "0").strip() not in ("", "0"):
+            # tools/bench_board.py measures the INSTALLED wheel: the in-repo
+            # python/ (no compiled bindings in a shipped tree) must not shadow it.
+            return env
+        env["PYTHONPATH"] = tree + (
+            os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+    return env
+
+
+def quality(lane, data, outs, rec, *, knn_k=None):
+    """Arm name -> quality dict, one float64 NumPy function per lane."""
+    q = {}
+    if lane == "kmeans":
+        X = data["X"]
+        for arm, o in outs.items():
+            C = o["centers"].astype(np.float64)
+            c2 = (C * C).sum(axis=1)
+            total = 0.0
+            for s in range(0, X.shape[0], 250_000):
+                xb = X[s:s + 250_000].astype(np.float64)
+                d = (xb * xb).sum(axis=1)[:, None] - 2.0 * (xb @ C.T) + c2[None, :]
+                total += float(np.maximum(d.min(axis=1), 0.0).sum())
+            q[arm] = {"inertia": total, "n_iter": int(o["n_iter"][0])}
+        ref = q.get("ours", {}).get("inertia")
+        # FAIRNESS FIX (2026-10-13 audit): an opponent that ran MORE Lloyd
+        # iterations than ours was not flagged (the torch arm ran 91 to ours' 33
+        # on AMD Istella). Every arm's n_iter now sits beside ours' as
+        # n_iter_over_ours (above 1: the opponent iterated more than ours).
+        # Results raced before this change were wrong for this lane; apply extra
+        # scrutiny.
+        ref_iter = q.get("ours", {}).get("n_iter")
+        for arm in q:
+            if ref:
+                q[arm]["inertia_over_ours"] = q[arm]["inertia"] / ref
+            if ref_iter:
+                q[arm]["n_iter_over_ours"] = q[arm]["n_iter"] / ref_iter
+    elif lane == "pca":
+        X = data["X"]
+        n = X.shape[0]
+        mu = np.zeros(X.shape[1])
+        for s in range(0, n, 250_000):
+            mu += X[s:s + 250_000].astype(np.float64).sum(axis=0)
+        mu /= n
+        total = 0.0
+        proj = {arm: 0.0 for arm in outs}
+        comps = {arm: o["components"].astype(np.float64) for arm, o in outs.items()}
+        for s in range(0, n, 250_000):
+            xb = X[s:s + 250_000].astype(np.float64) - mu
+            total += float((xb * xb).sum())
+            for arm, V in comps.items():
+                p = xb @ V.T
+                proj[arm] += float((p * p).sum())
+        for arm in outs:
+            q[arm] = {"explained_variance_ratio_sum": proj[arm] / total if total else None}
+    elif lane == "ols":
+        Xq, yq = data["Xq"].astype(np.float64), data["yq"].astype(np.float64)
+        ss_tot = float(((yq - yq.mean()) ** 2).sum())
+        for arm, o in outs.items():
+            pred = Xq @ o["coef"].astype(np.float64) + float(o["intercept"][0])
+            res = yq - pred
+            ss_res = float((res * res).sum())
+            q[arm] = {"r2": 1.0 - ss_res / ss_tot if ss_tot else None,
+                      "rmse": float(np.sqrt(ss_res / yq.shape[0])),
+                      "finite": bool(np.all(np.isfinite(pred)))}
+    elif lane == "knn":
+        k = KNN_K if knn_k is None else int(knn_k)
+        if k < 1 or k > data["index"].shape[0]:
+            raise ValueError("recall k must be within the index row count")
+        for arm, output in outs.items():
+            if output["ind"].shape != (data["queries"].shape[0], k):
+                raise ValueError("recall output shape does not match requested k for " + arm)
+        index = data["index"].astype(np.float64)
+        Q = data["queries"].astype(np.float64)
+        nq = Q.shape[0]
+        shortlist = min(4 * k, index.shape[0])
+
+        def d64(qrows, ids):
+            diff = Q[qrows][:, None, :] - index[ids]
+            return (diff * diff).sum(axis=2)
+
+        # THE REFERENCE IS OURS TO COMPUTE, NOT AN ARM'S: float64 NumPy brute
+        # force. A norm-expansion shortlist of 4*k per query, unioned with every
+        # arm's returned ids, then exact float64 differences over that union;
+        # the reference is its kth smallest distance. An id an arm found that
+        # the shortlist missed is in the union, so it cannot be scored a miss.
+        x2 = (index * index).sum(axis=1)
+        kth = np.empty(nq)
+        for s in range(0, nq, 64):
+            e = min(s + 64, nq)
+            qb = Q[s:e]
+            dd = (qb * qb).sum(axis=1)[:, None] - 2.0 * (qb @ index.T) + x2[None, :]
+            cand = np.argpartition(dd, shortlist - 1, axis=1)[:, :shortlist]
+            union = np.concatenate([cand] + [o["ind"][s:e].astype(np.int64) for o in outs.values()],
+                                   axis=1)
+            exact = d64(np.arange(s, e), union)
+            for r in range(e - s):
+                _u, first = np.unique(union[r], return_index=True)
+                kth[s + r] = np.sort(exact[r, first])[k - 1]
+        for arm, o in outs.items():
+            ids = o["ind"].astype(np.int64)
+            entry = {"reference": "float64 NumPy brute force (shortlist %d plus every arm's ids, exact differences)" % shortlist}
+            srt = np.sort(ids, axis=1)
+            distinct = 1 + (np.diff(srt, axis=1) != 0).sum(axis=1)
+            entry["rows_with_repeated_ids"] = int((distinct < k).sum())
+            d = np.concatenate([d64(np.arange(s, min(s + 256, nq)), ids[s:s + 256])
+                                for s in range(0, nq, 256)], axis=0)
+            within = d <= kth[:, None] * (1.0 + 1e-9) + 1e-12
+            hits = np.minimum(within.sum(axis=1), distinct)
+            entry["recall_at_k"] = float(hits.mean() / k)
+            q[arm] = entry
+    elif lane == "kde":
+        sentinel = -3.0e38
+        for arm, o in outs.items():
+            s = o["scores"].astype(np.float64)
+            ok = np.isfinite(s) & (s > sentinel)
+            q[arm] = {"mean_log_likelihood": float(s[ok].mean()) if ok.any() else None,
+                      "rows_without_density": int((~ok).sum())}
+    elif lane in ("dbscan", "hdbscan"):
+        # Cluster count, noise share, and agreement with OUR labels (adjusted
+        # Rand index over every row both arms labeled; noise is its own label).
+        ref = outs.get("ours")
+        for arm, o in outs.items():
+            lab = o["labels"].astype(np.int64).reshape(-1)
+            ent = {"rows": int(lab.shape[0]),
+                   "n_clusters": int(np.unique(lab[lab >= 0]).shape[0]),
+                   "noise_fraction": float((lab < 0).mean())}
+            if lane == "hdbscan":
+                # FAIRNESS FIX (2026-10-13 audit): label agreement alone did
+                # not establish comparable clustering quality. Use the
+                # already-declared silhouette margin on every consumed row.
+                # Noise remains a label group under sklearn's definition;
+                # dropping noise or sampling rows would change this metric.
+                import sklearn
+                from sklearn import config_context
+                from sklearn.metrics import silhouette_score
+                rows = int(rec["hdbscan"]["rows"])
+                if lab.size != rows:
+                    raise ValueError("HDBSCAN output rows differ from its declared input slice")
+                if 1 < np.unique(lab).size < rows:
+                    # A memory ceiling for the validation oracle's distance
+                    # chunks, independent of benchmark dimensions or labels.
+                    with config_context(working_memory=256):
+                        ent["silhouette"] = float(silhouette_score(data["X"][:rows], lab, metric="euclidean"))
+                    ent["silhouette_scope"] = "all consumed rows; noise is a label group; no sampling"
+                    ent["silhouette_library"] = "sklearn.metrics.silhouette_score"
+                    ent["silhouette_library_version"] = sklearn.__version__
+            if ref is not None and arm != "ours" and ref["labels"].size == lab.size:
+                from sklearn.metrics import adjusted_rand_score
+                r = ref["labels"].astype(np.int64).reshape(-1)
+                ent["ari_vs_ours"] = float(adjusted_rand_score(r, lab))
+                ent["noise_agreement_vs_ours"] = float(((r < 0) == (lab < 0)).mean())
+            q[arm] = ent
+    elif lane == "svc":
+        yq = data["yq"].astype(np.float64)
+        for arm, o in outs.items():
+            q[arm] = {"accuracy": float((o["pred"] == yq).mean()),
+                      "n_support": int(o["n_support"][0])}
+    return q
+
+
+#: What each library's arm has OUTSIDE its clock, keyed on `info["library"]`.
+#: Read from the ready record every arm already sends; nothing here measures
+#: anything new and nothing here changes what is timed.
+def _span_facts(arm, info):
+    """What is inside this arm's timed region and what is outside it.
+
+    THE NUMBER WAS ALREADY MEASURED AND THEN THROWN AWAY (2026-09-12, lane
+    harness-honesty). `_cuml_setup` and `_torch_setup` have always recorded
+    `upload_ms_untimed`, `SkKDE` has always recorded `tree_fit_ms_untimed`,
+    and the module docstring has always said which arms fit before the clock.
+    All of it reached the JSON and none of it reached `CTD-RATIO`, which is
+    the one line a reader actually reads. This assembles it.
+
+    WHY IT MATTERS, WITH THE DIRECTION STATED. On Istella-S KDE the opponent's
+    X is device-resident before its clock starts while ours uploads inside the
+    timed call -- about 19.7 ms of host work at d = 220, of which 7.28 ms is
+    host validation (DEVIATION 604), against 36.9 ms of device entry
+    (`bench/results/kde_fused_2026-09-12/README.md`). That asymmetry runs
+    AGAINST US: our published KDE gap is worse than the code deserves. It is
+    surfaced for the same reason a gap in our favour would be -- a ratio whose
+    two sides cover different spans of work is not a like-for-like number, and
+    a reader is entitled to know before drawing a conclusion from it.
+
+    NOTHING IS EQUALIZED HERE. No work moves into or out of any clock and no
+    ratio changes; the asymmetry is named, not corrected. Correcting it on our
+    side is a bindings question (keeping the DeviceBuffer alive across fit),
+    it is legitimate only as a user-facing improvement because a user
+    re-fitting pays that upload too, and it must never be done to improve a
+    ratio."""
+    info = info or {}
+    library = info.get("library", "?")
+    config = str(info.get("config", ""))
+    facts = {
+        "upload_ms_untimed": info.get("upload_ms_untimed"),
+        "fit_ms_untimed": info.get("tree_fit_ms_untimed"),
+    }
+    # A PRE-CLOCK FIT IS A DECLARED FACT, NEVER AN INFERENCE FROM PROSE
+    # (2026-09-12, lane harness-honesty-3). This used to substring-match
+    # "fit before the clock" in the arm's own config string. That is a
+    # silent-zero generator of exactly the class this reporting exists to
+    # eliminate: reword the prose -- a tidy-up, a rename, a translation, a
+    # copy-edit -- and a TRUE fact turns false with no error, no missing
+    # output and nothing for a reader to notice. It is strictly worse than
+    # the problem it solved. Every ready record now carries the flag, set at
+    # the place the pre-clock fit actually happens (CumlKNN, CumlKDE, SkKDE)
+    # and defaulted to False in the four builders, so the field is ALWAYS
+    # present on a record built by this file.
+    #
+    # The prose fallback survives only for a record this file did not build
+    # (an older JSON replayed, a worker from another checkout), and it is
+    # LOUD: the source is reported on the CTD-SPAN line and a warning rides
+    # with it, because a guess that succeeds silently is the thing being
+    # removed here.
+    declared = info.get("pre_clock_fit")
+    if declared is None:
+        facts["pre_clock_fit"] = ("fit before the clock" in config
+                                  or info.get("tree_fit_ms_untimed") is not None)
+        facts["pre_clock_fit_source"] = "INFERRED-FROM-PROSE"
+        facts["pre_clock_fit_warning"] = (
+            "this arm's ready record carries no pre_clock_fit flag, so the "
+            "fact was GUESSED from its config text; a reworded string would "
+            "silently flip it. Set info['pre_clock_fit'] where the fit "
+            "happens.")
+    else:
+        facts["pre_clock_fit"] = bool(declared)
+        facts["pre_clock_fit_source"] = "declared"
+    if library == "anonlib":
+        # Our public call uploads and validates inside the clock, because that
+        # is what a caller of this surface pays. Stated, not measured here: a
+        # per-stage split needs the binding's own instrument, and this file
+        # must not invent a number it did not take in this run.
+        facts["inside_clock"] = "host_to_device_upload,host_validation,call"
+        facts["input_home"] = "host"
+    elif library in ("cuml", "torch", "cuvs", "hipvs"):   # hipvs: FAIRNESS FIX (2026-10-13 audit)
+        facts["inside_clock"] = "call"
+        facts["input_home"] = "device"
+    else:
+        facts["inside_clock"] = "call"
+        facts["input_home"] = "host"
+    facts["library"] = library
+    return facts
+
+
+def _fmt_span(v):
+    return "-" if v is None else ("%.3f" % v if isinstance(v, float) else str(v))
+
+
+def _span_qty(v):
+    """A magnitude for the asymmetry field, or the WORD `unmeasured`.
+
+    Not `-`: a dash beside `fit_before_its_clock` reads as a formatting fault
+    or, worse, as zero. The two facts are independent -- cuML's kNN and KDE
+    demonstrably fit before their clock and NO term in their ready record
+    times that fit, while scikit-learn's KDE records one. So the fact is
+    reported as measured and the missing magnitude is reported as missing."""
+    return "unmeasured" if v is None else "%.3f_ms" % v
+
+
+def _span_warnings(spans, opponents):
+    """Which opponents' clocks cover LESS WORK than ours, and why.
+
+    A separate function rather than a loop inside `race` so a check can reach
+    it without workers, a GPU and a dataset. The lane that added it is the one
+    that keeps finding numbers nobody could prove were produced by the code
+    they were attributed to; an emission path exercised only by a full rented
+    run is exactly that shape of risk (`tools/test_ctd_span.py`).
+
+    Returns a list of `arm:reason+reason` strings, empty when every arm's
+    clock covers the same span. Only asymmetries AGAINST ours are reported,
+    because those are the ones that make our own ratio look worse than the
+    code deserves and would otherwise be read as a like-for-like loss."""
+    ours_span = spans.get("ours", {})
+    warn = []
+    for k in sorted(opponents):
+        s = spans.get(k, {})
+        why = []
+        if s.get("input_home") == "device" and ours_span.get("input_home") == "host":
+            why.append("upload_outside_its_clock(%s)"
+                       % _span_qty(s.get("upload_ms_untimed")))
+        if s.get("pre_clock_fit") and not ours_span.get("pre_clock_fit"):
+            why.append("fit_before_its_clock(%s)"
+                       % _span_qty(s.get("fit_ms_untimed")))
+        if why:
+            warn.append("%s:%s" % (k, "+".join(why)))
+    return warn
+
+
+def infer_phase(args, lane, ds, arms, workers, result):
+    """`race --infer`: after the fit rounds, one warm-up and `--rounds` timed
+    inference rounds per arm that completed every fit round, the order rotated
+    each round like the fit's. Returns the `infer` record of the race JSON."""
+    xq = (result.get("block") or {}).get("arrays", {}).get("Xq", {}).get("shape")
+    infer = {"call": INFER_CALL[lane], "batch": "Xq", "rows": (xq or [None])[0], "arms": {}}
+    eligible = [a for a in arms if workers[a].alive and len(result["arms"][a]["ms"]) == args.rounds]
+    for arm in arms:
+        infer["arms"][arm] = {"warmup_ms": None, "ms": [], "digests": [], "mem": [],
+                              "status": "ok" if arm in eligible else "no_fit"}
+    for r in range(args.rounds + 1):
+        live = [a for a in eligible if workers[a].alive and infer["arms"][a]["status"] == "ok"]
+        if not live:
+            break
+        shift = r % len(live)
+        for arm in live[shift:] + live[:shift]:
+            w = workers[arm]
+            rec = infer["arms"][arm]
+            w.send("infer %d" % r)
+            msg = w.read(args.warmup_seconds if r == 0 else args.round_seconds)
+            if msg is None or msg.get("event") != "infer":
+                rec["status"] = "timeout" if msg is None else "error"
+                rec["error"] = msg
+                rec["failed_round"] = r
+                if msg is None:
+                    w.kill("infer_timeout", None)
+                print("CTD-INFER-REFUSED lane=%s dataset=%s arm=%s stage=infer%d detail=%s"
+                      % (lane, ds, arm, r, json.dumps(msg)), flush=True)
+                continue
+            rec["mem"].append(msg.get("mem"))
+            if r == 0:
+                rec["warmup_ms"] = msg["ms"]
+                rec["call_text"] = msg.get("call")
+                rec["info"] = msg.get("info")
+            else:
+                rec["ms"].append(msg["ms"])
+            rec["digests"].append(msg["digest"])
+            print("CTD-INFER-ROUND lane=%s dataset=%s arm=%s round=%d ms=%.3f digest=%s"
+                  % (lane, ds, arm, r, msg["ms"], msg["digest"]), flush=True)
+            time.sleep(args.pause)
+    return infer
+
+
+def infer_summary(lane, ds, infer, rounds):
+    for arm, a in infer["arms"].items():
+        ok = a["status"] == "ok" and len(a["ms"]) == rounds
+        a["median_ms"] = median(a["ms"]) if ok else None
+        a["min_ms"] = min(a["ms"]) if ok else None
+        a["max_ms"] = max(a["ms"]) if ok else None
+        a["digest_stable"] = (len(set(a["digests"][1:])) == 1) if ok else None
+        print("CTD-INFER lane=%s dataset=%s arm=%s call=%s rows=%s status=%s median_ms=%s "
+              "digest_stable=%s quality=%s"
+              % (lane, ds, arm, infer["call"], infer["rows"], a["status"], a["median_ms"],
+                 a["digest_stable"], json.dumps((infer.get("quality") or {}).get(arm, {}),
+                                                sort_keys=True)), flush=True)
+
+
+def race(args):
+    lane, ds = args.lane, args.dataset
+    # Default: our GPU arm only (the author, Oct 3 2026). Opponents race only when
+    # --arms names them or --with-opponents asks for the lane's whole roster.
+    if args.arms:
+        arms = [a for a in args.arms.split(",") if a]
+    elif getattr(args, "with_opponents", False):
+        arms = list(ARMS[lane])
+    else:
+        arms = ["ours"]
+    _probe().refuse_our_cpu_arms(arms, "classical_two_datasets")
+    # FAIRNESS FIX (2026-10-13 audit): an arm in REFUSED_ARMS is not an opponent; it is dropped
+    # by name and the race runs without it. Results raced before this change were wrong for
+    # those lanes; apply extra scrutiny.
+    refused_arms = {a: REFUSED_ARMS[(lane, a)] for a in arms if (lane, a) in REFUSED_ARMS}
+    for a, why in refused_arms.items():
+        print("CTD-REFUSED lane=%s dataset=%s arm=%s stage=plan detail=%s"
+              % (lane, args.dataset, a, json.dumps(why)), flush=True)
+    arms = [a for a in arms if a not in refused_arms]
+    for a in arms:
+        if (lane, a) not in BUILDERS:
+            raise SystemExit("no arm %r for lane %r" % (a, lane))
+    os.makedirs(args.out, exist_ok=True)
+    os.makedirs(args.work, exist_ok=True)
+    block = os.path.join(args.data, "%s-%s" % (BLOCK_OF[lane], ds))
+    with open(block + ".json") as fh:
+        rec = json.load(fh)
+    result = {"lane": lane, "dataset": ds, "block": rec, "arms": {},
+              "rounds_requested": args.rounds, "started": now_utc(),
+              "script": "tools/classical_two_datasets.py",
+              "commit": os.environ.get("ANONLIB_REPO_COMMIT", "unknown")}
+    if refused_arms:                      # FAIRNESS FIX (2026-10-13 audit): see REFUSED_ARMS
+        result["refused_arms"] = refused_arms
+    tag = "%s-%s" % (lane, ds)
+    # THE SCORER PREFLIGHT (lane harness-evidence, 2026-10-14; tools/race_scorer_preflight.py): before any
+    # worker starts, the block the scorer reads loads and holds its arrays, and the scorer scores known data
+    if not getattr(args, "params_only", False):
+        RSP = _sibling("race_scorer_preflight")
+        try:
+            result["scorer_preflight"] = scorer_preflight(RSP, lane, ds, block, rec)
+        except RSP.ScorerUnavailable as exc:
+            return RSP.refuse(result, arms, str(exc), os.path.join(args.out, "%s.json" % tag), "CTD")
+    elif getattr(args, "scorer_preflight", False):
+        # preflight smoke (2026-10-14): the same check, recorded, and the parameter probe still runs
+        RSP = _sibling("race_scorer_preflight")
+        result["scorer_preflight"] = smoke_scorer_receipt(
+            RSP, lambda: scorer_preflight(RSP, lane, ds, block, rec), lane, ds)
+    workers = {}
+    for arm in arms:
+        py = args.ours_python if arm in ("ours", "ours-base", "ours-fast") \
+            else args.theirs_python
+        cmd = shlex.split(py) + [os.path.abspath(__file__), "worker", "--arm", arm,
+                                 "--lane", lane, "--dataset", ds, "--data", args.data]
+        workers[arm] = start_worker(arm, cmd, _worker_env(arm, args.root),
+                                    os.path.join(args.out, "%s-%s.log" % (tag, arm)), args.root,
+                                    params_only=getattr(args, "params_only", False))
+        result["arms"][arm] = {"command": cmd, "warmup_ms": None, "ms": [],
+                               "digests": [], "mem": [], "status": "ok"}
+    # Ready, in parallel: each worker loads its data and its library.
+    for arm, w in workers.items():
+        msg = w.read(args.ready_seconds)
+        if msg is None or msg.get("event") != "ready":
+            w.kill("not_ready", msg)
+            result["arms"][arm]["status"] = "not_ready"
+            result["arms"][arm]["error"] = msg
+            print("CTD-REFUSED lane=%s dataset=%s arm=%s stage=ready detail=%s"
+                  % (lane, ds, arm, json.dumps(msg)), flush=True)
+            continue
+        w.info = msg["info"]
+        result["arms"][arm]["info"] = msg["info"]
+        result["arms"][arm]["params_record"] = msg.get("params")
+    # SAME SEED, SAME TUNING PARAMETERS, checked before the first timed round
+    # (tools/bench_board_params.py). A refusal fails the race by name.
+    result["lane_config"] = CONFIG[lane]
+    print("CTD-SETTINGS lane=%s dataset=%s %s" % (lane, ds, CONFIG[lane]["params"]), flush=True)
+    for mm in CONFIG[lane]["mismatches"]:
+        print("CTD-MISMATCH lane=%s dataset=%s %s" % (lane, ds, mm), flush=True)
+    if getattr(args, "params_only", False):
+        return params_only_exit(result, workers, arms, lane, "classical",
+                                os.path.join(args.out, tag + ".params.json"))
+    records = {a: result["arms"][a].get("params_record") for a in arms
+               if workers[a].alive and result["arms"][a].get("params_record") is not None}
+    refused = enforce_params(lane, "classical", records, result, "CTD")
+    if refused is not None:
+        for arm in arms:
+            w = workers[arm]
+            if w.alive:
+                w.kill("params_refused", refused[:500])
+                result["arms"][arm]["status"] = "params_refused"
+                result["arms"][arm]["error"] = refused[:2000]
+            w.log.close()
+        result["finished"] = now_utc()
+        with open(os.path.join(args.out, tag + ".json"), "w") as fh:
+            json.dump(result, fh, indent=2, sort_keys=True, default=str)
+        return 3
+    for r in range(args.rounds + 1):
+        live = [a for a in arms if workers[a].alive]
+        if not live:
+            break
+        shift = r % len(live)
+        order = live[shift:] + live[:shift]
+        for arm in order:
+            w = workers[arm]
+            if not w.alive:
+                continue
+            w.send("round %d" % r)
+            msg = w.read(args.warmup_seconds if r == 0 else args.round_seconds)
+            if msg is None or msg.get("event") != "round":
+                status = "timeout" if msg is None else "error"
+                w.kill(status, msg)
+                result["arms"][arm]["status"] = status
+                result["arms"][arm]["error"] = msg
+                result["arms"][arm]["failed_round"] = r
+                print("CTD-REFUSED lane=%s dataset=%s arm=%s stage=round%d detail=%s"
+                      % (lane, ds, arm, r, json.dumps(msg)), flush=True)
+                continue
+            if r == 0:
+                result["arms"][arm]["warmup_ms"] = msg["ms"]
+            else:
+                result["arms"][arm]["ms"].append(msg["ms"])
+            result["arms"][arm]["digests"].append(msg["digest"])
+            if msg.get("operation") is not None:
+                result["arms"][arm].setdefault("operations", []).append(dict(msg["operation"], round=r, warmup=r == 0))
+            if msg.get("state_receipt") is not None:
+                result["arms"][arm].setdefault("state_receipts", []).append(msg["state_receipt"])
+            if msg.get("upload_separate") is not None:
+                result["arms"][arm].setdefault("upload_separate", []).append(
+                    dict(msg["upload_separate"], round=r, warmup=r == 0))
+            result["arms"][arm]["mem"].append(msg.get("mem"))
+            print("CTD-ROUND lane=%s dataset=%s arm=%s round=%d ms=%.3f digest=%s"
+                  % (lane, ds, arm, r, msg["ms"], msg["digest"]), flush=True)
+            time.sleep(args.pause)
+    infer = None
+    if getattr(args, "infer", False) and lane in INFER_LANES:
+        infer = infer_phase(args, lane, ds, arms, workers, result)
+    outs = {}
+    infer_outs = {}
+    for arm in arms:
+        w = workers[arm]
+        if w.alive and len(result["arms"][arm]["ms"]) == args.rounds:
+            path = os.path.join(args.work, "%s-%s.npz" % (tag, arm))
+            w.send("save %s" % path)
+            msg = w.read(args.round_seconds)
+            if msg is not None and msg.get("event") == "saved":
+                with np.load(path) as z:
+                    outs[arm] = {k: z[k] for k in z.files}
+                result["arms"][arm]["info"] = msg.get("info", result["arms"][arm].get("info"))
+            else:
+                result["arms"][arm]["status"] = "save_failed"
+                result["arms"][arm]["error"] = msg
+        if infer is not None and w.alive and infer["arms"].get(arm, {}).get("status") == "ok":
+            ipath = os.path.join(args.work, "%s-%s-infer.npz" % (tag, arm))
+            w.send("infer_save %s" % ipath)
+            msg = w.read(args.round_seconds)
+            if msg is not None and msg.get("event") == "infer_saved":
+                with np.load(ipath) as z:
+                    infer_outs[arm] = {k: z[k] for k in z.files}
+            else:
+                infer["arms"][arm]["status"] = "save_failed"
+                infer["arms"][arm]["error"] = msg
+        w.close()
+    result["finished_rounds"] = now_utc()
+    try:
+        with np.load(block + ".npz") as z:
+            data = {k: z[k] for k in z.files}
+        result["quality"] = quality(lane, data, outs, rec)
+    except Exception as exc:  # noqa: BLE001
+        result["quality"] = {"error": repr(exc)}
+        data = None
+    if infer is not None:
+        try:
+            infer["quality"] = infer_quality(lane, data, infer_outs, outs) if data else {}
+        except Exception as exc:  # noqa: BLE001
+            infer["quality"] = {"error": repr(exc)}
+        infer_summary(lane, ds, infer, args.rounds)
+        result["infer"] = infer
+    ours = result["arms"].get("ours", {})
+    ours_med = median(ours.get("ms", [])) if len(ours.get("ms", [])) == args.rounds else None
+    result["ratios_ours_over"] = {}
+    spans = {}
+    for arm in arms:
+        a = result["arms"][arm]
+        ok = a["status"] == "ok" and len(a["ms"]) == args.rounds
+        a["median_ms"] = median(a["ms"]) if ok else None
+        a["min_ms"] = min(a["ms"]) if ok else None
+        a["max_ms"] = max(a["ms"]) if ok else None
+        a["digest_stable"] = (len(set(a["digests"][1:])) == 1) if ok else None
+        dev = (a.get("info") or {}).get("device", "?")
+        qual = result.get("quality", {}).get(arm, {})
+        print("CTD lane=%s dataset=%s arm=%s device=%s status=%s median_ms=%s min_ms=%s max_ms=%s "
+              "digest_stable=%s quality=%s"
+              % (lane, ds, arm, dev, a["status"], a["median_ms"], a["min_ms"], a["max_ms"],
+                 a["digest_stable"], json.dumps(qual, sort_keys=True)), flush=True)
+        # WHAT WAS INSIDE THIS ARM'S CLOCK, beside its time. Assembled from the
+        # ready record the arm already sent; no timing is affected.
+        span = _span_facts(arm, a.get("info"))
+        # THE SEPARATE UPLOAD CLOCK (ours only; `_ours_upload_probe`): the
+        # median of the scored rounds' separate uploads, beside the scored
+        # median, and the DERIVED difference. The scored median is untouched.
+        ups = [u["ms"] for u in a.get("upload_separate", []) if not u.get("warmup") and "ms" in u]
+        span["upload_ms_separate"] = statistics.median(ups) if ups else None
+        span["fit_minus_upload_ms"] = ((a["median_ms"] - span["upload_ms_separate"])
+                                       if (ok and span["upload_ms_separate"] is not None) else None)
+        span["fit_minus_upload_ms_source"] = "derived: scored median - separate upload median"
+        spans[arm] = span
+        a["span"] = span
+        print("CTD-SPAN lane=%s dataset=%s arm=%s input_home=%s inside_clock=%s "
+              "upload_ms_untimed=%s fit_ms_untimed=%s pre_clock_fit=%s "
+              "pre_clock_fit_source=%s upload_ms_separate=%s fit_minus_upload_ms=%s"
+              % (lane, ds, arm, span["input_home"], span["inside_clock"],
+                 _fmt_span(span["upload_ms_untimed"]), _fmt_span(span["fit_ms_untimed"]),
+                 str(span["pre_clock_fit"]).lower(),
+                 span.get("pre_clock_fit_source", "declared"),
+                 _fmt_span(span["upload_ms_separate"]), _fmt_span(span["fit_minus_upload_ms"])), flush=True)
+        if span.get("pre_clock_fit_warning"):
+            print("CTD-SPAN-WARNING lane=%s dataset=%s arm=%s %s"
+                  % (lane, ds, arm, span["pre_clock_fit_warning"]), flush=True)
+        if arm != "ours" and ours_med and a["median_ms"]:
+            result["ratios_ours_over"][arm] = ours_med / a["median_ms"]
+    result["spans"] = spans
+    if result["ratios_ours_over"]:
+        # THE RATIO IS UNCHANGED. The `ours/<arm>=<float>` tokens are exactly
+        # what they were; a `span_asymmetry=` field is appended naming every
+        # opponent whose clock covers less work than ours, so the one line a
+        # reader reads cannot be read as like-for-like when it is not.
+        warn = _span_warnings(spans, result["ratios_ours_over"])
+        print("CTD-RATIO lane=%s dataset=%s %s%s" % (lane, ds, " ".join(
+            "ours/%s=%.4f" % (k, v) for k, v in sorted(result["ratios_ours_over"].items())),
+            (" span_asymmetry=" + ",".join(warn)) if warn else " span_asymmetry=none"),
+            flush=True)
+        if warn:
+            print("CTD-SPAN-NOTE lane=%s dataset=%s the ratios above are NOT "
+                  "like-for-like spans: ours uploads (and validates) inside its "
+                  "clock while these arms do not. The asymmetry is named, not "
+                  "corrected; no work was moved into or out of any clock."
+                  % (lane, ds), flush=True)
+    result["finished"] = now_utc()
+    with open(os.path.join(args.out, tag + ".json"), "w") as fh:
+        json.dump(result, fh, indent=2, sort_keys=True, default=str)
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# summary
+# ---------------------------------------------------------------------------
+
+def _quality_text(q):
+    if not q:
+        return "-"
+    return ",".join("%s=%s" % (k, ("%.6g" % v) if isinstance(v, float) else v)
+                    for k, v in sorted(q.items()) if k not in ("reference",))
+
+
+def summary(args):
+    rows = []
+    for name in sorted(os.listdir(args.out)):
+        if not name.endswith(".json") or name.count("-") != 1:
+            continue
+        lane, ds = name[:-5].split("-")
+        if lane not in LANES or ds not in DATASETS:
+            continue
+        with open(os.path.join(args.out, name)) as fh:
+            r = json.load(fh)
+        shapes = r["block"].get("arrays", {})
+        first = shapes.get("X") or shapes.get("index") or {}
+        shape = "x".join(str(s) for s in first.get("shape", []))
+        for arm, a in r["arms"].items():
+            info = a.get("info") or {}
+            rows.append([lane, ds, shape, arm, info.get("device", "?"),
+                         info.get("device_name") or info.get("cpu_model") or info.get("vendor_used") or "-",
+                         a.get("status"), a.get("median_ms"), a.get("min_ms"), a.get("max_ms"),
+                         len(a.get("ms", [])), a.get("digest_stable"),
+                         _quality_text(r.get("quality", {}).get(arm)),
+                         r.get("ratios_ours_over", {}).get(arm)])
+    head = ["lane", "dataset", "shape", "arm", "device", "device_name", "status", "median_ms",
+            "min_ms", "max_ms", "rounds", "digest_stable", "quality", "ours_over_this"]
+    with open(os.path.join(args.out, "summary.tsv"), "w") as fh:
+        fh.write("\t".join(head) + "\n")
+        for row in rows:
+            fh.write("\t".join("" if v is None else (("%.4f" % v) if isinstance(v, float) else str(v))
+                               for v in row) + "\n")
+    with open(os.path.join(args.out, "summary.tsv")) as fh:
+        sys.stdout.write(fh.read())
+    return 0
+
+
+def build_parser():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("prep")
+    p.add_argument("--data", required=True)
+    p.add_argument("--lanes", default=",".join(LANES))
+    p.add_argument("--datasets", default=",".join(DATASETS))
+    p.add_argument("--max-rows", type=int, default=0,
+                   help="SMOKE shape: cap every block near this many rows (0 = the lane shapes)")
+    w = sub.add_parser("worker")
+    w.add_argument("--arm", required=True)
+    w.add_argument("--lane", required=True, choices=LANES)
+    w.add_argument("--dataset", required=True, choices=DATASETS)
+    w.add_argument("--data", required=True)
+    r = sub.add_parser("race")
+    r.add_argument("--lane", required=True, choices=LANES)
+    r.add_argument("--dataset", required=True, choices=DATASETS)
+    r.add_argument("--data", required=True)
+    r.add_argument("--out", required=True)
+    r.add_argument("--work", default="/root/ctd-work",
+                   help="where arm outputs (labels, components) are saved; kept OUT of the fetched tree")
+    r.add_argument("--root", default=REPO)
+    r.add_argument("--arms", default="",
+                   help="comma list of arms (explicit; may name opponents). Default: our GPU "
+                        "arm only ('ours'); opponents are scored once and stored")
+    r.add_argument("--with-opponents", action="store_true",
+                   help="with no --arms: race every arm of the lane (ours and its opponents)")
+    # One seed, one scored run per arm by default (the author 2026-10-14): alpha, no noise fighting; just get measurements.
+    r.add_argument("--rounds", type=int, default=1)
+    r.add_argument("--ours-python", default="pixi run python3")
+    r.add_argument("--theirs-python", default=sys.executable)
+    r.add_argument("--ready-seconds", type=float, default=600.0)
+    r.add_argument("--params-only", action="store_true",
+                   help="construct every arm, read its parameters back, write <out>/<tag>.params.json "
+                        "and stop before the warm-up (the board's opponent-store lookup)")
+    r.add_argument("--scorer-preflight", action="store_true",
+                   help="with --params-only: run the quality-scorer preflight first and record its receipt "
+                        "(a refusal included) in the params JSON (bench_board.py --preflight-scorer)")
+    r.add_argument("--warmup-seconds", type=float, default=600.0)
+    r.add_argument("--round-seconds", type=float, default=300.0)
+    r.add_argument("--pause", type=float, default=0.5)
+    r.add_argument("--infer", action="store_true",
+                   help="after the fit rounds, time the lane's public predict or transform "
+                        "on the eval rows (kmeans, pca, ols, svc; CTD-INFER lines and an "
+                        "`infer` record). Off by default: the race is then unchanged")
+    s = sub.add_parser("summary")
+    s.add_argument("--out", required=True)
+    return ap
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    if args.cmd == "prep":
+        return prep(args)
+    if args.cmd == "worker":
+        return worker(args)
+    if args.cmd == "race":
+        if args.rounds < 1:
+            raise SystemExit("--rounds must be >= 1")
+        return race(args)
+    return summary(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

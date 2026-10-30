@@ -1,0 +1,473 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 the authors. Part of anonlib, DOI-WITHHELD
+"""CPU training for the par-* lanes whose driver shards in Python
+(lane/cpu-training-par-classical, 2026-09-15): par-scaler, par-arima and
+par-holtwinters; since lane/cpu-training-par-wave2 (the same day) also the
+query-sharded and reference-sharded neighbor drivers, and since
+lane/cpu-verifier-par-samba (wave 3, 2026-09-16) the Samba stack's gradient
+shards (par-samba and par-samba-clip), the same ParallelNeuralTrainer route
+par-mlp takes.
+
+Source checks (run on a box with nothing built): the manifest declares each
+lane on the family whose host binding serves its shard fits; the pool's
+CPU_OPERATIONS are exactly the worker operations those drivers send, each
+sent from a NON-cooperative pool (the driver splits and merges in Python);
+no cooperative driver's operation is admitted.
+
+Runtime checks (skipped, and SAID to be skipped, when a binding is absent or
+a GPU set loaded): inside reference_training a column-sharded scaler fit
+sends one worker request per shard and equals the plain fit byte for byte; a
+cooperative driver and a non-cooperative operation outside the route refuse
+by name before any worker starts.
+The bit claim against the GPU columns is the CPU identity gate's.
+
+    cd python && python3 -m anonlib.tests.test_cpu_training_par_classical
+"""
+
+# Gate-runner scope: host runtime checks require the CPU-only route.
+GATE_BACKENDS = ("cpu",)
+import re
+import sys
+from pathlib import Path
+
+import anonlib
+from anonlib._cpu_reference import reference_training
+from anonlib import _backend, _parallel_pool, host_surface
+
+ROOT = Path(__file__).resolve().parents[3]
+
+LANES = {"par-scaler": "preprocessing", "par-arima": "arima", "par-holtwinters": "tsa",
+         # lane/lm-attention-fallback (2026-09-19): the prediction half of the
+         # same series partition, the four parallel_forecasting drivers
+         "par-forecast-arima": "arima", "par-forecast-holtwinters": "tsa",
+         # wave 2 (lane/cpu-training-par-wave2, 2026-09-15): the neighbor drivers
+         "par-queries-knn": "core", "par-queries-radius": "core", "par-queries-kde": "estimators",
+         "par-reference-knn": "core", "par-reference-knn-reg": "core",
+         "par-forest": "rf", "par-forest-et": "trees", "par-mlp": "training",
+         # wave 3 (lane/cpu-verifier-par-samba, 2026-09-16): the Samba stack's
+         # gradient shards, the same driver as par-mlp on the same family
+         "par-samba": "training", "par-samba-clip": "training",
+         "par-rbf-sampler": "kernel_methods",
+         # lane/unlaned-public-algorithms (2026-09-20): the GaussianProcess
+         # CLASSIFIER's class-level shards, the two public entries
+         # tools/verification_matrix.py reported with no identity lane at all
+         "par-gpc-fit": "gp", "par-gpc-predict": "gp",
+         # lane/cpu-routes-gpu-only-four (2026-09-20): the two drivers that
+         # checked `_backend.vendor()` before they built a layer or prepared
+         # a fold. On a CPU-only install a device index is one worker
+         # PROCESS, and everything either driver does with it is its own
+         # Python; the shards are the neural and gbdt host families'.
+         "par-causal-lm": "neural", "par-cross-val": "gbdt"}
+DRIVERS = {
+    "python/anonlib/parallel_preprocessing.py": ("scaler_fit", "scaler_transform"),
+    "python/anonlib/parallel_classical.py": ("arima_fit", "holtwinters_fit", "rbf_sampler_rows"),
+    "python/anonlib/parallel_neighbors.py": ("neighbor_state", "neighbor_query"),
+    "python/anonlib/parallel_neighbors_reference.py": ("neighbor_reference", "neighbor_vote"),
+    "python/anonlib/parallel_ensemble.py": ("forest_fit",),
+}
+
+
+def _read(rel):
+    return (ROOT / rel).read_text(encoding="utf-8")
+
+
+def test_manifest_declares_the_par_lanes():
+    covered = host_surface.covered_lanes()
+    for lane, family in LANES.items():
+        assert lane in covered, f"{lane} is not a covered training lane"
+        assert lane in host_surface.family(family)["training_lanes"], f"{lane} is not a {family} training lane"
+        assert host_surface.TRAINING_LANE_NAMES[lane] in host_surface.training_sentence()
+
+
+def test_cpu_operations_are_the_python_sharded_drivers():
+    wanted = set()
+    for rel, operations in DRIVERS.items():
+        text = _read(rel)
+        for op in operations:
+            wanted.add(op)
+            # Each admitted operation is sent from a function whose pool is
+            # NOT cooperative: find the function body that names the op.
+            bodies = [b for b in re.split(r"^def ", text, flags=re.M) if f"'{op}'" in b]
+            assert bodies, f"{op} is not sent from {rel}"
+            for body in bodies:
+                assert "DevicePool(devices)" in body and "cooperative=True" not in body, (
+                    f"{op} in {rel} is not sent from a non-cooperative pool")
+    # par-mlp's and par-samba's gradient shards: ParallelNeuralTrainer builds a
+    # plain pool for mlp_gradient/samba_gradient and a cooperative one for the
+    # matching update in the same __init__, so their admission is checked by
+    # name here and below, not by body.
+    trainer = _read("python/anonlib/parallel_training.py")
+    assert "self._operation = 'mlp_gradient'" in trainer and "self._pool = DevicePool(devices)" in trainer
+    assert "self._operation = 'samba_gradient'" in trainer
+    assert "self._update_pool = DevicePool(self._pool.devices, cooperative=True)" in trainer
+    # the one request per logical shard, and the single update that folds them
+    assert "results = self._pool.map(requests)" in trainer
+    assert "self._operation.replace('_gradient', '_update')" in trainer
+    # the fold is the driver's own Python, in shard order
+    worker = _read("python/anonlib/_parallel_worker.py")
+    assert "if operation in ('samba_gradient', 'samba_update'):" in worker
+    assert "gradients = ordered_sum_gradients(args)" in worker
+    wanted.update(("mlp_gradient", "samba_gradient"))
+    # DistributedIVFIndex's disjoint shards (lane/laneless-public-classes,
+    # 2026-09-19). `from_index` builds ONE non-cooperative pool and sends an
+    # `ivf_store` per shard; `search` and the Euclidean root then go through
+    # that SAME pool, so their sends sit in a different function from the
+    # construction and are checked by name here, as par-mlp's are above. The
+    # merge itself is the driver's own call, in shard order (Python until
+    # lane/py-dn-ann, 2026-09-28; now `ivf_merge_shards` in every IVF binding).
+    ivf = _read("python/anonlib/parallel_ivf.py")
+    assert "pool = DevicePool(devices)" in ivf and "cooperative=True" not in ivf
+    assert "requests.append(('ivf_store', shard, ()))" in ivf
+    assert "self._pool.map([('ivf_search_stored', None, (q,)) for _ in self.devices])" in ivf
+    assert "self._pool.map([('ivf_finalize', result, (self.metric_code_,))])" in ivf
+    # the merge is ONE native call since lane/py-dn-ann (2026-09-28), the
+    # driver's own statement, served by the same binding on every column
+    assert "self._native.ivf_merge_shards(" in ivf and "candidates.sort()" not in ivf
+    wanted.update(("ivf_store", "ivf_search_stored", "ivf_finalize"))
+    # parallel_forecasting's four drivers (lane/lm-attention-fallback,
+    # 2026-09-19). `_run` builds the ONE non-cooperative pool for every
+    # request the two predict drivers append, so the send sits in a different
+    # function from the pool and is checked by name here, as par-mlp's and
+    # DistributedIVFIndex's are. The split is `_ranges` over a range of
+    # SERIES and the merge is the driver's own memcopy in `zip(ranges, parts)`
+    # order: both are the driver's Python, and the worker runs the bare
+    # `state.predict` with no capability call and no device-count env var, so
+    # no binding restates the partition at any device count.
+    forecasting = _read("python/anonlib/parallel_forecasting.py")
+    assert "pool = DevicePool(devices)" in forecasting and "cooperative=True" not in forecasting
+    assert forecasting.count("requests.append(('forecast_predict', part, ('predict', (start, end))))") == 2
+    assert forecasting.count("for (lo, hi), value in zip(ranges, parts):") == 2
+    assert "ANONLIB_" not in forecasting
+    assert "    if operation == 'forecast_predict':\n        method, positional = args\n" in worker
+    assert "        return state.predict(*positional)\n" in worker
+    wanted.add("forecast_predict")
+    # parallel_gaussian_process's two class-level drivers
+    # (lane/unlaned-public-algorithms, 2026-09-20). `_run` builds the ONE
+    # non-cooperative pool for every request the fit and predict drivers
+    # build, so the send sits in a different function from the pool and is
+    # checked by name here, as par-mlp's, DistributedIVFIndex's and the
+    # forecasting drivers' are. The split is one-vs-rest CLASSES, built by a
+    # Python comprehension over `columns`, and the merge is the driver's own
+    # Python in class order; no device-count environment variable appears, so
+    # no binding restates the partition at any device count. The worker's own
+    # work is the plain `_fit_binary` / `_latent`, the gp family's single
+    # `gpc_fit` and `gpc_predict` host entries.
+    gpc = _read("python/anonlib/parallel_gaussian_process.py")
+    assert "pool = DevicePool(devices)" in gpc and "cooperative=True" not in gpc
+    assert "columns = [1] if len(classes) == 2 else range(len(classes))" in gpc
+    assert "requests = [('gpc_class_fit', _fresh(estimator)," in gpc
+    # args are (fit, q, want_proba) plus the binary out_kind when set
+    assert "requests.append(('gpc_class_predict', part, args))" in gpc
+    assert "args = (fit, q, want_proba, out_kind) if out_kind else (fit, q, want_proba)" in gpc
+    # the class columns stay Arrays and the one-vs-rest combine is the
+    # binding's (`_gpc_impl._ovr_combine`, cpu-gpu-cleanup c-gp-kernel)
+    assert "arrays = list(_run(requests, devices))" in gpc
+    assert "proba, codes32 = _ovr_combine(estimator._extension(), arrays, int(q.shape[0]))" in gpc
+    assert "ANONLIB_" not in gpc
+    assert "    if operation == 'gpc_class_fit':\n" in worker
+    # the kernel is the fit-time working copy (`_kernel`, 2c44cf25d: the
+    # constructor stores its parameters verbatim)
+    assert "        return state._fit_binary(state._extension(), x, y01, *_kernel_arrays(state._kernel))\n" in worker
+    assert "    if operation == 'gpc_class_predict':\n" in worker
+    assert "        mean, _, probability = state._latent(ext, fit, q, want_proba)\n" in worker
+    wanted.update(("gpc_class_fit", "gpc_class_predict"))
+    # ParallelCausalLM's one operation and cross_val_score's two
+    # (lane/cpu-routes-gpu-only-four, 2026-09-20). `causal_lm_layer` is the
+    # ONLY admitted operation that does not go through `pool.map`:
+    # `_rpc` addresses a single worker by index, so it calls `_cpu_refusal`
+    # itself and that call is what this checks, in place of the
+    # "non-cooperative pool" body check every other operation gets. The
+    # partition is `layer_devices`, one index per layer, and the merge is
+    # `CausalLM._run`'s sequential hand-off; the worker builds the route it
+    # was TOLD, never a route it guessed.
+    causal = _read("python/anonlib/models/parallel_causal_lm.py")
+    assert "pool = DevicePool(devices)" in causal and "cooperative=True" not in causal
+    assert "refusal = _cpu_refusal([request], False)" in causal
+    assert "request = ('causal_lm_layer', operation, args)" in causal
+    assert "self._rpc(device, 'route', self.route)" in causal
+    assert "return [_RemoteBlock(self, i, weights, kwargs) for i, weights in enumerate(layers)]" in causal
+    assert "ANONLIB_" not in causal
+    layer_worker = _read("python/anonlib/_causal_lm_worker.py")
+    assert "block = _block_classes(_route)[kind](weights, **kwargs)" in layer_worker
+    assert "prims = _GpuPrimitives() if _route == 'gpu' else _CpuPrimitives()" in layer_worker
+    assert "raise RuntimeError('loaded-model worker was not told its route')" in layer_worker
+    wanted.add("causal_lm_layer")
+    # cross_val_score's fold dispatch and its process witness. The split is
+    # `_prepare_folds`/`_take_rows` -- the SERIAL API's own fold code -- and
+    # the merge is `scores.extend(results)` in fold order. The device
+    # inventory is the one piece with no CPU counterpart, so the host route
+    # asks a DIFFERENT question through a DIFFERENT function; the GPU check
+    # must still be the one the GPU route calls.
+    cv = _read("python/anonlib/parallel_model_selection.py")
+    assert "pool = DevicePool(devices)" in cv and "cooperative=True" not in cv
+    assert "requests.append(('cross_val_fold', _clone(prototype)," in cv
+    assert "scores.extend(results)" in cv
+    assert "pool.map([('worker_identity', None, ()) for _ in pool.devices]), width)" in cv
+    assert "require_distinct_workers(inventory, vendor, width)" in cv
+    assert "ANONLIB_" not in cv
+    assert "    if operation == 'cross_val_fold':\n" in worker
+    assert "        return _fit_score_fold(state, *args)\n" in worker
+    wanted.update(("cross_val_fold", "worker_identity"))
+    assert set(_parallel_pool.CPU_OPERATIONS) == wanted, sorted(_parallel_pool.CPU_OPERATIONS)
+    assert set(_parallel_pool.CPU_SINGLE_DEVICE_COOPERATIVE) == {"mlp_update", "samba_update", "resample"}
+    cooperative = set()
+    for rel in ("python/anonlib/parallel_classical.py", "python/anonlib/parallel_preprocessing.py"):
+        for body in re.split(r"^def ", _read(rel), flags=re.M):
+            if "cooperative=True" in body:
+                cooperative |= set(re.findall(r"\('([a-z_]+)', ", body))
+    assert cooperative and not (cooperative & set(_parallel_pool.CPU_OPERATIONS)), sorted(cooperative)
+
+
+def _cpu_only_with(*basenames):
+    if _backend._CPU_ONLY is None:
+        print("SKIP: a GPU set loaded; the host route is not taken here")
+        return False
+    for basename in basenames:
+        if not Path(_backend.host_module_path(basename)).exists():
+            print(f"SKIP: {basename} is not built")
+            return False
+    return True
+
+
+def test_refusals_come_before_any_worker():
+    if _backend._CPU_ONLY is None:
+        print("SKIP: a GPU set loaded; the host route is not taken here")
+        return
+    for devices, cooperative, op, words in (
+            ((0,), True, "glm_fit", "cooperative multi-GPU driver glm_fit"),
+            ((0,), False, "forest_prepare", "parallel worker operation forest_prepare"),
+            ((0, 1), True, "mlp_update", "cooperative multi-GPU driver mlp_update across 2 devices"),
+            ((0, 1), True, "samba_update", "cooperative multi-GPU driver samba_update across 2 devices")):
+        pool = _parallel_pool.DevicePool(devices, cooperative=cooperative)
+        try:
+            pool.map([(op, None, None)])
+        except NotImplementedError as exc:
+            assert "no CPU implementation of the " + words in str(exc), str(exc)
+        else:
+            raise AssertionError(f"{op} was admitted on a CPU-only install")
+        assert pool._workers == [], "a worker started before the refusal"
+
+
+def test_the_gpc_class_fit_worker_follows_the_public_fit_guard():
+    """THE GPC SHARD CARRIES THE PUBLIC FIT'S GUARD (lane/unlaned-public-
+    algorithms, 2026-09-20). The other admitted fit operations run their
+    estimator's PUBLIC `fit` and inherit `_mode._guard_cpu_training`; the GPC
+    shard calls `_fit_binary`, below that decorator, so the worker calls
+    `_cpu_reference.require_training` itself. The two routes must answer
+    the same way on a CPU-only install. Since dac6e4d15 (CPU training is
+    public) that answer is "train": the plain fit and the driver both fit,
+    outside `reference_training()`, and agree byte for byte."""
+    if not _cpu_only_with("_anonlib_gp_host"):
+        return
+    import numpy as np
+    from anonlib.parallel_gaussian_process import fit_gaussian_process_classifier
+    X = np.ascontiguousarray(np.random.default_rng(11).standard_normal((48, 3)).astype(np.float32))
+    y = (X[:, 0] > 0).astype(np.int64)
+    kernel = anonlib.ConstantKernel(1.0) * anonlib.RBF(1.0)
+    plain = anonlib.GaussianProcessClassifier(kernel=kernel).fit(X, y)
+    par = fit_gaussian_process_classifier(anonlib.GaussianProcessClassifier(kernel=kernel), X, y,
+                                          devices=(0,))
+    for name in ("L_", "pi_", "W_sr_"):
+        assert (np.asarray(getattr(par.estimators_[0], name)).tobytes()
+                == np.asarray(getattr(plain.estimators_[0], name)).tobytes()), name
+
+
+@reference_training()
+def test_sharded_gpc_equals_the_plain_fit_when_built():
+    """The class shards are real and the merge is byte exact: one
+    `gpc_class_fit` per one-vs-rest column (ONE for two classes, THREE for
+    three), one `gpc_class_predict` per fitted class, and the published state
+    and the merged posterior equal the plain estimator's bytes. This is the
+    in-cell oracle the `par-gpc-fit` and `par-gpc-predict` lanes carry, held
+    here as well so a CPU box with no record can still see it fail."""
+    if not _cpu_only_with("_anonlib_gp_host"):
+        return
+    import numpy as np
+    from anonlib.parallel_gaussian_process import (fit_gaussian_process_classifier,
+                                                     predict_gaussian_process_classifier)
+    rng = np.random.default_rng(7)
+    X = np.ascontiguousarray(rng.standard_normal((64, 3)).astype(np.float32))
+    q = np.ascontiguousarray(rng.standard_normal((16, 3)).astype(np.float32))
+    kernel = anonlib.ConstantKernel(1.0) * anonlib.RBF(1.0)
+    sent = []
+    # `DevicePool.map` writes each wave's requests with `_send` and reads the
+    # replies with `_receive` (dd0b63678); `_call` is no longer on its path.
+    send = _parallel_pool.DevicePool._send
+
+    def spy(worker, request):
+        sent.append(request[2][0] if request[0] == "cpu_reference" else request[0])
+        return send(worker, request)
+
+    for labels, n_fits in (((X[:, 0] > 0).astype(np.int64), 1),
+                           ((X[:, 0] > 0).astype(np.int64) + (X[:, 1] > 0).astype(np.int64), 3)):
+        sent.clear()
+        _parallel_pool.DevicePool._send = staticmethod(spy)
+        try:
+            par = fit_gaussian_process_classifier(
+                anonlib.GaussianProcessClassifier(kernel=kernel), X, labels, devices=(0,))
+            proba = predict_gaussian_process_classifier(par, q, devices=(0,), method="predict_proba")
+        finally:
+            _parallel_pool.DevicePool._send = staticmethod(send)
+        assert sent == ["gpc_class_fit"] * n_fits + ["gpc_class_predict"] * n_fits, sent
+        plain = anonlib.GaussianProcessClassifier(kernel=kernel).fit(X, labels)
+        assert len(par.estimators_) == n_fits, len(par.estimators_)
+        for i in range(n_fits):
+            for name in ("L_", "pi_", "W_sr_"):
+                assert (np.asarray(getattr(par.estimators_[i], name)).tobytes()
+                        == np.asarray(getattr(plain.estimators_[i], name)).tobytes()), (i, name)
+        assert np.asarray(proba).tobytes() == np.asarray(plain.predict_proba(q)).tobytes()
+
+
+@reference_training()
+def test_sharded_scaler_equals_the_plain_fit_when_built():
+    if not _cpu_only_with("_anonlib_preprocessing_host"):
+        return
+    import numpy as np
+    from anonlib.parallel_preprocessing import fit_scaler, transform_scaler
+    X = np.random.default_rng(5).standard_normal((40, 10)).astype(np.float32)
+    sent = []
+    # `DevicePool.map` writes each wave's requests with `_send` and reads the
+    # replies with `_receive` (dd0b63678); `_call` is no longer on its path.
+    send = _parallel_pool.DevicePool._send
+
+    def spy(worker, request):
+        sent.append(request[2][0] if request[0] == "cpu_reference" else request[0])
+        return send(worker, request)
+
+    _parallel_pool.DevicePool._send = staticmethod(spy)
+    try:
+        par = fit_scaler(anonlib.StandardScaler(), X, columns_per_shard=4)
+        t = transform_scaler(par, X, columns_per_shard=4)
+    finally:
+        _parallel_pool.DevicePool._send = staticmethod(send)
+    assert sent == ["scaler_fit"] * 3 + ["scaler_transform"] * 3, sent
+    plain = anonlib.StandardScaler().fit(X)
+    for name in ("mean_", "var_", "scale_"):
+        assert np.asarray(getattr(par, name)).tobytes() == np.asarray(getattr(plain, name)).tobytes(), name
+    assert np.asarray(t).tobytes() == np.asarray(plain.transform(X)).tobytes()
+
+
+@reference_training()
+def test_sharded_samba_sends_two_gradients_and_one_ordered_update_when_built():
+    """par-samba's shards are real: two `samba_gradient` requests per step
+    from the non-cooperative pool and ONE `samba_update`, and the gradient
+    the update publishes is the driver's own ordered sum of the two shard
+    gradients, byte for byte (wave 3, lane/cpu-verifier-par-samba).
+
+    What this does NOT check, and cannot: the fold's ORDER. Both lanes use
+    two logical shards, and IEEE addition is commutative, so `g0 + g1` and
+    `g1 + g0` are the same bytes; only associativity fails, and that needs
+    three or more parts. Reversing the parts of `ordered_sum_gradients`
+    therefore moves nothing here and is not a control (measured 2026-09-16:
+    every cell stayed byte-identical under the reversal). What holds this
+    test to something real is the shard's CONTRIBUTION: dropping the second
+    shard from the fold makes this assertion fail and every cell of both
+    lanes DIVERGENT.
+    """
+    if not _cpu_only_with("_anonlib_training_host", "_anonlib_mamba_host",
+                          "_anonlib_transformer_host"):
+        return
+    import numpy as np
+    from anonlib.parallel_training import ParallelNeuralTrainer, ordered_sum_gradients
+    config = anonlib.SambaConfig(vocab=256, d_model=32, layers=("mamba3", "attention"),
+                                   n_heads=2, intermediate=64)
+    model = anonlib.SambaStack(config, generator=anonlib.training.Generator(1), lr=1e-3)
+    ids = np.arange(4 * 17, dtype=np.int32).reshape(4, 17) % 256
+    sent, shard_gradients = [], []
+    # `DevicePool.map` writes each wave's requests with `_send` and reads the
+    # replies with `_receive` (dd0b63678); `_call` is no longer on its path.
+    # One worker (devices=(0,)), so every wave is one request and each
+    # `_receive` answers the `_send` just before it.
+    send, receive = _parallel_pool.DevicePool._send, _parallel_pool.DevicePool._receive
+
+    def spy_send(worker, request):
+        sent.append(request[2][0] if request[0] == "cpu_reference" else request[0])
+        return send(worker, request)
+
+    def spy_receive(worker):
+        result = receive(worker)
+        if sent and sent[-1] == "samba_gradient":
+            shard_gradients.append(result[1])
+        return result
+
+    _parallel_pool.DevicePool._send = staticmethod(spy_send)
+    _parallel_pool.DevicePool._receive = staticmethod(spy_receive)
+    try:
+        with ParallelNeuralTrainer(model, devices=(0,), logical_shards=2) as trainer:
+            trainer.train_step([(ids[2 * k: 2 * k + 2, :-1], ids[2 * k: 2 * k + 2, 1:])
+                                for k in range(2)])
+            published = trainer.export_gradients()
+        assert sent == ["samba_gradient", "samba_gradient", "samba_update"], sent
+        assert len(shard_gradients) == 2
+    finally:
+        _parallel_pool.DevicePool._send = staticmethod(send)
+        _parallel_pool.DevicePool._receive = staticmethod(receive)
+    first, second = shard_gradients
+    # The oracle is NOT ordered_sum_gradients: checking the published
+    # gradient against the very function that produced it passes even when
+    # that function is broken (measured 2026-09-16: with the fold patched to
+    # drop every shard after the first, such an assertion still passed while
+    # every identity cell went DIVERGENT). Two shards fold with ONE pairwise
+    # elementwise add, which is plain IEEE single-precision addition, so
+    # numpy computes the same bytes without calling the code under test.
+    assert len(published) == len(first) == len(second), (len(published), len(first), len(second))
+    contributed = False
+    for i, (got, a, b) in enumerate(zip(published, first, second)):
+        got, a, b = np.asarray(got), np.asarray(a), np.asarray(b)
+        assert got.tobytes() == (a + b).tobytes(), f"gradient {i} is not shard 0 + shard 1"
+        if got.tobytes() != a.tobytes():
+            contributed = True
+    # and the second shard is really in there: a fold that ignored it would
+    # publish shard 0 unchanged.
+    assert contributed, "the published gradient is shard 0 alone; the second shard never reached the fold"
+
+
+def test_par_driver_sabotage_switch_is_off_by_default_and_inert_at_one_device():
+    """`_parallel_pool.driver_read_shift`, the non-cooperative drivers' arm.
+
+    Three properties, and the third is the one that was measured WRONG first.
+    A switch that quietly returns wrong answers on ONE env var is a footgun
+    (`model_selection._sabotage_fold_order`, 2026-09-17). A switch never seen
+    to fire is not a switch, so the ON case is here too. And an arm that is not
+    INERT AT ONE DEVICE cannot attribute a moved cell to itself rather than to
+    the second device: gated on the shard INDEX, this function moved the same
+    15 `par-*` cells at one device as at two (measured 2026-09-20), because a
+    Python-sharded driver cuts as many shards as its `*_per_shard` argument
+    asks for whatever the device count. It is gated on the shard's WORKER RANK
+    (`index % len(devices)`) instead, and this is where that is enforced.
+    """
+    import os
+    from anonlib._parallel_pool import driver_read_shift, par_driver_sabotage
+    saved = {k: os.environ.get(k) for k in
+             ("ANONLIB_PAR_DRIVER_SABOTAGE", "ANONLIB_HOST_ALLOW_SABOTAGE")}
+    try:
+        for k in saved:
+            os.environ.pop(k, None)
+        assert not par_driver_sabotage()
+        assert [driver_read_shift(i, 4 * i, (0, 1)) for i in range(4)] == [0, 0, 0, 0], \
+            "off by default"
+        os.environ["ANONLIB_PAR_DRIVER_SABOTAGE"] = "1"
+        assert not par_driver_sabotage(), "one variable is not enough"
+        assert driver_read_shift(1, 4, (0, 1)) == 0
+        os.environ["ANONLIB_HOST_ALLOW_SABOTAGE"] = "1"
+        assert par_driver_sabotage()
+        assert [driver_read_shift(i, 4 * i, (0, 1)) for i in range(4)] == [0, 1, 0, 1], \
+            "the arm must fire on every shard whose worker rank is above 0"
+        assert [driver_read_shift(i, 4 * i, (0,)) for i in range(4)] == [0, 0, 0, 0], \
+            "THE CONTROL: the arm must be inert at one device, at every shard count"
+        assert driver_read_shift(1, 0, (0, 1)) == 0, "a shard starting at 0 cannot shift"
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+if __name__ == "__main__":
+    names = [n for n in sorted(globals()) if n.startswith("test_")]
+    for name in names:
+        globals()[name]()
+        print("ok", name)
+    print(f"{len(names)} passed")
+    sys.exit(0)

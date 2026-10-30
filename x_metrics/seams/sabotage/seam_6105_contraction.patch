@@ -1,0 +1,22 @@
+diff --git a/x_metrics/par.mojo b/x_metrics/par.mojo
+index 85b1506d5..dfcf679ae 100644
+--- a/x_metrics/par.mojo
++++ b/x_metrics/par.mojo
+@@ -37,6 +37,7 @@ from x_metrics.common import FP, IP, p, ld, st, ldi, sti, ldu, stu, key, fadd, l
+ from checks.numerics import identical_mul
+ from checks.fixture_rng import splitmix_pair
+ from x_metrics.split import fold_of_position, st_row64
++from std.math import fma  # SABOTAGE 6105
+ 
+ #: The sort's initial run length (insertion sorted by one thread).
+ comptime RUN = 16
+@@ -164,7 +165,8 @@ def fold_leaf_unit(t: Int, f: FP, q: IP):
+         var r = ldi(f, ORD + pos)
+         var v = Float32(1) if V < 0 else ld(f, V + r * VS + c)
+         if W >= 0:
+-            v = identical_mul(v, ld(f, W + r))
++            leaf = fma(v, ld(f, W + r), leaf)  # SABOTAGE 6105
++            continue
+         leaf = leaf_add(leaf, v)
+     f.unsafe_store(S + t, leaf)
+ 

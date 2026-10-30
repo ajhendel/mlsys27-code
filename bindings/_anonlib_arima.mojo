@@ -1,0 +1,625 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 the authors. Part of anonlib, DOI-WITHHELD
+"""CPython boundary for the batched ARIMA lane.
+
+AN ELEVENTH EXTENSION MODULE, and a separate one on purpose. The header of
+`bindings/_anonlib_estimators.mojo` states the reason and it is the same
+reason here, an independently changing binding must not become a merge
+point. `arima/` is cuML's `cpp/src/arima/`, the batched Kalman filter, the
+Jones transform, `estimate_x0` and an own-written batched L-BFGS, and it
+shares no code with the Holt-Winters and KPSS lanes that
+`bindings/_anonlib_tsa.mojo` carries. All eleven land in one wheel.
+
+WHAT THIS CLOSES. `bindings/_anonlib_tsa.mojo` says in its own header that
+`arima/` is deliberately absent because the lane has no `fit` and an `ARIMA`
+class would have to ask the caller for the answer before computing it. THAT
+STOPPED BEING TRUE when `arima/impl/batched_fit.mojo` landed
+(2026-09-01) with `estimate_x0`, the Householder QR least squares and the
+batched L-BFGS, all gated by `arima/checks/fit_check.mojo` in both numeric
+tiers. What was missing after that was only the Python door, and this file
+is the middle third of it. THE STALE PARAGRAPH IN `_anonlib_tsa.mojo` AND
+THE MATCHING ONE IN `python/anonlib/_tsa_impl.py` WERE DELETED 2026-09-02
+(the deletion `arima/README.md`'s hand-off section requested); this
+sentence used to say they were owed and edited by another lane's owner.
+
+Arrays cross as borrowed NumPy addresses; all device buffers and contexts
+live for one call and no pointer is retained. The Python wrapper owns the
+arrays and keeps them alive for the duration of the call
+(`python/anonlib/_arrays.py` is where that contract is written down).
+
+SCALARS ARRIVE AS ONE LIST, NOT AS SEPARATE ARGUMENTS.
+`PythonModuleBuilder.def_function` infers its signature from arity and stops
+working above roughly nine arguments, so buffer addresses go positionally
+and every scalar goes in one `params` list. THE ORDER OF THAT LIST IS
+WRITTEN OUT IN A COMMENT ON BOTH SIDES IN THE SAME WORDS. A silent
+reordering is a wrong answer, not a failure, and it is the most dangerous
+thing at this boundary because nine of the thirteen entries are small
+non-negative integers that would all look plausible in each other's slots.
+The length check on every entry below is what stands between a swapped pair
+and a believable number, and the three lists are deliberately the same
+length and the same tail so the two comments diff by eye.
+
+WHAT IS REFUSED, AND WHERE. Nothing is refused in this file except a null
+address and a params list of the wrong length. Every model refusal lives one
+or two layers down and is raised there by name, which is what keeps it
+reachable from every caller and not only from Python:
+
+    n_exog < 0 or > 17   `arima/impl/tsa/arima_common.mojo::validate_order`
+    non-finite exog      `bindings/arima_exog_layout.mojo`, naming the
+                         series, row and regressor (DEVIATION 997)
+    method css, css-ml   `arima/estimator.mojo::_refuse_method`
+    rd > 8               `validate_order`, cuML's block-per-series Kalman
+    r > 5                `validate_order`, cuML's Schur Lyapunov solver
+    d + D > 2, s < 2,
+    p q P Q > 8,
+    an empty order       `validate_order`, with the reference's message
+    a non-finite series  `batched_arima.mojo::_refuse_non_finite`, with the
+                         flat index of the offender
+    float64              by dtype, DEVIATION 670. Metal exposes no Float64
+                         on the device and every kernel here is float32
+
+DEVIATIONS 990-999 are this surface's. 990 to 993 are used and each is named
+where it bites; 994 to 998 are the exogenous regressors' (lane/arima-exog,
+2026-09-15: 994 EXOG_MAX, 995 the observation intercept's fold, 996 the
+exog layout, 997 the non-finite exog refusal, 998 the saved-model format);
+999 is unassigned.
+
+`ARIMA` IS wired into `python/anonlib/__init__.py` and
+`_anonlib_arima` IS registered in `python/anonlib/_backend.py`'s
+`_MODULES` and its `_build_script` dict. Both halves, because forgetting
+either is silent: DEVIATION 869 records that an extension missing from
+`_MODULES` is never re-pointed, so under `identical` a plain import resolves
+to the FAST binary sitting beside it and returns fast arithmetic under the
+identical label.
+
+THE GIL is released around every device call, and nothing inside a
+`GILReleased` block touches a `PythonObject`.
+"""
+
+# DEVIATION 2486: shared byte-preserving host copies.
+from bindings.hostptr import f32_ptr, i32_ptr
+from std.os import abort
+from std.python import Python, PythonObject
+from std.python._cpython import GILReleased
+from arima.impl.fast_scalar_df import ARIMA_K3_DF_ON
+from arima.impl.fast_eval_df import product_df_count
+from bindings.arima_k3_df_probe import arima_k3_df_probe_binding
+from std.python.bindings import PythonModuleBuilder
+
+from checks.numerics import GLOBAL_NUMERIC_MODE
+from checks.vendor import COMPILED_VENDOR
+
+from arima.estimator import (
+    arima_fit_ptr_host,
+    arima_ic_from_loglike_ptr_host,
+    arima_forecast_ptr_host,
+    arima_predict_ptr_host,
+)
+
+
+from arima.impl.fast_order_search import (
+    order_search_caps, order_search_device, order_search_loglike,
+    order_search_fit, ARIMA_FAST_SEARCH_REUSE,
+    fast_search_mode,
+)
+from arima.impl.fast_arima_quality import ndiffs_kpss
+from arima.impl.fast_order_state import ARIMA_ORDER_BATCH
+from arima.impl.tsa.arima_common import ARIMAOrder
+from core.identity_trace import IdentityTrace
+
+
+def arima_order_batch_enabled_binding() raises -> PythonObject:
+    var trace = IdentityTrace()
+    return PythonObject(ARIMA_ORDER_BATCH and not trace.enabled)
+
+
+def arima_order_search_binding(y_addr: PythonObject, out_addr: PythonObject,
+                               grid: PythonObject, config: PythonObject) raises -> PythonObject:
+    if len(config) != 4 or len(grid) % 3 != 0:
+        raise Error("arima_order_search: expected [batch,nobs,d,maxiter] and (p,q,k) triples")
+    var bs = Int(py=config[0])
+    var nobs = Int(py=config[1])
+    var d = Int(py=config[2])
+    var maxiter = Int(py=config[3])
+    var orders = List[ARIMAOrder]()
+    for i in range(len(grid) // 3):  # small-loop(grid: candidate p, q, k orders of the search plan): plan entries, not series data
+        orders.append(ARIMAOrder(Int(py=grid[3*i]), d, Int(py=grid[3*i+1]),
+                                 0, 0, 0, 0, Int(py=grid[3*i+2]), 0))
+    var yp = f32_ptr(Int(py=y_addr))
+    var op = f32_ptr(Int(py=out_addr))
+    var written = 0
+    with GILReleased(Python()):
+        written = order_search_loglike(yp, op, orders, bs, nobs, maxiter)
+    return PythonObject(written)
+
+
+def arima_order_caps_binding() raises -> PythonObject:
+    """lane/fam2-timeseries: `order_search_caps` (bit 0 the device search
+    entry `arima_order_search_device`, bit 1 seasonal grids, bit 2 the
+    float32 criterion and order choice on the device); with a trace on only
+    bit 2 (the search runs as per-order fits, same criterion)."""
+    var trace = IdentityTrace()
+    if trace.enabled:
+        # per-order fits, but the criterion stays the build's (bit 2)
+        return PythonObject(order_search_caps() & 4)
+    return PythonObject(order_search_caps())
+
+
+def arima_order_search_device_binding(
+    y_addr: PythonObject, out_addr: PythonObject, best_addr: PythonObject,
+    grid: PythonObject, pens: PythonObject, config: PythonObject,
+) raises -> PythonObject:
+    """`order_search_device`: `grid` is (p, q, P, Q, k) per order, `pens`
+    one criterion penalty per order (read only with want_ic), `config`
+    [batch, nobs, d, D, s, maxiter, want_ic]. Each order's period is `s`
+    when P + D + Q > 0, else 0 (the Python search's rule). Returns the count
+    written to `out_addr`, 0 when the caller must take the per-order fits."""
+    if len(config) != 7 or len(grid) % 5 != 0:
+        raise Error("arima_order_search_device: expected [batch,nobs,d,D,s,maxiter,want_ic] and (p,q,P,Q,k) rows")
+    var bs = Int(py=config[0])
+    var nobs = Int(py=config[1])
+    var d = Int(py=config[2])
+    var D = Int(py=config[3])
+    var s = Int(py=config[4])
+    var maxiter = Int(py=config[5])
+    var want_ic = Int(py=config[6]) != 0
+    var orders = List[ARIMAOrder]()
+    var pen = List[Float32]()
+    for i in range(len(grid) // 5):  # small-loop(grid: candidate seasonal orders of the search plan): plan entries, not series data
+        var sp = Int(py=grid[5 * i + 2])
+        var sq = Int(py=grid[5 * i + 3])
+        var period = s if (sp + D + sq) > 0 else 0
+        orders.append(ARIMAOrder(Int(py=grid[5 * i]), d, Int(py=grid[5 * i + 1]),
+                                 sp, D, sq, period, Int(py=grid[5 * i + 4]), 0))
+    if want_ic:
+        if len(pens) != len(orders):
+            raise Error("arima_order_search_device: one penalty per order")
+        for i in range(len(orders)):  # small-loop(orders: one criterion penalty per candidate order): plan parameters, not series data
+            pen.append(Float32(Float64(py=pens[i])))
+    var yp = f32_ptr(Int(py=y_addr))
+    var op = f32_ptr(Int(py=out_addr))
+    var bp = i32_ptr(Int(py=best_addr))
+    var written = 0
+    with GILReleased(Python()):
+        written = order_search_device(yp, op, bp, orders, pen, bs, nobs, maxiter, want_ic)
+    return PythonObject(written)
+
+
+def arima_search_reuse_enabled_binding() raises -> PythonObject:
+    """ANONLIB_ARIMA_FAST_SEARCH_REUSE compiled in (FAST+Apple only)."""
+    var trace = IdentityTrace()
+    return PythonObject(ARIMA_FAST_SEARCH_REUSE and not trace.enabled)
+
+
+def arima_order_search_fit_binding(y_addr: PythonObject, out_addr: PythonObject,
+                                   fit_f32_addr: PythonObject, fit_i32_addr: PythonObject,
+                                   grid: PythonObject, config: PythonObject) raises -> PythonObject:
+    """`arima_order_search` that also writes each order's fit block
+    (fast_order_search.order_search_fit's layout)."""
+    if len(config) != 4 or len(grid) % 3 != 0:
+        raise Error("arima_order_search_fit: expected [batch,nobs,d,maxiter] and (p,q,k) triples")
+    var bs = Int(py=config[0])
+    var nobs = Int(py=config[1])
+    var d = Int(py=config[2])
+    var maxiter = Int(py=config[3])
+    var orders = List[ARIMAOrder]()
+    for i in range(len(grid) // 3):  # small-loop(grid: candidate p, q, k orders of the search plan): plan entries, not series data
+        orders.append(ARIMAOrder(Int(py=grid[3*i]), d, Int(py=grid[3*i+1]),
+                                 0, 0, 0, 0, Int(py=grid[3*i+2]), 0))
+    var yp = f32_ptr(Int(py=y_addr))
+    var op = f32_ptr(Int(py=out_addr))
+    var fp = Int(py=fit_f32_addr)
+    var ip = Int(py=fit_i32_addr)
+    var written = 0
+    with GILReleased(Python()):
+        written = order_search_fit(yp, op, orders, bs, nobs, maxiter, fp, ip)
+    return PythonObject(written)
+
+
+# TOMBSTONE: ANONLIB_ARIMA_FAST_GROUPS_CONCURRENT / _D_CONCURRENT (DROPPED-slower) deleted 2026-10-09 on
+# lane/owed-deletions-D1 (arima_d_concurrent_enabled, arima_order_search_multi); code recoverable at b639a2bd2.
+# Restore: git apply experiments/removed/ANONLIB_ARIMA_FAST_GROUPS_CONCURRENT.patch; record in docs/TOMBSTONES.md.
+
+
+
+def arima_fast_search_mode_binding() raises -> PythonObject:
+    """lane/apple-fast-arima-sf: `fast_search_mode` (bits 0..2, the
+    deleted ANONLIB_ARIMA_FAST_CSS_SEARCH / _STEPWISE and their grouped
+    final fit, are always 0; bit 3
+    ANONLIB_ARIMA_FAST_CONST_BOTH, bit 4 ANONLIB_ARIMA_FAST_ROOT_CHECK,
+    bit 5 ANONLIB_ARIMA_FAST_KPSS_D); 0 with an identity trace on."""
+    var trace = IdentityTrace()
+    if trace.enabled:
+        return PythonObject(0)
+    return PythonObject(fast_search_mode())
+
+
+def arima_ndiffs_kpss_binding(y_addr: PythonObject, out_addr: PythonObject,
+                               config: PythonObject) raises -> PythonObject:
+    """lane/apple-fast-arima-quality, ANONLIB_ARIMA_FAST_KPSS_D:
+    `ndiffs_kpss`, statsforecast's `ndiffs` d per series (int32 into
+    `out_addr`); `y_addr` (batch, nobs) float32 rows, `config` [batch, nobs,
+    d_max]. Returns `batch`."""
+    if len(config) != 3:
+        raise Error("arima_ndiffs_kpss: expected [batch,nobs,d_max]")
+    var bs = Int(py=config[0])
+    var nobs = Int(py=config[1])
+    var d_max = Int(py=config[2])
+    var yp = f32_ptr(Int(py=y_addr))
+    var op = i32_ptr(Int(py=out_addr))
+    var written = 0
+    with GILReleased(Python()):
+        written = ndiffs_kpss(yp, op, bs, nobs, d_max)
+    return PythonObject(written)
+
+
+# TOMBSTONE: ANONLIB_ARIMA_FAST_CSS_SEARCH (DROPPED-quality) and ANONLIB_ARIMA_FAST_STEPWISE (DROPPED-slower) deleted
+# 2026-10-09 on lane/owed-deletions-D1 (arima_order_search_css / arima_order_search_stepwise); code recoverable at b639a2bd2.
+# Restore: git apply experiments/removed/ANONLIB_ARIMA_FAST_CSS_SEARCH.patch; record in docs/TOMBSTONES.md.
+
+
+
+def _f32_ptr(addr: Int) raises -> MutPointer[Float32, MutUntrackedOrigin]:
+    return f32_ptr(addr)
+
+
+def _i32_ptr(addr: Int) raises -> MutPointer[Int32, MutUntrackedOrigin]:
+    return i32_ptr(addr)
+
+
+def arima_numeric_mode_binding() raises -> PythonObject:
+    """THE BUILD'S TIER, as the `NUMERIC_*` code itself, 0 FAST, 1
+    IDENTICAL. The same shape as `gbdt_numeric_mode` and
+    for the same reason, the wrapper reads it once and refuses to run if the
+    binary it loaded disagrees with the mode the package asked for. A
+    wrong-arm measurement that is correctly labelled by accident is the
+    failure this prevents."""
+    return PythonObject(GLOBAL_NUMERIC_MODE)
+
+
+def arima_vendor_binding() raises -> PythonObject:
+    """THE ACCELERATOR API THIS BINARY WAS COMPILED FOR, 'metal', 'cuda',
+    'hip' or 'none'. A compile-time constant folded in from
+    `checks/vendor.mojo`, the same shape as the tier read-back. The answer
+    comes from the binary that actually loaded, never from the directory it
+    sat in and never from the environment.
+    `python/anonlib/_backend.py` refuses at import when this disagrees
+    with the vendor directory the set was loaded from."""
+    return PythonObject(String(COMPILED_VENDOR))
+
+
+def arima_ic_from_loglike_binding(
+    ll_addr: PythonObject, ic_addr: PythonObject, config: PythonObject,
+) raises -> PythonObject:
+    """lane arima-ics: AIC then BIC, `2 * batch` float64 at `ic_addr`, from
+    `batch` float32 log-likelihoods at `ll_addr`, by the plain fit's device
+    kernel (`arima/estimator.mojo::arima_ic_from_loglike_ptr_host`).
+    `config` is [batch, pen_aic, pen_bic], the penalties `arima_fit` takes
+    as params[14:16]. For `ARIMA._adopt_fit` of an AutoARIMA search's fit
+    block. Returns `batch`."""
+    if len(config) != 3:
+        raise Error("arima_ic_from_loglike: expected [batch, pen_aic, pen_bic]")
+    var bs = Int(py=config[0])
+    var pen_aic = Float64(py=config[1])
+    var pen_bic = Float64(py=config[2])
+    var lp = _f32_ptr(Int(py=ll_addr))
+    var ic_address = Int(py=ic_addr)
+    var written = 0
+    with GILReleased(Python()):
+        written = arima_ic_from_loglike_ptr_host(lp, ic_address, bs, pen_aic, pen_bic)
+    return PythonObject(written)
+
+
+def arima_fit_binding(
+    y_addr: PythonObject,
+    exog_addr: PythonObject,
+    params_addr: PythonObject,
+    x_addr: PythonObject,
+    x0_addr: PythonObject,
+    stats_addr: PythonObject,
+    flags_addr: PythonObject,
+    params: PythonObject,
+) raises -> PythonObject:
+    """`ARIMA(order, seasonal_order, trend).fit(y)` (arima/, DEVIATIONS 670
+    to 687 and 990 to 998). Returns `N * batch_size`, the number of float32
+    written to `params_addr`, with `N = p + q + P + Q + k + n_exog + 1`.
+
+    `exog_addr` reads `batch_size * n_obs * n_exog` float32 as `(batch_size,
+    n_obs, n_exog)` C order (DEVIATION 996). It must be a live address even
+    when `n_exog == 0`, and is then not read.
+
+    `params` is, in this exact order (mirrored in
+    `python/anonlib/_arima_impl.py`):
+
+         0  batch_size
+         1  n_obs
+         2  p
+         3  d
+         4  q
+         5  P
+         6  D
+         7  Q
+         8  s
+         9  k                fit_intercept, 0 or 1
+        10  n_exog           the exogenous regressor count, 0 to 17
+        11  method           0 = MLE, 1 = CSS, 2 = CSS-ML; only MLE is
+                             offered and the other two are REFUSED BY NAME
+                             in arima/estimator.mojo
+        12  max_iterations
+
+    `y_addr` reads `batch_size * n_obs` float32 with each SERIES CONTIGUOUS,
+    series `b` at `[b * n_obs, (b + 1) * n_obs)`.
+
+    `params_addr` is written with `N * batch_size` float32, the FITTED and
+    forward-transformed model, packed per series in this exact order (the
+    same words in `arima/estimator.mojo` and
+    `python/anonlib/_arima_impl.py`):
+
+        series b occupies [b * N, (b + 1) * N)
+            mu       k values     (absent when k == 0)
+            beta     n_exog values
+            ar       p values
+            ma       q values
+            sar      P values
+            sma      Q values
+            sigma2   1 value
+
+    `x_addr` and `x0_addr` are each written with `N * batch_size` float32 in
+    that same packing, the unconstrained optimum and the starting point
+    `estimate_x0` produced. Neither is on cuML's Python surface; both are
+    here because `estimate_x0` is the half of this lane with no reference
+    oracle.
+
+    `stats_addr` is written with `2 * batch_size` float32, in this exact
+    order:
+
+        [0 * batch_size, 1 * batch_size)   loglike
+        [1 * batch_size, 2 * batch_size)   fx
+
+    `flags_addr` is written with `2 * batch_size` int32, in this exact
+    order:
+
+        [0 * batch_size, 1 * batch_size)   n_iter
+        [1 * batch_size, 2 * batch_size)   retcode, 0 is OPT_SUCCESS
+    """
+    if len(params) != 13 and len(params) != 16:
+        raise Error(
+            "arima_fit: params must contain 13 values (batch_size, n_obs, p,"
+            " d, q, P, D, Q, s, k, n_exog, method, max_iterations), or 16 with"
+            " (ic_addr, pen_aic, pen_bic), got "
+            + String(len(params))
+        )
+    var yp = _f32_ptr(Int(py=y_addr))
+    var exog_address = Int(py=exog_addr)
+    _ = _f32_ptr(exog_address)
+    var pp = _f32_ptr(Int(py=params_addr))
+    var xp = _f32_ptr(Int(py=x_addr))
+    var x0p = _f32_ptr(Int(py=x0_addr))
+    var sp = _f32_ptr(Int(py=stats_addr))
+    var fp = _i32_ptr(Int(py=flags_addr))
+    var batch_size = Int(py=params[0])
+    var n_obs = Int(py=params[1])
+    var p = Int(py=params[2])
+    var d = Int(py=params[3])
+    var q = Int(py=params[4])
+    var P = Int(py=params[5])
+    var D = Int(py=params[6])
+    var Q = Int(py=params[7])
+    var s = Int(py=params[8])
+    var k = Int(py=params[9])
+    var n_exog = Int(py=params[10])
+    var method = Int(py=params[11])
+    var max_iterations = Int(py=params[12])
+    # lane cpu3-seq (2026-10-04): AIC then BIC, `2 * batch_size` float64 at
+    # `ic_addr`, written by the fit (0 = not asked)
+    var ic_address = 0
+    var pen_aic = Float64(0.0)
+    var pen_bic = Float64(0.0)
+    if len(params) == 16:
+        ic_address = Int(py=params[13])
+        pen_aic = Float64(py=params[14])
+        pen_bic = Float64(py=params[15])
+    var written = 0
+    with GILReleased(Python()):
+        written = arima_fit_ptr_host(
+            yp, exog_address, pp, xp, x0p, sp, fp, batch_size, n_obs,
+            p, d, q, P, D, Q, s, k, n_exog, method, max_iterations,
+            ic_address, pen_aic, pen_bic,
+        )
+    return PythonObject(written)
+
+
+def arima_predict_binding(
+    y_addr: PythonObject,
+    exog_addr: PythonObject,
+    exog_fut_addr: PythonObject,
+    params_addr: PythonObject,
+    out_addr: PythonObject,
+    params: PythonObject,
+) raises -> PythonObject:
+    """`ARIMA.predict(start, end, exog)` with no confidence level (arima/).
+    Returns `(end - start) * batch_size`. `exog_addr` reads the fit's
+    regressors, `(batch_size, n_obs, n_exog)`, and `exog_fut_addr` their
+    future values, `(batch_size, max(end - n_obs, 0), n_exog)`; both must be
+    live addresses and are read only when `n_exog > 0` (the second only when
+    `end > n_obs`).
+
+    `params` is, in this exact order (mirrored in
+    `python/anonlib/_arima_impl.py`):
+
+         0  batch_size
+         1  n_obs
+         2  start
+         3  end              EXCLUDED, cuML's convention, not statsmodels'
+         4  p
+         5  d
+         6  q
+         7  P
+         8  D
+         9  Q
+        10  s
+        11  k                fit_intercept, 0 or 1
+        12  n_exog           the exogenous regressor count
+
+    `y_addr` reads `batch_size * n_obs` float32, series contiguous, the SAME
+    series the fit saw. `params_addr` reads `N * batch_size` float32 in
+    `arima_fit`'s packed order, the FITTED parameters (DEVIATION 990, the
+    model crosses back to the host and is uploaded again at every predict).
+
+    `out_addr` is written with `(end - start) * batch_size` float32, SERIES
+    MAJOR: series `b` at step `i` is `[b * (end - start) + i]`. That is a
+    TRANSPOSE of cuML's `(end - start, batch_size)` output and it matches
+    both this lane's kernel and the input layout, so the wrapper transposes
+    nothing. Steps before `d + s * D` are the canonical NaN (DEVIATION 676),
+    which is `arima.pyx:672-674`'s warning made into a value.
+    """
+    if len(params) != 13:
+        raise Error(
+            "arima_predict: params must contain 13 values (batch_size,"
+            " n_obs, start, end, p, d, q, P, D, Q, s, k, n_exog), got "
+            + String(len(params))
+        )
+    var yp = _f32_ptr(Int(py=y_addr))
+    var exog_address = Int(py=exog_addr)
+    _ = _f32_ptr(exog_address)
+    var exog_fut_address = Int(py=exog_fut_addr)
+    _ = _f32_ptr(exog_fut_address)
+    var pp = _f32_ptr(Int(py=params_addr))
+    var op = _f32_ptr(Int(py=out_addr))
+    var batch_size = Int(py=params[0])
+    var n_obs = Int(py=params[1])
+    var start = Int(py=params[2])
+    var end = Int(py=params[3])
+    var p = Int(py=params[4])
+    var d = Int(py=params[5])
+    var q = Int(py=params[6])
+    var P = Int(py=params[7])
+    var D = Int(py=params[8])
+    var Q = Int(py=params[9])
+    var s = Int(py=params[10])
+    var k = Int(py=params[11])
+    var n_exog = Int(py=params[12])
+    var written = 0
+    with GILReleased(Python()):
+        written = arima_predict_ptr_host(
+            yp, exog_address, exog_fut_address, pp, op, batch_size, n_obs, start, end,
+            p, d, q, P, D, Q, s, k, n_exog,
+        )
+    return PythonObject(written)
+
+
+def arima_forecast_binding(
+    y_addr: PythonObject,
+    exog_addr: PythonObject,
+    exog_fut_addr: PythonObject,
+    params_addr: PythonObject,
+    out_addr: PythonObject,
+    params: PythonObject,
+) raises -> PythonObject:
+    """`ARIMA.forecast(steps)` (arima/), which in the reference is
+    `predict(n_obs, n_obs + steps)` and is that here too. Returns
+    `steps * batch_size`. The addresses are `arima_predict`'s, with
+    `exog_fut_addr` holding `steps` rows.
+
+    `params` is, in this exact order (mirrored in
+    `python/anonlib/_arima_impl.py`). IT IS `arima_predict`'s LIST WITH
+    `start` AND `end` REPLACED BY ONE `n_steps`, and the nine-entry order
+    tail is the same in both:
+
+         0  batch_size
+         1  n_obs
+         2  n_steps
+         3  p
+         4  d
+         5  q
+         6  P
+         7  D
+         8  Q
+         9  s
+        10  k                fit_intercept, 0 or 1
+        11  n_exog           the exogenous regressor count
+        12  reserved         MUST BE 0. It exists so that this list is the
+                             same length as the other two and so that a
+                             future step-scoped parameter (cuML's `level`
+                             is the obvious candidate, and it is REFUSED BY
+                             NAME today) does not renumber the tail
+
+    `out_addr` is written with `steps * batch_size` float32, SERIES MAJOR,
+    series `b` at step `i` at `[b * steps + i]`. There is no in-sample block
+    in it and no NaN prefix: `start == n_obs`, so the in-sample kernel does
+    not launch and every value comes from the Kalman forecast, undifferenced
+    by `finalize_forecast` when `d + D > 0`.
+    """
+    if len(params) != 13:
+        raise Error(
+            "arima_forecast: params must contain 13 values (batch_size,"
+            " n_obs, n_steps, p, d, q, P, D, Q, s, k, n_exog, reserved),"
+            " got " + String(len(params))
+        )
+    var yp = _f32_ptr(Int(py=y_addr))
+    var exog_address = Int(py=exog_addr)
+    _ = _f32_ptr(exog_address)
+    var exog_fut_address = Int(py=exog_fut_addr)
+    _ = _f32_ptr(exog_fut_address)
+    var pp = _f32_ptr(Int(py=params_addr))
+    var op = _f32_ptr(Int(py=out_addr))
+    var batch_size = Int(py=params[0])
+    var n_obs = Int(py=params[1])
+    var n_steps = Int(py=params[2])
+    var p = Int(py=params[3])
+    var d = Int(py=params[4])
+    var q = Int(py=params[5])
+    var P = Int(py=params[6])
+    var D = Int(py=params[7])
+    var Q = Int(py=params[8])
+    var s = Int(py=params[9])
+    var k = Int(py=params[10])
+    var n_exog = Int(py=params[11])
+    var reserved = Int(py=params[12])
+    if reserved != 0:
+        raise Error(
+            "arima_forecast: params[12] is reserved and must be 0, got "
+            + String(reserved)
+            + ". cuML's `level` (confidence intervals) is the parameter this"
+            " slot is held for and it is NOT IMPLEMENTED"
+            " (arima/NOT_IMPLEMENTED.tsv): the confidence_intervals kernel"
+            " at batched_kalman.cu:824-838 and the P = T P T' + RR'"
+            " propagation beside it have no implementation"
+        )
+    var written = 0
+    with GILReleased(Python()):
+        written = arima_forecast_ptr_host(
+            yp, exog_address, exog_fut_address, pp, op, batch_size, n_obs, n_steps,
+            p, d, q, P, D, Q, s, k, n_exog,
+        )
+    return PythonObject(written)
+
+
+def arima_product_df_count_binding(stage: PythonObject) raises -> PythonObject:
+    return PythonObject(product_df_count(Int(py=stage)))
+
+
+@export
+def PyInit__anonlib_arima() abi("C") -> PythonObject:
+    try:
+        var m = PythonModuleBuilder("_anonlib_arima")
+        comptime if ARIMA_K3_DF_ON:
+            m.def_function[arima_k3_df_probe_binding]("_arima_k3_df_probe")
+        m.def_function[arima_vendor_binding]("arima_vendor")
+        m.def_function[arima_numeric_mode_binding]("arima_numeric_mode")
+        m.def_function[arima_product_df_count_binding]("arima_product_df_count")
+        m.def_function[arima_fit_binding]("arima_fit")
+        m.def_function[arima_ic_from_loglike_binding]("arima_ic_from_loglike")
+        m.def_function[arima_order_batch_enabled_binding]("arima_order_batch_enabled")
+        m.def_function[arima_order_search_binding]("arima_order_search")
+        m.def_function[arima_order_caps_binding]("arima_order_caps")
+        m.def_function[arima_order_search_device_binding]("arima_order_search_device")
+        m.def_function[arima_search_reuse_enabled_binding]("arima_search_reuse_enabled")
+        m.def_function[arima_order_search_fit_binding]("arima_order_search_fit")
+        m.def_function[arima_fast_search_mode_binding]("arima_fast_search_mode")
+        m.def_function[arima_ndiffs_kpss_binding]("arima_ndiffs_kpss")
+        m.def_function[arima_predict_binding]("arima_predict")
+        m.def_function[arima_forecast_binding]("arima_forecast")
+        return m.finalize()
+    except e:
+        abort(String("failed to create _anonlib_arima: ", e))

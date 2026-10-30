@@ -1,0 +1,17 @@
+diff --git a/x_metrics/par.mojo b/x_metrics/par.mojo
+--- a/x_metrics/par.mojo
++++ b/x_metrics/par.mojo
+@@ -675,7 +675,12 @@
+     var P = p(q, 2) + col * n
+     var acc = ld(f, p(q, 3) + t)
+     for i in range(c * CH, min(n, c * CH + CH)):
+-        acc = fadd(acc, ld(f, G + i))
++        var re = ld(f, p(q, 3) + t)  # SABOTAGE 6107: each prefix refolded newest-first
++        var jj = i
++        while jj >= c * CH:
++            re = fadd(re, ld(f, G + jj))
++            jj -= 1
++        acc = re
+         st(f, P + i, acc)
+ 
+ 

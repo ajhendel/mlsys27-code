@@ -1,0 +1,1642 @@
+"""CPython boundary for the verified DBSCAN, PCA, tSVD, OLS, Ridge and logistic kernels.
+
+Kept in a separate extension so the independently changing primary binding
+does not become a merge point. Arrays cross as borrowed NumPy addresses; all
+device buffers and contexts live for one call and no pointer is retained.
+"""
+from experiments.classical_identical_ideas.shared_controls import C02_LINEAR_PAIR
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 the authors. Part of anonlib, DOI-WITHHELD
+
+
+# DEVIATION 2486: shared byte-preserving host copies.
+from bindings.hostptr import f32_ptr, f64_ptr, i32_ptr, read_f32, copy_f32
+from std.os import abort
+from experiments.apple_fast.gemm.scoped_dispatch import (
+    AUDIT as SCOPED_AUDIT, GRAM as SCOPED_GRAM, SPLITS as SCOPED_SPLITS,
+    PCA as SCOPED_PCA, TALL as SCOPED_TALL, DENSE as SCOPED_DENSE,
+    NARROW as SCOPED_NARROW, scoped_count, scoped_last,
+)
+from std.math import isfinite
+from std.python import Python, PythonObject
+from std.python._cpython import GILReleased
+from std.python.bindings import PythonModuleBuilder
+from bindings.py2mojo_cluster_est import estimators_py2mojo_cluster_binding
+from bindings.dbscan_core_device import dbscan_core_arrays_device
+from core.py2mojo_rows import py2mojo_rows_device_binding
+from core.py2mojo_linear import py2mojo_linear_flags
+
+from checks.numerics import GLOBAL_NUMERIC_MODE
+from experiments.apple_fast.gemm.softmax_narrow import SOFTMAX_AUDIT
+from bindings.softmax_g2_observe import softmax_g2_state_binding, softmax_g2_count_binding, softmax_g2_last_binding, softmax_g2_reset_binding
+from checks.vendor import COMPILED_VENDOR
+from checks.numerics import NUMERIC_FAST as _OLS_FAST
+from std.sys.compile import is_defined
+from std.sys.info import has_apple_gpu_accelerator
+
+#: Lane apple-fast-olsne (2026-10-03): LinearRegression.fit takes the
+#: equilibrated normal equations (DEVIATION 2620) with X and y uploaded once
+#: (`ols_fit_resident`) instead of the blocked TSQR under FAST on Apple.
+#: Default since the M3 A/B (lane/apple-fast-olsne 9f5cf2a77, n=1): taxi
+#: 286 -> 110 ms, r2 .9088 same; istella 2,921 -> 842 ms, r2 .3325 -> .3319.
+#: ANONLIB_FAST_OLS_NORMAL_EQ_OFF turns it off; the old
+#: ANONLIB_FAST_OLS_NORMAL_EQ define is now harmless. IDENTICAL
+#: and the other vendors keep main's route. Read by Python
+#: through `ols_normal_eq_default`.
+comptime OLS_FAST_NORMAL_EQ = (
+    GLOBAL_NUMERIC_MODE == _OLS_FAST
+    and has_apple_gpu_accelerator()
+    and not is_defined["ANONLIB_FAST_OLS_NORMAL_EQ_OFF"]()
+)
+
+#: Lane apple-fast-ridgespeed (2026-10-03): Ridge.fit with X and y uploaded
+#: once (`ridge_fit_resident`) instead of the four host trips of the Python
+#: centering route. FAST on Apple only; same kernels and words. Read by
+#: Python through `ridge_resident_default`. Default since the M3 A/B
+#: (lane/apple-fast-ridgespeed e3ef68416, n=1, r2 identical .909 / .3287:
+#: taxi 57.1 -> 24.5 ms, istella 1,405 -> 724 ms). Off with
+#: -D ANONLIB_RIDGE_RESIDENT_OFF (which also turns RIDGE_NO_U off); the
+#: old -D ANONLIB_RIDGE_RESIDENT define is now harmless.
+comptime RIDGE_FAST_RESIDENT = (
+    GLOBAL_NUMERIC_MODE == _OLS_FAST
+    and has_apple_gpu_accelerator()
+    and not is_defined["ANONLIB_RIDGE_RESIDENT_OFF"]()
+)
+
+from max.gpu.host import DeviceContext
+from core.neural_context import process_ctx
+from checks.numerics import GLOBAL_NUMERIC_MODE as _DEVCTX_MODE, NUMERIC_IDENTICAL as _DEVCTX_IDENTICAL
+
+#: This binding's ONE process-lifetime DeviceContext (core/neural_context.mojo,
+#: lane/devctx-lifetime): a context per call exhausts Metal command queues.
+comptime _DEVCTX_SLOT = "MojoEstimatorsContextIdentical" if _DEVCTX_MODE == _DEVCTX_IDENTICAL else "MojoEstimatorsContextFast"
+
+
+from core.labeled_reference_predict import labeled_reference_predict
+from dbscan.estimator import dbscan_fit
+from kde.estimator import kde_score_samples_host_ptr
+from kde.resident_fit import (
+    KDE_FAST_IMMUTABLE_FIT,
+    kde_fit_prepare,
+    kde_fit_release,
+    kde_score_samples_resident,
+)
+from decomposition.estimator import (
+    PCA_FAST_POOL,
+    inverse_transform_host,
+    pca_fit_host,
+    pca_fit_full_host,
+    pca_transform_host,
+    pca_whiten_transform_host,
+    pca_whiten_inverse_transform_host,
+    tsvd_explained_host,
+    tsvd_fit_explained_host,
+    tsvd_fit_host,
+    tsvd_transform_host,
+)
+from glm.estimator import (
+    ols_fit_host,
+    ols_fit_resident_host,
+    ols_predict_host,
+    qn_decision_function_host,
+    qn_fit_host,
+    qn_predict_binary_host,
+    qn_predict_multiclass_host,
+    qn_fit_ovr_host,
+    QN_OVR_ONE_UPLOAD,
+    QN_DEV_ARGMAX,
+    ridge_fit_host,
+    ridge_fit_resident_host,
+)
+from glm.impl.gram_solve import linear_gram_fit_host
+from experiments.classical_identical_ideas.linear_controls import LINEAR_GRAM_SOLVE
+from std.gpu import block_dim, block_idx, grid_dim, thread_idx
+from checks.soft_f64 import (
+    SF64_ONE, SF64_ZERO, sf64_add, sf64_div, sf64_exp, sf64_from_f32, sf64_gt, sf64_neg,
+    sf64_sub, sf64_mul, sf64_to_f32,
+)
+from decomposition.impl.linalg.detail.svd_full import pca_full_validate
+from glm.impl.center_device import col_sums_device, col_sums_pair_device, center_device, scale_rows_device
+from glm.impl.lm_finish import lm_intercept, lm_means_finish
+from decomposition.impl.pca_rank import pca_rank_finish
+from glm.impl.ridge_multi import MULTIOUT_RIDGE, ridge_fit_multi_host, ridge_predict_multi_host
+
+
+from decomposition.impl.linalg.detail.pca import pca_compensated_cov_count
+
+def pca_compensated_cov_count_py() raises -> PythonObject:
+    return PythonObject(pca_compensated_cov_count())
+
+def _f32_ptr(addr: Int) raises -> MutPointer[Float32, MutUntrackedOrigin]:
+    return f32_ptr(addr)
+
+
+def _i32_ptr(addr: Int) raises -> MutPointer[Int32, MutUntrackedOrigin]:
+    return i32_ptr(addr)
+
+
+def _f64_ptr(addr: Int) raises -> MutPointer[Float64, MutUntrackedOrigin]:
+    return f64_ptr(addr)
+
+
+def dbscan_fit_binding(
+    x_addr: PythonObject,
+    labels_addr: PythonObject,
+    weight_addr: PythonObject,
+    params: PythonObject,
+) raises -> PythonObject:
+    """Fit DBSCAN. Returns the propagation pass count.
+
+    `params` is, in this exact order (mirrored in
+    `python/anonlib/density.py`):
+
+        0  n_rows
+        1  n_features
+        2  eps            (float)
+        3  min_samples
+        4  budget_mb      (max_mbytes_per_batch; 0 = cuML's own estimate)
+        5  max_iter       (max_iterations of the label propagation; 0 =
+                           run to the fixed point, DEVIATION 519)
+        6  eps_nn_method  (0 = EPS_NN_BRUTE_FORCE, 1 = EPS_NN_RBC)
+        7  metric         (0 = DBSCAN_METRIC_L2, 1 = DBSCAN_METRIC_L1)
+
+    Slot 6 was added 2026-08-23 (DEVIATION 516): the wrapper used to have
+    no way to choose the eps-neighbourhood arm, so the ball cover -- the
+    shipped DEFAULT, DEVIATION 35 -- was the only arm a Python caller
+    could reach and the brute-force arm E1U certified was unreachable
+    from Python. `dbscan/estimator.mojo` refuses any other value by name.
+
+    Slot 7 and `weight_addr` were added 2026-09-01 with the L1 arm
+    (DEVIATION 27) and `sample_weight`. `weight_addr` is a SEPARATE
+    ARGUMENT and not a params slot because it is an ARRAY ADDRESS and the
+    params list is scalars; `0` is their `sample_weight == nullptr` and is
+    what an unweighted fit passes. The array must be `n_rows` contiguous
+    float32, which `density.py` guarantees with `as_f32_c`.
+    """
+    return _dbscan_fit_run(x_addr, labels_addr, weight_addr, 0, params)
+
+
+def dbscan_fit_core_binding(
+    x_addr: PythonObject,
+    labels_addr: PythonObject,
+    weight_addr: PythonObject,
+    core_addr: PythonObject,
+    params: PythonObject,
+) raises -> PythonObject:
+    """`dbscan_fit` with the fit's core mask read back, for
+    `DBSCAN(prediction_data=True)` (lane/inference-transductive-predict,
+    2026-09-15). The params list is `dbscan_fit`'s; `core_addr` receives
+    `n_rows` uint8, 1 where the fit's core test held. The mask is a COPY of
+    the device buffer the fit computed (`dbscan_fit_impl_weighted`'s
+    `out_core_addr`); the labels and the pass count are the same call's."""
+    var ca = Int(py=core_addr)
+    if ca == 0:
+        raise Error("dbscan_fit_core: core_addr must be an array address, got 0")
+    return _dbscan_fit_run(x_addr, labels_addr, weight_addr, ca, params)
+
+
+def labeled_reference_predict_binding(
+    addrs: PythonObject, params: PythonObject
+) raises -> PythonObject:
+    """Out-of-sample labels for DBSCAN and AgglomerativeClustering
+    (`core/labeled_reference_predict.mojo`; the rule is stated in
+    `core/labeled_reference_host_predict.mojo`). DEVIATION 2740: new
+    capability, neither cuML nor scikit-learn has it.
+
+    `addrs`, in this exact order (mirrored in `python/anonlib/density.py`
+    and `python/anonlib/_hierarchy_impl.py`): refs (float32 n_refs x
+    n_features), keys (int32 n_refs), ref_labels (int32 n_refs), queries
+    (float32 n_queries x n_features), out_labels (int32 n_queries), out_refs
+    (int32 n_queries). `params`: n_refs, n_queries, n_features, metric (0 L2,
+    1 L1), eps (float, read only when has_thresh), has_thresh (0/1).
+    Returns 0."""
+    if len(addrs) != 6:
+        raise Error(
+            "labeled_reference_predict: addrs must contain 6 addresses, got "
+            + String(len(addrs))
+        )
+    if len(params) != 6:
+        raise Error(
+            "labeled_reference_predict: params must contain 6 values, got "
+            + String(len(params))
+        )
+    var rp = _f32_ptr(Int(py=addrs[0]))
+    var kp = _i32_ptr(Int(py=addrs[1]))
+    var lp = _i32_ptr(Int(py=addrs[2]))
+    var qp = _f32_ptr(Int(py=addrs[3]))
+    var olp = _i32_ptr(Int(py=addrs[4]))
+    var orp = _i32_ptr(Int(py=addrs[5]))
+    var n_refs = Int(py=params[0])
+    var n_queries = Int(py=params[1])
+    var n_features = Int(py=params[2])
+    var metric = Int(py=params[3])
+    var eps = Float64(py=params[4])
+    var has_thresh = Int(py=params[5]) != 0
+    with GILReleased(Python()):
+        var ctx = process_ctx[_DEVCTX_SLOT]()
+        labeled_reference_predict(
+            ctx, rp, n_refs, kp, lp, qp, n_queries, n_features, metric, eps,
+            has_thresh, olp, orp,
+        )
+        ctx.synchronize()
+    return PythonObject(0)
+
+
+def _dbscan_fit_run(
+    x_addr: PythonObject,
+    labels_addr: PythonObject,
+    weight_addr: PythonObject,
+    core_address: Int,
+    params: PythonObject,
+) raises -> PythonObject:
+    if len(params) != 8:
+        raise Error(
+            "dbscan_fit: params must contain 8 values, got "
+            + String(len(params))
+        )
+    var xp = _f32_ptr(Int(py=x_addr))
+    var lp = _i32_ptr(Int(py=labels_addr))
+    var wa = Int(py=weight_addr)
+    var nr = Int(py=params[0])
+    var nf = Int(py=params[1])
+    var eps = Float64(py=params[2])
+    var min_samples = Int(py=params[3])
+    var budget = Int(py=params[4])
+    var max_iter = Int(py=params[5])
+    var eps_nn_method = Int(py=params[6])
+    var metric = Int(py=params[7])
+    var passes = 0
+    with GILReleased(Python()):
+        var ctx = process_ctx[_DEVCTX_SLOT]()
+        passes = dbscan_fit(
+            ctx, xp, nr, nf, eps, min_samples, lp, budget, max_iter,
+            eps_nn_method, metric, wa, core_address,
+        )
+        ctx.synchronize()
+    return PythonObject(passes)
+
+
+def pca_fit_binding(
+    x_addr: PythonObject,
+    components_addr: PythonObject,
+    mean_addr: PythonObject,
+    explained_addr: PythonObject,
+    ratio_addr: PythonObject,
+    singular_addr: PythonObject,
+    params: PythonObject,
+) raises -> PythonObject:
+    """Fit PCA and write its five public arrays; return noise variance."""
+    if len(params) != 3:
+        raise Error("pca_fit: params must contain n_rows, n_features, n_components")
+    var xp = _f32_ptr(Int(py=x_addr))
+    var cp = _f32_ptr(Int(py=components_addr))
+    var mp = _f32_ptr(Int(py=mean_addr))
+    var ep = _f32_ptr(Int(py=explained_addr))
+    var rp = _f32_ptr(Int(py=ratio_addr))
+    var sp = _f32_ptr(Int(py=singular_addr))
+    var nr = Int(py=params[0])
+    var nf = Int(py=params[1])
+    var nc = Int(py=params[2])
+    var noise = Float64(0.0)
+    with GILReleased(Python()):
+        var ctx = process_ctx[_DEVCTX_SLOT]()
+        noise = pca_fit_host(
+            ctx, xp, cp, mp, ep, rp, sp, nr, nf, nc
+        )
+        ctx.synchronize()
+    return PythonObject(noise)
+
+
+def pca_fast_pool_on_binding() raises -> PythonObject:
+    """lane/apple-fast-w4-decomp: 1 when this build compiled
+    PCA_FAST_POOL (decomposition/estimator.mojo), else 0 (a quality
+    capture's proof of which arm is installed)."""
+    comptime if PCA_FAST_POOL:
+        return PythonObject(1)
+    return PythonObject(0)
+
+
+def pca_fit_full_binding(
+    x_addr: PythonObject,
+    components_addr: PythonObject,
+    mean_addr: PythonObject,
+    explained_addr: PythonObject,
+    ratio_addr: PythonObject,
+    singular_addr: PythonObject,
+    params: PythonObject,
+) raises -> PythonObject:
+    """Additive R-SVD fit export; same five outputs as pca_fit.
+
+    This exposes existing arithmetic, not a new numerical certificate.
+    Validate its tall-matrix contract before creating a device context.
+    """
+    if len(params) != 3:
+        raise Error("pca_fit_full: params must contain n_rows, n_features, n_components")
+    var nr = Int(py=params[0])
+    var nf = Int(py=params[1])
+    var nc = Int(py=params[2])
+    pca_full_validate(nr, nf, nc)
+    var xp = _f32_ptr(Int(py=x_addr))
+    var cp = _f32_ptr(Int(py=components_addr))
+    var mp = _f32_ptr(Int(py=mean_addr))
+    var ep = _f32_ptr(Int(py=explained_addr))
+    var rp = _f32_ptr(Int(py=ratio_addr))
+    var sp = _f32_ptr(Int(py=singular_addr))
+    var noise = Float64(0.0)
+    with GILReleased(Python()):
+        var ctx = process_ctx[_DEVCTX_SLOT]()
+        noise = pca_fit_full_host(ctx, xp, cp, mp, ep, rp, sp, nr, nf, nc)
+        ctx.synchronize()
+    return PythonObject(noise)
+
+
+def pca_transform_binding(
+    x_addr: PythonObject,
+    mean_addr: PythonObject,
+    components_addr: PythonObject,
+    out_addr: PythonObject,
+    params: PythonObject,
+) raises -> PythonObject:
+    if len(params) != 3:
+        raise Error("pca_transform: params must contain 3 values")
+    var xp = _f32_ptr(Int(py=x_addr))
+    var mp = _f32_ptr(Int(py=mean_addr))
+    var cp = _f32_ptr(Int(py=components_addr))
+    var op = _f32_ptr(Int(py=out_addr))
+    var nr = Int(py=params[0])
+    var nf = Int(py=params[1])
+    var nc = Int(py=params[2])
+    with GILReleased(Python()):
+        var ctx = process_ctx[_DEVCTX_SLOT]()
+        pca_transform_host(ctx, xp, mp, cp, op, nr, nf, nc)
+        ctx.synchronize()
+    return PythonObject(0)
+
+
+def _pca_whiten_pointer(
+    address: Int, count: Int,
+) raises -> MutPointer[Float32, MutUntrackedOrigin]:
+    if address <= 0 or address % 4 != 0:
+        raise Error("PCA whitening requires positive aligned FP32 pointers")
+    if address > 9223372036854775807 - count * 4:
+        raise Error("PCA whitening pointer span overflows signed Int")
+    return _f32_ptr(address)
+
+
+def _pca_whiten_apply(
+    input_addr: PythonObject,
+    mean_addr: PythonObject,
+    components_addr: PythonObject,
+    singular_addr: PythonObject,
+    out_addr: PythonObject,
+    params: PythonObject,
+    inverse: Bool,
+) raises -> PythonObject:
+    # Additive ABI only: the unwhitened transform exports keep their arity
+    # and arithmetic. All host input checks precede the DeviceContext.
+    if len(params) != 4:
+        raise Error("PCA whitening params require rows, features, components, fit_rows")
+    var nr = Int(py=params[0])
+    var nf = Int(py=params[1])
+    var nc = Int(py=params[2])
+    var nfit = Int(py=params[3])
+    if nr < 1 or nf < 1 or nc < 1 or nc > nf or nfit < 2:
+        # one feature admitted with the one-column PCA fit (lane sk-kernels)
+        raise Error("PCA whitening requires positive rows/features/components and fit_rows>=2")
+    if nr > 2147483647 or nf > 2147483647 or nc > 2147483647 or nfit > 2147483647:
+        raise Error("PCA whitening dimensions exceed Int32")
+    if nr > 2147483647 // nf or nc > 2147483647 // nf:
+        raise Error("PCA whitening matrix cell count exceeds Int32")
+    var input_count = nr * (nc if inverse else nf)
+    var output_count = nr * (nf if inverse else nc)
+    var xa = Int(py=input_addr)
+    var ma = Int(py=mean_addr)
+    var ca = Int(py=components_addr)
+    var sa = Int(py=singular_addr)
+    var oa = Int(py=out_addr)
+    var xp = _pca_whiten_pointer(xa, input_count)
+    var mp = _pca_whiten_pointer(ma, nf)
+    var cp = _pca_whiten_pointer(ca, nc * nf)
+    var sp = _pca_whiten_pointer(sa, nc)
+    var op = _pca_whiten_pointer(oa, output_count)
+    var starts = List[Int]()
+    starts.append(xa)
+    starts.append(ma)
+    starts.append(ca)
+    starts.append(sa)
+    var counts = List[Int]()
+    counts.append(input_count)
+    counts.append(nf)
+    counts.append(nc * nf)
+    counts.append(nc)
+    for i in range(4):
+        if oa < starts[i] + counts[i] * 4 and starts[i] < oa + output_count * 4:
+            raise Error("PCA whitening output must not overlap any input")
+    # cpu2-l6-bindings: the finiteness and sign refusals of every input
+    # and of the output run as device scans of the resident buffers
+    # (`device_checks=True`), never as host walks of the caller's arrays.
+    with GILReleased(Python()):
+        var ctx = process_ctx[_DEVCTX_SLOT]()
+        if inverse:
+            pca_whiten_inverse_transform_host(
+                ctx, xp, cp, sp, mp, op, nr, nf, nc, nfit, device_checks=True
+            )
+        else:
+            pca_whiten_transform_host(
+                ctx, xp, mp, cp, sp, op, nr, nf, nc, nfit, device_checks=True
+            )
+        ctx.synchronize()
+    return PythonObject(0)
+
+
+def pca_whiten_transform_binding(
+    x_addr: PythonObject, mean_addr: PythonObject,
+    components_addr: PythonObject, singular_addr: PythonObject,
+    out_addr: PythonObject, params: PythonObject,
+) raises -> PythonObject:
+    return _pca_whiten_apply(
+        x_addr, mean_addr, components_addr, singular_addr, out_addr, params, False)
+
+
+def pca_whiten_inverse_transform_binding(
+    scores_addr: PythonObject, components_addr: PythonObject,
+    singular_addr: PythonObject, mean_addr: PythonObject,
+    out_addr: PythonObject, params: PythonObject,
+) raises -> PythonObject:
+    return _pca_whiten_apply(
+        scores_addr, mean_addr, components_addr, singular_addr, out_addr, params, True)
+
+
+def tsvd_fit_binding(
+    x_addr: PythonObject,
+    components_addr: PythonObject,
+    singular_addr: PythonObject,
+    params: PythonObject,
+) raises -> PythonObject:
+    """Fit tSVD. Only components and singular values are claimed."""
+    if len(params) != 3:
+        raise Error("tsvd_fit: params must contain 3 values")
+    var xp = _f32_ptr(Int(py=x_addr))
+    var cp = _f32_ptr(Int(py=components_addr))
+    var sp = _f32_ptr(Int(py=singular_addr))
+    var nr = Int(py=params[0])
+    var nf = Int(py=params[1])
+    var nc = Int(py=params[2])
+    with GILReleased(Python()):
+        var ctx = process_ctx[_DEVCTX_SLOT]()
+        tsvd_fit_host(ctx, xp, cp, sp, nr, nf, nc)
+        ctx.synchronize()
+    return PythonObject(0)
+
+
+def tsvd_explained_binding(
+    x_addr: PythonObject,
+    components_addr: PythonObject,
+    explained_addr: PythonObject,
+    ratio_addr: PythonObject,
+    params: PythonObject,
+) raises -> PythonObject:
+    """TruncatedSVD's explained_variance_ and explained_variance_ratio_
+    (`tsvd_explained_host`): params `n_rows, n_features, n_components`."""
+    if len(params) != 3:
+        raise Error("tsvd_explained: params must contain 3 values")
+    var xp = _f32_ptr(Int(py=x_addr))
+    var cp = _f32_ptr(Int(py=components_addr))
+    var ep = _f32_ptr(Int(py=explained_addr))
+    var rp = _f32_ptr(Int(py=ratio_addr))
+    var nr = Int(py=params[0])
+    var nf = Int(py=params[1])
+    var nc = Int(py=params[2])
+    with GILReleased(Python()):
+        var ctx = process_ctx[_DEVCTX_SLOT]()
+        tsvd_explained_host(ctx, xp, cp, ep, rp, nr, nf, nc)
+        ctx.synchronize()
+    return PythonObject(0)
+
+
+def tsvd_fit_explained_binding(
+    x_addr: PythonObject,
+    components_addr: PythonObject,
+    singular_addr: PythonObject,
+    explained_addr: PythonObject,
+    ratio_addr: PythonObject,
+    params: PythonObject,
+) raises -> PythonObject:
+    """`tsvd_fit` then `tsvd_explained` in one call (`tsvd_fit_explained_host`,
+    lane fg-pca T1: one upload of X under the IDENTICAL default; the two
+    calls in order under -D ANONLIB_IDN_TSVD_ONE_UPLOAD_OFF): params
+    `n_rows, n_features, n_components`."""
+    if len(params) != 3:
+        raise Error("tsvd_fit_explained: params must contain 3 values")
+    var xp = _f32_ptr(Int(py=x_addr))
+    var cp = _f32_ptr(Int(py=components_addr))
+    var sp = _f32_ptr(Int(py=singular_addr))
+    var ep = _f32_ptr(Int(py=explained_addr))
+    var rp = _f32_ptr(Int(py=ratio_addr))
+    var nr = Int(py=params[0])
+    var nf = Int(py=params[1])
+    var nc = Int(py=params[2])
+    with GILReleased(Python()):
+        var ctx = process_ctx[_DEVCTX_SLOT]()
+        tsvd_fit_explained_host(ctx, xp, cp, sp, ep, rp, nr, nf, nc)
+        ctx.synchronize()
+    return PythonObject(0)
+
+
+def tsvd_transform_binding(
+    x_addr: PythonObject,
+    components_addr: PythonObject,
+    out_addr: PythonObject,
+    params: PythonObject,
+) raises -> PythonObject:
+    if len(params) != 3:
+        raise Error("tsvd_transform: params must contain 3 values")
+    var xp = _f32_ptr(Int(py=x_addr))
+    var cp = _f32_ptr(Int(py=components_addr))
+    var op = _f32_ptr(Int(py=out_addr))
+    var nr = Int(py=params[0])
+    var nf = Int(py=params[1])
+    var nc = Int(py=params[2])
+    with GILReleased(Python()):
+        var ctx = process_ctx[_DEVCTX_SLOT]()
+        tsvd_transform_host(ctx, xp, cp, op, nr, nf, nc)
+        ctx.synchronize()
+    return PythonObject(0)
+
+
+def inverse_transform_binding(
+    scores_addr: PythonObject,
+    components_addr: PythonObject,
+    mean_addr: PythonObject,
+    out_addr: PythonObject,
+    params: PythonObject,
+) raises -> PythonObject:
+    """Reconstruct scores @ components, optionally adding a PCA mean.
+
+    params: n_rows, n_features, n_components, add_mean.
+    """
+    if len(params) != 4:
+        raise Error("inverse_transform: params must contain 4 values")
+    var zp = _f32_ptr(Int(py=scores_addr))
+    var cp = _f32_ptr(Int(py=components_addr))
+    var mp = _f32_ptr(Int(py=mean_addr))
+    var op = _f32_ptr(Int(py=out_addr))
+    var nr = Int(py=params[0])
+    var nf = Int(py=params[1])
+    var nc = Int(py=params[2])
+    var add_mean = Int(py=params[3]) != 0
+    with GILReleased(Python()):
+        var ctx = process_ctx[_DEVCTX_SLOT]()
+        inverse_transform_host(ctx, zp, cp, mp, op, nr, nf, nc, add_mean)
+        ctx.synchronize()
+    return PythonObject(0)
+
+
+def ols_fit_binding(
+    x_addr: PythonObject,
+    y_addr: PythonObject,
+    coef_addr: PythonObject,
+    params: PythonObject,
+) raises -> PythonObject:
+    if len(params) != 2:
+        raise Error("ols_fit: params must contain n_rows, n_features")
+    var xp = _f32_ptr(Int(py=x_addr))
+    var yp = _f32_ptr(Int(py=y_addr))
+    var wp = _f32_ptr(Int(py=coef_addr))
+    var nr = Int(py=params[0])
+    var nf = Int(py=params[1])
+    with GILReleased(Python()):
+        var ctx = process_ctx[_DEVCTX_SLOT]()
+        ols_fit_host(ctx, xp, yp, wp, nr, nf)
+        ctx.synchronize()
+    return PythonObject(0)
+
+
+def ols_normal_eq_default_binding() raises -> PythonObject:
+    """True when this build routes LinearRegression.fit to the normal
+    equations by default (`OLS_FAST_NORMAL_EQ`, lane apple-fast-olsne)."""
+    return PythonObject(OLS_FAST_NORMAL_EQ)
+
+
+def ols_fit_resident_binding(
+    x_addr: PythonObject,
+    y_addr: PythonObject,
+    coef_addr: PythonObject,
+    mu_addr: PythonObject,
+    ymean_addr: PythonObject,
+    params: PythonObject,
+) raises -> PythonObject:
+    """Lane apple-fast-olsne: the unweighted normal-equations fit with X
+    and y uploaded once (glm/estimator.mojo `ols_fit_resident_host`).
+    params: n_rows, n_features, center (0/1). With center, mu (float32
+    [n_features]) and ymean (float64 [1]) are written. Returns 0."""
+    comptime if not OLS_FAST_NORMAL_EQ:
+        raise Error("ols_fit_resident: only the FAST Apple build (OLS_FAST_NORMAL_EQ) has this route")
+    if len(params) != 3:
+        raise Error("ols_fit_resident: params must contain n_rows, n_features, center")
+    var xp = _f32_ptr(Int(py=x_addr))
+    var yp = _f32_ptr(Int(py=y_addr))
+    var wp = _f32_ptr(Int(py=coef_addr))
+    var mp = _f32_ptr(Int(py=mu_addr))
+    var ymp = _f64_ptr(Int(py=ymean_addr))
+    var nr = Int(py=params[0])
+    var nf = Int(py=params[1])
+    var center = Int(py=params[2]) != 0
+    if nr <= 0 or nf <= 0:
+        raise Error("ols_fit_resident: n_rows and n_features must be positive")
+    with GILReleased(Python()):
+        var ctx = process_ctx[_DEVCTX_SLOT]()
+        ols_fit_resident_host(ctx, xp, yp, wp, mp, ymp, nr, nf, center)
+        ctx.synchronize()
+    return PythonObject(0)
+# TOMBSTONE: ANONLIB_OLS_FAST_DEVICE_CENTER (DROPPED-semantics) deleted 2026-10-03 by dd83da010; code recoverable at dd83da010^.
+# Restore: git apply experiments/removed/ANONLIB_OLS_FAST_DEVICE_CENTER.patch; record in docs/TOMBSTONES.md.
+
+
+def lm_classical_stats_binding() raises -> PythonObject:
+    # NOT COMPILED — NOT TESTED — IDENTITY NOT VERIFIED — QUALITY NOT VERIFIED — NOT MEASURED.
+    return PythonObject(Int(C02_LINEAR_PAIR))
+
+
+def lm_col_sums_pair_binding(x: PythonObject, y: PythonObject, sx: PythonObject, sy: PythonObject, params: PythonObject) raises -> PythonObject:
+    if len(params) != 2:
+        raise Error("lm_col_sums_pair: params must contain rows, cols")
+    var xa = Int(py=x)
+    var ya = Int(py=y)
+    var sxa = Int(py=sx)
+    var sya = Int(py=sy)
+    var rows = Int(py=params[0])
+    var cols = Int(py=params[1])
+    with GILReleased(Python()):
+        var ctx = process_ctx[_DEVCTX_SLOT]()
+        col_sums_pair_device(ctx, xa, ya, sxa, sya, rows, cols)
+    return PythonObject(0)
+
+
+def lm_col_sums_binding(x_addr: PythonObject, out_addr: PythonObject, params: PythonObject) raises -> PythonObject:
+    """Lane hr-small-passes: the exact, correctly rounded float64 sum of
+    every column of a float32 [rows, cols] matrix, on the device
+    (glm/impl/center_device.mojo). params: rows, cols. Returns 0."""
+    if len(params) != 2:
+        raise Error("lm_col_sums: params must contain rows, cols")
+    var xa = Int(py=x_addr)
+    var oa = Int(py=out_addr)
+    var nr = Int(py=params[0])
+    var nc = Int(py=params[1])
+    with GILReleased(Python()):
+        var ctx = process_ctx[_DEVCTX_SLOT]()
+        col_sums_device(ctx, xa, oa, nr, nc)
+    return PythonObject(0)
+
+
+def lm_means_finish_binding(
+    sums_addr: PythonObject, mean64_addr: PythonObject, mean32_addr: PythonObject,
+    params: PythonObject, total: PythonObject,
+) raises -> PythonObject:
+    """Lane py-runtime: the column means from `lm_col_sums`' exact float64
+    sums (glm/impl/lm_finish.mojo; it was Python's `_column_means_f64`,
+    `_column_means` and `_vector_mean`). params: cols, rows, weighted (1:
+    mean * rows / total, cuML's weighted mean). Writes the binary64 means
+    and their float32 roundings. Returns 0."""
+    if len(params) != 3:
+        raise Error("lm_means_finish: params must contain cols, rows, weighted")
+    var nc = Int(py=params[0])
+    var nr = Int(py=params[1])
+    var weighted = Int(py=params[2]) != 0
+    var t = Float64(py=total)
+    if nc <= 0:
+        return PythonObject(0)
+    lm_means_finish(_f64_ptr(Int(py=sums_addr)), _f64_ptr(Int(py=mean64_addr)), _f32_ptr(Int(py=mean32_addr)),
+                    nc, nr, weighted, t)
+    return PythonObject(0)
+
+
+def lm_intercept_binding(
+    xmean_addr: PythonObject, coef_addr: PythonObject, params: PythonObject, y_mean: PythonObject,
+) raises -> PythonObject:
+    """Lane py-runtime: y_mean - math.fsum(xmean_j * coef_j) over float32
+    xmean and coef (glm/impl/lm_finish.mojo; it was Python's
+    `_set_intercept`). params: cols. Returns the binary64 intercept."""
+    if len(params) != 1:
+        raise Error("lm_intercept: params must contain cols")
+    var nc = Int(py=params[0])
+    var ym = Float64(py=y_mean)
+    if nc <= 0:
+        return PythonObject(ym - 0.0)
+    return PythonObject(lm_intercept(_f32_ptr(Int(py=xmean_addr)), _f32_ptr(Int(py=coef_addr)), nc, ym))
+
+
+def pca_rank_finish_binding(
+    ratio_addr: PythonObject, ev_addr: PythonObject, params: PythonObject, frac: PythonObject,
+) raises -> PythonObject:
+    """Lane py-runtime: PCA's kept component count for a float n_components
+    (or the given MLE rank) and the dropped tail's noise variance
+    (decomposition/impl/pca_rank.mojo; it was Python in PCA.fit). params:
+    nc, keep (-1: choose by frac). Returns [keep, noise_variance]."""
+    if len(params) != 2:
+        raise Error("pca_rank_finish: params must contain nc, keep")
+    var nc = Int(py=params[0])
+    var keep_in = Int(py=params[1])
+    var noise: Float64 = 0.0
+    var keep = 0
+    if nc > 0:
+        keep = pca_rank_finish(_f32_ptr(Int(py=ratio_addr)), _f32_ptr(Int(py=ev_addr)), nc, keep_in,
+                               Float64(py=frac), noise)
+    var out = Python.list()
+    out.append(PythonObject(keep))
+    out.append(PythonObject(noise))
+    return out
+
+
+def lm_center_binding(x_addr: PythonObject, mu_addr: PythonObject, out_addr: PythonObject, params: PythonObject) raises -> PythonObject:
+    """Lane hr-small-passes: out = x - mu per column in float32 on the
+    device, subnormals flushed. params: rows, cols. Returns 0."""
+    if len(params) != 2:
+        raise Error("lm_center: params must contain rows, cols")
+    var xa = Int(py=x_addr)
+    var ma = Int(py=mu_addr)
+    var oa = Int(py=out_addr)
+    var nr = Int(py=params[0])
+    var nc = Int(py=params[1])
+    with GILReleased(Python()):
+        var ctx = process_ctx[_DEVCTX_SLOT]()
+        center_device(ctx, xa, ma, oa, nr, nc)
+    return PythonObject(0)
+
+
+def lm_scale_rows_binding(x_addr: PythonObject, w_addr: PythonObject, out_addr: PythonObject, params: PythonObject) raises -> PythonObject:
+    """Lane hr-small-passes: out = x * w per row in float32 on the device,
+    subnormals flushed. params: rows, cols. Returns 0."""
+    if len(params) != 2:
+        raise Error("lm_scale_rows: params must contain rows, cols")
+    var xa = Int(py=x_addr)
+    var wa = Int(py=w_addr)
+    var oa = Int(py=out_addr)
+    var nr = Int(py=params[0])
+    var nc = Int(py=params[1])
+    with GILReleased(Python()):
+        var ctx = process_ctx[_DEVCTX_SLOT]()
+        scale_rows_device(ctx, xa, wa, oa, nr, nc)
+    return PythonObject(0)
+
+
+def ols_predict_binding(
+    x_addr: PythonObject,
+    coef_addr: PythonObject,
+    out_addr: PythonObject,
+    params: PythonObject,
+) raises -> PythonObject:
+    """GPU matrix-vector prediction; Python adds the scalar intercept."""
+    if len(params) != 3:
+        raise Error("ols_predict: params must contain n_rows, n_features, intercept")
+    var xp = _f32_ptr(Int(py=x_addr))
+    var cp = _f32_ptr(Int(py=coef_addr))
+    var op = _f32_ptr(Int(py=out_addr))
+    var nr = Int(py=params[0])
+    var nf = Int(py=params[1])
+    var intercept = Float32(Float64(py=params[2]))
+    with GILReleased(Python()):
+        var ctx = process_ctx[_DEVCTX_SLOT]()
+        ols_predict_host(ctx, xp, cp, op, nr, nf, intercept)
+        ctx.synchronize()
+    return PythonObject(0)
+
+
+def ridge_fit_binding(
+    x_addr: PythonObject,
+    y_addr: PythonObject,
+    coef_addr: PythonObject,
+    params: PythonObject,
+) raises -> PythonObject:
+    """`ridgeFit`, the eig arm (DEVIATION 545). params: n_rows, n_features,
+    alpha. The intercept is the Python layer's host centering, as for OLS."""
+    if len(params) != 3:
+        raise Error("ridge_fit: params must contain n_rows, n_features, alpha")
+    var xp = _f32_ptr(Int(py=x_addr))
+    var yp = _f32_ptr(Int(py=y_addr))
+    var wp = _f32_ptr(Int(py=coef_addr))
+    var nr = Int(py=params[0])
+    var nf = Int(py=params[1])
+    var alpha = Float32(Float64(py=params[2]))
+    with GILReleased(Python()):
+        var ctx = process_ctx[_DEVCTX_SLOT]()
+        ridge_fit_host(ctx, xp, yp, wp, nr, nf, alpha)
+        ctx.synchronize()
+    return PythonObject(0)
+
+
+def linear_gram_solve_default_binding() raises -> PythonObject:
+    """True when this build has ANONLIB_CLASSICAL_LINEAR_GRAM_SOLVE
+    (lane/classical-structural): LinearRegression.fit and Ridge.fit try the
+    resident centered-Gram fit `linear_gram_fit` first."""
+    return PythonObject(LINEAR_GRAM_SOLVE)
+
+
+def linear_gram_fit_binding(
+    x_addr: PythonObject,
+    y_addr: PythonObject,
+    coef_addr: PythonObject,
+    mu_addr: PythonObject,
+    ymean_addr: PythonObject,
+    params: PythonObject,
+) raises -> PythonObject:
+    """ANONLIB_CLASSICAL_LINEAR_GRAM_SOLVE (glm/impl/gram_solve.mojo): OLS
+    (alpha 0) or Ridge (alpha > 0) by the resident centered Gram and the
+    IDENTICAL Cholesky, X and y uploaded once. params: n_rows, n_features,
+    alpha, center (0/1). Returns 0 with coef (and, with center, mu float32
+    [n_features] and ymean float64 [1]) written, or 1 with nothing written
+    when the Gram is not trusted: the caller then runs its incumbent route."""
+    comptime if not LINEAR_GRAM_SOLVE:
+        raise Error("linear_gram_fit: this build lacks the route (FAST, or -D ANONLIB_CLASSICAL_LINEAR_GRAM_SOLVE_OFF)")
+    if len(params) != 4:
+        raise Error("linear_gram_fit: params must contain n_rows, n_features, alpha, center")
+    var xp = _f32_ptr(Int(py=x_addr))
+    var yp = _f32_ptr(Int(py=y_addr))
+    var wp = _f32_ptr(Int(py=coef_addr))
+    var mp = _f32_ptr(Int(py=mu_addr))
+    var ymp = _f64_ptr(Int(py=ymean_addr))
+    var nr = Int(py=params[0])
+    var nf = Int(py=params[1])
+    var alpha = Float32(Float64(py=params[2]))
+    var center = Int(py=params[3]) != 0
+    if nr <= 0 or nf <= 0:
+        raise Error("linear_gram_fit: n_rows and n_features must be positive")
+    if alpha > Float32(0.0) and nf == 1:
+        # Ridge at one column selects ridgeSVD in the incumbent (refused by
+        # name there); the same answer here: the caller's route decides.
+        return PythonObject(1)
+    var status = 1
+    with GILReleased(Python()):
+        var ctx = process_ctx[_DEVCTX_SLOT]()
+        status = linear_gram_fit_host(ctx, xp, yp, wp, mp, ymp, nr, nf, alpha, center)
+        ctx.synchronize()
+    return PythonObject(status)
+
+
+def ridge_resident_default_binding() raises -> PythonObject:
+    """True when this build routes Ridge.fit through `ridge_fit_resident`
+    (`RIDGE_FAST_RESIDENT`, lane apple-fast-ridgespeed)."""
+    return PythonObject(RIDGE_FAST_RESIDENT)
+
+
+def ridge_fit_resident_binding(
+    x_addr: PythonObject,
+    y_addr: PythonObject,
+    coef_addr: PythonObject,
+    mu_addr: PythonObject,
+    ymean_addr: PythonObject,
+    params: PythonObject,
+) raises -> PythonObject:
+    """Lane apple-fast-ridgespeed: Ridge's fit with X and y uploaded once
+    (glm/estimator.mojo `ridge_fit_resident_host`). params: n_rows,
+    n_features, alpha, center (0/1). With center, mu (float32 [n_features])
+    and ymean (float64 [1]) are written. Returns 0."""
+    comptime if not RIDGE_FAST_RESIDENT:
+        raise Error("ridge_fit_resident: only the FAST Apple build without -D ANONLIB_RIDGE_RESIDENT_OFF has this route")
+    if len(params) != 4:
+        raise Error("ridge_fit_resident: params must contain n_rows, n_features, alpha, center")
+    var xp = _f32_ptr(Int(py=x_addr))
+    var yp = _f32_ptr(Int(py=y_addr))
+    var wp = _f32_ptr(Int(py=coef_addr))
+    var mp = _f32_ptr(Int(py=mu_addr))
+    var ymp = _f64_ptr(Int(py=ymean_addr))
+    var nr = Int(py=params[0])
+    var nf = Int(py=params[1])
+    var alpha = Float32(Float64(py=params[2]))
+    var center = Int(py=params[3]) != 0
+    if nr <= 0 or nf <= 0:
+        raise Error("ridge_fit_resident: n_rows and n_features must be positive")
+    with GILReleased(Python()):
+        var ctx = process_ctx[_DEVCTX_SLOT]()
+        ridge_fit_resident_host(ctx, xp, yp, wp, mp, ymp, nr, nf, alpha, center)
+        ctx.synchronize()
+    return PythonObject(0)
+
+
+def ridge_fit_multi_binding(
+    x_addr: PythonObject,
+    y_addr: PythonObject,
+    coef_addr: PythonObject,
+    ymean_addr: PythonObject,
+    params: PythonObject,
+) raises -> PythonObject:
+    """Lane apple-fast-meta (ANONLIB_MULTIOUT_RIDGE): ridge on every column
+    of Y (n_rows x n_targets, row-major) in one program; coef is n_targets x
+    n_features, ymean the n_targets column means. params: n_rows,
+    n_features, n_targets, alpha, center_y (1 subtracts the column means),
+    and optionally xmean_addr, icpt_addr: then icpt[j] = ymean[j] - xmean .
+    coef[j, :] (binary64 products and sum, ascending features; lane
+    pyglue-numeric: a Python fsum per target)."""
+    if len(params) != 5 and len(params) != 7:
+        raise Error("ridge_fit_multi: params must contain n_rows, n_features, n_targets, alpha, center_y"
+                    " (, xmean_addr, icpt_addr)")
+    var xp = _f32_ptr(Int(py=x_addr))
+    var yp = _f32_ptr(Int(py=y_addr))
+    var wp = _f32_ptr(Int(py=coef_addr))
+    var mp = _f32_ptr(Int(py=ymean_addr))
+    var nr = Int(py=params[0])
+    var nf = Int(py=params[1])
+    var nt = Int(py=params[2])
+    var alpha = Float32(Float64(py=params[3]))
+    var center = Int(py=params[4]) != 0
+    with GILReleased(Python()):
+        var ctx = process_ctx[_DEVCTX_SLOT]()
+        ridge_fit_multi_host(ctx, xp, yp, wp, mp, nr, nf, nt, alpha, center)
+        ctx.synchronize()
+    if len(params) == 7:
+        var xm = _f32_ptr(Int(py=params[5]))
+        var ic = _f32_ptr(Int(py=params[6]))
+        if nt > 0 and nf > 0:
+            with GILReleased(Python()):
+                # cpu2-l6-bindings: the intercepts on the device
+                # (`ridge_multi_icpt_kernel`), one thread per target
+                var ctx = process_ctx[_DEVCTX_SLOT]()
+                var d_xm = ctx.enqueue_create_buffer[DType.float32](nf)
+                var d_w = ctx.enqueue_create_buffer[DType.float32](nt * nf)
+                var d_m = ctx.enqueue_create_buffer[DType.float32](nt)
+                var d_ic = ctx.enqueue_create_buffer[DType.float32](nt)
+                ctx.enqueue_copy(dst_buf=d_xm, src_ptr=xm)
+                ctx.enqueue_copy(dst_buf=d_w, src_ptr=wp)
+                ctx.enqueue_copy(dst_buf=d_m, src_ptr=mp)
+                ctx.enqueue_function[ridge_multi_icpt_kernel](
+                    d_xm.unsafe_ptr(), d_w.unsafe_ptr(), d_m.unsafe_ptr(),
+                    d_ic.unsafe_ptr(), Int64(nf), Int64(nt),
+                    grid_dim=(nt + 255) // 256, block_dim=256,
+                )
+                ctx.enqueue_copy(dst_ptr=ic, src_buf=d_ic)
+                ctx.synchronize()
+                _ = d_xm^
+                _ = d_w^
+                _ = d_m^
+                _ = d_ic^
+                _ = ctx^
+    return PythonObject(0)
+
+
+def ridge_multi_icpt_kernel(
+    xmean: MutPointer[Float32, MutAnyOrigin],
+    coef: MutPointer[Float32, MutAnyOrigin],
+    ymean: MutPointer[Float32, MutAnyOrigin],
+    icpt: MutPointer[Float32, MutAnyOrigin],
+    n_features_in: Int64,
+    n_targets_in: Int64,
+):
+    """cpu2-l6-bindings: `icpt[j] = ymean[j] - xmean . coef[j, :]`, one
+    thread per target, the host loop's statements over
+    `checks/soft_f64.mojo`'s binary64 (the Apple GPU has no float64): each
+    product of two widened floats is exact, the sum is serial ascending in
+    features, the difference and the narrowing are round-to-nearest-even,
+    which are the words the host loop wrote."""
+    var nf = Int(n_features_in)
+    var j = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if j >= Int(n_targets_in):
+        return
+    var dot = SF64_ZERO
+    for c in range(nf):
+        dot = sf64_add(
+            dot,
+            sf64_mul(
+                sf64_from_f32(xmean.unsafe_load(c)),
+                sf64_from_f32(coef.unsafe_load(j * nf + c)),
+            ),
+        )
+    icpt.unsafe_store(
+        j, sf64_to_f32(sf64_sub(sf64_from_f32(ymean.unsafe_load(j)), dot))
+    )
+
+
+def ridge_predict_multi_binding(
+    x_addr: PythonObject,
+    coef_addr: PythonObject,
+    icpt_addr: PythonObject,
+    out_addr: PythonObject,
+    params: PythonObject,
+) raises -> PythonObject:
+    """Lane apple-fast-meta (ANONLIB_MULTIOUT_RIDGE): out (n_rows x
+    n_targets, row-major) = X coef^T + icpt. params: n_rows, n_features,
+    n_targets."""
+    if len(params) != 3:
+        raise Error("ridge_predict_multi: params must contain n_rows, n_features, n_targets")
+    var xp = _f32_ptr(Int(py=x_addr))
+    var cp = _f32_ptr(Int(py=coef_addr))
+    var ip = _f32_ptr(Int(py=icpt_addr))
+    var op = _f32_ptr(Int(py=out_addr))
+    var nr = Int(py=params[0])
+    var nf = Int(py=params[1])
+    var nt = Int(py=params[2])
+    with GILReleased(Python()):
+        var ctx = process_ctx[_DEVCTX_SLOT]()
+        ridge_predict_multi_host(ctx, xp, cp, ip, op, nr, nf, nt)
+        ctx.synchronize()
+    return PythonObject(0)
+
+
+def qn_fit_binding(
+    x_addr: PythonObject,
+    y_addr: PythonObject,
+    coef_addr: PythonObject,
+    info_addr: PythonObject,
+    params: PythonObject,
+) raises -> PythonObject:
+    """`qnFit` (DEVIATIONS 546-549). params: n_rows, n_features,
+    n_classes, penalty_l1, penalty_l2, grad_tol, change_tol, max_iter,
+    linesearch_max_iter, lbfgs_memory, fit_intercept, penalty_normalized,
+    has_sample_weight -- cuML's `qn_params` in its field order -- and,
+    since lane/logistic-multiclass (2026-09-14), an OPTIONAL 14th, the loss
+    id: QN_LOSS_LOGISTIC (0) with `n_classes == 2`, the value a 13-field
+    call gets, or QN_LOSS_SOFTMAX (2) with `n_classes > 2`, the coef buffer
+    then `n_classes * (n_features + fit_intercept)` floats. Since
+    lane/expose-qn-objectives (2026-09-20) the 14th also takes the SVC
+    losses (3, 4; `n_classes == 2`, y in {0, 1}) and the regression losses
+    (squared 1, absolute 7, SVR 5 and 6; `n_classes == 1`), and an
+    OPTIONAL 15th is `svr_eps`, the SVR sensitivity (0 when absent).
+    Lane sk-kernels: with has_sample_weight = 1 a 16th field is required,
+    the address of `n_rows` float32 per-row weights.
+    Returns num_iters; info[0] = objective, info[1] = retcode."""
+    if len(params) < 13 or len(params) > 16:
+        raise Error("qn_fit: params must carry the 13 qn_params fields, plus an optional 14th, the loss id, an optional 15th, svr_eps, and a 16th, the sample_weight address, when has_sample_weight is 1")
+    var xp = _f32_ptr(Int(py=x_addr))
+    var yp = _f32_ptr(Int(py=y_addr))
+    var wp = _f32_ptr(Int(py=coef_addr))
+    var ip = _f32_ptr(Int(py=info_addr))
+    var nr = Int(py=params[0])
+    var nf = Int(py=params[1])
+    var nc = Int(py=params[2])
+    var l1 = Float64(py=params[3])
+    var l2 = Float64(py=params[4])
+    var grad_tol = Float64(py=params[5])
+    var change_tol = Float64(py=params[6])
+    var max_iter = Int(py=params[7])
+    var ls_max = Int(py=params[8])
+    var mem = Int(py=params[9])
+    var fit_intercept = Int(py=params[10]) != 0
+    var normalized = Int(py=params[11]) != 0
+    var has_sw = Int(py=params[12]) != 0
+    var loss = Int(py=params[13]) if len(params) >= 14 else 0
+    var svr_eps = Float64(py=params[14]) if len(params) >= 15 else 0.0
+    if has_sw and len(params) != 16:
+        raise Error("qn_fit: has_sample_weight = 1 needs the 16th field, the sample_weight address")
+    var swp = _f32_ptr(Int(py=params[15])) if has_sw else yp
+    var iters = 0
+    with GILReleased(Python()):
+        var ctx = process_ctx[_DEVCTX_SLOT]()
+        iters = qn_fit_host(
+            ctx, xp, yp, wp, ip, nr, nf, nc, l1, l2, grad_tol, change_tol,
+            max_iter, ls_max, mem, fit_intercept, normalized, has_sw, swp,
+            loss, svr_eps,
+        )
+        ctx.synchronize()
+    return PythonObject(iters)
+
+
+def qn_fit_ovr_binding(
+    x_addr: PythonObject,
+    codes_addr: PythonObject,
+    coef_addr: PythonObject,
+    info_addr: PythonObject,
+    params: PythonObject,
+) raises -> PythonObject:
+    """One-vs-rest `qnFit` with X uploaded once (lane fam2-linear). params:
+    n_rows, n_features, first_class, n_fits, penalty_l1, penalty_l2,
+    grad_tol, change_tol, max_iter, linesearch_max_iter, lbfgs_memory,
+    fit_intercept, penalty_normalized, loss (an SVC or the logistic id),
+    and (lane sk-kernels) an OPTIONAL 15th, the address of `n_rows` float32
+    per-row sample weights. codes: int32 dense class codes. coef: n_fits rows of n_features +
+    fit_intercept floats. info: per fit objective, retcode, num_iters."""
+    if len(params) != 14 and len(params) != 15:
+        raise Error("qn_fit_ovr: params must carry 14 fields and an optional 15th, the sample_weight address (see the docstring)")
+    var xp = _f32_ptr(Int(py=x_addr))
+    var cp = _i32_ptr(Int(py=codes_addr))
+    var wp = _f32_ptr(Int(py=coef_addr))
+    var ip = _f32_ptr(Int(py=info_addr))
+    var nr = Int(py=params[0])
+    var nf = Int(py=params[1])
+    var first = Int(py=params[2])
+    var n_fits = Int(py=params[3])
+    var l1 = Float64(py=params[4])
+    var l2 = Float64(py=params[5])
+    var grad_tol = Float64(py=params[6])
+    var change_tol = Float64(py=params[7])
+    var max_iter = Int(py=params[8])
+    var ls_max = Int(py=params[9])
+    var mem = Int(py=params[10])
+    var fit_intercept = Int(py=params[11]) != 0
+    var normalized = Int(py=params[12]) != 0
+    var loss = Int(py=params[13])
+    var has_sw = len(params) == 15
+    var swp = _f32_ptr(Int(py=params[14])) if has_sw else wp
+    with GILReleased(Python()):
+        var ctx = process_ctx[_DEVCTX_SLOT]()
+        qn_fit_ovr_host(
+            ctx, xp, cp, wp, ip, nr, nf, first, n_fits, l1, l2, grad_tol,
+            change_tol, max_iter, ls_max, mem, fit_intercept, normalized, loss,
+            has_sw, swp,
+        )
+        ctx.synchronize()
+    return PythonObject(0)
+
+
+def qn_decision_function_binding(
+    x_addr: PythonObject,
+    coef_addr: PythonObject,
+    out_addr: PythonObject,
+    params: PythonObject,
+) raises -> PythonObject:
+    """`qnDecisionFunction`: scores = X w + b. params: n_rows, n_features,
+    fit_intercept and, since lane/logistic-multiclass (2026-09-14), an
+    OPTIONAL 4th, n_classes: absent or below 3 is the binary shape (out is
+    n_rows floats, the contract every 3-field caller has), `n_classes > 2`
+    the softmax shape (out is `n_rows * n_classes` floats, row-major)."""
+    if len(params) != 3 and len(params) != 4:
+        raise Error("qn_decision_function: params must contain n_rows, n_features, fit_intercept and an optional n_classes")
+    var xp = _f32_ptr(Int(py=x_addr))
+    var cp = _f32_ptr(Int(py=coef_addr))
+    var op = _f32_ptr(Int(py=out_addr))
+    var nr = Int(py=params[0])
+    var nf = Int(py=params[1])
+    var fi = Int(py=params[2]) != 0
+    var nc = Int(py=params[3]) if len(params) == 4 else 1
+    with GILReleased(Python()):
+        var ctx = process_ctx[_DEVCTX_SLOT]()
+        qn_decision_function_host(ctx, xp, cp, op, nr, nf, fi, nc)
+        ctx.synchronize()
+    return PythonObject(0)
+
+
+def qn_predict_binary_binding(
+    x_addr: PythonObject,
+    coef_addr: PythonObject,
+    out_addr: PythonObject,
+    params: PythonObject,
+) raises -> PythonObject:
+    """Binary `qn_predict`: int64 0/1 codes under strict score > 0."""
+    if len(params) != 3:
+        raise Error("qn_predict_binary: params must contain n_rows, n_features, fit_intercept")
+    var nr = Int(py=params[0])
+    var nf = Int(py=params[1])
+    var fi = Int(py=params[2]) != 0
+    var op = MutPointer[Int64, MutUntrackedOrigin](unsafe_from_address=Int(py=out_addr))
+    # Every PythonObject is read BEFORE the GIL is released: `Int(py=...)`
+    # calls into the interpreter (the host binding's copy of this entry
+    # crashed with SIGSEGV doing it inside GILReleased).
+    var xp = _f32_ptr(Int(py=x_addr))
+    var cp = _f32_ptr(Int(py=coef_addr))
+    with GILReleased(Python()):
+        var ctx = process_ctx[_DEVCTX_SLOT]()
+        qn_predict_binary_host(ctx, xp, cp, op, nr, nf, fi)
+        ctx.synchronize()
+    return PythonObject(0)
+
+
+def qn_predict_multiclass_binding(
+    x_addr: PythonObject,
+    coef_addr: PythonObject,
+    out_addr: PythonObject,
+    params: PythonObject,
+) raises -> PythonObject:
+    """Multiclass `qn_predict` (lane fam2-linear): int64 class codes, the
+    row argmax of the softmax decision function taken on the device (first
+    maximum wins). params: n_rows, n_features, fit_intercept, n_classes."""
+    if len(params) != 4:
+        raise Error("qn_predict_multiclass: params must contain n_rows, n_features, fit_intercept, n_classes")
+    var nr = Int(py=params[0])
+    var nf = Int(py=params[1])
+    var fi = Int(py=params[2]) != 0
+    var nc = Int(py=params[3])
+    var op = MutPointer[Int64, MutUntrackedOrigin](unsafe_from_address=Int(py=out_addr))
+    var xp = _f32_ptr(Int(py=x_addr))
+    var cp = _f32_ptr(Int(py=coef_addr))
+    with GILReleased(Python()):
+        var ctx = process_ctx[_DEVCTX_SLOT]()
+        qn_predict_multiclass_host(ctx, xp, cp, op, nr, nf, fi, nc)
+        ctx.synchronize()
+    return PythonObject(0)
+
+
+def qn_sigmoid_kernel(
+    scores: MutPointer[Float32, MutAnyOrigin],
+    dst: MutPointer[UInt64, MutAnyOrigin],
+    n_rows_in: Int64,
+):
+    """The binary `predict_proba` link on the device, one thread per row,
+    grid-stride (cpu-gpu-cleanup w2-core-scope; was `qn_sigmoid_host` on
+    the host, DEVIATION 549): `p1 = 1 / (1 + exp(-z))`, `p0 = 1 - p1` over
+    `checks/soft_f64.mojo`'s binary64 (the Apple GPU has no float64;
+    `sf64_exp` is `portable_exp64` statement for statement). Under
+    IDENTICAL these are the host column's words
+    (`core/classical_host_predict.mojo::host_qn_sigmoid`). `dst` receives
+    the binary64 bit patterns, (n_rows, 2) row-major."""
+    var n_rows = Int(n_rows_in)
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    var stride = Int(grid_dim.x) * Int(block_dim.x)
+    while i < n_rows:
+        var nz = sf64_neg(sf64_from_f32(scores.unsafe_load(i)))
+        var p = sf64_div(SF64_ONE, sf64_add(SF64_ONE, sf64_exp(nz)))
+        dst.unsafe_store(2 * i, sf64_sub(SF64_ONE, p))
+        dst.unsafe_store(2 * i + 1, p)
+        i += stride
+
+
+def qn_sigmoid_binding(
+    scores_addr: PythonObject,
+    out_addr: PythonObject,
+    params: PythonObject,
+) raises -> PythonObject:
+    """The binary predict_proba link ON THE DEVICE (cpu-gpu-cleanup
+    w2-core-scope; was `qn_sigmoid_host` on the host, DEVIATION 549):
+    scores is float32 (n_rows,), out is float64 (n_rows, 2). See
+    `qn_sigmoid_kernel`."""
+    if len(params) != 1:
+        raise Error("qn_sigmoid: params must contain n_rows")
+    var sp = _f32_ptr(Int(py=scores_addr))
+    var op = _f64_ptr(Int(py=out_addr))
+    var nr = Int(py=params[0])
+    if nr <= 0:
+        return PythonObject(0)
+    with GILReleased(Python()):
+        var ctx = process_ctx[_DEVCTX_SLOT]()
+        var d_scores = ctx.enqueue_create_buffer[DType.float32](nr)
+        ctx.enqueue_copy(dst_buf=d_scores, src_ptr=sp)
+        var d_out = ctx.enqueue_create_buffer[DType.uint64](2 * nr)
+        ctx.enqueue_function[qn_sigmoid_kernel](
+            d_scores.unsafe_ptr(), d_out.unsafe_ptr(), Int64(nr),
+            grid_dim=min((nr + QN_SOFTMAX_TPB - 1) // QN_SOFTMAX_TPB, QN_SOFTMAX_MAX_BLOCKS),
+            block_dim=QN_SOFTMAX_TPB,
+        )
+        ctx.enqueue_copy(dst_ptr=op.bitcast[UInt64](), src_buf=d_out)
+        ctx.synchronize()
+        _ = d_scores^
+        _ = d_out^
+        _ = ctx^
+    return PythonObject(0)
+
+
+def qn_softmax_kernel(
+    scores: MutPointer[Float32, MutAnyOrigin],
+    dst: MutPointer[UInt64, MutAnyOrigin],
+    n_rows_in: Int64,
+    n_classes_in: Int64,
+):
+    """The multinomial `predict_proba` link on the device, one thread per
+    row, grid-stride (cpu-gpu-cleanup t-gbdt). `qn_softmax_host`'s
+    statements (`glm/estimator.mojo`, lane/logistic-multiclass) over
+    `checks/soft_f64.mojo`'s binary64 (the Apple GPU has no float64; the
+    soft ops are IEEE round-to-nearest, `sf64_exp` is `portable_exp64`
+    statement for statement): `m` the first maximum under a strict `>` from
+    the first entry, `s` the serial ascending sum of `exp(z_c - m)`,
+    `p_c = exp(z_c - m) / s`. Under IDENTICAL these are the host column's
+    words (`core/classical_host_predict.mojo::host_qn_softmax`). `out`
+    receives the binary64 bit patterns."""
+    var n_rows = Int(n_rows_in)
+    var nc = Int(n_classes_in)
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    var stride = Int(grid_dim.x) * Int(block_dim.x)
+    while i < n_rows:
+        var base = i * nc
+        var m = sf64_from_f32(scores.unsafe_load(base))
+        for c in range(1, nc):
+            var v = sf64_from_f32(scores.unsafe_load(base + c))
+            if sf64_gt(v, m):
+                m = v
+        var acc = SF64_ZERO
+        for c in range(nc):
+            var z = sf64_from_f32(scores.unsafe_load(base + c))
+            acc = sf64_add(acc, sf64_exp(sf64_sub(z, m)))
+        for c in range(nc):
+            var z = sf64_from_f32(scores.unsafe_load(base + c))
+            dst.unsafe_store(base + c, sf64_div(sf64_exp(sf64_sub(z, m)), acc))
+        i += stride
+
+
+comptime QN_SOFTMAX_TPB = 128
+comptime QN_SOFTMAX_MAX_BLOCKS = 65535
+
+
+def qn_softmax_binding(
+    scores_addr: PythonObject,
+    out_addr: PythonObject,
+    params: PythonObject,
+) raises -> PythonObject:
+    """The multinomial predict_proba link ON THE DEVICE (cpu-gpu-cleanup
+    t-gbdt; was `qn_softmax_host` on host threads): scores is float32
+    (n_rows, n_classes) row-major, out is float64 (n_rows, n_classes).
+    params: n_rows, n_classes. See `qn_softmax_kernel`."""
+    if len(params) != 2:
+        raise Error("qn_softmax: params must contain n_rows, n_classes")
+    var sp = _f32_ptr(Int(py=scores_addr))
+    var op = _f64_ptr(Int(py=out_addr))
+    var nr = Int(py=params[0])
+    var nc = Int(py=params[1])
+    if nc < 3:
+        raise Error("qn_softmax: n_classes must be at least 3; the binary link is qn_sigmoid")
+    if nr <= 0:
+        return PythonObject(0)
+    with GILReleased(Python()):
+        var ctx = process_ctx[_DEVCTX_SLOT]()
+        var n = nr * nc
+        var d_scores = ctx.enqueue_create_buffer[DType.float32](n)
+        ctx.enqueue_copy(dst_buf=d_scores, src_ptr=sp)
+        var d_out = ctx.enqueue_create_buffer[DType.uint64](n)
+        ctx.enqueue_function[qn_softmax_kernel](
+            d_scores.unsafe_ptr(), d_out.unsafe_ptr(), Int64(nr), Int64(nc),
+            grid_dim=min((nr + QN_SOFTMAX_TPB - 1) // QN_SOFTMAX_TPB, QN_SOFTMAX_MAX_BLOCKS),
+            block_dim=QN_SOFTMAX_TPB,
+        )
+        ctx.enqueue_copy(dst_ptr=op.bitcast[UInt64](), src_buf=d_out)
+        ctx.synchronize()
+        _ = d_scores^
+        _ = d_out^
+        _ = ctx^
+    return PythonObject(0)
+
+
+def kde_score_samples_binding(
+    train_addr: PythonObject,
+    query_addr: PythonObject,
+    weights_addr: PythonObject,
+    out_addr: PythonObject,
+    params: PythonObject,
+    kernel: PythonObject,
+    metric: PythonObject,
+) raises -> PythonObject:
+    """KernelDensity.score_samples (kde/, DEVIATIONS 600-604): log density
+    of each query row under the fitted training set. Writes `n_query`
+    float32 to `out_addr`. `params`, in this order (mirrored in
+    `python/anonlib/density.py`):
+
+        0  n_train
+        1  n_query
+        2  n_features
+        3  bandwidth   (float)
+        4  has_weights (0/1; weights_addr is read only when 1)
+
+    `kernel` and `metric` are the sklearn/cuML names; the host entry
+    refuses every unimplemented one BY NAME (kde/estimator.mojo). Returns
+    n_query. Added 2026-08-23 by the identity lane on the kde lane's
+    hand-off (kde/README.md).
+    """
+    if len(params) != 5 and len(params) != 6:
+        raise Error(
+            "kde_score_samples: params must contain 5 or 6 values, got "
+            + String(len(params))
+        )
+    if len(params) == 6 and Int(py=params[5]) != 0:
+        # the sum folds on the device in `kde_score_samples_resident` (the
+        # route KernelDensity takes wherever `kde_fit_prepare` exists)
+        raise Error("kde_score_samples: want_total is served by kde_score_samples_resident on this binding")
+    var tp = _f32_ptr(Int(py=train_addr))
+    var qp = _f32_ptr(Int(py=query_addr))
+    var op = _f32_ptr(Int(py=out_addr))
+    var n_train = Int(py=params[0])
+    var n_query = Int(py=params[1])
+    var n_features = Int(py=params[2])
+    var bandwidth = Float32(Float64(py=params[3]))
+    var has_weights = Int(py=params[4]) != 0
+    var kname = String(py=kernel)
+    var mname = String(py=metric)
+    # DEVIATION 2660: X and the queries are validated and staged from the
+    # caller's memory (no `List` copies); the weights, `n_train` values
+    # that `kde_fit_validate` and `host_sum_weights` read, are still one
+    # owned copy. The scores are written to `out_addr` from the pinned
+    # download buffer. Same values in, same bits out.
+    var weights = List[Float32]()
+    if has_weights:
+        var wp = _f32_ptr(Int(py=weights_addr))
+        weights = read_f32(Int(wp), max(0, n_train))
+    with GILReleased(Python()):
+        kde_score_samples_host_ptr(
+            tp, n_train, qp, n_query, n_features, bandwidth, kname,
+            mname, weights, has_weights, op,
+        )
+    return PythonObject(n_query)
+
+
+def kde_fast_immutable_fit_binding() raises -> PythonObject:
+    return PythonObject(Int(KDE_FAST_IMMUTABLE_FIT))
+
+
+def kde_fit_prepare_binding(
+    train_addr: PythonObject,
+    weights_addr: PythonObject,
+    params: PythonObject,
+    kernel: PythonObject,
+    metric: PythonObject,
+) raises -> PythonObject:
+    """Validate and upload a KDE fit set once (DEVIATION 3003); returns the
+    handle `kde_score_samples_resident` scores through. `params`, in this
+    order (mirrored in `python/anonlib/density.py`):
+
+        0  n_train
+        1  n_features
+        2  bandwidth   (float)
+        3  has_weights (0/1; weights_addr is read only when 1)
+
+    Refuses, by name, everything `kde_score_samples` refuses about the fit
+    set. Release with `kde_fit_release`."""
+    if len(params) != 4:
+        raise Error(
+            "kde_fit_prepare: params must contain 4 values, got "
+            + String(len(params))
+        )
+    var tp = _f32_ptr(Int(py=train_addr))
+    var n_train = Int(py=params[0])
+    var n_features = Int(py=params[1])
+    var bandwidth = Float32(Float64(py=params[2]))
+    var has_weights = Int(py=params[3]) != 0
+    var kname = String(py=kernel)
+    var mname = String(py=metric)
+    var weights = List[Float32]()
+    if has_weights:
+        var wp = _f32_ptr(Int(py=weights_addr))
+        weights = read_f32(Int(wp), max(0, n_train))
+    var handle: Int
+    with GILReleased(Python()):
+        handle = kde_fit_prepare(tp, n_train, n_features, bandwidth, kname, mname, weights, has_weights)
+    return PythonObject(handle)
+
+
+def kde_fit_release_binding(handle: PythonObject) raises -> PythonObject:
+    """Drop a resident KDE fit set (DEVIATION 3003)."""
+    kde_fit_release(Int(py=handle))
+    return PythonObject(None)
+
+
+def kde_score_samples_resident_binding(
+    handle: PythonObject,
+    query_addr: PythonObject,
+    out_addr: PythonObject,
+    params: PythonObject,
+    kernel: PythonObject,
+    metric: PythonObject,
+) raises -> PythonObject:
+    """`kde_score_samples` over a resident fit set (DEVIATION 3003).
+    `params`: [n_query, n_features, bandwidth(, want_total)]. Writes
+    `n_query` float32 to `out_addr`; returns n_query, or with want_total the
+    scores' fixed-order float32 sum (on the device, `device_sum_f32_fixed`;
+    lane pyglue-numeric: KernelDensity.score summed them on the host)."""
+    if len(params) != 3 and len(params) != 4:
+        raise Error(
+            "kde_score_samples_resident: params must contain 3 or 4 values, got "
+            + String(len(params))
+        )
+    var want_total = len(params) == 4 and Int(py=params[3]) != 0
+    var h = Int(py=handle)
+    var qp = _f32_ptr(Int(py=query_addr))
+    var op = _f32_ptr(Int(py=out_addr))
+    var n_query = Int(py=params[0])
+    var n_features = Int(py=params[1])
+    var bandwidth = Float32(Float64(py=params[2]))
+    var kname = String(py=kernel)
+    var mname = String(py=metric)
+    var total = Float32(0)
+    with GILReleased(Python()):
+        total = kde_score_samples_resident(
+            h, qp, n_query, n_features, bandwidth, kname, mname, op, want_total=want_total,
+        )
+    if want_total:
+        return PythonObject(Float64(total))
+    return PythonObject(n_query)
+
+
+def estimators_numeric_mode_binding() raises -> PythonObject:
+    """THE BUILD'S TIER, as the `NUMERIC_*` code itself: 0 FAST, 1
+    IDENTICAL. The same shape as `svm_numeric_mode`. This
+    binding had no read-back until 2026-09-10, so
+    `NumericModeMixin.numeric_mode_used()` fell through to the module path
+    hint, which for the FAST tier is the package directory itself and read
+    back as the word 'anonlib' rather than a tier."""
+    return PythonObject(GLOBAL_NUMERIC_MODE)
+
+
+def estimators_vendor_binding() raises -> PythonObject:
+    """THE ACCELERATOR API THIS BINARY WAS COMPILED FOR: 'metal', 'cuda',
+    'hip' or 'none'. A compile-time constant folded in from
+    `checks/vendor.mojo`, the same shape as the tier read-back
+    (`gbdt_numeric_mode`): the answer comes from the binary that actually
+    loaded, never from the directory it sat in or from the environment.
+    `python/anonlib/_backend.py` refuses at import when this disagrees
+    with the vendor directory the set was loaded from."""
+    return PythonObject(String(COMPILED_VENDOR))
+
+
+
+def py2mojo_rows_binding(mode: PythonObject, src_addr: PythonObject, dst_addr: PythonObject,
+                         params: PythonObject) raises -> PythonObject:
+    """lane/apple-fast-py2mojo-linear: per-row probability glue on the
+    device (`core/py2mojo_rows.mojo`)."""
+    return py2mojo_rows_device_binding(process_ctx[_DEVCTX_SLOT](), mode, src_addr, dst_addr, params)
+
+
+def py2mojo_linear_flags_binding() raises -> PythonObject:
+    return PythonObject(py2mojo_linear_flags())
+
+
+def dbscan_core_arrays_binding(
+    x_addr: PythonObject, labels_addr: PythonObject, core_addr: PythonObject, params: PythonObject
+) raises -> PythonObject:
+    """DBSCAN's core arrays on the device (lane cpu4-python,
+    bindings/dbscan_core_device.mojo); the host walk is the host column's."""
+    var ctx = process_ctx[_DEVCTX_SLOT]()
+    return dbscan_core_arrays_device(ctx, x_addr, labels_addr, core_addr, params)
+
+
+def scoped_gemm_flags_binding() raises -> PythonObject:
+    return PythonObject(Int(SCOPED_TALL) + 2 * Int(SCOPED_DENSE) + 4 * Int(SCOPED_GRAM) + 8 * Int(SCOPED_NARROW) + 16 * Int(SCOPED_SPLITS) + 32 * Int(SCOPED_PCA))
+
+
+def scoped_gemm_count_binding(route: PythonObject, arm: PythonObject) raises -> PythonObject:
+    return PythonObject(scoped_count(Int(py=route), Int(py=arm)))
+
+
+def scoped_gemm_metadata_binding(index: PythonObject) raises -> PythonObject:
+    return PythonObject(scoped_last(Int(py=index)))
+
+
+@export
+def PyInit__anonlib_estimators() abi("C") -> PythonObject:
+    try:
+        var m = PythonModuleBuilder("_anonlib_estimators")
+        m.def_function[pca_compensated_cov_count_py]("pca_compensated_cov_count")
+        m.def_function[dbscan_parallel_available_binding]("dbscan_parallel_available")
+        m.def_function[gram_parallel_available_binding]("gram_parallel_available")
+        m.def_function[gram_parallel_available_binding]("gram_outputs_parallel_available")
+        m.def_function[gram_parallel_available_binding]("qr_parallel_available")
+        m.def_function[glm_parallel_available_binding]("glm_parallel_available")
+        m.def_function[estimators_vendor_binding]("estimators_vendor")
+        m.def_function[estimators_numeric_mode_binding]("estimators_numeric_mode")
+        m.def_function[py2mojo_rows_binding]("py2mojo_rows")
+        m.def_function[py2mojo_linear_flags_binding]("py2mojo_linear_flags")
+        m.def_function[dbscan_fit_binding]("dbscan_fit")
+        m.def_function[dbscan_fit_core_binding]("dbscan_fit_core")
+        m.def_function[dbscan_core_arrays_binding]("dbscan_core_arrays")
+        m.def_function[estimators_py2mojo_cluster_binding]("estimators_py2mojo_cluster")
+        m.def_function[labeled_reference_predict_binding]("labeled_reference_predict")
+        m.def_function[kde_score_samples_binding]("kde_score_samples")
+        m.def_function[kde_fit_prepare_binding]("kde_fit_prepare")
+        m.def_function[kde_fast_immutable_fit_binding]("kde_fast_immutable_fit")
+        m.def_function[kde_fit_release_binding]("kde_fit_release")
+        m.def_function[kde_score_samples_resident_binding]("kde_score_samples_resident")
+        comptime if SCOPED_AUDIT:
+            m.def_function[scoped_gemm_flags_binding]("scoped_gemm_flags")
+            m.def_function[scoped_gemm_count_binding]("scoped_gemm_count")
+            m.def_function[scoped_gemm_metadata_binding]("scoped_gemm_metadata")
+        m.def_function[pca_fit_binding]("pca_fit")
+        m.def_function[pca_fast_pool_on_binding]("pca_fast_pool_on")
+        m.def_function[pca_fit_full_binding]("pca_fit_full")
+        m.def_function[pca_transform_binding]("pca_transform")
+        m.def_function[pca_whiten_transform_binding]("pca_whiten_transform")
+        m.def_function[pca_whiten_inverse_transform_binding]("pca_whiten_inverse_transform")
+        m.def_function[tsvd_fit_binding]("tsvd_fit")
+        m.def_function[tsvd_transform_binding]("tsvd_transform")
+        m.def_function[tsvd_explained_binding]("tsvd_explained")
+        m.def_function[tsvd_fit_explained_binding]("tsvd_fit_explained")
+        m.def_function[inverse_transform_binding]("inverse_transform")
+        m.def_function[ols_fit_binding]("ols_fit")
+        m.def_function[ols_fit_resident_binding]("ols_fit_resident")
+        m.def_function[ols_normal_eq_default_binding]("ols_normal_eq_default")
+        m.def_function[lm_col_sums_binding]("lm_col_sums")
+        m.def_function[lm_classical_stats_binding]("lm_classical_stats")
+        m.def_function[lm_col_sums_pair_binding]("lm_col_sums_pair")
+        m.def_function[lm_means_finish_binding]("lm_means_finish")
+        m.def_function[lm_intercept_binding]("lm_intercept")
+        m.def_function[pca_rank_finish_binding]("pca_rank_finish")
+        m.def_function[lm_center_binding]("lm_center")
+        m.def_function[lm_scale_rows_binding]("lm_scale_rows")
+        m.def_function[ols_predict_binding]("ols_predict")
+        m.def_function[ridge_fit_binding]("ridge_fit")
+        m.def_function[ridge_fit_resident_binding]("ridge_fit_resident")
+        m.def_function[ridge_resident_default_binding]("ridge_resident_default")
+        m.def_function[linear_gram_fit_binding]("linear_gram_fit")
+        m.def_function[linear_gram_solve_default_binding]("linear_gram_solve_default")
+        comptime if MULTIOUT_RIDGE:
+            m.def_function[ridge_fit_multi_binding]("ridge_fit_multi")
+            m.def_function[ridge_predict_multi_binding]("ridge_predict_multi")
+        comptime if SOFTMAX_AUDIT:
+            m.def_function[softmax_g2_state_binding]("softmax_g2_state")
+            m.def_function[softmax_g2_count_binding]("softmax_g2_count")
+            m.def_function[softmax_g2_last_binding]("softmax_g2_last")
+            m.def_function[softmax_g2_reset_binding]("softmax_g2_reset")
+        m.def_function[qn_fit_binding]("qn_fit")
+        comptime if QN_OVR_ONE_UPLOAD:
+            m.def_function[qn_fit_ovr_binding]("qn_fit_ovr")
+        m.def_function[qn_decision_function_binding]("qn_decision_function")
+        m.def_function[qn_predict_binary_binding]("qn_predict_binary")
+        comptime if QN_DEV_ARGMAX:
+            m.def_function[qn_predict_multiclass_binding]("qn_predict_multiclass")
+        m.def_function[qn_sigmoid_binding]("qn_sigmoid")
+        m.def_function[qn_softmax_binding]("qn_softmax")
+        return m.finalize()
+    except e:
+        abort(String("failed to create _anonlib_estimators: ", e))
+
+
+def gram_parallel_available_binding() raises -> PythonObject:
+    return PythonObject(1)
+
+
+def glm_parallel_available_binding() raises -> PythonObject:
+    return PythonObject(1)
+
+
+def dbscan_parallel_available_binding() raises -> PythonObject:
+    return PythonObject(1)

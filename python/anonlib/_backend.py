@@ -1,0 +1,2567 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 the authors. Part of anonlib, DOI-WITHHELD
+"""Which binaries this process runs: the numeric-mode selector.
+
+TWO builds of every extension module can sit in the package, one per tier:
+
+    python/anonlib/_anonlib*.so                   NUMERIC_FAST
+    python/anonlib/identical/_anonlib*.so         NUMERIC_IDENTICAL
+
+    fast           no promise; speed only. The same fit on the same box may
+                   return different bits on two runs, and on the histogram
+                   lanes it measurably does.
+    identical      the same bits on every run, and the same bits on Metal,
+                   CUDA and HIP.
+
+`ANONLIB_NUMERIC_MODE=<tier>` in the environment AT IMPORT TIME makes
+`anonlib` load that set under the canonical module names, so every caller's
+`from . import _anonlib_gbdt` sees the right arithmetic (IDENTITY_PATHS.md;
+E1/archive/evidence/E2_RESULTS.md are the measurements). Unset selects `identical`. Explicit `fast` loads the baseline
+set. Anything else raises: a mode that is accepted and ignored is worse than
+one refused.
+
+The mode is a BUILD DEFINE (`-D ANONLIB_NUMERIC_IDENTICAL=1`, read by
+`checks/numerics.mojo` through `is_defined`), and the identical binaries
+come from `ANONLIB_NUMERIC_MODE=<tier> bash bindings/build_*.sh`. It
+used to be a line in numerics.mojo flipped by sed and rebuilt in place, which
+is fine for one lab session and wrong for a product (and for two sessions
+sharing one checkout: an edit made during a flip window was lost on
+2026-08-23). `numeric_mode()` reports what was actually loaded, read back
+from the binary where it can be (`gbdt_numeric_mode`), so a wrong-arm
+measurement is impossible to label correctly by accident.
+
+THE VENDOR AXIS (2026-08-29, docs/LINUX_WHEEL.md)
+-------------------------------------------------
+The tier ladder above is one axis. The Linux wheel adds a second: ONE PyPI
+name carries a CUDA set and a HIP set, each in both tiers, and the
+vendor is picked AT IMPORT. The layout is one directory per accelerator API,
+and the tier layout above repeats INSIDE it unchanged:
+
+    macOS (unchanged)          python/anonlib/{,identical}/*.so
+    Linux                      python/anonlib/cuda/{,identical}/*.so
+                               python/anonlib/hip/{,identical}/*.so
+    a source checkout on a     python/anonlib/{,identical}/*.so
+    Linux box (every E1 leg)   ("flat": whatever bindings/build_*.sh wrote)
+
+`_layout()` decides which of the three this install is by LOOKING AT THE
+DISK, not at the platform: a vendor directory with binaries in it means the
+wheel layout, otherwise the flat one. The flat case is what every rented leg
+has ever built and it keeps working exactly as before.
+
+THE ORDER OF TRUST, most to least:
+
+  1. WHAT THE BINARY SAYS. Every binding exports `<prefix>_vendor()`, a
+     compile-time constant (`checks/vendor.mojo`): 'metal', 'cuda',
+     'hip' or 'none'. After a set is loaded, EVERY module in it is asked,
+     and one that disagrees with the directory it was loaded from is
+     refused at import, the same refusal as a tier mismatch. A CUDA `.so`
+     filed under `hip/` imports cleanly on an NVIDIA box and does not
+     touch the device until the first fit; this is the only place that
+     catches it.
+  2. `ANONLIB_VENDOR` in the environment, which picks the DIRECTORY and
+     nothing else. It cannot make a `hip/` binary say 'cuda'; it can only
+     make the selector open `hip/` on a box that has no AMD device, and
+     that fails at the first device call with the runtime's own error.
+  3. WHAT THE BOX APPEARS TO HAVE (`_probe_box`): the device nodes and the
+     driver libraries each API needs, checked with `os.path.exists` and
+     `ctypes.CDLL`. This picks the directory when the environment did not.
+     It is evidence about the box, and it is deliberately the LAST word,
+     not the first: a probe can be fooled by a container that mounts a
+     driver it cannot use, and the binary cannot be.
+
+THE ARCHITECTURE AXIS (2026-08-30, LEGS_2026-08-30.md)
+------------------------------------------------------
+One `mojo build` emits device code for EXACTLY ONE GPU architecture and no
+PTX, so there is no JIT fallback: a binary runs on the architecture family
+it was built for and nothing else. Measured 2026-08-30: a set built on an
+H100 carried `sm_90a` only, installed cleanly on an A40, and failed 27 of
+29 lanes with CUDA_ERROR_NO_BINARY_FOR_GPU. A portable wheel therefore
+carries one set PER ARCHITECTURE, one directory level under the vendor:
+
+    python/anonlib/cuda/sm_80/{,identical}/*.so
+    python/anonlib/cuda/sm_90a/...
+    python/anonlib/hip/gfx942/...
+
+and the architecture is picked at import, right after the vendor, in this
+order:
+
+  1. `ANONLIB_GPU_ARCH` in the environment picks the DIRECTORY. It must
+     name a set the install carries or the import raises.
+  2. The device's own architecture, read WITHOUT loading any extension:
+     for cuda, `cuDeviceGetAttribute(COMPUTE_CAPABILITY_MAJOR/MINOR)`
+     through ctypes on the driver library the probe already loads; for
+     hip, `gfx_target_version` out of /sys/class/kfd/kfd/topology (the
+     KFD topology needs no ROCm library at all). An exact match wins; on
+     cuda a device `sm_XY` also accepts a carried `sm_XYa` (same chip,
+     architecture-specific build), and failing both, the HIGHEST carried
+     non-`a` architecture of the same major family that does not exceed
+     the device (NVIDIA documents cubin forward compatibility within a
+     family; sm_80 code runs on sm_86/sm_89). `a`-suffixed builds are
+     architecture-specific and never chosen by the family rule. On hip
+     there is NO family rule: gfx code objects are ISA-exact, so anything
+     but an exact match refuses.
+  3. When the device architecture cannot be determined and the install
+     carries exactly ONE architecture for the chosen vendor, that one is
+     used (there is nothing better to do and it is what an arch-less
+     install always did). More than one and no answer refuses, naming
+     `ANONLIB_GPU_ARCH`.
+
+THE PTX SLOT (the author 2026-10-10: PTX is a normal target; no flag)
+-----------------------------------------------------------------
+The native sets above carry no PTX. The loader also supports one PTX
+set, `cuda_ptx/sm_80` (gpu_plugins.PTX_ARCH), as a regular slot, which the
+driver compiles on the machine. A published wheel omits this set while
+`gpu_plugins.PLUGINS['cuda']['ptx_shipped']` is False (PyPI's file-size limit);
+the following fallback requires it to be installed. The loader takes a native
+set when the
+device's architecture has one (sm_89 today) and the PTX set on every other
+NVIDIA GPU of compute capability 8.0 or newer (A100 sm_80, H100/H200 sm_90,
+Blackwell sm_100/sm_120, ...), in every numeric mode, IDENTICAL included:
+the PTX set's identity is its column in the reference table, recorded like
+every native column (docs/NVIDIA_PTX_IDENTITY.md). `ANONLIB_GPU_ARCH=sm_80`
+selects it by name, like any architecture directory. See `_ptx_base`.
+
+THE PLUGIN PACKAGES (2026-09-25, gpu_plugins.py)
+-----------------------------------------------
+Since the split, the Linux `anonlib` wheel carries no GPU set: the CUDA sets
+come from `anonlib-nvidia` and the HIP sets from `anonlib-amd`, each of
+which installs its files at the very paths above (anonlib/cuda/...,
+anonlib/hip/...) so every RUNPATH resolves exactly as it did in the combined
+wheel. `_layout()` therefore finds a plugin's sets the way it always found
+them, on disk, and ADDS three refusals when this install is the split core (a
+`gpu_plugins.json` in its .dist-info), each a `GpuPluginError` that
+`select()` never turns into the CPU-only set:
+
+  * a box whose probe shows a GPU for which no plugin is installed beside
+    this core refuses at import. The core requires BOTH plugins at its own
+    version (gpu_plugins.core_requirements), so this fires only on a broken
+    install; it says the install is incomplete and names the repair
+    (`pip install --force-reinstall "anonlib==<version>"`);
+    ANONLIB_VENDOR=cpu runs the CPU bindings on purpose instead;
+  * a plugin whose version is not this core's exactly refuses, naming both;
+  * sets under anonlib/<vendor>/ that no installed plugin owns refuse.
+
+The old combined wheel, the macOS wheel and a source checkout carry no marker
+and none of this applies to them.
+
+A vendor directory whose binaries sit directly in it (no architecture
+subdirectory) keeps working as before: that is every set built before the
+axis existed, and the flat/legacy behaviour is a supported layout, not a
+deprecation. `gpu_arch()` and `gpu_arch_how()` report what was picked and
+why.
+
+THERE IS NO CPU PATH, so when the wheel layout is present and no vendor can
+be picked the import RAISES, naming every path and library it looked for
+and what it found, rather than importing a package whose every fit would
+fail. `vendor()` reports what was picked, cross-checked against the loaded
+binaries; `NumericModeMixin.vendor_used()` reports it per estimator.
+"""
+
+import contextlib
+import importlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import sys
+import threading
+
+from . import gpu_plugins, host_surface
+from ._version import __version__ as _CORE_VERSION
+
+
+# THE RUNTIME REWRITES THE PROCESS ENVIRONMENT WHEN A BINDING LOADS.
+# Measured 2026-09-23 on a RunPod CPU pod (0.8.15 wheel, a uv venv): after the
+# first Mojo binding is executed the parent process carries
+# PYTHONEXECUTABLE=<the first python3 on PATH>, PYTHONPATH=":" and
+# MOJO_PYTHON_LIBRARY, none of which were set before. The bundled runtime
+# writes them for its embedded interpreter. A child started afterwards with
+# `subprocess.run([sys.executable, ...])` inherits them, and on CPython 3.11
+# that child took its executable and prefix from PYTHONEXECUTABLE: it came up
+# as the pixi env's python3 with the venv's site-packages gone and `import
+# numpy` failing (test_crossvendor_coverage.py's CLI test, red on 3.11
+# only; 3.10 and 3.14 ignore the variable on Linux). The runtime has read them
+# by the time exec_module returns, so every binding load restores the
+# caller's environment: a variable that was absent is removed again and one
+# that was set keeps its value.
+#
+# THE RUNTIME WRITES THE C ENVIRON, NOT os.environ. os.environ is a mapping
+# copied at interpreter start; a C setenv() from a loaded library changes what
+# a child inherits without changing the mapping, so `os.environ.get` read
+# None before AND after the load while the child still saw the variables
+# (pod vzzgf45v5abi16, 2026-09-23). The restore therefore goes through
+# os.unsetenv and os.putenv, which act on the C environ directly, and keeps
+# the mapping in step.
+_RUNTIME_ENV = ("PYTHONEXECUTABLE", "PYTHONPATH", "MOJO_PYTHON_LIBRARY")
+
+
+def _exec_binding(loader, module):
+    """The loader's exec_module, with the process environment restored."""
+    before = {k: os.environ.get(k) for k in _RUNTIME_ENV}
+    try:
+        loader.exec_module(module)
+        _record_baseline_load(getattr(loader, "path", None))
+    finally:
+        for k, v in before.items():
+            if v is None:
+                os.environ.pop(k, None)
+                os.unsetenv(k)
+            else:
+                os.environ[k] = v
+                os.putenv(k, v)
+
+# DEVIATION 869, 2026-08-24. THIS TUPLE AND `_build_script` BELOW MUST LIST
+# EVERY EXTENSION, AND THE COST OF FORGETTING ONE IS A MISLABELLED
+# MEASUREMENT RATHER THAN A FAILURE.
+#
+# `select()` only installs the identical binary for names IT KNOWS. An
+# extension absent from this tuple is never re-pointed, so under
+# ANONLIB_NUMERIC_MODE=identical a plain `from . import _anonlib_x`
+# resolves to the FAST binary sitting beside it and returns the fast
+# arithmetic under the identical label. That is the exact failure this
+# module's docstring says is impossible to make by accident, and it was
+# possible for five extensions at once until this edit.
+#
+# Five bindings landed on 2026-08-24 (svm/isolation-forest, solver/hierarchy,
+# metrics/spectral, holtwinters/tsa, and the linalg GEMM surface). FOUR of
+# their authors independently found this tuple stale and each wrote a private
+# mode-aware loader to work around it. Those workarounds are now dead code
+# and their authors marked them for deletion; delete them when convenient.
+#
+# When you add a binding, add it in BOTH places or the build will work and
+# the numbers will be quietly wrong.
+_MODULES = (
+    "_anonlib",
+    "_anonlib_estimators",
+    "_anonlib_gbdt",
+    "_anonlib_rf",
+    "_anonlib_trees",
+    "_anonlib_svm",
+    "_anonlib_solver",
+    "_anonlib_metrics",
+    "_anonlib_preprocessing",
+    "_anonlib_tsa",
+    "_anonlib_linalg",
+    "_anonlib_arima",
+    "_anonlib_training",
+    # Runtime-shaped decoder LM trainer; source integration is not qualification.
+    "_anonlib_byte_lm",
+    # Added 2026-09-01 with the GaussianProcessRegressor exposure. The
+    # binding itself (bindings/_anonlib_gp.mojo + build_gp.sh) is OWED at
+    # the time of this edit; listing the name FIRST is deliberate, because
+    # this tuple is the difference between an unbuilt extension raising BY
+    # NAME and a wrong-tier binary answering under the right label
+    # (DEVIATION 869, the header above).
+    "_anonlib_gp",
+    # Added 2026-09-01 with the Mamba block surface (Mamba1Block /
+    # Mamba2Block, `_mamba_impl.py`; Mamba3Block joined later the same
+    # day). The binding (bindings/_anonlib_mamba.mojo + build_mamba.sh)
+    # landed in the same commit; the Mamba-1/2 entries built and gated
+    # green in all three tiers that evening, and the Mamba-3 entries
+    # followed: gated green at 08a38a13 in all three tiers, with the
+    # corpus arm added 2026-09-03. The "RUN OWED per tier until rebuilt"
+    # note here was stale (60a90de9 fixed the twin sentence in
+    # __init__.py and missed this one). ONE APPLE M4 throughout, and the
+    # binding FAULTS on AMD in every tier. Listing the name here and in
+    # `_build_script`, both, is what makes an unbuilt extension raise BY
+    # NAME with the build command instead of a wrong-tier binary
+    # answering under the right label (DEVIATION 869, the header above).
+    "_anonlib_mamba",
+    # Added 2026-09-02 with the transformer block surface
+    # (TransformerBlock, `_transformer_impl.py`). The binding
+    # (bindings/_anonlib_transformer.mojo + build_transformer.sh, the
+    # FIFTEENTH) landed in the same commit and COMPILED FOR THE FIRST TIME
+    # 2026-09-02, on APPLE ONLY; `tests/test_transformer_surface.py` is
+    # green in all three tiers on that one box, and no NVIDIA or AMD box
+    # has built or run it. Listing the name here and in
+    # `_build_script`, both, is what makes an unbuilt extension raise BY
+    # NAME with the build command instead of a wrong-tier binary
+    # answering under the right label (DEVIATION 869, the header above).
+    "_anonlib_transformer",
+    # Workstream D, 2026-09-14: four families that were built and identity-gated with no
+    # public door. Each is its own binding and build script, IDENTICAL only,
+    # listed here and in `_build_script` both so an unbuilt one raises BY
+    # NAME with the build command (DEVIATION 869). Compile-checked on one
+    # Apple M4 the day they were written; no box has run them through the
+    # Python door yet, and the identity_break lanes and three columns are
+    # owed. The Cholesky door is inside
+    # `_anonlib_gp` (bindings/build_gp.sh already links cholesky/).
+    "_anonlib_kernel_methods",
+    "_anonlib_mixture",
+    "_anonlib_hdbscan",
+    "_anonlib_resample",
+    # 2026-09-14, lane/expose-ivf-embedding: the two `_NOT_YET` entries given
+    # their doors. IVFIndex (bindings/_anonlib_ivf.mojo, prepared earlier
+    # the same day and listed now that check-ivf reads ALL OK with one card
+    # on Apple, NVIDIA and AMD) and Embedding (bindings/_anonlib_embedding.mojo,
+    # profile anonlib.identical.embedding.fp32.v1 with padding_idx and the
+    # microbatch carry). IDENTICAL only, like every non-tree binding.
+    "_anonlib_ivf",
+    "_anonlib_embedding",
+)
+# THE EXPANSION LANES' GPU BINDINGS (lane/algos-prep, 2026-09-27): read from
+# the per-lane fragments host_surface.py merges (`_surface_<lane>.py`), so a
+# lane adds its binding in its own file and never here. Kept out of the literal
+# above, which packaging/check_ext_lists.py reads as the base inventory; every
+# other list appends the same `expansion_gpu_bindings()` and the checker holds
+# each of them to it. Empty until a lane declares one.
+_MODULES += tuple(host_surface.expansion_gpu_bindings())
+
+#: ONE RULE FOR TIERS (DEVIATION 2490, 2026-09-10): THE TREE LANES SHIP
+#: TWO TIERS, EVERYTHING ELSE SHIPS IDENTICAL ONLY.
+#:
+#: The product is cross-vendor bitwise identity. That is the thing no other
+#: library sells, on any platform, and it is the default tier. A FAST tier
+#: only earns its place where we have measured a win against the opponent's
+#: own CPU, and that is trees on Apple silicon: tree fitting calls no BLAS
+#: (histogram building and split finding are scatter-gather over integers),
+#: so the opponent gets nothing from Accelerate's AMX coprocessor, and
+#: ExtraTrees measured 1.25-1.61x scikit-learn on ALL TEN cores at covtype
+#: 581k. Nothing else has that argument:
+#:
+#:   * The classical families (k-means, kNN, PCA, SVD, the linear models,
+#:     UMAP, GP, ARIMA, preprocessing) have a BLAS call as their inner loop.
+#:     On an M4 (2026-09-10) Accelerate does 1438 GFLOP/s fp32 GEMM on four
+#:     P-cores against ~4000 for the ten-core GPU, and ONE CPU thread already
+#:     draws 88 of the 120 GB/s the two share. A FAST kernel there wins ~2.5x
+#:     at best over a CPU that scikit-learn gets for free, for the price of
+#:     the reproducibility guarantee. Not a product.
+#:   * SVC and SVR could beat libsvm's single thread on a Mac, but two
+#:     families with a fast tier that is not "trees" is a rule a user has to
+#:     look up. One rule beats two wins.
+#:   * The neural lanes (transformer, mamba, training, byte LM) gate every
+#:     fused kernel on the identical contract, so their lower tiers were
+#:     SLOWER than the default (DEVIATION 2300 is the cost: a `k_last`
+#:     failure that lived only in a tier nobody ran). SUPERSEDED 2026-09-27
+#:     for every neural binding, the byte LM included: see `_CLASSICAL_FAST`.
+#:
+#: This is an ALLOWLIST on purpose. A binding added tomorrow is identical
+#: only until someone measures a win and adds it here, which is the rule in
+#: CONTRIBUTING.md (Numeric modes): a tier we will not benchmark is a
+#: tier we do not ship. The build scripts of every binding outside this set
+#: exit 2 on any other ANONLIB_NUMERIC_MODE, and this set is why the Python
+#: side raises a sentence a caller can act on instead of an ImportError about
+#: a missing `.so`.
+_TIERED = frozenset({
+    "_anonlib_gbdt",   # GradientBoosting
+    "_anonlib_rf",     # RandomForest
+    "_anonlib_trees",  # ExtraTrees
+})
+
+#: Classical ML ships a FAST tier too (2026-09-25, reversing DEVIATION 2490
+#: for everything that is not a neural network). IDENTICAL stays the default
+#: everywhere; FAST is opt-in and promises speed and quality, not bits.
+_CLASSICAL_FAST = frozenset({
+    "_anonlib",  # k-means and k-NN; buffer helpers stay IDENTICAL
+    "_anonlib_estimators",
+    "_anonlib_svm",
+    "_anonlib_solver",
+    "_anonlib_metrics",
+    "_anonlib_preprocessing",
+    "_anonlib_tsa",
+    "_anonlib_linalg",
+    "_anonlib_arima",
+    "_anonlib_gp",
+    "_anonlib_kernel_methods",
+    "_anonlib_mixture",
+    "_anonlib_hdbscan",
+    "_anonlib_resample",
+    "_anonlib_ivf",
+    # THE NEURAL FAMILY (lane neural, 2026-09-27): the transformer block,
+    # Mamba-1/2/3, the Samba stack, the MLP, embedding and the training
+    # primitives. IDENTICAL-only from 2026-09-10 (their fused kernels were
+    # then gated on IDENTICAL, so the lower tiers ran slower unfused arms);
+    # those gates are gone and FAST runs the same kernels with the pins on
+    # the free schedule. Quality, never bits.
+    # The byte LM (`_anonlib_byte_lm`) joined FAST on 2026-10-03 (afn-lm):
+    # build_byte_lm.sh builds it under ANONLIB_NUMERIC_MODE=fast.
+    "_anonlib_byte_lm",
+    "_anonlib_training",
+    "_anonlib_mamba",
+    "_anonlib_transformer",
+    "_anonlib_embedding",
+})
+# Every expansion lane builds FAST too, sequence and cnn included
+# (2026-09-27); host_surface.EXPANSION_IDENTICAL_ONLY is empty.
+_CLASSICAL_FAST |= frozenset(host_surface.expansion_gpu_bindings("classical"))
+_FAST_TIERED = _TIERED | _CLASSICAL_FAST
+_IDENTICAL_ONLY = frozenset(_MODULES) - _FAST_TIERED
+
+
+def _offers(name, mode):
+    """Whether binding `name` ships tier `mode`."""
+    if mode == "identical":
+        return True
+    if mode == "fast":
+        return name in _FAST_TIERED
+    return False
+_SELECTED = None
+
+_IDENTICAL_ONLY_REASON = (
+    "Trees, classical ML and the neural blocks ship a fast tier; this "
+    "binding ships IDENTICAL only."
+)
+
+
+def _identical_only_reason(name):
+    """The sentence that explains why this binding lacks a tier."""
+    return _IDENTICAL_ONLY_REASON
+
+
+#: Tier name -> the code `<ext>_numeric_mode()` reports, which is the
+#: `NUMERIC_*` constant in `checks/numerics.mojo`. Keep the two in step:
+#: this dict is how a binary in the wrong directory is caught.
+_MODE_CODE = {"fast": 0, "identical": 1}
+_CODE_MODE = {v: k for k, v in _MODE_CODE.items()}
+
+
+# ===================================================================
+# THE VENDOR AXIS. See the module docstring, "THE VENDOR AXIS".
+# ===================================================================
+
+#: The accelerator APIs a set can be compiled for, in the order the box
+#: probe consults them. These are the DIRECTORY names under the package on
+#: Linux and the strings `<prefix>_vendor()` returns.
+_VENDORS = ("cuda", "hip", "metal")
+#: The two that can share one Linux wheel. `metal` is never a directory: the
+#: macOS wheel keeps the flat layout.
+_LINUX_VENDORS = ("cuda", "hip")
+
+#: What `_probe_box` looks for, per API. Every entry is checked and every
+#: result is reported, so the no-GPU refusal can say exactly what was looked
+#: for and what was found. Paths are the device nodes the driver creates;
+#: libraries are the ones the MAX runtime dlopens to reach the device
+#: (the CUDA driver API and the HIP runtime). Versioned sonames first, then
+#: the bare name, because a driver install ships the former and a dev
+#: install adds the latter.
+_PROBE = {
+    "cuda": {
+        "paths": ("/dev/nvidiactl", "/dev/nvidia0"),
+        "libs": ("libcuda.so.1", "libcuda.so"),
+    },
+    "hip": {
+        # `/dev/kfd` ONLY. `/dev/dri/renderD128` was here until 2026-08-31 and
+        # it is NOT AMD-specific: it is the generic DRM render node and every
+        # GPU creates one, NVIDIA included. On an A40 that has /dev/dri the
+        # probe found "hip evidence" beside real cuda evidence, and because a
+        # shipped wheel carries BOTH vendor sets the selector saw two
+        # candidates and REFUSED TO IMPORT, telling the user to set
+        # ANONLIB_VENDOR on a machine with one NVIDIA card in it. It
+        # surfaced as three sabotage cases failing on an A40 and passing on an
+        # H100, which is the same code on two boxes and therefore the box.
+        # `/dev/kfd` is ROCm's kernel fusion driver node, created by the
+        # amdgpu KFD path alone, so it is the honest device-node test.
+        "paths": ("/dev/kfd",),
+        "libs": ("libamdhip64.so.7", "libamdhip64.so.6", "libamdhip64.so"),
+    },
+}
+
+
+def _vendor_fn(name):
+    """The read-back function each binding exports: `anonlib_vendor` on
+    `_anonlib`, `<suffix>_vendor` on every `_anonlib_<suffix>`."""
+    if name == "_anonlib":
+        return "anonlib_vendor"
+    return name[len("_anonlib_"):] + "_vendor"
+
+
+def read_vendor(module):
+    """What `module` says it was compiled for, or None when it predates the
+    read-back (a binary built before 2026-08-29). A stub raises by name on
+    any attribute, and `hasattr` does not swallow ImportError, so the probe
+    is guarded the way `numeric_mode()` guards its own."""
+    fn = _vendor_fn(module.__name__.rsplit(".", 1)[-1])
+    try:
+        f = getattr(module, fn, None)
+    except (ImportError, AttributeError):
+        return None
+    if f is None:
+        return None
+    return str(f())
+
+
+_VENDOR_SELECTED = None
+_VENDOR_HOW = None
+_LAYOUT = None
+
+
+def _pkg_dir():
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def _has_binaries(d):
+    try:
+        return any(n.endswith(".so") for n in os.listdir(d))
+    except OSError:
+        return False
+
+
+def _probe_box():
+    """Evidence, per Linux vendor, that this box can reach its device.
+
+    Returns {vendor: {"paths": {path: bool}, "libs": {lib: bool},
+    "found": bool}}. `found` is True when ANY device node or ANY library
+    resolved. Every lookup is recorded so the refusal below can print the
+    whole table rather than a verdict."""
+    import ctypes
+    out = {}
+    for v, spec in _PROBE.items():
+        paths = {p: os.path.exists(p) for p in spec["paths"]}
+        libs = {}
+        for lib in spec["libs"]:
+            try:
+                ctypes.CDLL(lib)
+                libs[lib] = True
+            except OSError:
+                libs[lib] = False
+        out[v] = {
+            "paths": paths, "libs": libs,
+            "found": any(paths.values()) or any(libs.values()),
+        }
+    return out
+
+
+def _force_requested():
+    """ANONLIB_VENDOR_FORCE, read the way a shell user would expect. Anything
+    other than these spellings is NOT a request to override, because a
+    misspelled override that silently engages is the same defect as no
+    override at all."""
+    return os.environ.get("ANONLIB_VENDOR_FORCE", "").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def _probe_lines(probe, only=None):
+    """The probe table. `only` narrows it to one vendor, for a refusal that is
+    about that vendor alone."""
+    lines = []
+    for v in (_LINUX_VENDORS if only is None else (only,)):
+        r = probe[v]
+        lines.append(f"  {v}:")
+        for p, ok in r["paths"].items():
+            lines.append(f"    {p:<28} {'FOUND' if ok else 'absent'}")
+        for lib, ok in r["libs"].items():
+            lines.append(f"    {lib:<28} {'loads' if ok else 'not loadable'}")
+    return lines
+
+
+# ===================================================================
+# THE PLUGIN PACKAGES. See the module docstring and gpu_plugins.py.
+# ===================================================================
+
+
+class GpuPluginError(ImportError):
+    """A GPU plugin refusal: a GPU on this box with no plugin installed for
+    it, a plugin of another version, or sets no plugin owns. `select()`
+    re-raises it instead of installing the CPU-only set, because serving a
+    GPU box's fits from the host bindings would be exactly the silent CPU
+    fallback this refusal exists to prevent. ANONLIB_VENDOR=cpu is the way
+    to run on the CPU on purpose."""
+
+
+#: The core's marker document when this install is the split core, False
+#: when it is not, None until read.
+_SPLIT = None
+#: vendor -> {distribution, version, location} of every plugin installed
+#: beside this core (the split core only).
+_PLUGINS_FOUND = {}
+
+
+def _site_dir():
+    """The directory this package sits in (site-packages on an install). A
+    plugin's files resolve their runtime only from here, so this is also the
+    ONLY place a plugin's distribution is looked for."""
+    return os.path.dirname(_pkg_dir())
+
+
+def _find_distribution(name, paths):
+    """The installed distribution `name` whose .dist-info is in one of
+    `paths`, or None. Never raises."""
+    try:
+        from importlib import metadata
+        for dist in metadata.distributions(name=name, path=list(paths)):
+            return dist
+    except Exception:
+        return None
+    return None
+
+
+def _split_core():
+    """The core's gpu_plugins.json when THIS install is the split Linux core,
+    else None. Read from the .dist-info beside this package directory only,
+    so another environment's install never answers for this one."""
+    global _SPLIT
+    if _SPLIT is not None:
+        return _SPLIT or None
+    _SPLIT = False
+    dist = _find_distribution(gpu_plugins.CORE_DISTRIBUTION, [_site_dir()])
+    if dist is None:
+        return None
+    try:
+        text = dist.read_text(gpu_plugins.CORE_MARKER)
+    except Exception:
+        text = None
+    if not text:
+        return None
+    try:
+        doc = json.loads(text)
+    except ValueError:
+        doc = None
+    if not isinstance(doc, dict) or doc.get("schema") != gpu_plugins.CORE_SCHEMA:
+        raise GpuPluginError(
+            f"anonlib: the {gpu_plugins.CORE_MARKER} in this install's .dist-info "
+            f"({_site_dir()}) is not a {gpu_plugins.CORE_SCHEMA} document; "
+            "reinstall anonlib")
+    _SPLIT = doc
+    return doc
+
+
+def gpu_plugin():
+    """{distribution, version, location} of the plugin whose sets this
+    process loads, or None (CPU-only, macOS, the combined wheel, a source
+    checkout)."""
+    if _CPU_ONLY is not None:
+        return None
+    _layout()
+    return _PLUGINS_FOUND.get(_VENDOR_SELECTED)
+
+
+def _read_plugin_marker(dist, filename, expected):
+    try:
+        doc = json.loads(dist.read_text(filename) or "null")
+    except (ValueError, OSError, TypeError):
+        doc = None
+    if doc != expected:
+        raise GpuPluginError(f"anonlib: invalid {filename} for {dist.metadata['Name']}; "
+                             "reinstall this release's GPU packages")
+    return doc
+
+
+def _check_plugins(pkg, present):
+    """Validate both vendor wheels and every registered architecture slot."""
+    _PLUGINS_FOUND.clear()
+    fix = gpu_plugins.reinstall_command(_CORE_VERSION)
+    for vendor in gpu_plugins.vendors():
+        row = gpu_plugins.plugin(vendor)
+        dist = _find_distribution(row["distribution"], [_site_dir()])
+        vdir = os.path.join(pkg, gpu_plugins.native_directory(vendor))
+        if _vendor_has_set(os.path.join(pkg, vendor)):
+            raise GpuPluginError(f"anonlib: legacy {vendor} sets remain in a new vendor install; {fix}")
+        if dist is None:
+            if vendor in present:
+                raise GpuPluginError(f"anonlib: {vdir} carries sets but no {row['distribution']} "
+                                     f"is installed beside this core; incomplete install; {fix}")
+            continue
+        if dist.version != _CORE_VERSION:
+            raise GpuPluginError(f"anonlib: {row['distribution']} {dist.version} and anonlib "
+                                 f"{_CORE_VERSION} must be the same version exactly; {fix}")
+        arches = _arch_dirs(vdir)
+        if not gpu_plugins.valid_arches(row["profile"], arches):
+            raise GpuPluginError(f"anonlib: {row['distribution']} has missing or unexpected "
+                                 f"architecture sets {arches}; {fix}")
+        try:
+            raw_marker = json.loads(dist.read_text(gpu_plugins.PLUGIN_MARKER) or "{}")
+            bundle = raw_marker.get("bundled_ptx") if isinstance(raw_marker, dict) else None
+            expected = gpu_plugins.plugin_marker(vendor, _CORE_VERSION, arches, bundled_ptx=bundle)
+        except (ValueError, TypeError) as exc:
+            raise GpuPluginError(f"anonlib: invalid {row['distribution']} PTX slot metadata: {exc}; {fix}") from exc
+        _read_plugin_marker(dist, gpu_plugins.PLUGIN_MARKER, expected)
+        # The PTX slot is required like a native slot (the author 2026-10-10: PTX is a
+        # normal target; no flag): a vendor wheel whose marker binds it must carry it.
+        # ... while gpu_plugins ships it (`ptx_shipped`): 0.8.39/0.8.40 leave the slot out of the
+        # wheel because sm_89 + sm_80 is 134 MiB, over PyPI's 100 MiB limit (2026-10-12).
+        # An absent directory is a wheel shipped without the slot; a present but empty one is a broken install.
+        if row.get("ptx") and not _has_binaries(_ptx_directory(pkg)) and (
+                row.get("ptx_shipped", True) or os.path.isdir(_ptx_directory(pkg))):
+            raise GpuPluginError(f"anonlib: {row['distribution']} is missing its PTX set "
+                                 f"{_ptx_directory(pkg)}; incomplete install; {fix}")
+        _PLUGINS_FOUND[vendor] = {"distribution": row["distribution"], "version": dist.version,
+                                  "location": _site_dir(), "code_format": "native",
+                                  "payloads": [row["distribution"]]}
+        if bundle is not None:
+            _PLUGINS_FOUND[vendor]["bundled_ptx"] = bundle
+
+
+_BASELINE_SELECTION = None
+_BASELINE_FILES = {}
+_BASELINE_ROOT = None
+
+
+def baseline_selection_receipt():
+    """Evidence of the PTX set's selection and of every PTX binding this
+    process loaded (file and sha256), or None when a native set is loaded."""
+    if _BASELINE_SELECTION is None:
+        return None
+    import copy
+    return copy.deepcopy(_BASELINE_SELECTION)
+
+
+def ptx_payload_files():
+    """{relative path: sha256} of the PTX set this process selected, as
+    verified against its manifest; empty when no PTX set is selected."""
+    if _BASELINE_SELECTION is None:
+        return {}
+    return dict(_BASELINE_FILES)
+
+
+def _ptx_directory(pkg):
+    """The PTX set's directory: cuda_ptx/sm_80 beside the split core (the
+    anonlib-nvidia install), cuda/sm_80 in the combined and source layouts."""
+    vdir = gpu_plugins.PTX_DIRECTORY if _split_core() else "cuda"
+    return os.path.join(pkg, vdir, gpu_plugins.PTX_ARCH)
+
+
+def _installed_source_commit(pkg):
+    """The source commit of this install: identity_columns/COMMIT in a wheel;
+    in a source checkout (a recording box: tools/record_identity_column.sh
+    nvidia-ptx-*) the checkout's HEAD, which that script holds clean."""
+    from pathlib import Path
+    marker = Path(pkg) / "identity_columns" / "COMMIT"
+    if marker.is_file() or _split_core():
+        return marker.read_text().strip()
+    import subprocess
+    try:
+        return subprocess.run(["git", "-C", str(pkg), "rev-parse", "HEAD"], capture_output=True,
+                              text=True, timeout=20, check=True).stdout.strip()
+    except subprocess.SubprocessError as exc:
+        raise ValueError(f"no identity_columns/COMMIT and no git checkout at {pkg}: {exc}") from exc
+
+
+def _ptx_base(pkg, why, how):
+    """THE PTX SLOT (the author 2026-10-10: PTX is a normal target; no flag).
+
+    Called for a detected NVIDIA device with no compatible native set (`why`
+    is that refusal), or when ANONLIB_GPU_ARCH names the PTX slot. Every
+    numeric mode takes it, IDENTICAL included, exactly like a native set: its
+    identity is the PTX column of the reference table. The set must be
+    present, its manifest must hash to the vendor marker (on the split
+    install), every binding must match the manifest, and the manifest's
+    source must be the clean installed source, or the import refuses. Nothing
+    here ever selects the CPU set (every refusal is a `GpuPluginError`)."""
+    global _BASELINE_SELECTION, _BASELINE_FILES, _BASELINE_ROOT, _ARCH_SELECTED, _ARCH_HOW
+    from pathlib import Path
+    import hashlib
+    root = Path(_ptx_directory(pkg))
+    try:
+        if not _has_binaries(str(root)):
+            raise ValueError(f"this install carries no PTX set at {root}")
+        raw = (root / gpu_plugins.BASELINE_MANIFEST).read_bytes()
+        manifest_hash = hashlib.sha256(raw).hexdigest()
+        if _split_core():
+            bundle = _PLUGINS_FOUND.get("cuda", {}).get("bundled_ptx")
+            if not isinstance(bundle, dict) or manifest_hash != bundle.get("manifest_sha256"):
+                raise ValueError("the PTX manifest differs from the anonlib-nvidia vendor marker")
+        doc = json.loads(raw)
+        actual = {p.relative_to(root).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
+                  for p in root.rglob("*.so")
+                  if not {"host", ".libs"} & set(p.relative_to(root).parts)}  # glue: inventory installed binary paths and file digests (the manifest's scope)
+        gpu_plugins.validate_baseline_manifest(doc, actual)
+        source = _installed_source_commit(pkg)
+        if source != doc["source_commit"] or doc.get("source_dirty") is not False:
+            raise ValueError("the PTX set's source differs from the clean installed core")
+    except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
+        raise GpuPluginError(f"{why}\nPTX set refused: {exc}") from exc
+    _BASELINE_ROOT, _BASELINE_FILES = str(root), actual
+    _BASELINE_SELECTION = dict(schema="anonlib.ptx-selection.v2", selected="ptx",
+        fallback="ptx", code_format=gpu_plugins.PTX_CODE_FORMAT, arch=gpu_plugins.PTX_ARCH,
+        how=how, numeric_mode=requested_mode(), manifest_sha256=manifest_hash,
+        source_commit=source, loaded_files=[])
+    _ARCH_SELECTED = gpu_plugins.PTX_ARCH
+    _ARCH_HOW = how
+    info = _PLUGINS_FOUND.get("cuda")
+    if info is not None:
+        info.update(code_format=gpu_plugins.PTX_CODE_FORMAT)
+    return str(root)
+
+
+def _record_baseline_load(path):
+    if _BASELINE_SELECTION is None:
+        return
+    from pathlib import Path
+    import hashlib
+    candidate = Path(path).resolve()
+    root = Path(_BASELINE_ROOT).resolve()
+    if root not in candidate.parents:
+        if "cuda_native" in candidate.parts or "hip_native" in candidate.parts:
+            raise GpuPluginError("anonlib: a native GPU binding loaded while the PTX set is selected")
+        return  # host inference/runtime bindings are not GPU sets
+    rel = candidate.relative_to(root).as_posix()
+    digest = hashlib.sha256(candidate.read_bytes()).hexdigest()
+    if _BASELINE_FILES.get(rel) != digest:
+        raise GpuPluginError(f"anonlib: PTX binding changed after manifest verification: {rel}")
+    row = dict(file=rel, sha256=digest)
+    if row not in _BASELINE_SELECTION["loaded_files"]:
+        _BASELINE_SELECTION["loaded_files"].append(row)
+
+
+def _vendor_directory(pkg, vendor):
+    return os.path.join(pkg, gpu_plugins.native_directory(vendor) if _split_core() else vendor)
+
+
+def _missing_plugin_error(vendors, probe, present, forced=None):
+    """The refusal for a GPU on this box whose plugin is not installed."""
+    lines = []
+    for vendor in vendors:
+        row = gpu_plugins.plugin(vendor)
+        elsewhere = None
+        try:
+            from importlib import metadata
+            other = metadata.distribution(row["distribution"])
+            elsewhere = f"{other.version} at {other.locate_file('')}"
+        except Exception:
+            pass
+        why = ("ANONLIB_VENDOR=" + forced) if forced else "this box shows a device"
+        lines.append(
+            f"anonlib: {why} for {row['label']}, and {row['distribution']}, the "
+            f"package that carries the {row['label']} binaries, is not installed "
+            f"beside this anonlib {_CORE_VERSION} ({_site_dir()}). anonlib requires "
+            f"it, so this install is incomplete; reinstall it:\n"
+            f"    {gpu_plugins.reinstall_command(_CORE_VERSION)}")
+        if elsewhere:
+            lines.append(
+                f"  A {row['distribution']} {elsewhere} is importable, but a plugin "
+                "must be installed into the same environment (site-packages) as "
+                "anonlib itself.")
+    if probe is not None:
+        lines.append("What was looked for and found:")
+        lines.extend(_probe_lines(probe))
+    if present:
+        lines.append(f"Installed plugins carry: {present}.")
+    lines.append(
+        "anonlib does not fall back to the CPU on a box with a GPU. To run on "
+        "the CPU on purpose, set ANONLIB_VENDOR=cpu before import.")
+    return GpuPluginError("\n".join(lines))
+
+
+# ===================================================================
+# THE ARCHITECTURE AXIS. See the module docstring.
+# ===================================================================
+
+#: Directory names that count as an architecture level under a vendor
+#: directory: sm_80, sm_90a, gfx90a, gfx942, ... Anything else under the
+#: vendor directory (identical/, .libs/) is not one.
+_ARCH_RE = re.compile(r"^(sm_[0-9]+a?|gfx[0-9a-f]+)$")
+
+_ARCH_SELECTED = None
+_ARCH_HOW = None
+
+
+def _arch_dirs(vdir):
+    """The architecture subdirectories of one vendor directory that hold
+    binaries, sorted. Empty list means the arch-less (legacy) layout."""
+    try:
+        names = os.listdir(vdir)
+    except OSError:
+        return []
+    return sorted(n for n in names
+                  if _ARCH_RE.match(n) and _has_binaries(os.path.join(vdir, n)))
+
+
+def _vendor_has_set(vdir):
+    """Does this vendor directory carry ANY loadable set: binaries directly
+    in it (legacy) or under an architecture subdirectory."""
+    return _has_binaries(vdir) or bool(_arch_dirs(vdir))
+
+
+def _device_arch(vendor):
+    """(arch, how) for the first visible device of `vendor`, or
+    (None, why-not). NEVER loads an extension and never opens a MAX device
+    context: cuda is asked through ctypes on the driver library the probe
+    already loads, hip through the KFD topology files, which need no ROCm
+    library at all. Every failure returns a reason a refusal can print."""
+    if vendor == "cuda":
+        import ctypes
+        lib = None
+        for name in _PROBE["cuda"]["libs"]:
+            try:
+                lib = ctypes.CDLL(name)
+                break
+            except OSError:
+                continue
+        if lib is None:
+            return None, "no libcuda could be loaded"
+        try:
+            rc = lib.cuInit(0)
+            if rc != 0:
+                return None, f"cuInit returned {rc}"
+            n = ctypes.c_int(0)
+            rc = lib.cuDeviceGetCount(ctypes.byref(n))
+            if rc != 0 or n.value < 1:
+                return None, f"cuDeviceGetCount rc={rc} count={n.value}"
+            dev = ctypes.c_int(0)
+            rc = lib.cuDeviceGet(ctypes.byref(dev), 0)
+            if rc != 0:
+                return None, f"cuDeviceGet returned {rc}"
+            major = ctypes.c_int(0)
+            minor = ctypes.c_int(0)
+            # 75/76: CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR/MINOR.
+            rc1 = lib.cuDeviceGetAttribute(ctypes.byref(major), 75, dev)
+            rc2 = lib.cuDeviceGetAttribute(ctypes.byref(minor), 76, dev)
+            if rc1 != 0 or rc2 != 0:
+                return None, f"cuDeviceGetAttribute rc={rc1}/{rc2}"
+        except (OSError, AttributeError) as exc:
+            return None, f"driver call failed: {exc}"
+        return (f"sm_{major.value}{minor.value}",
+                "compute capability from the CUDA driver")
+    if vendor == "hip":
+        # gfx_target_version encodes major*10000 + minor*100 + step; the
+        # gfx name spells minor and step in hex (gfx90a is 9.0.10). CPU
+        # nodes in the topology carry 0 and are skipped.
+        base = "/sys/class/kfd/kfd/topology/nodes"
+        try:
+            nodes = sorted(os.listdir(base))
+        except OSError:
+            return None, f"{base} not readable"
+        for node in nodes:
+            props = os.path.join(base, node, "properties")
+            try:
+                with open(props) as f:
+                    text = f.read()
+            except OSError:
+                continue
+            for line in text.splitlines():
+                parts = line.split()
+                if len(parts) == 2 and parts[0] == "gfx_target_version":
+                    v = int(parts[1])
+                    if v > 0:
+                        return (f"gfx{v // 10000:d}{(v // 100) % 100:x}{v % 100:x}",
+                                f"gfx_target_version in {props}")
+        return None, f"no GPU node with gfx_target_version under {base}"
+    return None, f"no device-architecture probe for vendor {vendor!r}"
+
+
+def _sm_parts(arch):
+    """('sm_86' -> (8, 6, False)); ('sm_90a' -> (9, 0, True)). The minor
+    digit is the LAST digit: sm_121a is 12.1."""
+    body = arch[len("sm_"):]
+    specific = body.endswith("a")
+    if specific:
+        body = body[:-1]
+    return int(body[:-1]), int(body[-1]), specific
+
+
+class _NoCompatibleNative(ImportError):
+    """A detected device has no compatible carried native architecture."""
+
+
+def _pick_arch(vendor, vdir, archs):
+    """Which of `archs` (the carried architecture directories) this box
+    should load, and how that was decided. Raises with the whole table when
+    nothing carried can run here."""
+    forced = os.environ.get("ANONLIB_GPU_ARCH", "").strip().lower()
+    if forced:
+        if forced not in archs:
+            raise ImportError(
+                f"anonlib: ANONLIB_GPU_ARCH={forced} but this install "
+                f"carries no such set under {vdir}; it carries {archs}"
+            )
+        return forced, "ANONLIB_GPU_ARCH in the environment"
+    dev, how = _device_arch(vendor)
+    if dev is None:
+        if len(archs) == 1:
+            return archs[0], (f"the only architecture carried (the device's "
+                              f"own could not be read: {how})")
+        raise ImportError(
+            f"anonlib: this install carries {vendor} sets for {archs} and "
+            f"the device's architecture could not be determined ({how}), so "
+            "there is nothing to choose by. Set ANONLIB_GPU_ARCH to one "
+            "of the names above."
+        )
+    if dev in archs:
+        return dev, f"exact match for the device ({how}: {dev})"
+    if vendor == "cuda":
+        # The device reports sm_XY; an sm_XYa build targets exactly that
+        # chip and runs on it (the `a` restricts WHICH DEVICES, not this
+        # one). Prefer it before any family fallback.
+        if dev + "a" in archs:
+            return dev + "a", (f"architecture-specific build for this exact "
+                               f"device ({dev} -> {dev}a)")
+        # Cubin forward compatibility WITHIN a family: NVIDIA guarantees
+        # sm_X0-class code runs on later minor revisions of major X, and
+        # `a`-suffixed builds are excluded from that guarantee, so they are
+        # excluded here. The highest carried candidate that does not exceed
+        # the device wins.
+        dmaj, dmin, _ = _sm_parts(dev)
+        cands = []
+        for a in archs:
+            if not a.startswith("sm_"):
+                continue
+            maj, minr, specific = _sm_parts(a)
+            if specific or maj != dmaj or minr > dmin:
+                continue
+            cands.append((minr, a))
+        if cands:
+            _, best = max(cands)
+            return best, (f"same-family lower architecture ({best} code "
+                          f"runs forward on this {dev} device)")
+    lines = "\n".join(f"    {a}" for a in archs)
+    hint = ("gfx code objects are ISA-exact; there is no cross-architecture "
+            "compatibility on hip" if vendor == "hip" else
+            "cubins run forward only within one family, and `a`-suffixed "
+            "builds only on their exact chip")
+    raise _NoCompatibleNative(
+        f"anonlib: this device is {dev} ({how}) and no {vendor} set this "
+        f"install carries can run on it ({hint}). Carried:\n{lines}\n"
+        "A release carrying this device's architecture is needed; "
+        "ANONLIB_GPU_ARCH can force one of the directories above, and the "
+        "first kernel launch will then report the runtime's own error."
+    )
+
+
+def _vendor_base(pkg, vendor):
+    """The directory `tier_dir` roots at for one chosen vendor: the vendor
+    directory itself on the arch-less layout, or the chosen architecture
+    subdirectory. Sets _ARCH_SELECTED/_ARCH_HOW either way."""
+    global _ARCH_SELECTED, _ARCH_HOW
+    vdir = _vendor_directory(pkg, vendor)
+    archs = _arch_dirs(vdir)
+    if vendor == "cuda":
+        # THE PTX SLOT is not a native candidate: native first, then PTX
+        # (the author 2026-10-10: PTX is a normal target; no flag). In the combined
+        # and source layouts it sits at cuda/sm_80 beside the native sets.
+        archs = [a for a in archs if a != gpu_plugins.PTX_ARCH]
+        forced = os.environ.get("ANONLIB_GPU_ARCH", "").strip().lower()
+        if forced == gpu_plugins.PTX_ARCH:
+            return _ptx_base(pkg, f"anonlib: ANONLIB_GPU_ARCH={forced} selects the PTX set",
+                             "ANONLIB_GPU_ARCH in the environment (the PTX set)")
+    ptx_only = vendor == "cuda" and not archs and _has_binaries(_ptx_directory(pkg))
+    if not archs and not ptx_only:
+        _ARCH_SELECTED = None
+        _ARCH_HOW = "no architecture level (arch-less set)"
+        return vdir
+    try:
+        if ptx_only:
+            raise _NoCompatibleNative("anonlib: this install carries no native cuda set, only the PTX set")
+        arch, how = _pick_arch(vendor, vdir, archs)
+    except _NoCompatibleNative as exc:
+        if vendor != "cuda":
+            raise
+        return _ptx_fallback(pkg, exc)
+    _ARCH_SELECTED = arch
+    _ARCH_HOW = how
+    return os.path.join(vdir, arch)
+
+
+def _ptx_fallback(pkg, native_refusal):
+    """A detected NVIDIA device with no compatible native set takes the PTX
+    set when its compute capability is 8.0 or newer (the PTX set targets
+    compute capability 8.0 and the driver compiles it forward to any later
+    one); an older device refuses with the native refusal."""
+    dev, how = _device_arch("cuda")
+    if not dev or not dev.startswith("sm_"):
+        raise GpuPluginError(f"{native_refusal}\nPTX set refused: the device architecture could not "
+                             f"be read ({how})") from native_refusal
+    if _sm_parts(dev)[:2] < (8, 0):
+        raise GpuPluginError(f"{native_refusal}\nPTX set refused: {dev} is older than compute "
+                             "capability 8.0, the PTX set's target") from native_refusal
+    return _ptx_base(pkg, str(native_refusal),
+                     f"no native set for this {dev} device ({how}); the PTX set, compiled by the driver")
+
+
+def gpu_arch():
+    """The GPU architecture whose binaries this process loaded.
+
+    Returns
+    -------
+    str or None
+        The architecture name, such as ``'sm_80'`` or ``'gfx942'``; None when
+        no architecture choice was made (macOS, a source checkout, or a
+        CPU-only install).
+
+    Examples
+    --------
+    >>> import anonlib
+    >>> arch = anonlib.gpu_arch()
+    """
+    if _CPU_ONLY is not None:
+        return None
+    _layout()
+    return _ARCH_SELECTED
+
+
+def gpu_arch_how():
+    """How the GPU architecture was chosen, as a sentence.
+
+    For example an exact match for the device, the ``ANONLIB_GPU_ARCH``
+    environment variable, or a compatible lower architecture of the same
+    family. Useful when diagnosing an install (``anonlib doctor`` prints it).
+
+    Returns
+    -------
+    str
+    """
+    if _CPU_ONLY is not None:
+        return "no GPU binary set loaded (CPU-only install, DEVIATION 2615)"
+    _layout()
+    return _ARCH_HOW
+
+
+def _layout():
+    """('flat', <pkg dir>) or ('vendor', <pkg dir>/<vendor>[/<arch>]),
+    decided ONCE.
+
+    The wheel layout is recognised by a vendor directory WITH BINARIES IN
+    IT. A bare directory does not count: the macOS wheel never has one, a
+    source checkout never has one, and an empty one left by a failed build
+    must not turn a working flat install into a vendor lookup."""
+    global _LAYOUT, _VENDOR_SELECTED, _VENDOR_HOW
+    if _LAYOUT is not None:
+        return _LAYOUT
+    pkg = _pkg_dir()
+    present = [v for v in _LINUX_VENDORS
+               if _vendor_has_set(_vendor_directory(pkg, v))]
+    forced = os.environ.get("ANONLIB_VENDOR", "").strip().lower()
+    probe = None
+    if _split_core() is not None:
+        # THE SPLIT CORE (gpu_plugins.py). Its GPU sets come from plugins
+        # installed beside it; a plugin of another version, or sets no plugin
+        # owns, refuse whatever the box is.
+        _check_plugins(pkg, present)
+        if forced == "cpu":
+            raise ImportError(
+                "anonlib: ANONLIB_VENDOR=cpu; no GPU set is loaded, on request "
+                f"(installed plugins: {present or 'none'})")
+        if forced in _LINUX_VENDORS and forced not in present:
+            raise _missing_plugin_error([forced], None, present, forced=forced)
+        if not forced:
+            # A GPU ON THIS BOX WITHOUT ITS PLUGIN REFUSES, BY NAME. The core
+            # alone would otherwise import as the CPU-only set and serve a
+            # GPU box's fits from the host bindings, which no install of the
+            # combined wheel ever did.
+            probe = _probe_box()
+            hits = [v for v in present if probe[v]["found"]]
+            missing = [v for v in _LINUX_VENDORS if probe[v]["found"] and v not in present]
+            if missing and not hits:
+                raise _missing_plugin_error(missing, probe, present)
+            if not present:
+                raise ImportError(
+                    "anonlib: no supported GPU found on this box and no GPU plugin "
+                    f"({', '.join(r['distribution'] for r in gpu_plugins.PLUGINS.values())}) "
+                    "is installed; only the CPU bindings under anonlib/host/ load.\n"
+                    + "\n".join(_probe_lines(probe)))
+    if not present:
+        # macOS, or a Linux source checkout. The vendor is whatever the
+        # binaries say; `vendor()` reads it after `select()` has loaded them.
+        if forced == "cpu":
+            # ANONLIB_VENDOR=cpu IS THE ONE CPU SWITCH ON EVERY LAYOUT. Until
+            # 2026-09-26 the flat layout (the macOS wheel) returned before the
+            # variable was read, so a Mac user who asked for the CPU got the
+            # Metal set with no word said: a switch accepted and ignored. It
+            # now refuses the GPU set exactly as the split core does, and
+            # select() installs the CPU-only set when the host bindings are
+            # built (they ship in the macOS wheel), else re-raises this.
+            raise ImportError(
+                "anonlib: ANONLIB_VENDOR=cpu; no GPU set is loaded, on request "
+                "(flat layout)")
+        _LAYOUT = ("flat", pkg)
+        _VENDOR_HOW = "flat layout; read from the loaded binaries"
+        return _LAYOUT
+    if forced:
+        if forced not in _LINUX_VENDORS:
+            # `cpu` lands here too on the combined wheel, and select() then
+            # installs the CPU-only set when a host binding is built, exactly
+            # as it does for any refusal of this function.
+            raise ImportError(
+                f"anonlib: ANONLIB_VENDOR={forced!r}; it must be "
+                f"'cuda' or 'hip' to load a GPU set, or 'cpu' to load none "
+                f"(this install carries {present})"
+            )
+        if forced not in present:
+            raise ImportError(
+                f"anonlib: ANONLIB_VENDOR={forced} but this install "
+                f"carries no {forced} set under {os.path.join(pkg, forced)}; "
+                f"it carries {present}"
+            )
+        # A FORCED VENDOR WHOSE RUNTIME IS NOT ON THIS BOX AT ALL KILLS THE
+        # PROCESS. Measured 2026-08-30 against the finished 0.3.0 wheel, in a
+        # container with no device of either kind:
+        #
+        #   ANONLIB_VENDOR=cuda   imports, and the FIRST FIT raises a clean
+        #                           Python exception naming libnvidia-ml.so.1
+        #   ANONLIB_VENDOR=hip    SIGILL during import, no traceback at all
+        #
+        # The two vendors do not degrade alike. The hip binary's module init
+        # takes a trap when the HIP runtime library is absent, so a user who
+        # mistypes this variable, or sets it on the wrong box, gets a dead
+        # process and nothing to read. Refusing here, in Python, is the only
+        # place a message survives.
+        #
+        # THIS DOES NOT CLOSE THE ESCAPE HATCH the no-GPU refusal offers. That
+        # hatch is for "the device IS present and this probe is wrong", and a
+        # box with the device present has that vendor's driver library
+        # loadable, which is exactly what `found` means. Only the case with no
+        # device node AND no loadable driver library is refused, which is the
+        # case that cannot work whatever the binary does.
+        # ANONLIB_VENDOR_FORCE=1 proceeds anyway, for a box where the probe
+        # is wrong about a device that really is there. It says plainly that
+        # it may abort, because on the hip branch it may.
+        probe = _probe_box()
+        if not probe[forced]["found"] and not _force_requested():
+            raise ImportError(
+                f"anonlib: ANONLIB_VENDOR={forced}, but this box shows NO "
+                f"evidence of a {forced} device. Neither a device node nor a "
+                f"driver library was found:\n"
+                + "\n".join(_probe_lines(probe, only=forced))
+                + f"\n\nLoading the {forced} set anyway can KILL THIS PROCESS "
+                "rather than raise: measured 2026-08-30, forcing hip on a box "
+                "with no ROCm aborts during import with no traceback, while "
+                "forcing cuda on a box with no CUDA raises a normal exception "
+                "at the first fit. The two are not alike and this refusal is "
+                "the one that survives.\n"
+                "If the device really is present and this probe is wrong, "
+                "ANONLIB_VENDOR_FORCE=1 proceeds and accepts that risk. "
+                "Unset ANONLIB_VENDOR to let the probe choose."
+            )
+        base = _vendor_base(pkg, forced)
+        _VENDOR_SELECTED = forced
+        _VENDOR_HOW = "ANONLIB_VENDOR in the environment"
+        _LAYOUT = ("vendor", base)
+        return _LAYOUT
+    probe = probe or _probe_box()
+    hits = [v for v in present if probe[v]["found"]]
+    if len(hits) == 1:
+        base = _vendor_base(pkg, hits[0])
+        _VENDOR_SELECTED = hits[0]
+        _VENDOR_HOW = "the box probe (device nodes and driver libraries)"
+        _LAYOUT = ("vendor", base)
+        return _LAYOUT
+    if len(hits) > 1:
+        raise ImportError(
+            "anonlib: this box shows evidence of MORE THAN ONE supported "
+            f"GPU API ({hits}) and this install carries a set for each. "
+            "Choose one with ANONLIB_VENDOR=cuda or ANONLIB_VENDOR=hip "
+            "before import. What was looked for and found:\n"
+            + "\n".join(_probe_lines(probe))
+        )
+    raise ImportError(
+        "anonlib: NO SUPPORTED GPU FOUND ON THIS BOX, and there is no CPU "
+        "path in this package. This install carries binary sets for "
+        f"{present} under {pkg}. What was looked for and what was found:\n"
+        + "\n".join(_probe_lines(probe))
+        + "\n  ANONLIB_VENDOR is not set."
+        "\n\nA device node or a driver library for one of the sets above must "
+        "be visible to this process. In a container that means the GPU is "
+        "passed through (`--gpus all` for NVIDIA, `--device /dev/kfd "
+        "--device /dev/dri` for AMD). If the device is present and this "
+        "probe is wrong, ANONLIB_VENDOR=cuda or ANONLIB_VENDOR=hip picks "
+        "the directory directly and the first fit reports the runtime's own "
+        "error."
+    )
+
+
+def tier_dir(mode):
+    """The directory one tier's binaries live in, on this install and this
+    vendor. `fast` is the vendor directory itself (the package directory on
+    the flat layout); every other tier is one directory down under its own
+    name. THE ONE PLACE THIS IS COMPUTED: the four bindings with private
+    loaders (`_linalg_impl`, `_metrics_impl`, `_tsa_impl`, `_svm_impl`) call
+    this rather than joining paths themselves."""
+    _, base = _layout()
+    if mode == "fast":
+        return base
+    return os.path.join(base, mode)
+
+
+def _check_vendor(module, name, path):
+    """Refuse a binary whose compiled vendor disagrees with the directory it
+    was loaded from. Binaries that predate the read-back are let through
+    with None, which `vendor()` reports as such rather than inventing an
+    answer."""
+    global _VENDOR_SELECTED
+    kind, base = _layout()
+    said = read_vendor(module)
+    if said is None:
+        return None
+    if said == "none":
+        raise ImportError(
+            f"anonlib: {path} was compiled with NO accelerator target "
+            "(its vendor read-back says 'none'); it cannot run a kernel "
+            "anywhere. Rebuild it on a box with the GPU present."
+        )
+    if kind == "vendor":
+        # NOT the basename: with the architecture axis the directory the
+        # binaries load from is <vendor>/<arch>, and its basename is the
+        # architecture. The vendor is what _layout() selected.
+        expected = _VENDOR_SELECTED
+        if said != expected:
+            raise ImportError(
+                f"anonlib: {path} was compiled for {said} but sits in the "
+                f"{expected} set ({base}); a binary is in the wrong vendor "
+                "directory. The set is refused rather than loaded under a "
+                "label it does not answer to. Rebuild the sets with "
+                "packaging/linux/build_sets.sh on the right box and repack."
+            )
+    else:
+        # Flat layout: the first binary to answer decides, and every later
+        # one must agree with it. Two vendors' binaries in one flat
+        # directory is a build that went wrong, not a choice.
+        if _VENDOR_SELECTED is None:
+            _VENDOR_SELECTED = said
+        elif said != _VENDOR_SELECTED:
+            raise ImportError(
+                f"anonlib: {path} was compiled for {said} but the other "
+                f"binaries in {base} were compiled for {_VENDOR_SELECTED}; "
+                "a flat layout holds one vendor. Rebuild."
+            )
+    return said
+
+
+def requested_mode():
+    mode = os.environ.get("ANONLIB_NUMERIC_MODE", "identical").strip().lower()
+    if mode not in _MODE_CODE:
+        raise ImportError(
+            f"anonlib: ANONLIB_NUMERIC_MODE={mode!r}; it must be 'fast', "
+            "or 'identical' (the default)"
+        )
+    return mode
+
+
+# ===================================================================
+# A CPU-ONLY INSTALL (DEVIATION 2615)
+# ===================================================================
+# The no-GPU refusal below is deliberate and stays the rule for every GPU
+# binding. The ONE exception is a box where no GPU set loads but a CPU
+# binding under anonlib/host/ (`_anonlib_byte_lm_host.so`, DEVIATION
+# 2610, or `_anonlib_forest_host.so`, the forest host lane) is built. Then
+# the package imports, every GPU binding is a `_NoGpuBinding` stub that
+# raises BY NAME on use with the original refusal attached, and `vendor()`
+# answers 'cpu'. Nothing falls back: a GPU estimator on that box fails
+# exactly as loudly as before, only at use instead of at import.
+#
+# THE HOST BINDING SET (the CPU training lane, 2026-09-13). `_HOST_MODULES`
+# maps a `_MODULES` name to the host binding that exports the SAME function
+# names the GPU binding exports for the fits it covers. On a CPU-only
+# install `binding(name)` and the canonical `anonlib.<name>` resolve a
+# listed family to that binding when its file is built, through a
+# `_HostBinding` proxy that raises BY NAME for any function the host
+# binding lacks, so a lane with no host fit reads REFUSED and never a hash
+# of something else. Two rules keep it honest: the host set loads only when
+# `_CPU_ONLY` is not None, so a box with a GPU never serves host arithmetic
+# under a GPU label, and every host binding is read back (`<prefix>_vendor()`
+# must answer "cpu", `<prefix>_numeric_mode()` 1 and `<prefix>_column()`
+# "cpu", the kernel matrix's CPU column) before a single function is served.
+
+#: The refusal `select()` would have raised, when it installed the CPU-only
+#: stubs instead; None on every install that loaded a GPU set.
+_CPU_ONLY = None
+
+
+def host_binding_path():
+    """Where the CPU inference binding lives on this install. THROUGH
+    `host_module_path`, like every other door onto a host binding: until
+    lane/host-path-resolution (2026-09-16) this built its own path from the
+    package directory and was one of four answers that did not follow
+    ANONLIB_HOST_DIR."""
+    return host_module_path("_anonlib_byte_lm_host")
+
+
+def forest_host_binding_path():
+    """Where the CPU forest inference binding lives on this install (the
+    forest host lane, 2026-09-13, `_forest_host.py`). Through
+    `host_module_path`, as above."""
+    return host_module_path("_anonlib_forest_host")
+
+
+def host_binding_built():
+    """Whether ANY CPU binding is built. Any one is enough to turn the
+    no-GPU refusal into by-name stubs, because any one is a surface that
+    computes on this box."""
+    return bool(host_families_built())
+
+
+#: Names another directory of host bindings; how the CPU identity gate
+#: (.github/workflows/cpu-identity-gate.yml) loads the set it built with
+#: -D ANONLIB_HOST_SABOTAGE=1 without touching the production set.
+_HOST_DIR_ENV = "ANONLIB_HOST_DIR"
+
+
+def host_dir():
+    """Where every CPU binding lives on this install, `anonlib/host/`, or
+    the directory ANONLIB_HOST_DIR names."""
+    override = os.environ.get(_HOST_DIR_ENV, "").strip()
+    if override:
+        return os.path.abspath(override)
+    return os.path.join(_pkg_dir(), "host")
+
+
+def host_module_path(basename):
+    """The file a host binding of `basename` (`_anonlib_<family>_host`)
+    loads from.
+
+    THE ONE RESOLUTION PATH. `load_host_module` below, the two helpers
+    above, and the byte LM and forest INFERENCE doors
+    (`_byte_lm_host.binary_path`, `_forest_host.binary_path`, each after its
+    own named-binary variable) all answer from here, so one directory
+    setting moves every host binding together. Two of them resolved
+    independently until lane/host-path-resolution (2026-09-16), and under
+    ANONLIB_HOST_DIR the training door opened while the inference door
+    looked in the package directory: it refused there when the package had
+    no host set, and silently served the package's own binding when it
+    did."""
+    return os.path.join(host_dir(), basename + ".so")
+
+
+# THE BYTE LM AND FOREST INFERENCE DOORS' BINARY LOADERS (lane/lazy-imports,
+# 2026-10-10). They lived in `_byte_lm_host.py` and `_forest_host.py`, and
+# `_buffer._host_native` (the three, and seven, native helpers a CPU-only
+# install resolves from those binaries) imported each whole door for its
+# `_load()`. Every lane loads `_buffer.py`, so every lane's import closure
+# carried the byte LM door (lowbit, linalg, the decomposition and metrics
+# expansions) and the forest door (`_classical_host` and every classical door
+# it names): 251 files selected every lane in tools/test_lane_select.py. The
+# loaders are CPU-side backend plumbing and live here now; the doors keep
+# `binary_path` and `_load` as the same calls. Caches are per binding name.
+_DOOR_HOST_MODULES = {}
+
+
+#: The extra words a door's sabotage refusal has always carried.
+_DOOR_SABOTAGE_NOTE = {"_anonlib_byte_lm_host": " (DEVIATION 2612)"}
+
+
+def door_host_binary_path(basename):
+    """The door binary `basename` (`_anonlib_byte_lm_host`,
+    `_anonlib_forest_host`) this process loads, or would load: the file
+    `ANONLIB_<PREFIX>_BINARY` names (`ANONLIB_BYTE_LM_HOST_BINARY`,
+    `ANONLIB_FOREST_HOST_BINARY`), else this install's host binding of that
+    name, wherever `host_module_path` resolves it."""
+    override = os.environ.get(f"ANONLIB_{_host_prefix(basename).upper()}_BINARY", "").strip()
+    if override:
+        return os.path.abspath(override)
+    return host_module_path(basename)
+
+
+def load_door_host(basename):
+    """The door binary `basename`, loaded once per process under
+    `anonlib._host.<basename>` and READ BACK through its own prefix
+    (`byte_lm_host_*`, `forest_host_*`): IDENTICAL, `cpu`, and a sabotage
+    build (the base arm, and for the forest binding the CTR-path arm of
+    lane/inference-gbdt-ctr-tables, 2026-09-15, and the grove association arm
+    of DEVIATION 2961, 2026-09-17) refused unless
+    `ANONLIB_<PREFIX>_ALLOW_SABOTAGE=1`."""
+    module = _DOOR_HOST_MODULES.get(basename)
+    if module is not None:
+        return module
+    prefix = _host_prefix(basename)
+    path = door_host_binary_path(basename)
+    if not os.path.exists(path):
+        raise ImportError(
+            f"anonlib: {path} is not built. Build it with bindings/build_{prefix}.sh")
+    name = _HOST_MODULE_PREFIX + basename
+    module = sys.modules.get(name)
+    if module is None:
+        loader = importlib.machinery.ExtensionFileLoader(name, path)
+        spec = importlib.util.spec_from_loader(name, loader, origin=path)
+        module = importlib.util.module_from_spec(spec)
+        _exec_binding(loader, module)
+        sys.modules[name] = module
+    if int(getattr(module, prefix + "_numeric_mode")()) != 1:
+        raise RuntimeError(f"anonlib: {path} was not compiled IDENTICAL; rebuild it")
+    if str(getattr(module, prefix + "_vendor")()) != 'cpu':
+        raise RuntimeError(f"anonlib: {path} does not read back as the CPU binding")
+    ctr_sabotage = getattr(module, prefix + "_gbdt_ctr_sabotage", None)
+    groves_sabotage = getattr(module, prefix + "_groves_sabotage", None)
+    sabotaged = (bool(getattr(module, prefix + "_sabotage")())
+                 or bool(ctr_sabotage is not None and ctr_sabotage())
+                 or bool(groves_sabotage is not None and groves_sabotage()))
+    if sabotaged and os.environ.get(f"ANONLIB_{prefix.upper()}_ALLOW_SABOTAGE") != '1':
+        raise RuntimeError(
+            f"anonlib: {path} is the gate's SABOTAGE build"
+            f"{_DOOR_SABOTAGE_NOTE.get(basename, '')} and computes wrong answers "
+            "on purpose; it is refused outside the gate")
+    _DOOR_HOST_MODULES[basename] = module
+    return module
+
+
+def host_families_built():
+    """The basenames of every `_anonlib_*_host.so` under anonlib/host/,
+    sorted. What `tools/identity_break.py` records as `host.families`, so a
+    REFUSED cell on the CPU column is attributable to an unbuilt family
+    rather than a bug."""
+    d = host_dir()
+    if not os.path.isdir(d):
+        return []
+    return sorted(
+        f[:-3] for f in os.listdir(d)
+        if f.startswith("_anonlib_") and f.endswith("_host.so")
+    )
+
+
+#: `_MODULES` name -> the basename of the host binding under anonlib/host/
+#: that exports the SAME function names the GPU binding exports for the fits
+#: it covers, plus `<prefix>_vendor()` answering "cpu", `<prefix>_numeric_mode()`
+#: answering 1 and `<prefix>_column()` answering "cpu". THE TABLE IS READ FROM
+#: THE MANIFEST (`host_surface.py`, the host surface manifest lane,
+#: 2026-09-14): one file declares every host family, what it routes, which
+#: lanes it covers for training and serves for inference, and what it
+#: exports; `tests/test_host_surface.py` holds the bindings to it. Every
+#: family not routed there refuses BY NAME on a CPU-only install. The three
+#: bindings loaded by path, `_anonlib_byte_lm_host`,
+#: `_anonlib_forest_host` and `_anonlib_tokenizer_host`, export their
+#: own names (`byte_lm_host_*`, `forest_host_*`, `tokenizer_host_*` and
+#: `bpe_*`) for surfaces of their own (LanguageModelInference,
+#: LanguageModelHostTrainer, HostForest, HostGBDT, BpeTokenizer), are
+#: loaded in `_byte_lm_host.py`, `_forest_host.py`, `_gbdt_host.py` and
+#: `tokenizer.py` (the last through `load_host_module` below), and are
+#: deliberately NOT routed: mapping `_anonlib_rf` to the forest host
+#: binding would route RandomForestClassifier.predict to an entry with a
+#: different address contract under the GPU entry's name, and the
+#: tokenizer has no GPU binding to route from at all.
+#:
+#: What each routed binding carries, and what it leaves absent so the
+#: refusal stays by name:
+#:   _anonlib -> _anonlib_core_host: the base binding's HOST HELPERS
+#:     (transpose_f32, cast_colmajor_f64_to_f32, cast_f64_to_f32,
+#:     all_finite_*, gather_*, argmax_rows_*, so _buffer._native and _labels
+#:     resolve on a CPU-only install) and the knn host inference lane's
+#:     (2026-09-14) knn_search, knn_classify, knn_regress over
+#:     core/knn_host_predict.mojo, and (workstream E batch 2, 2026-09-14)
+#:     the training entry kmeans_fit over cluster/host/kmeans_oracle.mojo,
+#:     and (the spectral-precomputed lane, 2026-09-14) the dense affinity's
+#:     COO scan nonzero_f64_count and nonzero_f64_fill, and (batch 3,
+#:     2026-09-14) the cosine, manhattan, chebyshev and minkowski metrics
+#:     of the k-NN entries and the ball cover's radius_neighbors_count,
+#:     radius_neighbors_fill and rbc_knn_search as an exhaustive scan.
+#:   _anonlib_linalg -> _anonlib_linalg_host: gemm over
+#:     gemm/host/gemm_oracle.mojo::gemm_oracle, the profile's definition.
+#:   _anonlib_estimators -> _anonlib_estimators_host: kde_score_samples
+#:     over kde/host/kde_oracle.mojo, the classical inference entries
+#:     ols_predict, tsvd_transform, pca_transform, pca_whiten_transform,
+#:     pca_whiten_inverse_transform, qn_decision_function, qn_sigmoid over
+#:     core/classical_host_predict.mojo, and (workstream E, 2026-09-14) the
+#:     training entries pca_fit and tsvd_fit over
+#:     decomposition/host/pca_oracle.mojo and ols_fit and ridge_fit over
+#:     glm/host/glm_oracle.mojo, dbscan_fit over
+#:     dbscan/host/dbscan_oracle.mojo and (batch 2) qn_fit over
+#:     glm/host/qn_oracle.mojo (the L-BFGS arm; batch 3, 2026-09-14, adds
+#:     the OWL-QN arm, the softmax loss and DBSCAN's sample_weight;
+#:     qn's sample_weight refuses by name), pca_fit_full over
+#:     decomposition/host/pca_full_oracle.mojo (the pca-full-whiten lane,
+#:     2026-09-14; the tall route only, a wide matrix refuses by name);
+#:     inverse_transform is absent.
+#:   _anonlib_metrics -> _anonlib_metrics_host (workstream E batch 2,
+#:     2026-09-14): accuracy_score, adjusted_rand_score, entropy,
+#:     mutual_info_score, homogeneity_score, completeness_score,
+#:     v_measure_score, r2_score and silhouette over
+#:     metrics/host/metrics_oracle.mojo, spectral_fit_predict_dataset
+#:     over spectral/host/spectral_oracle.mojo (the spectral lane) and
+#:     spectral_fit_predict_graph over the same oracle (the
+#:     spectral-precomputed lane, 2026-09-14), umap_fit_transform,
+#:     umap_transform and umap_numeric_mode over umap/host/umap_oracle.mojo
+#:     (the umap lane, lane/cpu-training-umap-b, 2026-09-14: the IDENTICAL
+#:     device epoch fold restated on the host), and (the
+#:     metrics-classification lane, 2026-09-14) rand_score, the ranking and
+#:     classification metrics, the three regression errors, kl_divergence
+#:     and trustworthiness over metrics/host/classification_oracle.mojo.
+#:   _anonlib_preprocessing -> _anonlib_preprocessing_host (workstream
+#:     E batch 2, 2026-09-14): standard_fit, standard_transform, minmax_fit
+#:     and minmax_transform over preprocessing/host/scaler_oracle.mojo, the
+#:     whole GPU binding's surface.
+#:   _anonlib_tsa -> _anonlib_tsa_host: holtwinters_fit and
+#:     holtwinters_forecast over holtwinters/host/hw_oracle.mojo, and
+#:     (batch 3, 2026-09-14) kpss_test over tsa/checks/kpss_oracle.mojo;
+#:     select_d (ARIMA's) over the same KPSS host test (lane py-runtime-b).
+#:   _anonlib_solver -> _anonlib_solver_host: cd_fit and cd_predict over
+#:     solver/host/cd_oracle.mojo and gemm_oracle; agglomerative (phase 1b,
+#:     2026-09-14) adds linkage_fit over hierarchy/checks/linkage_oracle.mojo
+#:     (the pinned distances, Kruskal under the device's total order, the
+#:     dendrogram and the cut).
+#:   _anonlib_svm -> _anonlib_svm_host: svc_fit and svc_predict over
+#:     svm/host/smo_oracle.mojo; iforest (phase 1b, 2026-09-14) adds
+#:     iforest_run over isolation_forest/checks/if_oracle.mojo (the
+#:     fit-on-every-call surface kept, DEVIATION 874); batch 3 (2026-09-14)
+#:     adds svr_fit and svr_predict over the oracle's EPSILON_SVR arm.
+#:   _anonlib_trees -> _anonlib_trees_host (et-clf, et-reg; phase 1b,
+#:     2026-09-14): the eight et_*_fit entries over
+#:     extratrees/estimator.mojo::fit_extra_trees_classifier_host_exact and
+#:     fit_extra_trees_regressor_host_exact (the device trainer restated on
+#:     the host, exact keys and quantized leaves), forest_export,
+#:     forest_export_legacy, forest_export_release and et_predict over
+#:     core/forest_host_predict.mojo; since 2026-09-15 the resident
+#:     forest_prepare_gpu, forest_predict_resident_reuse_gpu and
+#:     forest_release_gpu (inference_engine='parallel_groves') over
+#:     core/forest_host_groves.mojo, with et_predict_gpu_parallel and the
+#:     other resident arms absent.
+#:   _anonlib_rf -> _anonlib_rf_host (rf-clf, rf-reg; workstream E
+#:     batch 3, 2026-09-14): the eight rf_*_fit entries over
+#:     ensemble/host/rf_oracle.mojo::rf_host_fit (the device trainer
+#:     restated on the host), forest_export, forest_export_legacy,
+#:     forest_export_release, and rf_predict_proba and rf_predict_reg over
+#:     core/forest_host_predict.mojo; since 2026-09-15 the POISSON, GAMMA and
+#:     INVERSE_GAUSSIAN criteria, rf_classifier_fit_weighted (the weighted
+#:     bootstrap; weights without a bootstrap refuse by name) and the
+#:     resident parallel_groves entries over core/forest_host_groves.mojo;
+#:     the shard fits and the non-resident GPU engines refuse by name. This is its own family, not the forest host binding
+#:     named above, because it exports the GPU binding's names.
+#:   _anonlib_gp -> _anonlib_gp_host (gp, gp-matern12, gp-matern32,
+#:     gp-matern52-ard; workstream E, 2026-09-14): gpr_fit and gpr_predict
+#:     over gaussian_process/host/gpr_oracle.mojo (the kernel matrix, the
+#:     Cholesky profile of cholesky/host/chol_oracle.mojo and gemm_oracle's
+#:     posterior mean), and the Cholesky door's cholesky_factor,
+#:     cholesky_solve and cholesky_profile_jitter over the same chol_oracle;
+#:     gp_parallel_available is absent, so the ordered multi-GPU driver
+#:     refuses by name.
+#:   _anonlib_gbdt -> _anonlib_gbdt_host (gbdt-symmetric, gbdt-rmse,
+#:     gbdt-depthwise, gbdt-lossguide; workstream E batch 3, 2026-09-14):
+#:     gbdt_fit over gbdt/host/gbdt_oracle.mojo::gbdt_host_fit (the device
+#:     trainer restated on the host for SymmetricTree, Logloss, Cosine and
+#:     Newton leaves), gbdt/host/gbdt_oracle_rmse.mojo::gbdt_rmse_host_fit
+#:     (the same tree with RMSE and the searcher's leaves) and
+#:     gbdt/host/gbdt_oracle_depthwise.mojo (Depthwise with Cosine, Lossguide
+#:     with NewtonL2); every other option value refuses by name inside
+#:     gbdt_fit,
+#:     gbdt_predict and gbdt_model_dim over the model text and
+#:     core/gbdt_host_predict.mojo, and gbdt_sigmoid; gbdt_fit_ordered_rmse
+#:     over gbdt/host/gbdt_oracle_ordered.mojo and
+#:     gbdt_fit_two_level_feature_freq over
+#:     gbdt/host/gbdt_oracle_feature_freq.mojo (gbdt-ordered-rmse,
+#:     gbdt-feature-freq; lane/cpu-training-gbdt-ordered, 2026-09-15);
+#:     gbdt_predict_multi and the adapters' binary transforms are absent. Its own family for the reason the rf family is: the
+#:     forest host binding exports other names under another contract.
+#:   _anonlib_training -> _anonlib_training_host (the mlp lane,
+#:     2026-09-14): optimizer_step and ce_loss over
+#:     training/checks/optimizer_oracle.mojo and loss_oracle.mojo (the
+#:     normative answers of the optimizer and loss profiles) and
+#:     mlp_bias_activation, mlp_relu_backward and mlp_sum_rows over
+#:     training/host/mlp_oracle.mojo, so SmallMLPTrainer trains on the CPU;
+#:     and (lane/cpu-training-misc, 2026-09-15) clip_grad_norm over the same
+#:     optimizer oracle, and accumulate, accumulation_is_aligned and the
+#:     embedding, RMSNorm and linear forward and backward over
+#:     training/host/samba_ops_oracle.mojo; and (lane/cpu-training-samba,
+#:     2026-09-15) neural_rng over core/philox_neural.mojo as
+#:     tools/mamba_host_gen.py writes it out for the host
+#:     (mamba/host/gen/philox_neural.mojo), so SambaStack trains on the CPU
+#:     with the mamba and transformer families' blocks.
+#:   _anonlib_resample -> _anonlib_resample_host (bootstrap,
+#:     permutation-test, monte-carlo; lane/cpu-training-misc, 2026-09-15):
+#:     bootstrap, permutation_test and monte_carlo_integrate over
+#:     resample/host/resample_host.mojo (resample/estimator.mojo's entry
+#:     points with the replicate and chunk kernels restated on the host);
+#:     resample_ranges_parallel_available is absent, so the multi-GPU range
+#:     drivers refuse by name.
+#:   _anonlib_arima -> _anonlib_arima_host (arima, arima-011,
+#:     arima-seasonal-c; workstream E, 2026-09-14): arima_fit,
+#:     arima_predict and arima_forecast over arima/host/arima_oracle.mojo
+#:     (estimate_x0, the Jones transform, the batched L-BFGS over the
+#:     finite-difference Kalman likelihood, the undifferenced forecast), the
+#:     GPU binding's whole surface; p, q or P above 1, any Q, d + D of 2,
+#:     p + q + k of 0 refuse by name; an in-sample prediction (start < n_obs)
+#:     runs since 2026-09-15. When this reference binding is not built (an
+#:     installed wheel), `_HOST_INFERENCE_MODULES` below routes the family to
+#:     `_anonlib_forecast_host`, which carries predict and forecast only.
+_HOST_MODULES = host_surface.routed_modules()
+
+#: `_MODULES` name -> an INFERENCE-ONLY host binding that serves the route
+#: when the reference binding above is not built (lane/inference-forecast-
+#: umap-pca, 2026-09-15). The inference wheels ship
+#: `_anonlib_forecast_host` (ARIMA's `arima_predict` and `arima_forecast`,
+#: no `arima_fit`) and not the reference `_anonlib_arima_host`, so on an
+#: installed CPU-only wheel `_anonlib_arima` resolves here; a source build
+#: that has the reference binding keeps it. An absent name still refuses by
+#: name through `_HostBinding`.
+_HOST_INFERENCE_MODULES = host_surface.inference_routes()
+
+#: The env switch the CPU identity gate sets to load a host binding built
+#: with `-D ANONLIB_HOST_SABOTAGE=1`; refused otherwise.
+_HOST_ALLOW_SABOTAGE = "ANONLIB_HOST_ALLOW_SABOTAGE"
+
+_HOST_MODULE_PREFIX = "anonlib._host."
+
+
+def _host_prefix(basename):
+    """`_anonlib_linalg_host` -> `linalg_host`, the read-back prefix."""
+    return basename[len("_anonlib_"):]
+
+
+def load_host_module(basename):
+    """Load (once per process, under `anonlib._host.<basename>`, the same
+    name `_byte_lm_host.py` and `_forest_host.py` use so one file is never
+    initialized twice) and READ BACK a host binding: it must say it was
+    compiled for the CPU (`<prefix>_vendor() == "cpu"`), IDENTICAL
+    (`<prefix>_numeric_mode() == 1`) and as the kernel matrix's CPU column
+    (`<prefix>_column() == "cpu"`, the comptime assert's witness), and a
+    sabotage build is refused unless ANONLIB_HOST_ALLOW_SABOTAGE=1."""
+    path = host_module_path(basename)
+    if not os.path.exists(path):
+        raise ImportError(
+            f"anonlib: {path} is not built. Build it with "
+            f"bindings/build_{_host_prefix(basename)}.sh"
+        )
+    full = _HOST_MODULE_PREFIX + basename
+    module = sys.modules.get(full)
+    if module is None:
+        loader = importlib.machinery.ExtensionFileLoader(full, path)
+        spec = importlib.util.spec_from_loader(full, loader, origin=path)
+        module = importlib.util.module_from_spec(spec)
+        _exec_binding(loader, module)
+        sys.modules[full] = module
+    prefix = _host_prefix(basename)
+
+    def read(fn):
+        f = getattr(module, prefix + "_" + fn, None)
+        if f is None:
+            raise ImportError(
+                f"anonlib: {path} exports no {prefix}_{fn}(); a host binding "
+                "must read back its vendor, numeric mode and column"
+            )
+        return f()
+
+    said = str(read("vendor"))
+    if said != "cpu":
+        raise ImportError(
+            f"anonlib: {path} was compiled for {said!r}, not the CPU; a "
+            "host binding is refused under any other vendor label"
+        )
+    compiled = _CODE_MODE.get(int(read("numeric_mode")), "unknown")
+    if compiled != "identical":
+        raise ImportError(
+            f"anonlib: {path} was compiled {compiled}; a host binding is "
+            "IDENTICAL only. Rebuild it"
+        )
+    column = str(read("column"))
+    if column != "cpu":
+        raise ImportError(
+            f"anonlib: {path} was compiled as the {column!r} kernel-matrix "
+            "column, not the CPU column; rebuild it with -D ANONLIB_COLUMN_CPU"
+        )
+    sabotage = getattr(module, prefix + "_sabotage", None)
+    if sabotage is not None and bool(sabotage()) and os.environ.get(_HOST_ALLOW_SABOTAGE) != "1":
+        raise ImportError(
+            f"anonlib: {path} is a SABOTAGE build and computes wrong answers "
+            f"on purpose; it is refused outside the gate ({_HOST_ALLOW_SABOTAGE}=1)"
+        )
+    return module
+
+
+def _no_cpu_implementation(name, item, reason, basename=None):
+    """The by-name refusal of a CPU-only install, one sentence a caller can
+    act on first, the original no-GPU refusal after it."""
+    built = host_families_built()
+    where = (
+        f"the host binding {basename} is built but exports no {item}"
+        if basename else
+        f"no host binding covers {name}"
+    )
+    return (
+        f"anonlib: no CPU implementation of {name}.{item} yet; see "
+        "SUPPORT_MATRIX.md (" + where + "; host "
+        f"bindings built here: {', '.join(built) or 'none'}). This process "
+        "loaded NO GPU binary set, so every GPU estimator, block and trainer "
+        "without a host binding is unavailable here. The surfaces that "
+        "compute on this box today are LanguageModelInference (byte LM "
+        "forward pass on the CPU), LanguageModelHostTrainer (one byte LM "
+        "training step on the CPU: forward, backward and the AdamW update), "
+        "HostForest and HostGBDT (predict and predict_proba of a saved forest "
+        "or GradientBoosting model on the CPU), and the saved-model inference "
+        "of LinearRegression, Ridge, TruncatedSVD, LogisticRegression, PCA, "
+        "ARIMA (predict and forecast), ExponentialSmoothing (forecast and "
+        "predict) and UMAP (transform) "
+        "(anonlib.host_model, or the classes themselves on a CPU-only "
+        "install), each only when its own host binding under anonlib/host/ "
+        "is built. "
+        "Why no GPU set loaded:\n" + reason
+    )
+
+
+class _NoGpuBinding(type(sys)):
+    """Stands in for a GPU binding with no host binding on a CPU-only
+    install. Every attribute raises BY NAME."""
+
+    def __init__(self, full, reason):
+        super().__init__(full)
+        self.__name = full.rsplit(".", 1)[-1]
+        self.__reason = reason
+
+    def __getattr__(self, item):
+        if item.startswith("__"):
+            raise AttributeError(item)
+        raise ImportError(_no_cpu_implementation(self.__name, item, self.__reason))
+
+
+# Python entries a `_HostBinding` serves beside its host binding's exports:
+# binding name -> (CPU-side module, entry names). They exist only on the CPU
+# vendor, so GPU-path Python reaches CPU-side code through the binding it
+# already holds and never imports it (ensemble.py's CTR model reader).
+_HOST_PY_ENTRIES = {
+    "_anonlib_gbdt": ("_gbdt_host", frozenset({"gbdt_ctr_model_dim", "gbdt_ctr_predict"})),
+}
+
+
+class NoCpuEntry(AttributeError):
+    """The by-name refusal of an entry a built host binding does not export.
+
+    It is an AttributeError (ImportError and AttributeError cannot both be
+    bases: their instance layouts conflict), and the package's guards catch
+    (ImportError, AttributeError), so a refusal reads as before and a PROBE
+    is not a use:
+    `getattr(b, name, None)` answers None and `hasattr` answers False, and the
+    caller takes the route its own comment names for a binary without that
+    entry (the host column's route). Until 2026-10-03 a probe of a device-only
+    entry (`rf_device_finite_scan`, `trees_device_finite_scan`,
+    `iforest_device_scan`, `ridge_resident_default`, `x_trees_dart_open`)
+    raised here and took the whole CPU fit down (refcol host smoke at
+    811275d5b); `_mamba_impl._exports` and `_transformer_impl._exports` had
+    each worked around the same trap by hand. Calling the entry still raises
+    BY NAME, so a fit with no CPU implementation is still a refusal."""
+
+
+class _HostBinding(type(sys)):
+    """Stands in for a GPU binding whose family HAS a host binding on a
+    CPU-only install. An attribute the host binding exports is served from
+    it (loaded and read back on first use); one it lacks raises BY NAME, so
+    a fit with no CPU implementation is a refusal and never a different
+    routine under the same name."""
+
+    def __init__(self, full, name, basename, reason):
+        super().__init__(full)
+        self.__name = name
+        self.__basename = basename
+        self.__reason = reason
+
+    def __getattr__(self, item):
+        if item.startswith("__"):
+            raise AttributeError(item)
+        py_entries = _HOST_PY_ENTRIES.get(self.__name)
+        if py_entries is not None and item in py_entries[1]:
+            pkg = __name__.rsplit(".", 1)[0]
+            return getattr(importlib.import_module(f"{pkg}.{py_entries[0]}"), item)
+        module = load_host_module(self.__basename)
+        fn = getattr(module, item, None)
+        if fn is None:
+            raise NoCpuEntry(
+                _no_cpu_implementation(self.__name, item, self.__reason, self.__basename)
+            )
+        return fn
+
+
+def _select_cpu_only(pkg, mode, reason):
+    """Install the CPU-only set under the canonical names: a `_HostBinding`
+    for every family whose host binding is listed in `_HOST_MODULES` and
+    built, a `_NoGpuBinding` stub for the rest. Only the stubbed names are
+    MISSING; a routed family is present on this box."""
+    global _SELECTED, _CPU_ONLY
+    for name in _MODULES:
+        full = f"{pkg.__name__}.{name}"
+        basename = _HOST_MODULES.get(name)
+        if not (basename and os.path.exists(host_module_path(basename))):
+            fallback = _HOST_INFERENCE_MODULES.get(name)
+            basename = fallback if fallback and os.path.exists(host_module_path(fallback)) else None
+        if basename:
+            module = _HostBinding(full, name, basename, reason)
+        else:
+            module = _NoGpuBinding(full, reason)
+            if name not in _MISSING:
+                _MISSING.append(name)
+        sys.modules[full] = module
+        setattr(pkg, name, module)
+    _CPU_ONLY = reason
+    _SELECTED = mode
+    return _SELECTED
+
+
+def _cpu_only_binding(name, requested):
+    """`binding()` on a CPU-only install: the module `_select_cpu_only`
+    installed under the canonical name, IDENTICAL only. A tier other than
+    identical is refused by name, because no host binding builds one."""
+    if name not in _MODULES:
+        raise ImportError(f"anonlib: {name} is not a binding this package lists")
+    if requested != "identical":
+        raise ValueError(
+            f"anonlib: {name} has no {requested!r} tier on a CPU-only install; "
+            "every host binding is IDENTICAL only. Drop numeric_mode= or pass "
+            "numeric_mode='identical'."
+        )
+    pkg = __name__.rsplit(".", 1)[0]
+    # A family served by a Python adapter over a host binding loaded by path
+    # (host_surface.ADAPTED_MODULES; the byte LM trainer's single-device
+    # entries over _anonlib_byte_lm_host, lane/cpu-training-embedding-ivf,
+    # 2026-09-15). Served only when that host binding is built; otherwise the
+    # installed stub refuses by name as before.
+    adapted = host_surface.ADAPTED_MODULES.get(name)
+    if adapted is not None and os.path.exists(host_module_path(host_surface.family(adapted["family"])["binding"])):
+        return importlib.import_module(f"{pkg}.{adapted['module']}").binding()
+    module = sys.modules.get(f"{pkg}.{name}")
+    if module is None:
+        raise ImportError(
+            f"anonlib: {name} was not installed by the CPU-only selector; "
+            "import anonlib first"
+        )
+    return module
+
+
+def _bound_amd_memory_manager():
+    """On an AMD GPU host (ROCm's /dev/kfd), bound MAX's device memory manager
+    before any DeviceContext exists. Its default reserves 90% of FREE VRAM in
+    every process (one 185 GB hipMalloc on an MI300X): each new process waits
+    seconds for the previous one's chunk to be released and cleared, and a
+    second process on the same GPU starves, fails its allocations and then
+    segfaults inside libamdhip64 (2026-10-16, amd-investigate). 1 GiB is the
+    pool tools/gemm_remote_leg.sh already qualified on AMD; a caller's own
+    setting wins (setdefault). NVIDIA keeps MAX's defaults: pool-only
+    overrides refused small CUDA allocations there."""
+    if sys.platform.startswith("linux") and os.path.exists("/dev/kfd"):
+        os.environ.setdefault("MODULAR_DEVICE_CONTEXT_MEMORY_MANAGER_SIZE", str(1 << 30))
+
+
+def select():
+    """Install the requested binary set under the canonical module names.
+    Called once from `anonlib/__init__.py` before any submodule imports a
+    binding. Idempotent."""
+    global _SELECTED
+    if _SELECTED is not None:
+        return _SELECTED
+    _bound_amd_memory_manager()
+    mode = requested_mode()
+    pkg_dir = _pkg_dir()
+    pkg = sys.modules[__name__.rsplit(".", 1)[0]]
+    # THE DIRECTORY COMES FROM tier_dir(), which folds in the vendor axis:
+    # the package directory on macOS and on a flat Linux checkout, and
+    # python/anonlib/<vendor>/ on the Linux wheel. `_layout()` raises here,
+    # at import, when the wheel layout is present and no vendor can be
+    # picked; that is the no-GPU refusal and it is deliberate. DEVIATION
+    # 2615 turns it into by-name stubs only when the CPU binding is built.
+    try:
+        ident_dir = tier_dir(mode)
+    except GpuPluginError:
+        # A GPU box without its plugin, or a mismatched plugin: never the
+        # CPU-only set (see GpuPluginError).
+        raise
+    except (ImportError, AttributeError) as exc:
+        if not host_binding_built():
+            raise
+        return _select_cpu_only(pkg, mode, str(exc))
+    if mode == "fast" and ident_dir == pkg_dir:
+        # FAST USED TO RETURN HERE, INSTALLING NOTHING, and that made it the
+        # ONLY tier that cannot survive a partial build. An upper tier gets a
+        # `_MissingUpperTier` stub for each binding that did not build, so the
+        # package imports and the estimators that need that binding raise BY
+        # NAME on use. Under fast there were no stubs, so `from . import
+        # _anonlib_trees` in extratrees.py raised at PACKAGE IMPORT and took
+        # the whole library down.
+        #
+        # Measured on a rented RTX 4090, 2026-08-29: a leg that deliberately
+        # built four of the ten bindings got tables from the identical arm
+        # -- three lanes REFUSED by name, the rest measured --
+        # and from the fast arm got a traceback ending "cannot import name
+        # '_anonlib_trees' ... (most likely due to a circular import)",
+        # which names the wrong cause and loses every lane that would have
+        # worked. Same partial build, two entirely different outcomes,
+        # decided by which tier was asked for.
+        #
+        # Present bindings are left to normal import: this installs a stub for
+        # a MISSING one and touches nothing else. The vendor of the present
+        # ones is read back lazily by `vendor()`, because on this layout the
+        # binaries are imported by the estimator modules, not here.
+        for name in _MODULES:
+            full = f"{pkg.__name__}.{name}"
+            if not _offers(name, "fast"):
+                # BEFORE the on-disk check, on purpose. A fast `.so` of an
+                # identical-only lane is never a legitimate artifact, only a
+                # stale one (the lane's build script exits 2 on this tier),
+                # and until DEVIATION 2490 a stale file here was imported
+                # under the canonical name and ANSWERED. The stub wins over
+                # whatever sits on disk.
+                if full in sys.modules and not isinstance(sys.modules[full], _IdenticalOnlyTier):
+                    del sys.modules[full]
+                module = _IdenticalOnlyTier(full, name, "fast")
+                sys.modules[full] = module
+                setattr(pkg, name, module)
+                _MISSING.append(name)
+                continue
+            if os.path.exists(os.path.join(pkg_dir, name + ".so")):
+                continue
+            if full in sys.modules:
+                continue
+            module = _MissingUpperTier(
+                full, os.path.join(pkg_dir, name + ".so"),
+                _build_script(name), "fast",
+            )
+            sys.modules[full] = module
+            setattr(pkg, name, module)
+            _MISSING.append(name)
+        _SELECTED = "fast"
+        return _SELECTED
+    # Every tier above fast, AND fast on the Linux wheel layout, where the
+    # binaries sit under python/anonlib/<vendor>/ and a plain
+    # `from . import _anonlib_x` would not find them. Explicit load,
+    # installed under the canonical names.
+    missing = []
+    for name in _MODULES:
+        full = f"{pkg.__name__}.{name}"
+        if not _offers(name, mode):
+            module = _IdenticalOnlyTier(full, name, mode)
+            sys.modules[full] = module
+            setattr(pkg, name, module)
+            continue
+        path = os.path.join(ident_dir, name + ".so")
+        if not os.path.exists(path):
+            # NEVER fall back to the FAST binary under an upper-tier name,
+            # and NEVER fall back to the OTHER VENDOR'S binary under this
+            # one's: a wrong-mode or wrong-vendor module that imports is a
+            # mislabelled measurement. Install a stub that raises BY NAME on
+            # use, so the estimators that need this binding fail loudly and
+            # the rest of the package (the tree families on an AMD box whose
+            # linalg binding did not build, E2 round 2) keeps working.
+            missing.append(name)
+            module = _MissingUpperTier(full, path, _build_script(name), mode)
+        else:
+            loader = importlib.machinery.ExtensionFileLoader(full, path)
+            spec = importlib.util.spec_from_loader(full, loader, origin=path)
+            module = importlib.util.module_from_spec(spec)
+            _exec_binding(loader, module)
+            # WHAT THE BINARY SAYS BEATS THE DIRECTORY IT SAT IN. Raises on
+            # a vendor mismatch; see the module docstring.
+            _check_vendor(module, name, path)
+        sys.modules[full] = module
+        setattr(pkg, name, module)
+    if len(missing) == len(_MODULES):
+        refusal = (
+            f"anonlib: ANONLIB_NUMERIC_MODE={mode} but no {mode} "
+            f"binary exists under {ident_dir}. Build them with\n    "
+            f"ANONLIB_NUMERIC_MODE={mode} bash bindings/build*.sh"
+        )
+        if _BASELINE_SELECTION is not None:
+            raise GpuPluginError(refusal + "; the PTX set never falls back to the CPU")
+        if host_binding_built():
+            return _select_cpu_only(pkg, mode, refusal)
+        raise ImportError(refusal)
+    _SELECTED = mode
+    _MISSING.extend(missing)
+    return _SELECTED
+
+
+
+# ===================================================================
+# THE MODE AS A PARAMETER, NOT AN ENVIRONMENT VARIABLE
+# ===================================================================
+# `select()` above is the ORIGINAL mechanism and it is process-wide: it reads
+# an environment variable ONCE, before the first estimator is imported, and
+# rebinds `sys.modules` so every caller in the process gets one tier. That is
+# a global, set outside the program, that cannot be changed afterwards and
+# cannot differ between two estimators in one script.
+#
+# `load_set` is the mechanism underneath the parameter form. It loads a WHOLE
+# TIER side by side with the others, under private dotted names, and hands
+# back a namespace. It does not touch `sys.modules` under the canonical names
+# and does not disturb whatever `select()` installed.
+#
+# **THAT THE SETS CAN COEXIST IS MEASURED, NOT ASSUMED** (2026-08-29). Each
+# `.so` carries its own Mojo runtime and opens its own device context, so
+# "they will conflict" was the live risk and the reason the parameter form was
+# not attempted earlier. The sets were loaded into one process, then called
+# INTERLEAVED -- fast, identical, fast -- twice over, on one
+# 256x4096 @ 4096x128 product on an Apple M4. Each returned its own
+# arithmetic every time (identical differing from fast, which is the pinned
+# profile), and a call after the
+# identical set did not inherit its answer.
+#
+# THE PyInit SYMBOL IS WHY THE NAMES ARE DOTTED. CPython derives the init
+# symbol it looks for from the LAST dotted component of the module name, so a
+# flat name like `probe_fast__anonlib_linalg` makes the loader hunt for
+# `PyInit_probe_fast__anonlib_linalg` and fail. The tail must stay the real
+# module name; the prefix does the disambiguating.
+
+_SETS = {}
+
+
+class _ModeSet:
+    """One tier's binaries, loaded together and addressed by attribute.
+
+    `getattr` raises BY NAME for a binding this tier has not built, rather
+    than falling back to another tier's -- the same rule `select()` follows,
+    and for the same reason: a wrong-mode module that imports cleanly is a
+    mislabelled measurement.
+    """
+
+    def __init__(self, mode, modules, missing, deferred=None):
+        self.mode = mode
+        self._modules = modules
+        self.missing = missing
+        self._deferred = dict(deferred or {})
+
+    def __getattr__(self, name):
+        if name.startswith("__"):
+            raise AttributeError(name)
+        try:
+            return self._modules[name]
+        except KeyError:
+            pass
+        path = self._deferred.pop(name, None)
+        if path is not None:
+            self._modules[name] = _load_member(self.mode, name, path)
+            return self._modules[name]
+        if not _offers(name, self.mode):
+            raise ImportError(
+                f"anonlib: {name} has no {self.mode!r} tier. "
+                f"{_identical_only_reason(name)} See _IDENTICAL_ONLY."
+            )
+        if name in self.missing:
+            raise ImportError(
+                f"anonlib: numeric_mode={self.mode!r} needs "
+                f"python/anonlib/{'' if self.mode == 'fast' else self.mode + '/'}"
+                f"{name}.so, which is not built. Build it with\n    "
+                f"{'' if self.mode == 'fast' else 'ANONLIB_NUMERIC_MODE=' + self.mode + ' '}"
+                f"bash bindings/{_build_script(name)}"
+            )
+        raise AttributeError(name)
+
+    def __repr__(self):
+        return f"<anonlib binaries: {self.mode}>"
+
+
+#: Bindings that register Mojo-owned Python types (`add_type`). Mojo keys a
+#: registered type by its type id, which two tiers of one binding share, so
+#: a process that initializes BOTH tiers of one of these aborts inside
+#: PyInit ("Error building multiple Python type objects bound to Mojo
+#: type"). `load_set` therefore loads them only when asked for (lane neural,
+#: 2026-09-27: a FAST process's buffer helpers load the IDENTICAL set, which
+#: used to initialize IDENTICAL `_anonlib_mamba` beside the FAST one and
+#: abort), and `_load_member` refuses a second tier by name instead.
+_TYPE_REGISTERING = frozenset({
+    "_anonlib_mamba", "_anonlib_transformer", "_anonlib_byte_lm",
+})
+
+
+def _load_member(mode, name, path):
+    """One binding of one tier, under `anonlib._sets.<mode>.<name>`."""
+    full = f"anonlib._sets.{mode}.{name}"
+    existing = sys.modules.get(full)
+    if existing is not None:
+        return existing
+    # select() may already have initialized this exact binary under its
+    # canonical name. Reinitializing it under _sets registers Mojo-owned
+    # Python types twice and aborts. Share only the same resolved file;
+    # other tiers/vendors retain their separate loading and validation.
+    canonical = sys.modules.get(f"anonlib.{name}")
+    canonical_path = vars(canonical).get('__file__') if canonical is not None else None
+    if canonical_path and os.path.realpath(canonical_path) == os.path.realpath(path):
+        _check_vendor(canonical, name, path)
+        sys.modules[full] = canonical
+        return canonical
+    if name in _TYPE_REGISTERING:
+        others = [m for m in _MODE_CODE if m != mode and f"anonlib._sets.{m}.{name}" in sys.modules]
+        if canonical_path or others:
+            raise ImportError(
+                f"anonlib: {name} registers Mojo-owned Python types, so one "
+                f"process can hold only one tier of it, and another tier is "
+                f"already loaded ({canonical_path or others[0]}). Use one "
+                f"numeric_mode per process for this binding."
+            )
+    loader = importlib.machinery.ExtensionFileLoader(full, path)
+    spec = importlib.util.spec_from_loader(full, loader, origin=path)
+    module = importlib.util.module_from_spec(spec)
+    _exec_binding(loader, module)
+    # WHAT THE BINARY SAYS BEATS THE DIRECTORY IT SAT IN.
+    _check_vendor(module, name, path)
+    sys.modules[full] = module
+    return module
+
+
+_HOST_HELPER = threading.local()
+
+
+@contextlib.contextmanager
+def host_helper_scope():
+    """For `_buffer._native` alone. The host-side byte helpers (cast,
+    transpose, finiteness) live in the IDENTICAL base binary in every tier and
+    launch no kernel, so resolving them is not an IDENTICAL request. Kept as
+    the marker of such a load; no tier refuses it (the PTX set serves every
+    tier since 2026-10-10)."""
+    previous = getattr(_HOST_HELPER, "active", False)
+    _HOST_HELPER.active = True
+    try:
+        yield
+    finally:
+        _HOST_HELPER.active = previous
+
+
+def load_set(mode):
+    """Load (and cache) every binding for one tier, side by side with the
+    others. The mechanism behind a per-call `numeric_mode=`."""
+    mode = (default_mode() if mode is None else mode).strip().lower()
+    if mode not in _MODE_CODE:
+        raise ValueError(
+            f"anonlib: numeric_mode={mode!r}; it must be 'fast', "
+            "or 'identical' (the default)"
+        )
+    if mode in _SETS:
+        return _SETS[mode]
+    # The vendor axis is folded in by tier_dir(): the same `<vendor>/` root
+    # `select()` used, so a per-call `numeric_mode=` can never reach across
+    # to the other vendor's set.
+    tier_dir_ = tier_dir(mode)
+    modules, missing, deferred = {}, [], {}
+    for name in _MODULES:
+        # An identical-only lane is not "not built yet" in the lower tiers, it
+        # is not offered there. Skipping it keeps `missing` meaning what the
+        # _ModeSet error message says it means.
+        if not _offers(name, mode):
+            continue
+        path = os.path.join(tier_dir_, name + ".so")
+        if not os.path.exists(path):
+            missing.append(name)
+            continue
+        if name in _TYPE_REGISTERING:
+            deferred[name] = path
+            continue
+        modules[name] = _load_member(mode, name, path)
+    if not modules and not deferred:
+        raise ImportError(
+            f"anonlib: numeric_mode={mode!r} but no binary for that tier "
+            f"exists under {tier_dir_}. Build them with\n    "
+            f"{'' if mode == 'fast' else 'ANONLIB_NUMERIC_MODE=' + mode + ' '}"
+            "bash bindings/build*.sh"
+        )
+    # READ THE TIER BACK OUT OF THE BINARY, never trust the directory. A .so
+    # in the wrong folder is the one failure this whole file exists to catch,
+    # and it is cheaper to catch here than in a results table.
+    gb = modules.get("_anonlib_gbdt")
+    if gb is not None and hasattr(gb, "gbdt_numeric_mode"):
+        compiled = _CODE_MODE.get(gb.gbdt_numeric_mode(), "unknown")
+        if compiled != mode:
+            raise RuntimeError(
+                f"anonlib: {tier_dir_}/_anonlib_gbdt.so was compiled "
+                f"{compiled} but sits in the {mode} directory; rebuild it"
+            )
+    _SETS[mode] = _ModeSet(mode, modules, missing, deferred)
+    return _SETS[mode]
+
+
+#: The tier used when a call names none. Starts at whatever the environment
+#: selected, so existing scripts are unaffected, and is settable IN CODE.
+_DEFAULT_MODE = None
+
+
+def default_mode():
+    global _DEFAULT_MODE
+    if _DEFAULT_MODE is None:
+        _DEFAULT_MODE = _SELECTED or requested_mode()
+    return _DEFAULT_MODE
+
+
+# Choose the tier IN CODE, at runtime. Returns the previous value.
+#
+# Loading is eager and deliberate: a name that cannot be honoured must fail
+# HERE, at the line that asked for it, not at some later fit that would
+# otherwise silently run on the tier it was already holding.
+def set_default_mode(mode):
+    """Set the process-wide default numeric mode.
+
+    Estimators created without an explicit ``numeric_mode=`` use this mode.
+    The starting default is the ``ANONLIB_NUMERIC_MODE`` environment
+    variable, or ``"identical"`` when it is unset. The mode's binaries are
+    loaded immediately, so a mode that cannot be used fails here rather than at
+    a later fit.
+
+    - ``"identical"`` (default): in ``identical`` mode, anonlib returns the same bits on Apple, NVIDIA and AMD GPUs.
+    - ``"fast"``: the fastest arithmetic, available on Apple GPUs only; no
+      bitwise promise.
+
+    Using a family under a mode it does not ship raises ImportError.
+
+    Parameters
+    ----------
+    mode : {"identical", "fast"} or None
+        The new default; None keeps the current one. ``'fast'`` is available on
+        Apple GPUs only.
+
+    Returns
+    -------
+    str
+        The previous default.
+
+    Examples
+    --------
+    >>> import anonlib
+    >>> previous = anonlib.set_numeric_mode("identical")
+    """
+    global _DEFAULT_MODE
+    mode = (default_mode() if mode is None else mode).strip().lower()
+    load_set(mode)
+    prev = default_mode()
+    _DEFAULT_MODE = mode
+    return prev
+
+
+def binding(name, mode=None):
+    """Resolve a binding and reject a readable compiled-mode mismatch at call time."""
+    requested = default_mode() if mode is None else mode
+    if not isinstance(requested, str) or requested.strip().lower() not in _MODE_CODE:
+        raise ValueError("numeric_mode must be fast, identical or None")
+    requested = requested.strip().lower()
+    if not _offers(name, requested):
+        raise ValueError(
+            f"anonlib: {name} has no {requested!r} tier. "
+            f"{_identical_only_reason(name)} "
+            "Drop numeric_mode= (identical is the default) or pass "
+            "numeric_mode='identical'."
+        )
+    # A CPU-ONLY INSTALL NEVER REACHES load_set: there is no tier directory
+    # to open, and `_layout()` would raise the no-GPU refusal again. The
+    # module the selector installed (a host binding proxy, or a stub that
+    # refuses by name) is the answer, and it is IDENTICAL only.
+    if _CPU_ONLY is not None:
+        return _cpu_only_binding(name, requested)
+    selected = load_set(requested)
+    module = getattr(selected, name)
+    # A correctly built GBDT sibling does not establish RF/ET (or any other
+    # extension) mode. Check the actual called module, including cached sets.
+    getter_name = _vendor_fn(name).removesuffix("_vendor") + "_numeric_mode"
+    getter = getattr(module, getter_name, None)
+    if getter is not None:
+        compiled = _CODE_MODE.get(getter(), "unknown")
+        if compiled != selected.mode:
+            raise RuntimeError(
+                f"anonlib: {name} was compiled for {compiled}, but this call "
+                f"requested {selected.mode}; rebuild the {selected.mode} binding"
+            )
+    return module
+
+
+_MISSING = []
+
+
+class _MissingUpperTier(type(sys)):
+    """Stands in for an identical binary that is not built.
+    Importing it succeeds (the package imports every binding at load);
+    touching any attribute raises with the build command FOR THE TIER THAT
+    WAS ASKED FOR -- it used to say "identical" whatever you asked for, which
+    hands the operator a command that builds the wrong binary."""
+
+    def __init__(self, full, path, script, mode):
+        super().__init__(full)
+        self.__missing_path = path
+        self.__script = script
+        self.__mode = mode
+
+    def __getattr__(self, item):
+        if item.startswith("__"):
+            raise AttributeError(item)
+        raise ImportError(
+            f"anonlib: ANONLIB_NUMERIC_MODE={self.__mode} but "
+            f"{self.__missing_path} is not built; build it with\n    "
+            f"ANONLIB_NUMERIC_MODE={self.__mode} bash "
+            f"bindings/{self.__script}"
+        )
+
+
+class _IdenticalOnlyTier(type(sys)):
+    """Stands in for a neural binding under a tier that lane does not offer.
+
+    Distinct from `_MissingUpperTier` on purpose. That one means "build it";
+    this one means "there is nothing to build", and handing an operator
+    `ANONLIB_NUMERIC_MODE=fast bash bindings/build_mamba.sh` would send them
+    at a script that now exits 2. See `_IDENTICAL_ONLY`."""
+
+    def __init__(self, full, name, mode):
+        super().__init__(full)
+        self.__name = name
+        self.__mode = mode
+
+    def __getattr__(self, item):
+        if item.startswith("__"):
+            raise AttributeError(item)
+        raise ImportError(
+            f"anonlib: {self.__name} has no {self.__mode!r} tier. The neural "
+            "lanes (transformer, mamba, training, byte LM) build IDENTICAL "
+            "only: their fused kernels are gated on the identical contract, so "
+            "the lower tiers ran the unfused path and were SLOWER than the "
+            "default. Run with ANONLIB_NUMERIC_MODE=identical (the default) "
+            "or pass numeric_mode='identical'."
+        )
+
+
+def _build_script(name):
+    # `.get` with a derived fallback, not `[name]`. A KeyError here would
+    # fire from inside the MISSING-binary path, replacing a clear "build it
+    # with this command" message with a traceback about a dict, at exactly
+    # the moment the caller most needs to be told what to run.
+    return {
+        "_anonlib": "build.sh",
+        "_anonlib_estimators": "build_estimators.sh",
+        "_anonlib_gbdt": "build_gbdt.sh",
+        "_anonlib_rf": "build_rf.sh",
+        "_anonlib_trees": "build_trees.sh",
+        "_anonlib_svm": "build_svm.sh",
+        "_anonlib_solver": "build_solver.sh",
+        "_anonlib_metrics": "build_metrics.sh",
+        "_anonlib_preprocessing": "build_preprocessing.sh",
+        "_anonlib_tsa": "build_tsa.sh",
+        "_anonlib_linalg": "build_linalg.sh",
+        "_anonlib_arima": "build_arima.sh",
+        "_anonlib_training": "build_training.sh",
+        "_anonlib_byte_lm": "build_byte_lm.sh",
+        "_anonlib_gp": "build_gp.sh",
+        "_anonlib_mamba": "build_mamba.sh",
+        "_anonlib_transformer": "build_transformer.sh",
+        "_anonlib_kernel_methods": "build_kernel_methods.sh",
+        "_anonlib_mixture": "build_mixture.sh",
+        "_anonlib_hdbscan": "build_hdbscan.sh",
+        "_anonlib_resample": "build_resample.sh",
+        "_anonlib_ivf": "build_ivf.sh",
+        "_anonlib_embedding": "build_embedding.sh",
+    }.get(name, "build" + name[len("_anonlib"):] + ".sh")
+
+
+# 'fast' or 'identical' -- what this process LOADED,
+# cross-checked against the gbdt binary's own compile-time answer when it
+# exposes one.
+#
+# IT REPORTS THE CURRENT DEFAULT, NOT THE IMPORT-TIME ONE. It returned
+# `_SELECTED` -- what `select()` loaded before the first estimator existed
+# -- until 2026-08-29, which meant that after
+#
+#     anonlib.set_numeric_mode("identical")
+#
+# this function still answered "fast" while every estimator built after
+# that line ran identical. A function whose whole purpose is that "a
+# run cannot be mislabeled by accident" was the one thing mislabeling it.
+# `numeric_mode_used()` on an estimator instance was already right, so the
+# two disagreed. Found by running the pair, not by reading them.
+def numeric_mode():
+    """The current default numeric mode of this process.
+
+    Returns
+    -------
+    {"identical", "fast"}
+        The mode estimators use when they are not given ``numeric_mode=``
+        (see :func:`anonlib.set_numeric_mode`). Where the loaded binaries
+        report their compiled mode, it is checked against this answer.
+
+    Raises
+    ------
+    RuntimeError
+        If a loaded binary was compiled for a different mode than the one
+        selected (a broken install).
+
+    Examples
+    --------
+    >>> import anonlib
+    >>> anonlib.numeric_mode()
+    'identical'
+    """
+    loaded = default_mode()
+    pkg = sys.modules[__name__.rsplit(".", 1)[0]]
+    # The cross-check has to read the binary of the tier being REPORTED. The
+    # package attributes hold whatever `select()` bound at import, so once the
+    # default has moved they belong to a different tier and comparing against
+    # them would raise the "binary is in the wrong directory" error below on a
+    # perfectly healthy install.
+    if loaded == (_SELECTED or "fast"):
+        gb = getattr(pkg, "_anonlib_gbdt", None)
+    else:
+        try:
+            gb = getattr(load_set(loaded), "_anonlib_gbdt", None)
+        except Exception:
+            gb = None
+    # `hasattr` ON A STUB RAISES, IT DOES NOT RETURN FALSE. A missing binding
+    # is represented by `_MissingUpperTier`, whose `__getattr__` raises
+    # ImportError BY NAME -- and `hasattr` only swallows AttributeError, so
+    # probing a stub propagates. Before this guard, asking a package with any
+    # unbuilt binding for its own mode raised, which took down every caller
+    # including `repeat_run_stability.py` on a leg that had deliberately built
+    # a subset (2026-08-29, AMD MI325X: "ANONLIB_NUMERIC_MODE=identical but
+    # ..._anonlib_gbdt.so is not built" out of a function whose entire job is
+    # to REPORT the mode).
+    #
+    # The stub is right to raise on use; the read-back is wrong to treat a
+    # probe as use. An absent gbdt binary means the cross-check cannot run,
+    # which is not the same as the cross-check failing.
+    try:
+        readable = gb is not None and hasattr(gb, "gbdt_numeric_mode")
+    except (ImportError, AttributeError):
+        readable = False
+    if readable:
+        compiled = _CODE_MODE.get(gb.gbdt_numeric_mode(), "unknown")
+        if compiled != loaded:
+            raise RuntimeError(
+                f"anonlib: the loaded gbdt binary was compiled {compiled} "
+                f"but the selector loaded the {loaded} set -- a binary is in "
+                "the wrong directory; rebuild both sets"
+            )
+    return loaded
+
+
+# 'metal', 'cuda' or 'hip': the accelerator API of the binaries this
+# process runs, READ BACK FROM THE BINARIES of the current default tier.
+#
+# Same shape as `numeric_mode()`: the selector's choice is only reported
+# after the loaded set has been asked and agrees. On the flat layout
+# (macOS, or a Linux source checkout) the selector made no choice and the
+# binaries are the only source; on the Linux wheel layout the directory
+# was chosen by `_layout()` and every binary in it was checked against
+# that directory when it loaded, so this cannot disagree with the
+# directory without having already raised.
+#
+# Returns None only for binaries built before the read-back existed
+# (before 2026-08-29), and says so in `vendor_how()` rather than
+# inventing a name from the platform.
+def vendor():
+    """The GPU programming interface of the binaries this process runs.
+
+    The answer is read back from the loaded binaries.
+
+    Returns
+    -------
+    {"metal", "cuda", "hip", "cpu"} or None
+        ``"metal"`` for Apple GPUs, ``"cuda"`` for NVIDIA, ``"hip"`` for AMD,
+        ``"cpu"`` on a CPU-only install. None only for binaries too old to
+        report it.
+
+    Raises
+    ------
+    RuntimeError
+        If the loaded binaries disagree with the vendor directory they were
+        loaded from (a broken install).
+
+    Examples
+    --------
+    >>> import anonlib
+    >>> anonlib.vendor() in ("metal", "cuda", "hip", "cpu")
+    True
+    """
+    global _VENDOR_SELECTED
+    if _CPU_ONLY is not None:
+        return "cpu"
+    kind, base = _layout()
+    loaded = default_mode()
+    try:
+        s = load_set(loaded)
+    except Exception:
+        s = None
+    said = None
+    if s is not None:
+        for name in _MODULES:
+            if name in s.missing:
+                continue
+            try:
+                said = read_vendor(getattr(s, name))
+            except (ImportError, AttributeError):
+                continue
+            if said is not None:
+                break
+    if kind == "vendor":
+        expected = _VENDOR_SELECTED
+        if said is not None and said != expected:
+            raise RuntimeError(
+                f"anonlib: the loaded {loaded} binaries were compiled for "
+                f"{said} but the selector opened the {expected} set -- a "
+                "binary is in the wrong vendor directory; rebuild both sets"
+            )
+        return expected
+    if said is not None:
+        _VENDOR_SELECTED = said
+    return _VENDOR_SELECTED
+
+
+def vendor_how():
+    """How the vendor was decided, for `python -m anonlib verify` and
+    `anonlib doctor`: 'flat layout; read from the loaded binaries',
+    'ANONLIB_VENDOR in the environment', or 'the box probe (device nodes
+    and driver libraries)'."""
+    if _CPU_ONLY is not None:
+        return (
+            "no GPU binary set loaded; the CPU bindings under anonlib/host/ "
+            f"only (DEVIATION 2615; built: {', '.join(host_families_built()) or 'none'})"
+        )
+    _layout()
+    return _VENDOR_HOW

@@ -1,0 +1,295 @@
+#!/usr/bin/env bash
+# File-only staging-plumbing fixtures for three release workflow shell blocks.
+# Root runs this test; no package/native or numerical qualification occurs.
+#
+#   bash packaging/release_workflow_test.sh
+#
+# WHY THIS EXISTS. `.github/workflows/release-provenance.yml` decides what
+# reaches PyPI, and until 0.3.0 every line of that decision was written unrun:
+# the only way to exercise it was to dispatch a release. Two bugs were found
+# by running it here, before it ever ran in CI, and one of them would have
+# broken EVERY macOS-only release:
+#
+#   * `${{ env.ANONLIB_LINUX_WHEEL_DIR }}` cannot see a variable set in the
+#     self-hosted runner's own environment; the override silently did nothing.
+#   * under `set -o pipefail`, `ls *.whl | grep -v -- '-macosx_'` exits 1 when
+#     there is no Linux wheel, which is the normal case. The Digest step would
+#     have died on a macOS-only release.
+#
+# WHAT IT RUNS. Not a retyped copy. It parses the YAML and extracts the
+# `run:` bodies of the `linux` (admit), `digest` and "What is about to be
+# published" steps VERBATIM, then drives them against fabricated wheels in a
+# temp directory. Nothing is compiled, downloaded, published or rented, and
+# the real `python/dist/` is never touched.
+# The installed-qualification verifier is an EXPLICIT TEST DOUBLE in each
+# temporary workspace. It checks its argv and records invocation; the real
+# verifier and stable workflow remain unchanged. These fake wheels cannot
+# establish installed compatibility or numerical proof.
+#
+# THE RULE THIS FILE LEARNED THE HARD WAY, twice. A refusal case that stops
+# refusing must FAIL, not disappear: `run_admit "$B" || ok "..."` scores
+# nothing at all when the check is removed, and the suite quietly went from
+# nine cases to eight while still printing FAIL=0. And a non-zero exit is NOT
+# proof the intended check fired: with the one-wheel check deleted the script
+# still failed, downstream, on a `basename` of two lines. Every refusal case
+# therefore asserts BOTH that the block refused AND that it named its own
+# reason. All nine sabotages below are caught; verified 2026-08-30.
+#
+#   drop the one-wheel check            drop the sidecar-exists check
+#   drop the version check              drop the sidecar-digest check
+#   drop the manylinux-tag check        restore the pipefail bug
+#   drop count-equals-manifest          drop `sha256sum -c`
+#   drop the macOS digest check
+set -uo pipefail
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+WF="$REPO/.github/workflows/release-provenance.yml"
+SP="$(mktemp -d)"; trap 'rm -rf "$SP"' EXIT
+python3 - "$WF" "$SP" <<'EXTRACT'
+import sys, yaml, pathlib
+wf, out = sys.argv[1], pathlib.Path(sys.argv[2])
+d = yaml.safe_load(open(wf))
+b = d["jobs"]["build"]["steps"]
+(out / "admit.sh").write_text([s for s in b if s.get("id") == "linux"][0]["run"])
+(out / "digest.sh").write_text([s for s in b if s.get("id") == "digest"][0]["run"])
+(out / "publish.sh").write_text(
+    [s for s in d["jobs"]["publish"]["steps"]
+     if s.get("name", "").startswith("What is about")][0]["run"])
+EXTRACT
+[ -s "$SP/admit.sh" ] && [ -s "$SP/digest.sh" ] && [ -s "$SP/publish.sh" ] || {
+  echo "could not extract the three run blocks from $WF"; exit 2; }
+PASS=0; FAIL=0
+ok(){ echo "  PASS  $1"; PASS=$((PASS+1)); }
+no(){ echo "  FAIL  $1  ($2)"; FAIL=$((FAIL+1)); }
+
+mkbox(){ # $1=version ; builds a fake workspace (a git checkout, as the job's is), echoes its path
+  local V="$1" B; B="$(mktemp -d "$SP/box.XXXXXX")"
+  mkdir -p "$B/python/dist" "$B/python/anonlib" "$B/stage/qualification" "$B/tools" "$B/tmp"
+  cp "$REPO/tools/gpu_release_projects.py" "$B/tools/"
+  cp "$REPO/python/anonlib/gpu_plugins.py" "$B/python/anonlib/"
+  printf 'version = "%s"\n' "$V" > "$B/python/pyproject.toml"
+  : > "$B/python/dist/anonlib-$V-py3-none-macosx_11_0_arm64.whl"
+  echo "macos body $V" > "$B/python/dist/anonlib-$V-py3-none-macosx_11_0_arm64.whl"
+  cat > "$B/tools/check_linux_release_qualification.py" <<'VERIFIER_STUB'
+"""TEST DOUBLE ONLY: staging invocation, not installed/numerical qualification."""
+import argparse
+import json
+from pathlib import Path
+parser = argparse.ArgumentParser()
+parser.add_argument('wheel', type=Path, nargs='+')
+parser.add_argument('--qualification-root', required=True, type=Path)
+parser.add_argument('--source-root', required=True, type=Path)
+parser.add_argument('--profile', required=True, choices=['release-linux3', 'release-split'])
+args = parser.parse_args()
+root = Path.cwd().resolve()
+# the job runs the checker from a `git archive HEAD` copy of the checkout
+if (not (args.source_root / 'tools/check_linux_release_qualification.py').is_file()
+        or args.qualification_root.resolve() != root / 'stage/qualification'
+        or any(w.parent.resolve() != root / 'stage' or not w.is_file() for w in args.wheel)
+        or (len(args.wheel) > 1) != (args.profile == 'release-split')):
+    raise SystemExit('TEST VERIFIER: incorrect qualification invocation')
+with (root / 'verifier-invocation.json').open('x') as stream:
+    json.dump(dict(wheel=[str(w) for w in args.wheel], profile=args.profile,
+                   qualification_root=str(args.qualification_root),
+                   source_root=str(args.source_root), scope='test-double staging only'), stream)
+if (root / 'refuse-qualification').exists():
+    raise SystemExit('TEST VERIFIER: qualification refused')
+VERIFIER_STUB
+  printf 'CORPUS_CASES = ()\n' > "$B/tools/verify_linux_surface_qualification.py"
+  cat > "$B/tools/wheel_api_audit.py" <<'SPLIT_STUB'
+"""TEST DOUBLE ONLY: the split audit's verdict is read from a marker file."""
+from pathlib import Path
+def split_audit(wheels):
+    names = sorted(Path(w).name for w in wheels)
+    (Path.cwd() / 'split-audit-invocation.txt').write_text('\n'.join(names) + '\n')
+    refused = Path.cwd() / 'refuse-split'
+    return dict(wheels=names, problems=['TEST SPLIT AUDIT: refused'] if refused.exists() else [])
+SPLIT_STUB
+  ( cd "$B" && git init -q && git add -A && git -c user.email=t@t -c user.name=t commit -qm fixture )
+  echo "$B"
+}
+stage(){ # $1=box $2=filename [$3=BAD to corrupt the sidecar]
+  local B="$1" N="$2"
+  stage_payloads "$B"
+  stage_zip "$B" "$N" 1
+  rm -f "$B/stage/$N.sha256"
+  if [ "${3:-}" = BAD ]; then echo "0000000000000000000000000000000000000000000000000000000000000000  $N" > "$B/stage/$N.sha256"
+  elif [ "${3:-}" = NOSIDE ]; then :
+  else shasum -a 256 "$B/stage/$N" | sed "s#$B/stage/##" > "$B/stage/$N.sha256"; fi
+}
+stage_zip(){ # $1=box $2=filename [$3=split marker: 1] ; a real zip, as the split detection reads it
+  python3 - "$1/stage/$2" "${3:-0}" <<'ZIP'
+import sys, zipfile, json, importlib.util
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("fixture_registry", Path(sys.argv[1]).parents[1] / "python/anonlib/gpu_plugins.py")
+gp = importlib.util.module_from_spec(spec); spec.loader.exec_module(gp)
+path, marker = sys.argv[1], sys.argv[2] == '1'
+name = path.rsplit('/', 1)[-1]
+with zipfile.ZipFile(path, 'w') as z:
+    z.writestr(name.split('-')[0] + '-' + name.split('-')[1] + '.dist-info/METADATA',
+               'Metadata-Version: 2.4\nName: ' + name.split('-')[0].replace('_', '-') +
+               '\nVersion: ' + name.split('-')[1] + '\n')
+    if marker:
+        z.writestr(name.split('-')[0] + '-' + name.split('-')[1] + '.dist-info/gpu_plugins.json', json.dumps(gp.core_marker(name.split('-')[1])))
+ZIP
+  ( cd "$1/stage" && shasum -a 256 "$2" > "$2.sha256" ); }
+stage_payloads(){
+  local profile
+  for profile in nvidia amd nvidia_ptx; do
+    stage_zip "$1" "anonlib_${profile}-0.3.0-py3-none-manylinux_2_35_x86_64.whl"
+  done
+}
+stage_complete(){
+  stage_zip "$1" "anonlib-0.3.0-py3-none-manylinux_2_35_x86_64.whl" 1
+  stage_payloads "$1"
+}
+run_admit(){ ( cd "$1" && ANONLIB_LINUX_WHEEL_DIR="$1/stage" GITHUB_WORKSPACE="$1" GITHUB_OUTPUT="$1/gho.txt" RUNNER_TEMP="$1/tmp" bash "$SP/admit.sh" ) >"$1/admit.out" 2>&1; }
+run_digest(){ ( cd "$1" && GITHUB_OUTPUT="$1/gho2.txt" bash "$SP/digest.sh" ) >"$1/digest.out" 2>&1; }
+
+echo "== admit =="
+B=$(mkbox 0.3.0); stage "$B" "anonlib-0.3.0-py3-none-manylinux_2_28_x86_64.whl"
+run_admit "$B" && [ -f "$B/python/dist/anonlib-0.3.0-py3-none-manylinux_2_28_x86_64.whl" ] \
+  && [ -s "$B/verifier-invocation.json" ] \
+  && ok "a good staged wheel is admitted" || no "a good staged wheel is admitted" "rc/copy"
+
+B=$(mkbox 0.3.0)   # empty stage dir
+run_admit "$B" && grep -q 'staged=none' "$B/gho.txt" \
+  && ok "no stage dir is a macOS-only release, not a failure" || no "empty stage" "$(tail -1 "$B/admit.out")"
+
+B=$(mkbox 0.3.0); stage "$B" "anonlib-0.3.0-py3-none-manylinux_2_28_x86_64.whl" BAD
+refuses(){ # $1=box $2=name $3=required error substring
+  if run_admit "$1"; then no "$2" "IT WAS ADMITTED"
+  elif ! grep -qF "$3" "$1/admit.out"; then no "$2" "refused, but not for this reason: $(grep -m1 '::error::' "$1/admit.out")"
+  else ok "$2"; fi; }
+refuses "$B" "a wheel whose digest does not match its sidecar is REFUSED" "sidecar says"
+
+B=$(mkbox 0.3.0); stage "$B" "anonlib-0.3.0-py3-none-manylinux_2_28_x86_64.whl" NOSIDE
+refuses "$B" "a wheel with no sidecar is REFUSED" "has no .sha256 sidecar"
+
+B=$(mkbox 0.3.0); stage "$B" "anonlib-0.2.0-py3-none-manylinux_2_28_x86_64.whl"
+refuses "$B" "a wheel of the WRONG VERSION is REFUSED" "expected version"
+
+B=$(mkbox 0.3.0); stage "$B" "anonlib-0.3.0-py3-none-linux_x86_64.whl"
+refuses "$B" "an UNAUDITED linux_x86_64 tag is REFUSED" "carries no manylinux tag"
+
+B=$(mkbox 0.3.0); stage "$B" "anonlib-0.3.0-py3-none-manylinux_2_28_x86_64.whl"; stage "$B" "anonlib-0.3.0-py3-none-manylinux_2_34_x86_64.whl"
+refuses "$B" "TWO staged wheels is REFUSED rather than guessed" "complete Linux release"
+
+B=$(mkbox 0.3.0); stage "$B" "anonlib-0.3.0-py3-none-manylinux_2_28_x86_64.whl"
+: > "$B/refuse-qualification"
+refuses "$B" "qualification-verifier refusal propagates" "TEST VERIFIER: qualification refused"
+[ -s "$B/verifier-invocation.json" ] \
+  && [ ! -e "$B/python/dist/anonlib-0.3.0-py3-none-manylinux_2_28_x86_64.whl" ] \
+  && ok "refused qualification is witnessed and never copied" \
+  || no "refused qualification is witnessed and never copied" "missing invocation or copied wheel"
+
+echo "== admit: the split Linux set (core + plugins) =="
+CORE=anonlib-0.3.0-py3-none-manylinux_2_35_x86_64.whl
+NVIDIA=anonlib_nvidia-0.3.0-py3-none-manylinux_2_35_x86_64.whl
+AMD=anonlib_amd-0.3.0-py3-none-manylinux_2_35_x86_64.whl
+PTX=anonlib_nvidia_ptx-0.3.0-py3-none-manylinux_2_35_x86_64.whl
+B=$(mkbox 0.3.0); stage_complete "$B"
+run_admit "$B" && [ -f "$B/python/dist/$CORE" ] && [ -f "$B/python/dist/$NVIDIA" ] && [ -f "$B/python/dist/$AMD" ] \
+  && grep -q '"release-split"' "$B/verifier-invocation.json" && grep -q "$AMD" "$B/split-audit-invocation.txt" \
+  && grep -qx 'plugins=\["amd","nvidia"\]' "$B/gho.txt" \
+  && grep -qx 'payloads=\["nvidia-ptx"\]' "$B/gho.txt" && [ -f "$B/python/dist/$PTX" ] \
+  && ok "the split set is admitted, split-audited and qualified as a set" || no "split set admitted" "$(tail -3 "$B/admit.out")"
+
+B=$(mkbox 0.3.0); stage_complete "$B"; rmdir "$B/stage/qualification"
+run_admit "$B" && [ -f "$B/python/dist/$AMD" ] && grep -qx 'plugins=\["amd","nvidia"\]' "$B/gho.txt" \
+  && ok "the split set is admitted with no qualification staged" || no "split set, no qualification" "$(tail -3 "$B/admit.out")"
+
+# the split core REQUIRES both plugins at its version: it never stages without both
+B=$(mkbox 0.3.0); stage_zip "$B" "$CORE" 1
+refuses "$B" "a split core with no plugin is REFUSED" "complete Linux release"
+
+B=$(mkbox 0.3.0); stage_zip "$B" "$CORE" 1; stage_zip "$B" "$NVIDIA"
+refuses "$B" "a split core without the AMD plugin is REFUSED" "complete Linux release"
+
+B=$(mkbox 0.3.0); stage_zip "$B" "$CORE" 1; stage_zip "$B" "$AMD"
+refuses "$B" "a split core without the NVIDIA plugin is REFUSED" "complete Linux release"
+
+B=$(mkbox 0.3.0); stage_zip "$B" "$CORE" 1; stage_zip "$B" "$AMD"; stage_zip "$B" "$NVIDIA"
+refuses "$B" "a split set without the PTX dependency is REFUSED" "complete Linux release"
+
+B=$(mkbox 0.3.0); stage_zip "$B" "anonlib-0.3.0-py3-none-manylinux_2_28_x86_64.whl"; stage_zip "$B" "$NVIDIA"
+refuses "$B" "a plugin beside a COMBINED wheel is REFUSED" "split-package marker"
+
+B=$(mkbox 0.3.0); stage_zip "$B" "$CORE" 1; stage_zip "$B" "anonlib_vulkan-0.3.0-py3-none-manylinux_2_35_x86_64.whl"
+refuses "$B" "a wheel of no known project is REFUSED" "unknown GPU release project"
+
+B=$(mkbox 0.3.0); stage_zip "$B" "$CORE" 1; stage_zip "$B" "$AMD"; stage_zip "$B" "anonlib_nvidia-0.2.0-py3-none-manylinux_2_35_x86_64.whl"
+refuses "$B" "a plugin of the WRONG VERSION is REFUSED" "expected version 0.3.0"
+
+B=$(mkbox 0.3.0); stage_complete "$B"; : > "$B/refuse-split"
+refuses "$B" "a split set failing split_audit is REFUSED" "TEST SPLIT AUDIT: refused"
+[ ! -e "$B/python/dist/$CORE" ] && ok "a refused split set is never copied" || no "refused split set copied" "copied"
+
+echo "== digest =="
+B=$(mkbox 0.3.0); run_digest "$B" \
+  && [ "$(grep -c 'macosx' "$B/gho2.txt")" -ge 1 ] \
+  && ok "macOS-only release still produces a manifest (the pipefail bug)" \
+  || no "macOS-only digest" "$(tail -3 "$B/digest.out")"
+
+B=$(mkbox 0.3.0); stage "$B" "anonlib-0.3.0-py3-none-manylinux_2_28_x86_64.whl"
+run_admit "$B" && run_digest "$B" \
+  && [ -s "$B/verifier-invocation.json" ] \
+  && [ "$(sed -n '/wheel_manifest<</,/MANIFEST_EOF/p' "$B/gho2.txt" | grep -c '\.whl$')" = 5 ] \
+  && [ "$(sed -n '/wheel_manifest<</,/MANIFEST_EOF/p' "$B/gho2.txt" | grep -n 'macosx' | cut -d: -f1)" = 2 ] \
+  && ok "five wheels, macOS FIRST in the manifest" \
+  || no "five-wheel manifest" "$(sed -n '/wheel_manifest/,/MANIFEST_EOF/p' "$B/gho2.txt")"
+
+B=$(mkbox 0.3.0); stage_complete "$B"
+run_admit "$B" && run_digest "$B" \
+  && [ "$(sed -n '/wheel_manifest<</,/MANIFEST_EOF/p' "$B/gho2.txt" | grep -c '\.whl$')" = 5 ] \
+  && [ "$(sed -n '/wheel_manifest<</,/MANIFEST_EOF/p' "$B/gho2.txt" | grep -n 'macosx' | cut -d: -f1)" = 2 ] \
+  && sed -n '/wheel_manifest<</,/MANIFEST_EOF/p' "$B/gho2.txt" | grep -q "  $AMD\$" \
+  && sed -n '/wheel_manifest<</,/MANIFEST_EOF/p' "$B/gho2.txt" | grep -q "  $PTX\$" \
+  && ok "the split set's five wheels, macOS FIRST, plugins and PTX in the manifest" \
+  || no "split manifest" "$(sed -n '/wheel_manifest/,/MANIFEST_EOF/p' "$B/gho2.txt")"
+
+echo "== publish =="
+# The publish job runs on ubuntu and only ever sees `dist/` plus the three
+# values the build job handed it. These cases fabricate that pair directly.
+pub(){ # $1=dir $2=EXPECTED_WHEEL $3=EXPECTED_SHA256 $4=manifest text
+  ( cd "$1" && EXPECTED_WHEEL="$2" EXPECTED_SHA256="$3" EXPECTED_MANIFEST="$4" \
+      bash "$SP/publish.sh" ) >"$1/pub.out" 2>&1; }
+pubbox(){ local D; D="$(mktemp -d "$SP/pub.XXXXXX")"; mkdir -p "$D/dist"
+  echo "macos"  > "$D/dist/anonlib-0.3.0-py3-none-macosx_11_0_arm64.whl"
+  echo "linux"  > "$D/dist/anonlib-0.3.0-py3-none-manylinux_2_28_x86_64.whl"
+  ( cd "$D/dist" && shasum -a 256 anonlib-0.3.0-py3-none-macosx_11_0_arm64.whl \
+      anonlib-0.3.0-py3-none-manylinux_2_28_x86_64.whl ) > "$D/man.txt"
+  echo "$D"; }
+prefuses(){ if pub "$1" "$2" "$3" "$4"; then no "$5" "IT WAS PUBLISHED"; else
+  if grep -qF "$6" "$1/pub.out"; then ok "$5"; else no "$5" "refused for another reason: $(grep -m1 '::error::' "$1/pub.out")"; fi; fi; }
+
+D=$(pubbox); M=$(cat "$D/man.txt"); MAC=$(grep macosx "$D/man.txt" | cut -d' ' -f1)
+pub "$D" "anonlib-0.3.0-py3-none-macosx_11_0_arm64.whl" "$MAC" "$M" \
+  && ok "two matching wheels are published" || no "two matching wheels" "$(tail -3 "$D/pub.out")"
+
+D=$(pubbox); M=$(cat "$D/man.txt"); MAC=$(grep macosx "$D/man.txt" | cut -d' ' -f1)
+echo "stowaway" > "$D/dist/anonlib-0.3.0-py3-none-manylinux_2_34_x86_64.whl"
+prefuses "$D" "anonlib-0.3.0-py3-none-macosx_11_0_arm64.whl" "$MAC" "$M" \
+  "an EXTRA wheel nobody built is REFUSED" "the build job named"
+
+D=$(pubbox); M=$(cat "$D/man.txt"); MAC=$(grep macosx "$D/man.txt" | cut -d' ' -f1)
+echo "tampered" > "$D/dist/anonlib-0.3.0-py3-none-manylinux_2_28_x86_64.whl"
+prefuses "$D" "anonlib-0.3.0-py3-none-macosx_11_0_arm64.whl" "$MAC" "$M" \
+  "a TAMPERED Linux wheel is REFUSED" "does not match its recorded digest"
+
+D=$(pubbox); M=$(cat "$D/man.txt"); MAC=$(grep macosx "$D/man.txt" | cut -d' ' -f1)
+rm "$D/dist/anonlib-0.3.0-py3-none-manylinux_2_28_x86_64.whl"
+prefuses "$D" "anonlib-0.3.0-py3-none-macosx_11_0_arm64.whl" "$MAC" "$M" \
+  "a MISSING wheel is REFUSED" "the build job named"
+
+D=$(pubbox); M=$(grep macosx "$D/man.txt"); MAC=$(echo "$M" | cut -d' ' -f1)
+rm "$D/dist/anonlib-0.3.0-py3-none-manylinux_2_28_x86_64.whl"
+pub "$D" "anonlib-0.3.0-py3-none-macosx_11_0_arm64.whl" "$MAC" "$M" \
+  && ok "a macOS-only release still publishes" || no "macOS-only publish" "$(tail -3 "$D/pub.out")"
+
+D=$(pubbox); M=$(cat "$D/man.txt")
+prefuses "$D" "anonlib-0.3.0-py3-none-macosx_11_0_arm64.whl" "0000000000000000000000000000000000000000000000000000000000000000" "$M" \
+  "a macOS digest that disagrees with the build job is REFUSED" "does not match the digest the build job recorded"
+
+echo
+echo "PASS=$PASS FAIL=$FAIL"
+[ "$FAIL" = 0 ]

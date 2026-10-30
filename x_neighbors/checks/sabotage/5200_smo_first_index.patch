@@ -1,0 +1,13 @@
+diff --git a/x_neighbors/items.mojo b/x_neighbors/items.mojo
+--- a/x_neighbors/items.mojo
++++ b/x_neighbors/items.mojo
+@@ -311,7 +311,8 @@
+         for t in range(n):
+             if alpha.unsafe_load(t) < cv.unsafe_load(t):
+                 var ng = -g.unsafe_load(t)
+-                if ng >= gmax:
++                if ng > gmax:
++
+                     gmax = ng
+                     gi = t
+         var gmax2 = neg_inf

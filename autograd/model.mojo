@@ -1,0 +1,1158 @@
+# SPDX-License-Identifier: Apache-2.0
+"""A user-defined model, trained through the tape from a flat description.
+
+Python assembles the description (an integer program and a float table,
+docs/plans/AUTOGRAD_API.md "Model description"); `parse_model` validates it
+once per call and `model_fit` / `model_predict` interpret it. Each batch
+records the forward graph on the tape, differentiates the loss and runs one
+optimizer step; every number is computed by executor launches (parallel, with
+the tape's fixed blocked folds), so the bits are the same on Apple, NVIDIA
+and AMD. Host loops run over layers, batches and epochs only.
+"""
+from std.sys.compile import is_defined
+from std.memory import bitcast, memcpy
+from sequence.exec_trait import Exec
+from sequence.ops import (
+    FP, Args, OP_COPY, OP_FILL, OP_GATHER_ROWS, OP_MLP_PERM, OP_ONE_HOT, OP_PROBA2, OP_SEQ_IOTA,
+    OPT_ADAM, OPT_ADAMW, OPT_SGD, dummy_ptr,
+)
+from sequence.mlp import mlp_epoch_key, mlp_perm_args
+from sequence.recurrent import OptConfig, OptState, opt_step
+from checks.numerics import ftz, identical_div, identical_pow64, identical_sqrt
+from autograd.tape import Tape, Tensor
+from autograd.ops import RELU, SIGMOID, TANH, SOFTMAX, AUTOGRAD_CURVE_WORD
+from autograd.layers import NeuralRules, layer_norm
+from autograd.data import AUTOGRAD_GATHER_EPOCH, gather_epoch, gather_epoch_fits
+from autograd.model_ops import OP_AGM_INIT_UNIFORM, OP_AGM_ROW_ARGMAX, OP_AGM_THRESHOLD
+from core.cast_in import CAST_KIND_SIGNED, CastIn
+from autograd.cast_ops import upload_cast
+# Description version 2 (lane ag-rankn-python, docs/plans/AUTOGRAD_RANKN.md
+# section 5): per-sample input shapes of any rank and the shape layers.
+from autograd.rankn import RN_MAX_RANK, ShapeN
+from autograd.rankn_conv import rankn_conv2d, rankn_max_pool2d, rankn_avg_pool2d
+from autograd.rankn_api import RankNRules, rn_as_shape, rn_dims, rn_resolve, rn_shape, rn_with_batch
+
+# Lane ag-data adds `Tape.dropout`; lane ag-forward adds the tape's
+# inference mode. Until they land these stay off and the model trainer does
+# not reach either (a Dropout layer is refused at fit time with a clear error;
+# prediction records a plain forward with gradient-free leaves).
+comptime HAS_DROPOUT = is_defined["ANONLIB_AUTOGRAD_HAS_DROPOUT"]()
+comptime HAS_INFERENCE = is_defined["ANONLIB_AUTOGRAD_HAS_INFERENCE"]()
+
+# LAUNCHES (lane ag-pass1-launches, read from the code; tape.mojo's
+# _linear_to and softmax_cross_entropy have the per-node detail).
+# Default: a Linear layer and the activation layer right after it are one
+# tape.linear node, and cross_entropy against class codes is one
+# tape.softmax_cross_entropy node.
+#   Linear(+bias)+activation, per layer: forward 1 (gemm_epi; + the row
+#     softmax for Softmax), backward 3 (dW, db, dX with the activation
+#     derivative of the layer below in its epilogue; 2 when the input needs
+#     no gradient); was forward 3, backward 7 (activation VJP 1, add VJP
+#     1, bias VJP 3, 2 GEMMs; 6 for the first layer), and the unfused
+#     composition is now 6 (the bias fold reads the upstream directly).
+#   cross_entropy on codes: forward 3, backward 1; was the dense one-hot
+#     composition, forward 7, backward 5 (and a one-hot target of N x out
+#     floats where the codes take N).
+#   Seed: one fill straight into the loss's gradient (was fill + copy).
+# Bits: the fused path is a bit version of its own (its GEMM epilogue and
+# column-sum bias gradient sum in a different order than the composed ops);
+# -D ANONLIB_AUTOGRAD_MODEL_UNFUSED keeps the composed nodes, for checks.
+comptime MODEL_UNFUSED = is_defined["ANONLIB_AUTOGRAD_MODEL_UNFUSED"]()
+
+# ---------------------------------------------------------------- description
+comptime SPEC_VERSION = 1
+comptime SPEC_HEADER = 3     # version, input features, layer count
+comptime SPEC_RECORD = 4     # ints per layer: code, arg0, arg1, reserved
+
+comptime LAYER_LINEAR = 1        # arg0 output units, arg1 bias (0/1)
+comptime LAYER_RELU = 2
+comptime LAYER_SIGMOID = 3
+comptime LAYER_TANH = 4
+comptime LAYER_SOFTMAX = 5
+comptime LAYER_LAYER_NORM = 6    # float: epsilon
+comptime LAYER_DROPOUT = 7       # float: drop probability
+comptime LAYER_RESIDUAL = 8      # arg0: -1 the model input, else an earlier layer's index
+# Version 2 only (shape layers; per-sample shapes exclude the batch axis):
+comptime LAYER_RESHAPE = 9       # args: the new per-sample dims (one may be -1), 0 pads
+comptime LAYER_PERMUTE = 10      # args: a permutation of the per-sample axes, -1 pads
+comptime LAYER_FLATTEN = 11      # the per-sample shape becomes one axis
+comptime LAYER_CONV2D = 12       # (out_channels, kernel, stride, padding, bias 0/1, groups; 0 = 1); input (C, H, W)
+comptime LAYER_MAXPOOL2D = 13    # (kernel, stride); input (C, H, W)
+comptime LAYER_AVGPOOL2D = 14    # (kernel, stride); input (C, H, W)
+
+# Version 2: [2, ndim, d0 .. d7 (unused 1), layer count, then per layer
+# (code, arg0 .. arg5, 0)]; one float per layer as in version 1.
+comptime SPEC2_VERSION = 2
+comptime SPEC2_HEADER = 2 + RN_MAX_RANK + 1
+comptime SPEC2_RECORD = 8
+comptime SPEC2_ARGS = 6
+
+comptime LOSS_MSE = 0
+comptime LOSS_CROSS_ENTROPY = 1
+comptime LOSS_BCE_WITH_LOGITS = 2
+comptime LOSS_HUBER = 3
+
+comptime TARGET_DENSE = 0        # Y is (N, out) float32
+comptime TARGET_CODES = 1        # Y is N int32 class codes; one-hot built on the executor
+comptime TARGET_CODE_VALUES = 2  # Y is N int32 codes; the (N, 1) target is the codes as floats
+
+comptime SCHED_CONSTANT = 0
+comptime SCHED_STEP = 1          # lr * gamma^(epoch // step)
+comptime SCHED_EXPONENTIAL = 2   # lr * gamma^epoch
+
+comptime OUT_RAW = 0
+comptime OUT_SOFTMAX = 1
+comptime OUT_SIGMOID = 2
+comptime OUT_PROBA2 = 3          # one output: sigmoid p, written as the (N, 2) [1 - p, p]
+comptime OUT_ARGMAX = 4          # the row argmax of the raw outputs, N float32 class codes
+comptime OUT_THRESHOLD = 5       # one output: sigmoid p > 0.5, N float32 class codes (0/1)
+
+# Row indices travel as float32 words (the shuffle and the gather), exact
+# below 2^24; the parameter counter of the initialisation is an Int32 slot.
+comptime MODEL_MAX_ROWS = 16777216
+comptime MODEL_MAX_PARAMS = 2147483647
+
+
+struct ModelSpec(Copyable, Movable):
+    """A parsed model description: per layer its code, integer arguments,
+    float argument, input and output widths and parameter offset (-1 when it
+    has none). Parameters are one flat float32 vector: a Linear layer's
+    weight (in, out) row-major, then its bias (out); a LayerNorm's weight
+    (width), then its bias (width); layers in order."""
+    var n_inputs: Int
+    var kinds: List[Int]
+    var arg0: List[Int]
+    var arg1: List[Int]
+    var farg: List[Float32]
+    var in_width: List[Int]
+    var out_width: List[Int]
+    var param_off: List[Int]
+    var n_params: Int
+    #: 1 or 2 (SPEC2_VERSION: the per-sample shapes below are set)
+    var version: Int
+    #: version 2: the per-sample input shape, each layer's per-sample input
+    #: and output shapes, and SPEC2_ARGS integer arguments per layer
+    var sample: ShapeN
+    var in_shape: List[ShapeN]
+    var out_shape: List[ShapeN]
+    var xargs: List[Int]
+
+    def __init__(out self):
+        self.n_inputs = 0
+        self.kinds = List[Int]()
+        self.arg0 = List[Int]()
+        self.arg1 = List[Int]()
+        self.farg = List[Float32]()
+        self.in_width = List[Int]()
+        self.out_width = List[Int]()
+        self.param_off = List[Int]()
+        self.n_params = 0
+        self.version = SPEC_VERSION
+        self.sample = ShapeN.matrix(1, 1)
+        self.in_shape = List[ShapeN]()
+        self.out_shape = List[ShapeN]()
+        self.xargs = List[Int]()
+
+    def n_layers(self) -> Int:
+        return len(self.kinds)
+
+    def out_features(self) -> Int:
+        return self.out_width[len(self.out_width) - 1]
+
+    def has_dropout(self) -> Bool:
+        for i in range(len(self.kinds)):  # driver-loop: over layers
+            if self.kinds[i] == LAYER_DROPOUT and self.farg[i] > Float32(0):
+                return True
+        return False
+
+
+def _layer_name(i: Int) -> String:
+    return "model: layer " + String(i)
+
+
+def parse_model(prog: List[Int], ptab: List[Float32]) raises -> ModelSpec:
+    """Validate a description and compute its widths and parameter offsets.
+
+    prog = [version, input features, layer count, then per layer
+    (code, arg0, arg1, 0)]; ptab = one float per layer (LayerNorm epsilon,
+    Dropout probability, 0 otherwise). Raises with a message naming the
+    first offending layer.
+    """
+    var s = ModelSpec()
+    if len(prog) < SPEC_HEADER:
+        raise Error("model: the description is empty")
+    if prog[0] == SPEC2_VERSION:
+        return parse_model_v2(prog, ptab)
+    if prog[0] != SPEC_VERSION:
+        raise Error("model: unknown description version " + String(prog[0]))
+    var d = prog[1]
+    var n = prog[2]
+    if d < 1:
+        raise Error("model: the input needs at least one feature")
+    if n < 1:
+        raise Error("model: add at least one layer")
+    if len(prog) != SPEC_HEADER + SPEC_RECORD * n:
+        raise Error("model: the description holds " + String(len(prog)) + " integers, "
+                    + String(SPEC_HEADER + SPEC_RECORD * n) + " expected for " + String(n) + " layers")
+    if len(ptab) != n:
+        raise Error("model: the float table holds " + String(len(ptab)) + " values, one per layer ("
+                    + String(n) + ") expected")
+    s.n_inputs = d
+    var width = d
+    var off = 0
+    var has_linear = False
+    for i in range(n):  # driver-loop: over layers
+        var base = SPEC_HEADER + SPEC_RECORD * i
+        var k = prog[base]
+        var a0 = prog[base + 1]
+        var a1 = prog[base + 2]
+        var f = ptab[i]
+        var p_off = -1
+        s.in_width.append(width)
+        if k == LAYER_LINEAR:
+            if a0 < 1 or a0 >= MODEL_MAX_ROWS:
+                raise Error(_layer_name(i) + " (Linear): output units must be between 1 and 2^24 - 1")
+            if a1 != 0 and a1 != 1:
+                raise Error(_layer_name(i) + " (Linear): bias must be 0 or 1")
+            p_off = off
+            off += width * a0 + (a0 if a1 == 1 else 0)
+            width = a0
+            has_linear = True
+        elif k == LAYER_RELU or k == LAYER_SIGMOID or k == LAYER_TANH or k == LAYER_SOFTMAX:
+            pass
+        elif k == LAYER_LAYER_NORM:
+            if not (f > Float32(0)):
+                raise Error(_layer_name(i) + " (LayerNorm): epsilon must be positive")
+            p_off = off
+            off += 2 * width
+        elif k == LAYER_DROPOUT:
+            if not (f >= Float32(0) and f < Float32(1)):
+                raise Error(_layer_name(i) + " (Dropout): the drop probability must be in [0, 1)")
+        elif k == LAYER_RESIDUAL:
+            if a0 < -1 or a0 >= i:
+                raise Error(_layer_name(i) + " (Residual): the source must be -1 (the model input) "
+                            + "or the index of an earlier layer")
+            var w_from = d if a0 == -1 else s.out_width[a0]
+            if w_from != width:
+                raise Error(_layer_name(i) + " (Residual): adds a width-" + String(w_from)
+                            + " tensor to a width-" + String(width) + " tensor")
+        else:
+            raise Error(_layer_name(i) + ": unknown layer code " + String(k))
+        if off > MODEL_MAX_PARAMS:
+            raise Error("model: more than 2^31 - 1 parameters")
+        s.kinds.append(k)
+        s.arg0.append(a0)
+        s.arg1.append(a1)
+        s.farg.append(f)
+        s.out_width.append(width)
+        s.param_off.append(p_off)
+    if not has_linear:
+        raise Error("model: add at least one Linear layer")
+    s.n_params = off
+    return s^
+
+
+def _arg(prog: List[Int], base: Int, k: Int) -> Int:
+    return prog[base + 1 + k]
+
+
+def conv_groups(spec: ModelSpec, i: Int) -> Int:
+    """Layer i's (a Conv2d) channel groups: its sixth argument, 0 (the
+    encoding before groups) read as 1."""
+    return max(1, spec.xargs[SPEC2_ARGS * i + 5])
+
+
+def conv_in_per_group(spec: ModelSpec, i: Int) -> Int:
+    """Layer i's (a Conv2d) input channels per group: the weight's
+    second dimension."""
+    return spec.in_shape[i].d[0] // conv_groups(spec, i)
+
+
+def parse_model_v2(prog: List[Int], ptab: List[Float32]) raises -> ModelSpec:
+    """Validate a version-2 description (SPEC2_*): the per-sample input
+    shape, then the layers with their per-sample shapes, widths (the last
+    axis) and parameter offsets. A Linear layer acts on the last axis; the
+    model's output must be one vector per sample."""
+    var s = ModelSpec()
+    s.version = SPEC2_VERSION
+    if len(prog) < SPEC2_HEADER:
+        raise Error("model: the description is empty")
+    var nd = prog[1]
+    if nd < 1 or nd > RN_MAX_RANK - 1:
+        raise Error("model: the input shape takes 1 to " + String(RN_MAX_RANK - 1) + " dimensions")
+    var idims = List[Int](capacity=nd)
+    for k in range(nd):  # small-loop(nd: the input rank, at most 7): description parsing, no data
+        idims.append(prog[2 + k])
+    var cur = rn_shape(idims, "model: input shape")
+    var n = prog[SPEC2_HEADER - 1]
+    if n < 1:
+        raise Error("model: add at least one layer")
+    if len(prog) != SPEC2_HEADER + SPEC2_RECORD * n:
+        raise Error("model: the description holds " + String(len(prog)) + " integers, "
+                    + String(SPEC2_HEADER + SPEC2_RECORD * n) + " expected for " + String(n) + " layers")
+    if len(ptab) != n:
+        raise Error("model: the float table holds " + String(len(ptab)) + " values, one per layer ("
+                    + String(n) + ") expected")
+    s.sample = cur
+    s.n_inputs = cur.count()
+    if s.n_inputs >= MODEL_MAX_ROWS:
+        raise Error("model: the input holds more than 2^24 - 1 values per sample")
+    var off = 0
+    var has_linear = False
+    for i in range(n):  # driver-loop: over layers
+        var base = SPEC2_HEADER + SPEC2_RECORD * i
+        var k = prog[base]
+        var a0 = _arg(prog, base, 0)
+        var a1 = _arg(prog, base, 1)
+        var f = ptab[i]
+        var p_off = -1
+        var width = cur.cols()
+        s.in_width.append(width)
+        s.in_shape.append(cur)
+        var nxt = cur
+        if k == LAYER_LINEAR:
+            if a0 < 1 or a0 >= MODEL_MAX_ROWS:
+                raise Error(_layer_name(i) + " (Linear): output units must be between 1 and 2^24 - 1")
+            if a1 != 0 and a1 != 1:
+                raise Error(_layer_name(i) + " (Linear): bias must be 0 or 1")
+            p_off = off
+            off += width * a0 + (a0 if a1 == 1 else 0)
+            var ld = rn_dims(cur)
+            ld[cur.ndim - 1] = a0
+            nxt = rn_shape(ld, _layer_name(i) + " (Linear)")
+            has_linear = True
+        elif k == LAYER_RELU or k == LAYER_SIGMOID or k == LAYER_TANH or k == LAYER_SOFTMAX:
+            pass
+        elif k == LAYER_LAYER_NORM:
+            if not (f > Float32(0)):
+                raise Error(_layer_name(i) + " (LayerNorm): epsilon must be positive")
+            p_off = off
+            off += 2 * width
+        elif k == LAYER_DROPOUT:
+            if not (f >= Float32(0) and f < Float32(1)):
+                raise Error(_layer_name(i) + " (Dropout): the drop probability must be in [0, 1)")
+        elif k == LAYER_RESIDUAL:
+            if a0 < -1 or a0 >= i:
+                raise Error(_layer_name(i) + " (Residual): the source must be -1 (the model input) "
+                            + "or the index of an earlier layer")
+            var from_shape = s.sample if a0 == -1 else s.out_shape[a0]
+            if not from_shape.same(cur):
+                raise Error(_layer_name(i) + " (Residual): adds tensors of different shapes")
+        elif k == LAYER_RESHAPE:
+            var rd = List[Int]()
+            for j in range(SPEC2_ARGS):  # small-loop(SPEC2_ARGS: six layer arguments): description parsing, no data
+                var v = _arg(prog, base, j)
+                if v == 0:
+                    break
+                rd.append(v)
+            if len(rd) < 1:
+                raise Error(_layer_name(i) + " (Reshape): give the new shape")
+            nxt = rn_resolve(cur, rd, _layer_name(i) + " (Reshape)")
+        elif k == LAYER_PERMUTE:
+            var seen = List[Bool](length=cur.ndim, fill=False)
+            var pd = List[Int](capacity=cur.ndim)
+            for j in range(SPEC2_ARGS):  # small-loop(SPEC2_ARGS: six layer arguments): description parsing, no data
+                var v = _arg(prog, base, j)
+                if j < cur.ndim:
+                    if v < 0 or v >= cur.ndim or seen[v]:
+                        raise Error(_layer_name(i) + " (Permute): the axes must list each of the "
+                                    + String(cur.ndim) + " sample axes once")
+                    seen[v] = True
+                    pd.append(cur.d[v])
+                elif v != -1:
+                    raise Error(_layer_name(i) + " (Permute): the axes must list each of the "
+                                + String(cur.ndim) + " sample axes once")
+            nxt = rn_shape(pd, _layer_name(i) + " (Permute)")
+        elif k == LAYER_FLATTEN:
+            var fd = List[Int]()
+            fd.append(cur.count())
+            nxt = rn_shape(fd, _layer_name(i) + " (Flatten)")
+        elif k == LAYER_CONV2D or k == LAYER_MAXPOOL2D or k == LAYER_AVGPOOL2D:
+            if cur.ndim != 3:
+                raise Error(_layer_name(i) + ": convolution and pooling take a (channels, height, width) input")
+            var c = cur.d[0]
+            var h = cur.d[1]
+            var w = cur.d[2]
+            var ch: Int
+            var ks: Int
+            var st: Int
+            var pad: Int
+            if k == LAYER_CONV2D:
+                ch = a0
+                ks = a1
+                st = _arg(prog, base, 2)
+                pad = _arg(prog, base, 3)
+                var bias = _arg(prog, base, 4)
+                var groups = max(1, _arg(prog, base, 5))
+                if ch < 1 or ks < 1 or st < 1 or pad < 0 or (bias != 0 and bias != 1):
+                    raise Error(_layer_name(i) + " (Conv2d): out_channels, kernel_size and stride must be "
+                                + "positive, padding >= 0 and bias 0 or 1")
+                if c % groups != 0 or ch % groups != 0:
+                    raise Error(_layer_name(i) + " (Conv2d): groups must divide the input channels and "
+                                + "out_channels")
+                p_off = off
+                off += ch * (c // groups) * ks * ks + (ch if bias == 1 else 0)
+            else:
+                ch = c
+                ks = a0
+                st = a1
+                pad = 0
+                if ks < 1 or st < 1:
+                    raise Error(_layer_name(i) + " (pooling): kernel_size and stride must be positive")
+            var oh = (h + 2 * pad - ks) // st + 1
+            var ow = (w + 2 * pad - ks) // st + 1
+            if h + 2 * pad < ks or w + 2 * pad < ks or oh < 1 or ow < 1:
+                raise Error(_layer_name(i) + ": the kernel is larger than the (padded) input")
+            var cd = List[Int]()
+            cd.append(ch)
+            cd.append(oh)
+            cd.append(ow)
+            nxt = rn_shape(cd, _layer_name(i))
+        else:
+            raise Error(_layer_name(i) + ": unknown layer code " + String(k))
+        if nxt.ndim > RN_MAX_RANK - 1:
+            raise Error(_layer_name(i) + ": a sample has at most " + String(RN_MAX_RANK - 1) + " dimensions")
+        if off > MODEL_MAX_PARAMS:
+            raise Error("model: more than 2^31 - 1 parameters")
+        s.kinds.append(k)
+        s.arg0.append(a0)
+        s.arg1.append(a1)
+        for j in range(SPEC2_ARGS):  # small-loop(SPEC2_ARGS: six layer arguments): description parsing, no data
+            s.xargs.append(_arg(prog, base, j))
+        s.farg.append(f)
+        s.out_shape.append(nxt)
+        s.out_width.append(nxt.cols())
+        s.param_off.append(p_off)
+        cur = nxt
+    if not has_linear:
+        raise Error("model: add at least one Linear layer")
+    if cur.ndim != 1:
+        raise Error("model: the output must be one vector per sample; add flatten() before the last "
+                    + "linear layer")
+    s.n_params = off
+    return s^
+
+
+@fieldwise_init
+struct FitConfig(Copyable, Movable):
+    """Training options of one fit (see `parse_fit` for the encoding)."""
+    var loss: Int
+    var target: Int
+    var opt: OptConfig
+    var lr: Float32
+    var sched: Int
+    var sched_step: Int
+    var sched_gamma: Float32
+    var batch: Int
+    var epochs: Int
+    var shuffle: Bool
+    var seed: UInt64
+    var patience: Int
+    var tol: Float64
+    var huber_delta: Float32
+    var init: Bool
+
+
+def check_fit(spec: ModelSpec, cfg: FitConfig, N: Int) raises:
+    """User-facing refusals of a fit's options against its model."""
+    var O = spec.out_features()
+    var last = spec.kinds[spec.n_layers() - 1]
+    if N < 1 or N >= MODEL_MAX_ROWS:
+        raise Error("model fit: the number of samples must be between 1 and 2^24 - 1")
+    if cfg.loss < LOSS_MSE or cfg.loss > LOSS_HUBER:
+        raise Error("model fit: unknown loss code " + String(cfg.loss))
+    if cfg.target < TARGET_DENSE or cfg.target > TARGET_CODE_VALUES:
+        raise Error("model fit: unknown target code " + String(cfg.target))
+    if cfg.target == TARGET_CODES and cfg.loss != LOSS_CROSS_ENTROPY:
+        raise Error("model fit: class-code targets need the cross_entropy loss")
+    if cfg.target == TARGET_CODE_VALUES and O != 1:
+        raise Error("model fit: code-value targets need a model with one output")
+    if cfg.loss == LOSS_CROSS_ENTROPY and O < 2:
+        raise Error("model fit: cross_entropy needs at least two outputs")
+    if (cfg.loss == LOSS_CROSS_ENTROPY or cfg.loss == LOSS_BCE_WITH_LOGITS) and (
+        last == LAYER_SOFTMAX or last == LAYER_SIGMOID
+    ):
+        raise Error("model fit: cross_entropy and bce_with_logits take logits; remove the final "
+                    + "Softmax or Sigmoid layer")
+    if cfg.loss == LOSS_HUBER and not (cfg.huber_delta > Float32(0)):
+        raise Error("model fit: the Huber delta must be positive")
+    var kind = cfg.opt.kind
+    if kind != OPT_SGD and kind != OPT_ADAM and kind != OPT_ADAMW:
+        raise Error("model fit: the optimizer must be sgd, momentum, adam or adamw")
+    if not (cfg.lr > Float32(0)):
+        raise Error("model fit: the learning rate must be positive")
+    if cfg.batch < 1 or cfg.epochs < 1:
+        raise Error("model fit: batch size and epochs must be at least 1")
+    if cfg.sched < SCHED_CONSTANT or cfg.sched > SCHED_EXPONENTIAL:
+        raise Error("model fit: unknown learning-rate schedule code " + String(cfg.sched))
+    if cfg.sched != SCHED_CONSTANT and not (cfg.sched_gamma > Float32(0)):
+        raise Error("model fit: the schedule's gamma must be positive")
+    if cfg.sched == SCHED_STEP and cfg.sched_step < 1:
+        raise Error("model fit: the step schedule's step size must be at least 1 epoch")
+    if cfg.patience < 0:
+        raise Error("model fit: n_iter_no_change must be >= 0 (0 trains every epoch)")
+    comptime if not HAS_DROPOUT:
+        if spec.has_dropout():
+            raise Error("model fit: Dropout is not available in this build")
+
+
+# ---------------------------------------------------------------- helpers
+def _copy[E: Exec](mut ex: E, dst: FP, src: FP, n: Int) raises:
+    var a = Args()
+    a.p0 = src
+    a.p1 = dst
+    ex.launch[OP_COPY](a, n)
+
+
+def _fill[E: Exec](mut ex: E, dst: FP, n: Int, value: Float32) raises:
+    var a = Args()
+    a.p0 = dst
+    a.f0 = value
+    ex.launch[OP_FILL](a, n)
+
+
+def _init_uniform[E: Exec](mut ex: E, dst: FP, n: Int, first: Int, seed: UInt64, bound: Float32) raises:
+    var a = Args()
+    a.p0 = dst
+    a.i2 = first
+    a.i3 = Int(seed & UInt64(0xFFFF))
+    a.i4 = Int((seed >> 16) & UInt64(0xFFFF))
+    a.i5 = Int((seed >> 32) & UInt64(0xFFFF))
+    a.i6 = Int((seed >> 48) & UInt64(0xFFFF))
+    a.f0 = bound
+    ex.launch[OP_AGM_INIT_UNIFORM](a, n)
+
+
+def model_init_params[E: Exec](mut ex: E, spec: ModelSpec, P: FP, seed: UInt64) raises:
+    """Initialise every parameter on the executor from the seed: a Linear
+    layer's weight and bias uniform in [-b, b], b = sqrt(6 / (in + out))
+    (Glorot uniform, scikit-learn's MLP bound); LayerNorm weight 1, bias 0."""
+    for i in range(spec.n_layers()):  # driver-loop: over layers
+        var k = spec.kinds[i]
+        var off = spec.param_off[i]
+        if k == LAYER_LINEAR:
+            var fi = spec.in_width[i]
+            var fo = spec.arg0[i]
+            var bound = ftz(identical_sqrt(ftz(identical_div(Float32(6), Float32(fi + fo)))))
+            var n = fi * fo + (fo if spec.arg1[i] == 1 else 0)
+            _init_uniform(ex, P + off, n, off, seed, bound)
+        elif k == LAYER_LAYER_NORM:
+            var w = spec.in_width[i]
+            _fill(ex, P + off, w, Float32(1))
+            _fill(ex, P + off + w, w, Float32(0))
+        elif k == LAYER_CONV2D:
+            # Glorot uniform over the receptive field: fan_in = C kh kw,
+            # fan_out = out_channels kh kw; the bias from the same draw, as Linear
+            var oc = spec.arg0[i]
+            var ks = spec.arg1[i]
+            # (with groups: fan_in = C / groups kh kw, the weight's second dimension)
+            var c = conv_in_per_group(spec, i)
+            var fan = c * ks * ks + oc * ks * ks
+            var bound = ftz(identical_sqrt(ftz(identical_div(Float32(6), Float32(fan)))))
+            var n = oc * c * ks * ks + (oc if spec.xargs[SPEC2_ARGS * i + 4] == 1 else 0)
+            _init_uniform(ex, P + off, n, off, seed, bound)
+
+
+def _param[E: Exec](
+    mut tape: Tape, mut ex: E, P: FP, Gr: FP, off: Int, rows: Int, cols: Int, train: Bool,
+) raises -> Tensor:
+    # Training: the gradient lands straight in its slot of Gr (variable_into).
+    if train:
+        return tape.variable_into(ex, P + off, Gr + off, rows, cols)
+    return tape.variable(ex, P + off, rows, cols, False)
+
+
+def model_forward[E: Exec](
+    mut tape: Tape, mut ex: E, spec: ModelSpec, P: FP, Gr: FP, x: Tensor, train: Bool,
+    seed: UInt64, step: Int,
+) raises -> Tensor:
+    """Record the model's forward on the tape from input x (B, n_inputs).
+    Dropout acts only when `train`; `step` (the optimizer step) and the
+    layer index pick its masks."""
+    if spec.version == SPEC2_VERSION:
+        return _model_forward_v2(tape, ex, spec, P, Gr, x, train, seed, step)
+    var outs = List[Tensor]()
+    var h = x
+    var i = 0
+    while i < spec.n_layers():  # driver-loop: over layers
+        var k = spec.kinds[i]
+        if k == LAYER_LINEAR:
+            var fi = spec.in_width[i]
+            var fo = spec.arg0[i]
+            var off = spec.param_off[i]
+            var w = _param(tape, ex, P, Gr, off, fi, fo, train)
+            comptime if MODEL_UNFUSED:
+                h = tape.matmul(ex, h, w)
+                if spec.arg1[i] == 1:
+                    var b = _param(tape, ex, P, Gr, off + fi * fo, 1, fo, train)
+                    h = tape.add(ex, h, b)
+            else:
+                var bias: Optional[Tensor] = None
+                if spec.arg1[i] == 1:
+                    bias = Optional[Tensor](_param(tape, ex, P, Gr, off + fi * fo, 1, fo, train))
+                var act = _absorbed_activation(spec, i)
+                h = tape.linear(ex, h, w, bias, act)
+                if act != 0:
+                    # the activation layer i + 1 rode in this node; layer i's
+                    # own (pre-activation) output is referenced by no layer
+                    outs.append(h)
+                    i += 1
+        elif k == LAYER_RELU:
+            h = tape.relu(ex, h)
+        elif k == LAYER_SIGMOID:
+            h = tape.sigmoid(ex, h)
+        elif k == LAYER_TANH:
+            h = tape.tanh(ex, h)
+        elif k == LAYER_SOFTMAX:
+            h = tape.softmax(ex, h)
+        elif k == LAYER_LAYER_NORM:
+            var d = spec.in_width[i]
+            var off = spec.param_off[i]
+            var weight = _param(tape, ex, P, Gr, off, 1, d, train)
+            var bias = _param(tape, ex, P, Gr, off + d, 1, d, train)
+            h = layer_norm(tape, ex, h, weight, bias, spec.farg[i])
+        elif k == LAYER_DROPOUT:
+            if train and spec.farg[i] > Float32(0):
+                comptime if HAS_DROPOUT:
+                    # depends on lane ag-data (Tape.dropout): one mask per
+                    # (seed, step, layer), the same on every vendor
+                    h = tape.dropout(ex, h, spec.farg[i], seed,
+                                     step * spec.n_layers() + i)
+                else:
+                    raise Error("model fit: Dropout is not available in this build")
+        elif k == LAYER_RESIDUAL:
+            var src = x if spec.arg0[i] == -1 else outs[spec.arg0[i]]
+            h = tape.add(ex, h, src)
+        outs.append(h)
+        i += 1
+    return h
+
+
+def _model_forward_v2[E: Exec](
+    mut tape: Tape, mut ex: E, spec: ModelSpec, P: FP, Gr: FP, x: Tensor, train: Bool,
+    seed: UInt64, step: Int,
+) raises -> Tensor:
+    """model_forward of a version-2 description: x is the (B, n_inputs)
+    batch, viewed as (B,) + the per-sample shape (free). Each layer's output
+    is held in its recorded shape (a free view when the op records only the
+    matrix view). Linear, the activations, LayerNorm and Dropout act on the
+    last axis through the matrix view (their 2-D words); reshape and
+    flatten are views, permute a strided view, conv2d and the pools the
+    conv lane's rank-4 ops (autograd/rankn_conv.mojo)."""
+    var B = tape.rows(x)
+    var x0 = rn_as_shape(tape, ex, x, rn_with_batch(B, spec.sample, "model"))
+    var outs = List[Tensor]()
+    var h = x0
+    var i = 0
+    while i < spec.n_layers():  # driver-loop: over layers
+        var k = spec.kinds[i]
+        var xa = SPEC2_ARGS * i
+        if k == LAYER_LINEAR:
+            var fi = spec.in_width[i]
+            var fo = spec.arg0[i]
+            var off = spec.param_off[i]
+            var w = _param(tape, ex, P, Gr, off, fi, fo, train)
+            var bias: Optional[Tensor] = None
+            if spec.arg1[i] == 1:
+                bias = Optional[Tensor](_param(tape, ex, P, Gr, off + fi * fo, 1, fo, train))
+            var act = _absorbed_activation(spec, i)
+            h = tape.linear(ex, h, w, bias, act)
+            h = rn_as_shape(tape, ex, h, rn_with_batch(B, spec.out_shape[i], "model"))
+            if act != 0:
+                outs.append(h)
+                i += 1
+        elif k == LAYER_RELU:
+            h = tape.relu(ex, h)
+        elif k == LAYER_SIGMOID:
+            h = tape.sigmoid(ex, h)
+        elif k == LAYER_TANH:
+            h = tape.tanh(ex, h)
+        elif k == LAYER_SOFTMAX:
+            h = tape.softmax(ex, h)
+        elif k == LAYER_LAYER_NORM:
+            var d = spec.in_width[i]
+            var off = spec.param_off[i]
+            var weight = _param(tape, ex, P, Gr, off, 1, d, train)
+            var lbias = _param(tape, ex, P, Gr, off + d, 1, d, train)
+            h = layer_norm(tape, ex, h, weight, lbias, spec.farg[i])
+        elif k == LAYER_DROPOUT:
+            if train and spec.farg[i] > Float32(0):
+                comptime if HAS_DROPOUT:
+                    h = tape.dropout(ex, h, spec.farg[i], seed, step * spec.n_layers() + i)
+                else:
+                    raise Error("model fit: Dropout is not available in this build")
+        elif k == LAYER_RESIDUAL:
+            var src = x0 if spec.arg0[i] == -1 else outs[spec.arg0[i]]
+            h = tape.add(ex, h, src)
+        elif k == LAYER_RESHAPE or k == LAYER_FLATTEN:
+            h = tape.view_nd(ex, h, rn_with_batch(B, spec.out_shape[i], "model"))
+        elif k == LAYER_PERMUTE:
+            var axes = List[Int]()
+            axes.append(0)
+            for j in range(spec.in_shape[i].ndim):  # small-loop(ndim: the sample rank, at most 7): shape metadata, no data
+                axes.append(spec.xargs[xa + j] + 1)
+            h = tape.permute(ex, h, axes)
+        elif k == LAYER_CONV2D:
+            var oc = spec.arg0[i]
+            var ks = spec.arg1[i]
+            var c = conv_in_per_group(spec, i)
+            var groups = conv_groups(spec, i)
+            var off = spec.param_off[i]
+            var wd = List[Int]()
+            wd.append(oc)
+            wd.append(c)
+            wd.append(ks)
+            wd.append(ks)
+            var w2 = _param(tape, ex, P, Gr, off, oc, c * ks * ks, train)
+            var w4 = tape.view_nd(ex, w2, rn_shape(wd, "model"))
+            if spec.xargs[xa + 4] == 1:
+                var bd = List[Int]()
+                bd.append(oc)
+                var b2 = _param(tape, ex, P, Gr, off + oc * c * ks * ks, 1, oc, train)
+                var b1 = tape.view_nd(ex, b2, rn_shape(bd, "model"))
+                h = rankn_conv2d(tape, ex, h, w4, Optional[Tensor](b1), spec.xargs[xa + 2], spec.xargs[xa + 3],
+                                 groups)
+            else:
+                h = rankn_conv2d(tape, ex, h, w4, None, spec.xargs[xa + 2], spec.xargs[xa + 3], groups)
+        elif k == LAYER_MAXPOOL2D:
+            h = rankn_max_pool2d(tape, ex, h, spec.arg0[i], spec.arg1[i])
+        elif k == LAYER_AVGPOOL2D:
+            h = rankn_avg_pool2d(tape, ex, h, spec.arg0[i], spec.arg1[i])
+        h = rn_as_shape(tape, ex, h, rn_with_batch(B, spec.out_shape[i], "model"))
+        outs.append(h)
+        i += 1
+    # the (B, outputs) result is read densely by the loss and the prediction copy
+    tape.materialize(ex, h)
+    return h
+
+
+def _absorbed_activation(spec: ModelSpec, i: Int) -> Int:
+    """The tape activation code (RELU, SIGMOID, TANH or SOFTMAX) of the
+    activation layer right after Linear layer i, when tape.linear can take
+    it into the same node; 0 when there is none or a Residual layer reads
+    layer i's pre-activation output."""
+    if i + 1 >= spec.n_layers():
+        return 0
+    for j in range(i + 1, spec.n_layers()):  # driver-loop: over layers
+        if spec.kinds[j] == LAYER_RESIDUAL and spec.arg0[j] == i:
+            return 0
+    var nk = spec.kinds[i + 1]
+    if nk == LAYER_RELU:
+        return RELU
+    if nk == LAYER_SIGMOID:
+        return SIGMOID
+    if nk == LAYER_TANH:
+        return TANH
+    if nk == LAYER_SOFTMAX:
+        return SOFTMAX
+    return 0
+
+
+def _fused_codes(cfg: FitConfig) -> Bool:
+    """True when the batch target is the (B, 1) class codes and the loss is
+    one softmax_cross_entropy node (the default build, cross_entropy on
+    class codes)."""
+    comptime if MODEL_UNFUSED:
+        return False
+    return cfg.loss == LOSS_CROSS_ENTROPY and cfg.target == TARGET_CODES
+
+
+def model_loss[E: Exec](
+    mut tape: Tape, mut ex: E, cfg: FitConfig, pred: Tensor, target: Tensor,
+) raises -> Tensor:
+    """The batch loss, a mean over the batch (mse, bce_with_logits and huber:
+    over every element; cross_entropy: over rows). bce_with_logits and huber
+    are compositions of tape operations, so their folds are the tape's
+    blocked folds. (They move to autograd/losses.mojo when lane ag-loss
+    lands.)"""
+    if cfg.loss == LOSS_MSE:
+        return tape.mse_loss(ex, pred, target)
+    if cfg.loss == LOSS_CROSS_ENTROPY:
+        if _fused_codes(cfg):
+            # target holds the (B, 1) codes as float values
+            return tape.softmax_cross_entropy(ex, pred, target)
+        return tape.cross_entropy(ex, pred, target)
+    if cfg.loss == LOSS_BCE_WITH_LOGITS:
+        # max(x, 0) - x y + log(1 + exp(-|x|)); its gradient is sigmoid(x) - y
+        # on either side of 0, and no exp overflows.
+        var pos = tape.relu(ex, pred)
+        var neg = tape.relu(ex, tape.scale(ex, pred, Float32(-1)))
+        var absx = tape.add(ex, pos, neg)
+        var one = tape.scalar(ex, Float32(1))
+        var soft = tape.log(ex, tape.add(ex, tape.exp(ex, tape.scale(ex, absx, Float32(-1))), one))
+        var per = tape.add(ex, tape.subtract(ex, pos, tape.multiply(ex, pred, target)), soft)
+        return tape.mean(ex, per)
+    # huber(delta): q = min(|r|, delta), over = |r| - q;
+    # 0.5 q^2 + delta over (quadratic inside delta, linear outside)
+    var r = tape.subtract(ex, pred, target)
+    var a = tape.add(ex, tape.relu(ex, r), tape.relu(ex, tape.scale(ex, r, Float32(-1))))
+    var delta = tape.scalar(ex, cfg.huber_delta)
+    var over = tape.relu(ex, tape.subtract(ex, a, delta))
+    var q = tape.subtract(ex, a, over)
+    var per = tape.add(ex, tape.scale(ex, tape.multiply(ex, q, q), Float32(0.5)),
+                       tape.scale(ex, over, cfg.huber_delta))
+    return tape.mean(ex, per)
+
+
+def epoch_lr(lr: Float32, sched: Int, sched_step: Int, gamma: Float32, epoch: Int) -> Float32:
+    """The learning rate of zero-based epoch `epoch` under schedule `sched`
+    (SCHED_CONSTANT, SCHED_STEP: lr gamma^(epoch // sched_step),
+    SCHED_EXPONENTIAL: lr gamma^epoch). A per-epoch host scalar computed in
+    Mojo; model_fit and the operation session's optimizers
+    (autograd/ops_api.mojo) both take it from here, so the same schedule
+    gives the same word."""
+    if sched == SCHED_CONSTANT:
+        return lr
+    var k = epoch // sched_step if sched == SCHED_STEP else epoch
+    if k == 0:
+        return lr
+    return Float32(Float64(lr) * identical_pow64(Float64(gamma), Float64(k)))
+
+
+def model_lr(cfg: FitConfig, epoch: Int) -> Float32:
+    """The epoch's learning rate (a per-epoch scalar, computed in Mojo)."""
+    return epoch_lr(cfg.lr, cfg.sched, cfg.sched_step, cfg.sched_gamma, epoch)
+
+
+# ---------------------------------------------------------------- resumable state
+# The state a fit carries from one epoch to the next beyond the parameters
+# and the two optimizer buffers: one int64 word each, floats by their bits.
+# `model_fit_state` writes it at the end of every fit; with `resume` it
+# starts from it, so 2 + 2 epochs give the words of 4 epochs (the epoch
+# index keys the shuffle (mlp_epoch_key) and the schedule, the step counter
+# keys the optimizer's bias correction and the dropout masks).
+comptime FIT_STATE_WORDS = 12
+comptime FS_VALID = 0      # 1 once a fit has written the state
+comptime FS_EPOCH = 1      # epochs completed: the next epoch's index
+comptime FS_STEP = 2       # optimizer steps completed
+comptime FS_STALL = 3      # early stopping: epochs without improvement
+comptime FS_BEST = 4       # early stopping: the best epoch loss (float64 bits)
+comptime FS_PW1 = 5        # OptState.pw1, beta1^t (float32 bits)
+comptime FS_PW2 = 6        # OptState.pw2, beta2^t (float32 bits)
+comptime FS_MU = 7         # OptState.mu_prod (float32 bits)
+comptime FS_OPT = 8        # the optimizer kind the buffers belong to
+comptime FS_NPARAMS = 9    # the parameter count they cover
+comptime FS_SEED_LO = 10   # the fit's seed, low 32 bits
+comptime FS_SEED_HI = 11   # the fit's seed, high 32 bits
+
+comptime IP64 = UnsafePointer[Int64, MutUntrackedOrigin]
+
+
+def _f32_word(v: Float32) -> Int64:
+    return Int64(bitcast[DType.uint32](v))
+
+
+def _word_f32(w: Int64) -> Float32:
+    return bitcast[DType.float32](UInt32(w & Int64(0xFFFFFFFF)))
+
+
+# ---------------------------------------------------------------- fit / predict
+def model_fit[E: Exec](
+    mut ex: E, spec: ModelSpec, cfg: FitConfig, X: CastIn, Y: CastIn, N: Int, Pio: FP, curve: FP,
+) raises -> Int:
+    """`model_fit_state` from a fresh start, the optimizer state discarded."""
+    var m = List[Float32](length=spec.n_params, fill=Float32(0))
+    var v = List[Float32](length=spec.n_params, fill=Float32(0))
+    var st = List[Int64](length=FIT_STATE_WORDS, fill=Int64(0))
+    var n_iter = model_fit_state(
+        ex, spec, cfg, X, Y, N, Pio, curve, FP(unsafe_from_address=Int(m.unsafe_ptr())),
+        FP(unsafe_from_address=Int(v.unsafe_ptr())), IP64(unsafe_from_address=Int(st.unsafe_ptr())),
+        curve, False,
+    )
+    _ = m^
+    _ = v^
+    _ = st^
+    return n_iter
+
+
+def model_fit_state[E: Exec](
+    mut ex: E, spec: ModelSpec, cfg_in: FitConfig, X: CastIn, Y: CastIn, N: Int, Pio: FP, curve: FP,
+    Mio: FP, Vio: FP, St: IP64, curve_prev: FP, resume: Bool,
+) raises -> Int:
+    """Train the model on X (N, n_inputs) and Y; returns the epochs run.
+
+    X and Y are the caller's arrays as they are (core/cast_in.mojo): any
+    accepted dtype in C or Fortran order, cast to row-major float32 on the
+    executor (autograd/cast_ops.mojo upload_cast; float32 C order is the
+    plain upload). Y is (N, out) for TARGET_DENSE, or N C-contiguous int32
+    class codes (their bits in float32 words) for TARGET_CODES (one-hot
+    target) and TARGET_CODE_VALUES (the codes as the (N, 1) float target). Pio holds the starting
+    parameters when cfg.init is False and receives the trained ones;
+    curve[0:epochs run] receives each epoch's mean loss (the batch losses
+    weighted by their row counts, a blocked fold, divided by N).
+
+    Each epoch draws its row order on the executor (the MLP's keyed
+    permutation, OP_MLP_PERM with mlp_epoch_key) or keeps the identity
+    order; each batch gathers its rows, records the forward and the loss,
+    runs backward into the gradient vector and one optimizer step
+    (sequence/recurrent.mojo opt_step). With patience > 0 training stops
+    after `patience` epochs whose loss did not improve on the best by more
+    than tol (one word read back per epoch).
+
+    Mio and Vio (n_params each) receive the optimizer's two state buffers
+    (the momentum buffer, or Adam's first and second moments) and St the
+    FIT_STATE_WORDS counters. With `resume` they are also the starting
+    state: training continues at epoch St[FS_EPOCH] and step St[FS_STEP]
+    with the first fit's seed, Pio holds the parameters (cfg.init must be
+    False), curve_prev holds the St[FS_EPOCH] earlier epochs' losses and
+    curve receives all of them, the earlier ones first. Without `resume`,
+    curve[0:epochs run] receives this fit's.
+    """
+    var cfg = cfg_in.copy()
+    var start = 0
+    var step = 0
+    var stall = 0
+    var best = Float64(1.0e308)
+    var st = OptState()
+    if resume:
+        if cfg.init:
+            raise Error("model fit: resuming continues from the saved parameters (init must be 0)")
+        if St[FS_VALID] != 1 or Int(St[FS_OPT]) != cfg.opt.kind or Int(St[FS_NPARAMS]) != spec.n_params:
+            raise Error("model fit: resume needs the training state of an earlier fit of this model "
+                        + "with the same optimizer")
+        start = Int(St[FS_EPOCH])
+        step = Int(St[FS_STEP])
+        stall = Int(St[FS_STALL])
+        best = bitcast[DType.float64](St[FS_BEST])
+        st.pw1 = _word_f32(St[FS_PW1])
+        st.pw2 = _word_f32(St[FS_PW2])
+        st.mu_prod = _word_f32(St[FS_MU])
+        cfg.seed = (UInt64(St[FS_SEED_HI]) << 32) | UInt64(St[FS_SEED_LO])
+        if start < 0 or step < 0 or start + cfg.epochs >= MODEL_MAX_ROWS:
+            raise Error("model fit: the saved epoch and step counters are out of range")
+    check_fit(spec, cfg, N)
+    var D = spec.n_inputs
+    var O = spec.out_features()
+    var np_ = spec.n_params
+    var bs = cfg.batch if cfg.batch < N else N
+    if X.rows != N or X.cols != D:
+        raise Error("model fit: X must be (n_samples, " + String(D) + ")")
+    var dX = ex.alloc(N * D)
+    upload_cast(ex, dX, X)
+    # the batch target's width: the outputs, or 1 for the class codes of the
+    # fused cross-entropy (no one-hot target)
+    var TW = 1 if _fused_codes(cfg) else O
+    var dY = ex.alloc(N * TW)
+    if cfg.target == TARGET_CODES or cfg.target == TARGET_CODE_VALUES:
+        # the codes' int32 bits travel in float32 words (op_one_hot reads them)
+        if Y.count() != N or Y.kind != CAST_KIND_SIGNED or Y.itemsize != 4 or not Y.is_c_order():
+            raise Error("model fit: the class codes must be N C-contiguous int32")
+        var dC = ex.alloc(N)
+        ex.upload(dC, FP(unsafe_from_address=Y.addr), N)
+        var oh = Args()
+        oh.p0 = dC
+        oh.p1 = dY
+        oh.i0 = TW
+        oh.i1 = 1 if (cfg.target == TARGET_CODE_VALUES or TW == 1) else 0
+        ex.launch[OP_ONE_HOT](oh, N * TW)
+    else:
+        if Y.rows != N or Y.cols != O:
+            raise Error("model fit: y must have " + String(O) + " outputs per row")
+        upload_cast(ex, dY, Y)
+    var P = ex.alloc(np_)
+    if cfg.init:
+        model_init_params(ex, spec, P, cfg.seed)
+    else:
+        ex.upload(P, Pio, np_)
+    var Gr = ex.alloc(np_)
+    var s1 = ex.alloc(np_)
+    var s2 = ex.alloc(np_)
+    var s3 = ex.alloc(np_)
+    if resume:
+        # the optimizer buffers where the earlier fit left them (s3 is not
+        # read by sgd, momentum, adam or adamw)
+        ex.upload(s1, Mio, np_)
+        ex.upload(s2, Vio, np_)
+    var didx = ex.alloc(N)
+    var xb = ex.alloc(bs * D)
+    var yb = ex.alloc(bs * TW)
+    # AUTOGRAD_GATHER_EPOCH (autograd/data.mojo, lane ag-pass5-composed): one
+    # gather an epoch into a permuted copy when it fits; each batch is then
+    # a slice of it (xb and yb point into the copy). The same words.
+    var epoch_gather = False
+    var Xp = dummy_ptr()
+    var Yp = dummy_ptr()
+    comptime if AUTOGRAD_GATHER_EPOCH:
+        epoch_gather = gather_epoch_fits(N, D + TW)
+        if epoch_gather:
+            Xp = ex.alloc(N * D)
+            Yp = ex.alloc(N * TW)
+    var n_batches = (N + bs - 1) // bs
+    var dloss = ex.alloc(n_batches)
+    var dcurve = ex.alloc(cfg.epochs)
+    var tape = Tape()
+    var epoch_tape = Tape()
+    var word = List[Float32](length=1, fill=Float32(0))
+    var inv_n = ftz(identical_div(Float32(1), Float32(N)))
+    var n_iter = 0
+    for e in range(cfg.epochs):  # driver-loop: over epochs
+        # the absolute epoch index: a resumed fit continues the row orders
+        # and the schedule of the fit it resumes
+        var epoch = start + e
+        if cfg.shuffle:
+            ex.launch[OP_MLP_PERM](mlp_perm_args(N, mlp_epoch_key(cfg.seed, epoch), didx), N)
+        elif e == 0:
+            var ia = Args()
+            ia.p0 = didx
+            ex.launch[OP_SEQ_IOTA](ia, N)
+        var lr = model_lr(cfg, epoch)
+        comptime if AUTOGRAD_GATHER_EPOCH:
+            # the order changes only when shuffling: an unshuffled fit keeps epoch 0's copy
+            if epoch_gather and (cfg.shuffle or e == 0):
+                gather_epoch(ex, dX, dY, didx, N, D, TW, Xp, Yp)
+        for bi in range(n_batches):  # driver-loop: over batches
+            var off = bi * bs
+            var B = bs if off + bs <= N else N - off
+            var gathered = False
+            comptime if AUTOGRAD_GATHER_EPOCH:
+                if epoch_gather:
+                    xb = Xp + off * D
+                    yb = Yp + off * TW
+                    gathered = True
+            if not gathered:
+                # X and Y rows of the batch in one launch
+                var gx = Args()
+                gx.p0 = dX
+                gx.p1 = didx
+                gx.p2 = xb
+                gx.p3 = dY
+                gx.p4 = yb
+                gx.i0 = B
+                gx.i1 = D
+                gx.i2 = off
+                gx.i3 = TW
+                ex.launch[OP_GATHER_ROWS](gx, B * (D + TW))
+            tape.reset()
+            var x = tape.variable(ex, xb, B, D, False)
+            var target = tape.variable(ex, yb, B, TW, False)
+            var out = model_forward(tape, ex, spec, P, Gr, x, True, cfg.seed, step)
+            comptime if AUTOGRAD_CURVE_WORD:
+                # lane ag-pass6-fold (PASS6 idea H(1)): the loss's own fold
+                # launch stores the batch's curve word mul(loss, B), the word
+                # tape.scale stores; cross-entropy's loss is not a fold
+                # output (a scale of one), so it keeps the two launches below
+                if cfg.loss != LOSS_CROSS_ENTROPY:
+                    tape.arm_fold_word(dloss + bi, Float32(B))
+            var loss = model_loss(tape, ex, cfg, out, target)
+            var word_done = tape.disarm_fold_word(loss)
+            if spec.version == SPEC2_VERSION:
+                # the rank-N lanes' custom tags (conv2d, pools) beside NeuralRules
+                tape.backward_scalar_with_rules(ex, loss, RankNRules())
+            else:
+                tape.backward_scalar_with_rules(ex, loss, NeuralRules())
+            if not word_done:
+                # the batch's loss times its rows, for the epoch's weighted mean
+                var weighted = tape.scale(ex, loss, Float32(B))
+                _copy(ex, dloss + bi, tape.value(weighted), 1)
+            step += 1
+            opt_step(ex, cfg.opt, st, step, lr, P, Gr, s1, s2, s3, np_)
+        epoch_tape.reset()
+        var parts = epoch_tape.variable(ex, dloss, 1, n_batches, False)
+        var mean = epoch_tape.scale(ex, epoch_tape.sum(ex, parts), inv_n)
+        _copy(ex, dcurve + e, epoch_tape.value(mean), 1)
+        n_iter = e + 1
+        if cfg.patience > 0:
+            ex.sync()
+            ex.download(FP(unsafe_from_address=Int(word.unsafe_ptr())), dcurve + e, 1)
+            var value = Float64(word[0])
+            if value > best - cfg.tol:
+                stall += 1
+            else:
+                stall = 0
+            if value < best:
+                best = value
+            if stall >= cfg.patience:
+                break
+    ex.sync()
+    ex.download(Pio, P, np_)
+    ex.download(Mio, s1, np_)
+    ex.download(Vio, s2, np_)
+    if resume and start > 0:
+        memcpy(dest=curve, src=curve_prev, count=start)
+    ex.download(curve + start, dcurve, n_iter)
+    St[FS_VALID] = 1
+    St[FS_EPOCH] = Int64(start + n_iter)
+    St[FS_STEP] = Int64(step)
+    St[FS_STALL] = Int64(stall)
+    St[FS_BEST] = bitcast[DType.int64](best)
+    St[FS_PW1] = _f32_word(st.pw1)
+    St[FS_PW2] = _f32_word(st.pw2)
+    St[FS_MU] = _f32_word(st.mu_prod)
+    St[FS_OPT] = Int64(cfg.opt.kind)
+    St[FS_NPARAMS] = Int64(np_)
+    St[FS_SEED_LO] = Int64(cfg.seed & UInt64(0xFFFFFFFF))
+    St[FS_SEED_HI] = Int64(cfg.seed >> 32)
+    tape.release(ex)
+    epoch_tape.release(ex)
+    _ = word^
+    return n_iter
+
+
+def model_predict[E: Exec](
+    mut ex: E, spec: ModelSpec, X: CastIn, N: Int, Pin: FP, dst: FP, chunk: Int, transform: Int,
+) raises:
+    """dst (N, out) = the model's output on X (N, n_inputs), optionally
+    through a row softmax (OUT_SOFTMAX) or an elementwise sigmoid
+    (OUT_SIGMOID); OUT_PROBA2 (one output) writes the (N, 2) [1 - p, p] of
+    the sigmoid p into dst instead; OUT_ARGMAX (the first-max-wins row
+    argmax) and OUT_THRESHOLD (one output, sigmoid p > 0.5) write N float32
+    class codes. Dropout is the identity. Rows run in chunks of `chunk`
+    so the tape's scratch stays bounded."""
+    if N < 1 or N >= MODEL_MAX_ROWS or chunk < 1:
+        raise Error("model predict: the number of samples must be between 1 and 2^24 - 1 and chunk >= 1")
+    if transform < OUT_RAW or transform > OUT_THRESHOLD:
+        raise Error("model predict: unknown output transform " + String(transform))
+    if (transform == OUT_PROBA2 or transform == OUT_THRESHOLD) and spec.out_features() != 1:
+        raise Error("model predict: binary probabilities and labels need a model with one output")
+    var D = spec.n_inputs
+    var O = spec.out_features()
+    var bs = chunk if chunk < N else N
+    if X.rows != N or X.cols != D:
+        raise Error("model predict: X must be (n_samples, " + String(D) + ")")
+    var dX = ex.alloc(N * D)
+    upload_cast(ex, dX, X)  # the caller's array as it is (autograd/cast_ops.mojo)
+    var P = ex.alloc(spec.n_params)
+    ex.upload(P, Pin, spec.n_params)
+    var dout = ex.alloc(N * O)
+    var tape = Tape()
+    var b0 = 0
+    while b0 < N:  # driver-loop: over row chunks (bounded tape scratch)
+        var B = bs if b0 + bs <= N else N - b0
+        tape.reset()
+        comptime if HAS_INFERENCE:
+            tape.no_grad()  # depends on lane ag-forward (inference mode)
+        var x = tape.variable(ex, dX + b0 * D, B, D, False)
+        var out = model_forward(tape, ex, spec, P, P, x, False, UInt64(0), 0)
+        if transform == OUT_SOFTMAX:
+            out = tape.softmax(ex, out)
+        elif transform == OUT_SIGMOID or transform == OUT_PROBA2 or transform == OUT_THRESHOLD:
+            out = tape.sigmoid(ex, out)
+        _copy(ex, dout + b0 * O, tape.value(out), B * O)
+        comptime if HAS_INFERENCE:
+            tape.record()
+        b0 += B
+    if transform == OUT_PROBA2:
+        var two = ex.alloc(N * 2)
+        var q = Args()
+        q.p0 = dout
+        q.p1 = two
+        ex.launch[OP_PROBA2](q, N * 2)
+        ex.sync()
+        ex.download(dst, two, N * 2)
+    elif transform == OUT_ARGMAX or transform == OUT_THRESHOLD:
+        var codes = ex.alloc(N)
+        var q = Args()
+        q.p0 = dout
+        q.p1 = codes
+        q.i0 = O
+        q.f0 = Float32(0.5)
+        if transform == OUT_ARGMAX:
+            ex.launch[OP_AGM_ROW_ARGMAX](q, N)
+        else:
+            ex.launch[OP_AGM_THRESHOLD](q, N)
+        ex.sync()
+        ex.download(dst, codes, N)
+    else:
+        ex.sync()
+        ex.download(dst, dout, N * O)
+    tape.release(ex)

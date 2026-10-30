@@ -1,0 +1,685 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 the authors. Part of anonlib, DOI-WITHHELD
+"""tools/bench_board_algos.py: the algorithm-expansion races. The tables, the
+SKIPPED path, the prep derivations and the conductor's quality functions, on
+tiny arrays (no GPU, no anonlib, no opponent library needed)."""
+import importlib.util
+import json
+import os
+import subprocess
+import sys
+import types
+
+import numpy as np
+import pytest
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def _load(name):
+    spec = importlib.util.spec_from_file_location("t_" + name, os.path.join(HERE, name + ".py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+A = _load("bench_board_algos")
+bb = _load("bench_board")
+
+
+@pytest.mark.parametrize("lane", ["qr", "svd", "randomized-svd"])
+def test_linalg_retains_all_scored_factors(monkeypatch, lane):
+    X = np.random.default_rng(7).normal(size=(31, 5)).astype(np.float32)
+    factors = np.linalg.qr(X) if lane == "qr" else np.linalg.svd(X, full_matrices=False)
+    monkeypatch.setattr(A, "_ours_class", lambda name: (name, lambda *a, **kw: factors))
+    monkeypatch.setattr(A, "_ours_info", lambda name: {})
+    runner = A._build_linalg(lane, "ours", {"X": X})
+    runner.fit()
+    outputs = runner.outputs()
+    keys = ("Q", "R") if lane == "qr" else ("U", "S", "Vh")
+    for key, original in zip(keys, factors):
+        np.testing.assert_array_equal(outputs[key], original)
+        assert outputs[key].shape == original.shape
+
+
+def test_qr_quality_rejects_corrupt_q_even_when_r_is_correct():
+    import board_quality as policy
+    X = np.random.default_rng(7).normal(size=(31, 5))
+    Q, R = np.linalg.qr(X)
+    values = A.quality("qr", {"X": X}, {
+        "ours": {"Q": Q, "R": R}, "library": {"Q": Q.copy(), "R": R.copy()}})
+    own, other = (dict(arm=name, quality=values[name]) for name in ("ours", "library"))
+    assert policy.compare(own, other)["verdict"] == "PASS"
+    bad = A.quality("qr", {"X": X}, {"library": {"Q": np.zeros_like(Q), "R": R}})
+    assert bad["library"]["relative_gram_difference"] < 1e-12
+    assert policy.compare(own, dict(arm="library", quality=bad["library"]))["verdict"] == "FAIL"
+    missing = A.quality("qr", {"X": X}, {"library": {"R": R}})
+    # A missing Q metric is "not scored" (2026-10-14), never passed.
+    assert policy.compare(own, dict(arm="library", quality=missing["library"]))["verdict"] == "INSUFFICIENT"
+
+
+def test_cupy_linalg_records_synchronized_input_copy_outside_fit(monkeypatch):
+    events = []
+    cp = types.ModuleType("cupy")
+    cp.__version__ = "fixture"
+    cp.asarray = lambda a: events.append("copy") or a.copy()
+    cp.cuda = types.SimpleNamespace(runtime=types.SimpleNamespace(
+        deviceSynchronize=lambda: events.append("sync")))
+    def cholesky(a):
+        events.append("fit")
+        return a
+    cp.linalg = types.SimpleNamespace(cholesky=cholesky)
+    ticks = iter([1., 1.003])
+    monkeypatch.setitem(sys.modules, "cupy", cp)
+    monkeypatch.setattr(A.time, "perf_counter", lambda: next(ticks))
+    runner = A._build_linalg("cholesky", "cupy-gpu", {"_cap": 256})
+    assert events == ["sync", "copy", "sync"]
+    assert runner.info["upload_ms_untimed"] == pytest.approx(3.)
+    assert runner.info["input_home"] == "device"
+    runner.fit()
+    assert events == ["sync", "copy", "sync", "fit", "sync"]
+
+
+def test_function_identity_survives_worker_json_transport():
+    import math
+    runner = A.Runner({}, lambda: None, lambda: {}, record={
+        "__library__": "math", "__implementation__": math.sqrt, "seed": 7})
+    transported = json.loads(json.dumps(runner.record))
+    assert transported["implementation"] == {"module": "math", "name": "sqrt"}
+    assert A._BP().arm_record(transported)["implementation"] == transported["implementation"]
+    assert transported["params"]["seed"] == 7
+
+
+def test_gpu_transform_quality_gets_retained_independent_reference(tmp_path):
+    D = dict(X=np.array([[0., 1.], [2., 3.], [4., 5.]], dtype=np.float32),
+             Xq=np.array([[1., 2.], [3., 4.]], dtype=np.float32))
+    outs = {"ours": {"pred": np.array([[.25, .25], [.75, .75]], dtype=np.float32)}}
+    receipt = A.transform_quality_reference("minmax-scaler", D, outs, tmp_path)
+    assert receipt["parameters"]["implementation"]["module"].startswith("sklearn.")
+    assert (tmp_path / "reference.npz").is_file()
+    assert receipt["inputs"]["X"]["shape"] == [3, 2]
+    q = A.quality("minmax-scaler", D, outs)
+    assert q["ours"]["rel_diff_vs_sklearn"] == 0
+    assert q["sklearn-cpu"]["rel_diff_vs_sklearn"] == 0
+    outs["ours"]["pred"][0, 0] = np.nan
+    assert "nonfinite" in A.quality("minmax-scaler", D, outs)["ours"]["error"]
+
+
+def test_optimizer_quality_detects_unchanged_parameter_despite_small_update():
+    initial = np.random.default_rng(A.SEED).standard_normal(128).astype(np.float32)
+    outs = {"ours": {"param": initial.copy()},
+            "torch-eager-fp32": {"param": initial - np.float32(1e-5)}}
+    q = A.quality("adam", {}, outs)
+    assert q["torch-eager-fp32"]["optimizer_update_error_vs_torch_fp32"] == 0
+    assert q["ours"]["rel_fro_vs_torch_eager_fp32"] < .001
+    assert q["ours"]["optimizer_update_error_vs_torch_fp32"] == pytest.approx(1.)
+
+
+def test_hipvs_worker_version_uses_actual_cuvs_module(monkeypatch):
+    probe = _load("bench_board_probe")
+    monkeypatch.setitem(sys.modules, "cuvs", types.SimpleNamespace(__version__="1.0.0"))
+    assert probe.library_version("hipvs") == "1.0.0"
+
+
+def test_cuml_minmax_uses_supported_unclipped_constructor(monkeypatch):
+    class MinMaxScaler:
+        def __init__(self, feature_range=(0, 1)):
+            self.feature_range = feature_range
+
+    monkeypatch.setattr(A, "_imp", lambda spec: MinMaxScaler)
+    make, _, params = A._est_factory("minmax-scaler", "cuml-gpu", {})
+    assert make().feature_range == (0, 1)
+    assert params == {"feature_range": (0, 1)}
+    assert A.LANES["minmax-scaler"]["params"]["clip"] is False
+
+
+@pytest.mark.parametrize("values", [
+    np.array([0, 1, 1], dtype=np.int64),
+    np.array([0.25, -1.5, 3.75], dtype=np.float32),
+])
+def test_torch_metric_export_moves_to_host_before_float64(values):
+    # Model MPS's unsupported dtype, without importing any GPU runtime. This
+    # exercises export on completed classifier and regression predictions.
+    class DevicePrediction:
+        def detach(self):
+            return self
+
+        def cpu(self):
+            return HostPrediction()
+
+        def double(self):
+            raise TypeError("MPS tensors cannot store float64")
+
+    class HostPrediction:
+        def double(self):
+            return self
+
+        def numpy(self):
+            return values.astype(np.float64)
+
+    exported = A._torch_metric_array(DevicePrediction())
+    assert exported.dtype == np.float64
+    np.testing.assert_array_equal(exported, values)
+
+
+def test_kernel_pca_quality_without_opponents():
+    X = np.array([[0., 0.], [1., 0.], [0., 2.], [2., 3.]])
+    K = np.exp(-((X[:, None] - X[None, :]) ** 2).sum(2) / X.shape[1])
+    values, vectors = np.linalg.eigh(K)
+    Z = vectors * np.sqrt(np.maximum(values, 0))
+    q = A.quality("kernel-pca", {"Xq": X}, {"ours-fast": {"pred": Z}})
+    assert q["ours-fast"]["rbf_feature_distance_relative_stress"] < 1e-12
+    assert A._rbf_embedding_stress(X, Z + 7) < 1e-12
+    assert A._rbf_embedding_stress(X, np.zeros_like(Z)) == pytest.approx(1)
+    assert A._rbf_embedding_stress(X, Z * 2) == pytest.approx(3)
+    with pytest.raises(ValueError):
+        A._rbf_embedding_stress(X, Z * np.nan)
+    with pytest.raises(ValueError):
+        A._rbf_embedding_stress(X, Z[:-1])
+
+XLANES = {"linear", "cluster", "neighbors", "decomp", "prep", "sequence", "trees", "cnn", "ann",
+          # the lanes of the public anonlib.training, resample, model_selection and
+          # embedding surfaces (2026-09-29)
+          "training", "resample", "model_selection", "embedding"}
+
+
+def test_tables_are_complete_and_stdlib_only():
+    assert {A.LANES[l]["xlane"] for l in A.LANE_ORDER} == XLANES
+    alone = set()
+    for lane in A.LANE_ORDER:
+        s = A.LANES[lane]
+        assert s["ours"] and all(isinstance(n, str) for n in s["ours"]), lane
+        assert s["datasets"], lane
+        cfg = A.lane_config(lane)
+        for k in ("ours_class", "timed_fit", "quality", "params", "mismatches"):
+            assert cfg[k] is not None, (lane, k)
+        json.dumps(cfg)
+        assert A.quality_kind(lane) in A.QUALITY_TEXT, lane
+        assert A.rows_text(lane)
+        for v in ("apple", "nvidia", "amd"):
+            opp = A.opponents(v, lane)
+            if not opp:
+                alone.add(lane)
+            if v != "nvidia":
+                assert not any(a in A._NVIDIA_ONLY for a in opp), (v, lane)
+        # two datasets of different kind, or its own named data
+        tab = [d for d in s["datasets"] if d in A.TAB]
+        assert len(s["datasets"]) >= 2 or s["block"] in ("tensor", "optim", "dense", "sym", "images",
+                                                          "corpus"), lane
+        assert not tab or set(tab) == set(A.TAB), lane
+    # torch.optim has no Lion and no LAMB: those race ours alone, named in not_planned.
+    # FAIRNESS FIX (2026-10-13 audit): the SGD lanes refuse scikit-learn's per-sample SGD (a
+    # different algorithm from ours' minibatch SGD), so off NVIDIA they race ours alone too.
+    # quantile: ours runs ADMM, no library does (its scikit-learn arm is refused).
+    # FAIRNESS FIX (2026-10-13 audit): incremental-pca's opponents (cuML, scikit-learn) run a
+    # different per-batch algorithm and are refused, so it races ours alone too.
+    # FAIRNESS FIX (2026-10-13 audit, second pass): tree-shap refuses every opponent (a different
+    # model), and the lanes whose ours estimator is or nests the binned DecisionTree refuse
+    # scikit-learn's exact-threshold trees, so off NVIDIA (decision-tree-*) or everywhere they
+    # race ours alone too.
+    # FAIRNESS FIX (2026-10-13 audit): radius-neighbors refuses scikit-learn (a tree or brute
+    # search against ours' random ball cover; no library has the same algorithm), tsne refuses
+    # scikit-learn's Barnes-Hut (cuML method='exact' races on NVIDIA only), and cagra refuses
+    # faiss's HNSW (cuVS on NVIDIA and hipVS on AMD are CAGRA), so off those vendors they race
+    # ours alone. Results raced before this change were wrong for these lanes.
+    assert alone == {"lion", "lamb", "sgd-clf", "sgd-reg", "incremental-pca", "tree-shap",
+                     "decision-tree-clf", "decision-tree-reg", "bagging-clf", "bagging-reg",
+                     "adaboost-clf", "adaboost-reg", "voting-clf", "voting-reg",
+                     "stacking-clf", "stacking-reg", "quantile", "radius-neighbors", "tsne",
+                     "cagra"}
+    assert any(w.startswith("cuml-gpu on incremental-pca: refused") for w in A.not_planned("nvidia"))
+    assert any(w.startswith("sklearn-cpu on bagging-clf: refused") for w in A.not_planned("apple"))
+    assert "xgboost-cpu" not in A.opponents("apple", "dart") and "lightgbm-cpu" in A.opponents("apple", "dart")
+    assert any("Lion and LAMB" in w for w in A.not_planned("nvidia"))
+    assert any(w.startswith("sklearn-cpu on sgd-clf: refused") for w in A.not_planned("amd"))
+    code = ("import sys, importlib.util; sys.modules['numpy'] = None; "
+            "s = importlib.util.spec_from_file_location('m', %r); "
+            "m = importlib.util.module_from_spec(s); s.loader.exec_module(m); print(len(m.LANES))"
+            % os.path.join(HERE, "bench_board_algos.py"))
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)
+    assert out.stdout.strip() == str(len(A.LANES))
+
+
+def test_lane_names_do_not_collide_with_the_other_families():
+    others = set(bb.TREE_LANES + bb.TREE_TASK_LANES + bb.CLASSICAL_LANES + bb.MORE_LANES
+                 + bb.NEURAL_LANES)
+    assert not others & set(A.LANE_ORDER)
+
+
+def test_every_opponent_has_a_pin_or_is_in_an_existing_set():
+    pinned = " ".join(A.PINS["nvidia"] + A.RAPIDS_EXTRA["nvidia"])
+    for lib in ("statsforecast", "statsmodels", "arch", "prophet", "networkx", "shap", "implicit",
+                "torch-geometric", "gpytorch", "faiss-cpu", "cugraph-cu12"):
+        assert lib + "==" in pinned, lib
+    assert all("==" in p for v in A.PINS.values() for p in v)
+
+
+@pytest.mark.parametrize("vendor", ["apple", "nvidia", "amd"])
+def test_plan_has_every_lane_with_our_arms(vendor):
+    races = bb.plan_races(vendor, bb.modes_for(vendor), ["algos"])
+    assert {r["lane"] for r in races} == set(A.LANE_ORDER)
+    want = {"ours": "identical"}          # the board never races our CPU (Oct 2 2026)
+    if vendor == "apple":
+        want["ours-fast"] = "fast"
+    for r in races:
+        assert r["our_arms"] == want, r["id"]
+        assert sorted(r["arms"][:len(want)]) == sorted(want)
+        # a race with any GPU opponent races only GPU opponents
+        opp = r["opponents"]
+        if any("-cpu" not in a for a in opp):
+            assert not any(bb._is_cpu_arm(a) for a in opp), r["id"]
+    # --datasets narrows taxi/Istella; a lane's own data always runs
+    only = bb.plan_races(vendor, bb.modes_for(vendor), ["algos"], datasets=["taxi"])
+    assert not any(r["dataset"] == "istella" for r in only)
+    assert any(r["dataset"] == "text" for r in only)
+
+
+def test_opponent_rosters():
+    nv = {l: A.opponents("nvidia", l) for l in A.LANE_ORDER}
+    # FAIRNESS FIX (2026-10-13 audit): scikit-learn's per-sample SGD is refused (see LANES)
+    assert nv["sgd-clf"] == ("cuml-gpu",)
+    assert A.opponents("amd", "sgd-reg") == ()
+    # FAIRNESS FIX (2026-10-13 audit, second pass): XGBoost's depth-wise DART is refused (see LANES)
+    assert nv["dart"] == ("lightgbm-cpu",)
+    assert nv["ivf-pq"] == ("faiss-cpu", "cuvs-gpu")
+    assert nv["pagerank"] == ("networkx-cpu", "cugraph-gpu")
+    assert nv["lstm-clf"][0] == "torch-eager-fp32" and "torch-compile-tf32" in nv["lstm-clf"]
+    assert nv["dart-reg"] == ("lightgbm-cpu",)
+    # FAIRNESS FIX (2026-10-13 audit): cuML AutoARIMA is float64 only and ours float32: refused
+    assert nv["autoarima"] == ("statsforecast-cpu",)
+    assert nv["gaussian-rp"] == nv["sparse-rp"] == ("sklearn-cpu", "cuml-gpu")
+    assert not A.LANES["gaussian-rp"].get("cuml_host_input")
+    # FAIRNESS FIX (2026-10-13 audit): hipVS (AMD's cuVS port) is the AMD GPU IVF-PQ and CAGRA
+    # opponent; faiss's HNSW is refused on cagra
+    assert A.opponents("amd", "ivf-pq") == ("faiss-cpu", "hipvs-gpu")
+    assert A.opponents("amd", "cagra") == ("hipvs-gpu",)
+    assert A.opponents("apple", "cagra") == () and A.opponents("apple", "tsne") == ()
+    assert "hipvs-gpu" not in nv["ivf-pq"] and nv["cagra"] == ("cuvs-gpu",)
+    assert not any("tf32" in a for a in A.opponents("apple", "conv2d"))
+
+
+def test_skipped_when_the_wheel_lacks_the_class(monkeypatch):
+    fake = types.ModuleType("anonlib")
+    fake.__version__ = "0.0-test"
+    fake.Ridge = object
+    monkeypatch.setitem(sys.modules, "anonlib", fake)
+    with pytest.raises(A.Skipped, match="SKIPPED: not built yet"):
+        A._ours_class("sgd-clf")
+    with pytest.raises(A.Skipped):
+        A.build("lu-solve", "ours", {})
+    fake.linalg = types.SimpleNamespace(solve=len)
+    assert A._ours_class("lu-solve") == ("linalg.solve", len)
+    fake.solve = abs                              # the first exported candidate wins
+    assert A._ours_class("lu-solve") == ("solve", abs)
+    # a nested base estimator the wheel lacks is a skip too, not an error
+    with pytest.raises(A.Skipped, match="GaussianNB"):
+        A._resolve(A._E("GaussianNB"), "ours")
+
+
+def test_refused_opponents_skip_by_name():
+    # FAIRNESS FIX (2026-10-13 audit): a refused opponent named on the command line refuses with
+    # the lane's reason before anything is built (no cuML or scikit-learn import needed)
+    for lane, arm in (("incremental-pca", "cuml-gpu"), ("incremental-pca", "sklearn-cpu"),
+                      ("autoarima", "cuml-gpu")):
+        with pytest.raises(RuntimeError, match="REFUSED: %s is not raced on %s: fairness audit "
+                                               "2026-10-13" % (arm, lane)):
+            A.build(lane, arm, {})
+        assert arm in A.lane_config(lane)["refused_opponents"]
+
+
+def test_board_marks_skipped_cells():
+    cells = [{"arm": "ours", "status": "REFUSED(x)"}, {"arm": "sklearn-cpu", "status": "ok"}]
+    r = {"arms": {"ours": {"status": "skipped", "error": "SKIPPED: not built yet (...)"},
+                  "sklearn-cpu": {"status": "ok"}}}
+    out = bb.algos_skips(cells, r)
+    assert out[0]["status"] == bb.ALGOS_SKIPPED and out[1]["status"] == "ok"
+
+
+def test_lane_arrays_derivations():
+    rng = np.random.default_rng(0)
+    B = {"X": rng.standard_normal((200, 6)).astype(np.float32),
+         "Xq": rng.standard_normal((50, 6)).astype(np.float32),
+         "y": (rng.random(200) > 0.5).astype(np.float32), "yq": (rng.random(50) > 0.5).astype(np.float32)}
+    D = A.lane_arrays("additive-chi2", dict(B))
+    assert D["X"].min() >= 0 and D["Xq"].min() >= 0
+    D = A.lane_arrays("knn-imputer", dict(B))
+    assert np.isnan(D["X"]).any() and not np.isnan(D["X_true"]).any()
+    D = A.lane_arrays("label-propagation", dict(B))
+    assert (D["y_semi"] == -1).sum() == 180
+    D = A.lane_arrays("multioutput-clf", dict(B))
+    assert D["X"].shape[1] == 5 and D["Y"].shape == (200, 2)
+    D = A.lane_arrays("isotonic", dict(B))
+    assert D["X"].ndim == 1
+    D = A.lane_arrays("incremental-pca", {"X": B["X"]})
+    assert D["X"].shape[0] + D["Xq"].shape[0] == 200
+    # 'half' resolves to d // 2; gaussian-rp itself races the cuML benchmark's 10 components
+    p = A._derived_params("gaussian-rp", {"X": B["X"]}, dict(A.LANES["gaussian-rp"]["params"],
+                                                              n_components="half"))
+    assert p["n_components"] == 3
+    assert A.LANES["gaussian-rp"]["params"]["n_components"] == 10
+    Y = np.random.default_rng(3).standard_normal((2, 100)).astype(np.float32)
+    D = A.lane_arrays("gru-clf", {"Y": Y})
+    n_fit = int(100 * 0.8) - A.SEQ_T
+    assert D["X"].shape == (2 * n_fit, A.SEQ_T, 1) and D["Xq"].shape[1:] == (A.SEQ_T, 1)
+    assert set(np.unique(D["y"])) <= {0.0, 1.0} and D["X"].dtype == np.float32
+    assert A.block_file("gru-clf", "synthetic") == "ts-synthetic"
+    D = A.lane_arrays("autoarima", {"Y": np.arange(2 * 100, dtype=np.float32).reshape(2, 100)})
+    assert D["Yfit"].shape == (2, 100 - A.TS_H) and D["Yhold"].shape == (2, A.TS_H)
+
+
+def test_taxi_hourly_recovers_the_month():
+    # Jan 1 2024 is weekday 0 in the decode's convention, Feb 1 weekday 3
+    x = np.zeros((4, 16), dtype=np.float32)
+    x[:, A.TAXI_PU] = 7
+    x[:, A.TAXI_HOUR] = 5
+    x[:, A.TAXI_DAY] = [1, 1, 2, 1]
+    x[:, A.TAXI_WDAY] = [0, 3, 1, 5]          # Jan 1, Feb 1, Jan 2, neither
+    C = A.taxi_hourly(x)
+    assert C[7, 5] == 1 and C[7, 31 * 24 + 5] == 1 and C[7, 24 + 5] == 1 and C.sum() == 3
+
+
+def test_graph_and_quality_helpers():
+    rng = np.random.default_rng(1)
+    X = rng.standard_normal((60, 3))
+    ip, ix = A.knn_graph(X, 4)
+    assert ip.shape == (61,) and ip[-1] == ix.shape[0]
+    src = np.repeat(np.arange(60), np.diff(ip))
+    assert set(zip(src.tolist(), ix.tolist())) == set(zip(ix.tolist(), src.tolist()))
+    assert not (src == ix).any()
+    one = np.zeros(60, dtype=np.int64)
+    assert abs(A._modularity(ip, ix, one)) < 1e-12
+    M = rng.standard_normal((20, 4))
+    assert A._subspace(M, M @ rng.standard_normal((4, 4))) == pytest.approx(1.0)
+    Xc = np.abs(rng.standard_normal((5, 3)))
+    K = A._kernel_exact("kernel-achi2", Xc, {"X": Xc})
+    assert K[0, 0] == pytest.approx(Xc[0].sum())
+    D = {"index": rng.standard_normal((100, 3)).astype(np.float32),
+         "queries": rng.standard_normal((7, 3)).astype(np.float32)}
+    X64, Q64 = D["index"].astype(np.float64), D["queries"].astype(np.float64)
+    truth = np.argsort(((Q64[:, None] - X64[None]) ** 2).sum(-1), axis=1)[:, :10]
+    assert A._recall(D, truth) == 1.0
+    A_, B_ = A.lu_system(64)
+    x = np.linalg.solve(A_.astype(np.float64), B_)
+    q = A.quality("lu-solve", {}, {"numpy-cpu": {"x": x.reshape(-1)}})
+    assert q["numpy-cpu"]["relative_residual"] < 1e-10
+
+
+def test_quality_by_kind():
+    rng = np.random.default_rng(2)
+    yq = (rng.random(40) > 0.5).astype(np.float32)
+    q = A.quality("perceptron", {"yq": yq}, {"sklearn-cpu": {"pred": yq.astype(np.float64)}})
+    assert q["sklearn-cpu"]["accuracy"] == 1.0
+    ref = {"pred": rng.standard_normal((40, 3))}
+    q = A.quality("robust-scaler", {}, {"sklearn-cpu": ref, "ours": {"pred": ref["pred"] + 1e-3}})
+    assert q["ours"]["max_abs_diff_vs_sklearn"] == pytest.approx(1e-3)
+    sup = {"support": np.array([1, 0, 1, 0])}
+    q = A.quality("select-chi2", {}, {"sklearn-cpu": sup, "ours": {"support": np.array([1, 1, 1, 0])}})
+    assert q["ours"]["jaccard_vs_sklearn"] == pytest.approx(2 / 3)
+    pytest.importorskip("sklearn")
+    Xs = rng.standard_normal((400, 6)).astype(np.float32)
+    ys = (Xs[:, 0] - Xs[:, 2] > 0).astype(np.float32)
+    exact = A._exact_rfe_support("rfe", {"X": Xs, "y": ys})
+    assert exact[0] and exact[2] and exact.sum() == 3
+    q = A.quality("rfe", {"X": Xs, "y": ys}, {"ours": {"support": exact.astype(np.int64)}})
+    assert q["ours"]["jaccard_vs_exact"] == 1.0 and "exact" not in q
+    phi = rng.standard_normal((5, 3))
+    q = A.quality("tree-shap", {}, {"x": {"phi": phi, "base": np.ones(5), "margin": phi.sum(1) + 1}})
+    assert q["x"]["max_additivity_error"] < 1e-12
+    Y = rng.standard_normal((3, 60))
+    q = A.quality("theta", {"Yfit": Y[:, :-A.TS_H], "Yhold": Y[:, -A.TS_H:]},
+                  {"a": {"forecast": Y[:, -A.TS_H:]}})
+    assert q["a"]["forecast_rmse"] == 0.0
+    y = rng.standard_normal((1, 8, 4)).astype(np.float32)
+    q = A.quality("conv2d", {}, {"torch-eager-fp32": {"y": y}, "ours": {"y": y}})
+    assert q["ours"]["rel_fro_vs_torch_eager_fp32"] == 0.0
+    # a quality function that raises is recorded by name, never fatal
+    q = A.quality("perceptron", {"yq": yq}, {"x": {}})
+    assert "error" in q["x"]
+
+
+def test_device_ndarray_is_copied_to_host():
+    """cuVS returns pylibraft device_ndarray; np.array() of it is garbage, so
+    the host copy must go through copy_to_host (the classical2 ivf cuvs arm
+    and every algos cuvs arm read their neighbours through it)."""
+    class Dev(object):
+        __module__ = "pylibraft.common.device_ndarray"
+
+        def copy_to_host(self):
+            return np.arange(6).reshape(2, 3)
+
+        def __array__(self, dtype=None, copy=None):
+            return np.full((2, 3), -1)
+    ctd = _load("classical_two_datasets")
+    assert ctd._to_host(Dev()).tolist() == [[0, 1, 2], [3, 4, 5]]
+    assert A._arr(Dev(), np.int64).tolist() == [[0, 1, 2], [3, 4, 5]]
+
+
+def test_bayesian_gmm_reg_covar_per_dataset(tmp_path, monkeypatch):
+    # Istella-S takes reg_covar 3e-3 on every arm (every arm refused at 1e-6);
+    # taxi keeps 1e-6. The dataset is the one _load_block read.
+    D = {"X": np.zeros((4, 3), np.float32)}
+    s = A.LANES["bayesian-gmm"]
+    for ds, want in (("istella", 3e-3), ("taxi", 1e-6)):
+        monkeypatch.setattr(A, "_DATASET", ds)
+        for params in (s["params"], s.get("sk_params", s["params"])):
+            assert A._derived_params("bayesian-gmm", D, params)["reg_covar"] == want
+    assert s["params"]["reg_covar"] == 1e-6          # the table itself is not changed
+    assert A.lane_config("bayesian-gmm")["dataset_params"] == {"istella": {"reg_covar": 3e-3}}
+    # _load_block records the dataset (the synthetic path needs no file)
+    monkeypatch.setattr(A, "block_file", lambda lane, ds: None)
+    A._load_block("bayesian-gmm", "istella", str(tmp_path))
+    assert A._DATASET == "istella"
+
+
+def test_no_other_lane_has_dataset_params():
+    assert sorted(k for k, s in A.LANES.items() if s.get("dataset_params")) == ["bayesian-gmm"]
+
+
+def test_embedding_early_return_retains_actual_inputs_and_implementation(monkeypatch, tmp_path):
+    nf = A._tool('neural_fixtures')
+    spec = A.LANES['embedding']
+    ids = np.array([[0, 1]], dtype=np.int64)
+    weight = np.array([[1., 2.], [3., 4.]], dtype=np.float32)
+    entry = nf.write_entry(str(tmp_path), 'embedding', 'synthetic', nf.variant(spec['task'], {}),
+                           task=spec['task'], params=spec['params'], smoke=False,
+                           x=ids, dy=np.ones((1, 2, 2), dtype=np.float32), state={'weight': weight})
+    nf.write_manifest(str(tmp_path), [entry], torch_version='fixture', seed=A.SEED)
+    monkeypatch.setattr(A, '_NEURAL_FIXTURES', str(tmp_path))
+    monkeypatch.setattr(A, '_DATASET', 'synthetic')
+    class Layer:
+        def __init__(self, weight, **kw): self.weight = weight
+    monkeypatch.setattr(A, '_ours_class', lambda lane: ('Embedding', Layer))
+    monkeypatch.setattr(A, '_ours_info', lambda lane: {})
+    runner = A._build_layer('embedding', 'ours', {})
+    assert runner.record['implementation']['name'].endswith('Layer')
+    assert runner.record['params']['input_arrays'] == A._input_array_records([('x', ids), ('weight', weight)])
+
+
+def test_dropout_quality_accepts_different_masks_and_rejects_wrong_work():
+    x = np.arange(1, 4001, dtype=np.float32).reshape(100, 10, 2, 2)
+    y = x / np.float32(.9)
+    z = y.copy()
+    y[:, 0] = 0
+    z[:, 1] = 0
+    for output in (y, z):
+        quality = A.dropout_quality(x, output, .1)
+        assert quality['dropout_contract_relative_error'] < 1e-6
+        assert quality['dropout_probability_z'] == 0
+    assert A.dropout_quality(x, y * 2, .1)['dropout_contract_relative_error'] > .1
+    assert A.dropout_quality(x, np.zeros_like(x), .1)['dropout_probability_z'] > 6
+    elementwise = (x / np.float32(.9)).copy()
+    elementwise[:, :, 0, 0] = 0
+    assert A.dropout_quality(x, elementwise, .1)['dropout_contract_relative_error'] > .1
+    with pytest.raises(ValueError):
+        A.dropout_quality(x, y * np.nan, .1)
+    with pytest.raises(ValueError):
+        A.dropout_quality(np.zeros_like(x), np.zeros_like(x), .1)
+
+
+def test_dropout_scorer_loads_verified_inputs_for_each_saved_arm(monkeypatch, tmp_path):
+    nf = A._tool('neural_fixtures')
+    spec = A.LANES['dropout2d']
+    x = np.ones((40, 10, 2, 2), dtype=np.float32)
+    entry = nf.write_entry(str(tmp_path), 'dropout2d', 'synthetic', nf.variant(spec['task'], {}),
+                           task=spec['task'], params=spec['params'], smoke=False,
+                           x=x, dy=x.copy(), state={})
+    nf.write_manifest(str(tmp_path), [entry], torch_version='fixture', seed=A.SEED)
+    monkeypatch.setattr(A, '_NEURAL_FIXTURES', None)
+    monkeypatch.setenv(nf.ENV_DIR, str(tmp_path))
+    a, b = x / np.float32(.9), x / np.float32(.9)
+    a[:, 0] = 0
+    b[:, 1] = 0
+    quality = A.quality('dropout2d', {}, {'ours': {'y': a}, 'torch-eager-fp32': {'y': b}})
+    assert all(q['dropout_probability_z'] == 0 for q in quality.values())
+
+
+@pytest.mark.parametrize('lane', ['gcn', 'graphsage', 'resnet-block'])
+@pytest.mark.parametrize('comparable', [False, True])
+def test_own_layer_retains_outputs_without_false_opponent_comparison(monkeypatch, tmp_path, lane, comparable):
+    """Exercise the real adapter with stub layers; no GPU or Torch installation."""
+    # The adapter now reads verified fixture bytes without torch. The old
+    # test stubbed the removed torch initializer and never supplied fixtures.
+    nf = A._tool('neural_fixtures')
+    D = {'X': np.array([[1., 2.]], dtype=np.float32)}
+    spec = A.LANES[lane]
+    entry = nf.write_entry(str(tmp_path), lane, 'fixture', nf.variant(spec['task'], D),
+                           task=spec['task'], params=spec['params'], smoke=False,
+                           x=D['X'], dy=np.ones((1, 2), dtype=np.float32),
+                           state={'conv.weight': np.array([3.], dtype=np.float32)},
+                           extra={'in_channels': 2})
+    nf.write_manifest(str(tmp_path), [entry], torch_version='fixture', seed=A.SEED)
+    monkeypatch.setattr(A, '_NEURAL_FIXTURES', str(tmp_path))
+    monkeypatch.setattr(A, '_DATASET', 'fixture')
+    monkeypatch.setattr(A, '_graph_layer_inputs', lambda D: (D['X'], np.zeros((2, 0), dtype=np.int64)))
+    class Layer:
+        def __init__(self, random_state=0, **kw): self.seed = random_state
+        def forward(self, x, *extra): return x + self.seed
+        def backward(self, dy): return dy
+    if comparable:
+        Layer.load_state_dict = lambda self, state: None
+    monkeypatch.setattr(A, '_ours_class', lambda lane: ('FixtureLayer', Layer))
+    monkeypatch.setattr(A, '_ours_info', lambda lane: {})
+    import bench_board_host_quality as host
+    gpu, cpu = A._build_layer(lane, 'ours', D), A._build_layer(lane, 'ours', D)
+    for runner in (gpu, cpu):
+        runner.fit(); runner.infer()
+    actual, reference = gpu.outputs(), cpu.outputs()
+    assert set(actual) == {'y' if comparable else 'own_y'}
+    assert actual[next(iter(actual))].shape == (1, 2)
+    assert host.compare(actual, reference) == {'relative_error_vs_own_host': 0.}
+    q = A.quality(lane, {}, {'ours': actual, 'torch-eager-fp32': {'y': np.zeros((1, 2))}})
+    assert bool(q['ours']) is comparable
+    assert gpu.info['output_comparable'] is comparable
+
+
+def test_fairness_fix_20261013_shared_ridge_is_the_centered_ridge_and_bit_stable():
+    """FAIRNESS FIX (2026-10-13 audit): every kernel/permutation-SHAP arm explains the one
+    float32 ridge _shared_ridge_f32 solves in a fixed order. It must be the centered alpha-1
+    ridge, the same bits on every call, and named in the lane params so stale opponent cells
+    are not copied beside it. Results raced before this change were wrong for these lanes;
+    apply extra scrutiny."""
+    rng = np.random.default_rng(7)
+    X = rng.standard_normal((500, 7)).astype(np.float32)
+    y = (X @ np.arange(1, 8, dtype=np.float32) + 0.5).astype(np.float32)
+    w32, b32 = A._shared_ridge_f32(X, y)
+    Xd, yd = X.astype(np.float64), y.astype(np.float64)
+    mu, ym = Xd.mean(0), yd.mean()
+    w = np.linalg.solve((Xd - mu).T @ (Xd - mu) + np.eye(7), (Xd - mu).T @ (yd - ym))
+    assert w32.dtype == np.float32 and w32.shape == (7,)
+    assert np.allclose(w32, w, rtol=1e-5, atol=1e-6)
+    assert abs(b32 - (ym - mu @ w)) < 1e-4
+    w2, b2 = A._shared_ridge_f32(X, y)
+    assert w2.tobytes() == w32.tobytes() and b2 == b32
+    for lane in ("kernel-shap", "permutation-shap", "tree-shap"):
+        assert A.lane_config(lane)["params"].get("explained_model"), lane
+
+
+# ---- TIMED-WORK FIX (2026-10-14): transformer lanes time real work -----------------------------
+
+_STATELESS_LANES = ("normalizer", "binarizer", "poly-features", "poly-count-sketch", "additive-chi2",
+                    "skewed-chi2", "gaussian-rp", "sparse-rp")
+_STATS_LANES = ("robust-scaler", "maxabs-scaler", "minmax-scaler", "standard-scaler",
+                "quantile-transformer", "power-transformer")
+
+
+def test_transformer_lanes_name_their_timed_call_in_lane_config():
+    for lane in _STATELESS_LANES:
+        cfg = A.lane_config(lane)
+        assert cfg["timed_op"] == "fit_transform"
+        assert cfg["timed_fit"].startswith("fit_transform(X)")
+        assert cfg["timed_infer"] == "transform(Xq)"
+    for lane in _STATS_LANES:
+        cfg = A.lane_config(lane)
+        assert cfg["timed_op"] == "fit"
+        assert cfg["timed_fit"].startswith("fit(X), fitted statistics synchronized")
+
+
+class _FakeOut:
+    def __init__(self):
+        self.read = 0
+
+    def __array__(self, dtype=None, copy=None):
+        self.read += 1
+        return np.zeros((2, 2), dtype=np.float32)
+
+
+def _fake_transformer(calls):
+    class T:
+        def fit(self, X, y=None):
+            calls.append("fit")
+            self.scale_ = _FakeOut()
+            return self
+
+        def fit_transform(self, X, y=None):
+            calls.append("fit_transform")
+            self.scale_ = _FakeOut()
+            self.out = _FakeOut()
+            return self.out
+
+        def transform(self, X):
+            calls.append("transform")
+            return np.asarray(X)
+    return T
+
+
+@pytest.mark.parametrize("lane,arm,want", [
+    ("normalizer", "ours", "fit_transform"), ("normalizer", "cuml-gpu", "fit_transform"),
+    ("binarizer", "ours", "fit_transform"), ("gaussian-rp", "cuml-gpu", "fit_transform"),
+    ("standard-scaler", "ours", "fit"), ("quantile-transformer", "cuml-gpu", "fit"),
+])
+def test_both_arms_run_the_same_timed_call_and_synchronize(monkeypatch, lane, arm, want):
+    calls, synced = [], []
+    T = _fake_transformer(calls)
+    monkeypatch.setattr(A, "_est_factory", lambda l, a, D: (T, "lib.T", {}))
+    monkeypatch.setattr(A, "_ours_info", lambda name: {"input_home": "host"})
+    monkeypatch.setattr(A, "_cuml_up", lambda arrays: (dict(arrays), {"upload_ms_untimed": 1.0},
+                                                       lambda: synced.append(1)))
+    monkeypatch.setattr(A, "_BP", lambda: types.SimpleNamespace(arm_record=lambda o: None))
+    X = np.ones((8, 3), dtype=np.float32)
+    runner = A._build_est(lane, arm, {"X": X, "Xq": X})
+    runner.fit()
+    assert calls == [want]
+    assert runner.info["timed_op"] == want
+    if arm == "cuml-gpu":
+        assert synced == [1]                  # the device output / statistics synchronized in the clock
+        assert "input_copy" not in runner.info
+    else:
+        model = runner.model_for_hash()
+        assert model.scale_.read == 1          # fitted statistics read back inside the clock
+        if want == "fit_transform":
+            assert model.out.read == 1         # the output materialized inside the clock
+        assert "inside the timed call" in runner.info["input_copy"]
+        assert [k for k, _ in runner.upload_inputs] == ["X"]   # the copy probe sizes X
+    runner.infer()
+    assert calls[-1] == "transform"
+
+
+def test_span_names_the_timed_call_and_our_input_copy():
+    a = {"info": {"input_home": "host", "timed_op": "fit_transform",
+                  "input_copy": "inside the timed call: ours takes host arrays"},
+         "upload_separate": [{"ms": 2.0, "bytes": 96, "inputs": ["X"]}], "median_ms": 5.0}
+    span = A.arm_span("normalizer", "ours", a, True)
+    assert span["timed_op"] == "fit_transform"
+    assert span["inside_clock"].startswith("fit_transform(X)")
+    assert span["input_copy"].startswith("inside the timed call")
+    assert span["upload_ms_separate"] == 2.0 and span["upload_bytes_separate"] == 96

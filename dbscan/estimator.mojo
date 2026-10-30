@@ -1,0 +1,408 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 the authors. Part of anonlib, DOI-WITHHELD
+"""The callable surface over DBSCAN.
+
+`dbscan/impl.mojo:132` already has `dbscan_fit_impl`,
+matching the reference `cuml/cpp/src/dbscan/dbscan.cuh:101`. It takes `DeviceBuffer`s, so
+a caller holding a numpy array cannot reach it. This file is the same shape as
+`neighbors/estimator.mojo` and `cluster/estimator.mojo`: host pointers in,
+device work owned here, results read back.
+
+**This one is thinner than the k-means surface, and the reason is worth
+stating.** k-means needed the estimator to choose fixed-point accumulator
+scales, which is a real policy decision with a wrong answer. DBSCAN has no
+such knob: its labels are integers and its tunables are eps, min_samples,
+the metric and the per-sample weights, all of which the caller states. So
+there is less here, and the small amount that IS here is listed below rather
+than being spread through the code.
+
+THE POLICY CHOICES
+------------------
+
+1. **THE LABEL CONVENTION IS scikit-learn's AND IT COMES FROM THE IMPLEMENTATION, NOT
+   FROM HERE.** Noise is `-1` and clusters are exactly `0..n_clusters-1`.
+   That is what cuML's `final_relabel` plus `relabelForSkl`
+   (`runner.cuh:410-416`) produce and what `dbscan/checks/dbscan_check.mojo`
+   asserts. This file does not renumber anything, and a caller can compare
+   `labels_` against scikit-learn's directly.
+
+2. **`eps_nn_method` DEFAULTS TO `EPS_NN_RBC`, the random ball cover, AND
+   THAT IS THIS IMPLEMENTATION'S DEFAULT, NOT cuML's** -- DEVIATION 35 in
+   `dbscan/impl/runner.mojo`: cuML's Python default is
+   `algorithm='brute'` and on an int32-label build their dispatch never
+   reaches RBC. (This item used to say "cuML's default"; corrected
+   2026-08-23.) The ball cover measured 2.7x-27x faster at 16k-200k rows
+   and `check_dbscan_rbc_matches_brute` holds the two labellings identical
+   point for point. This file does not add an opinion beyond the runner's
+   default; `EPS_NN_BRUTE_FORCE` is reachable by passing it explicitly
+   (`anonlib.DBSCAN(algorithm='brute')`) and is the arm `dbscan_brute` in
+   the benchmark compares against and the arm `archive/evidence/E1U_RESULTS.md` certified.
+
+3. **`max_mbytes_per_batch = 0` MEANS THEIR ESTIMATE, NOT "NO LIMIT".** Zero
+   selects cuML's own `80% * total - dataset` rule
+   (`dbscan.cuh:157-158`), which reads TOTAL device memory rather than free,
+   because their own comment says the free figure cannot be relied on. Any
+   other value is used as given and unvalidated, which is also theirs.
+
+4. **THE RETURN IS THE PROPAGATION PASS COUNT**, summed over the batches
+   -- NOT the batch count, which this item claimed until 2026-08-23 (the
+   function docstring below records the history; the batch count reaches
+   the outside only through the identity-trace header's `batches=`). It is
+   surfaced because a pass count far above the batch count is a long
+   label chain, and DEVIATION 519 is about exactly that.
+
+5. **`sample_weight` IS HONORED AND ENTERS IN EXACTLY ONE PLACE** (added
+   2026-09-01). A point is core when the SUM OF THE WEIGHTS in its
+   eps-neighbourhood reaches `min_samples`, not when the COUNT does; that is
+   cuML's `runner.cuh:300-306` and scikit-learn's `_dbscan.py:451-455`, and
+   they agree. Nothing else in the fit reads it. The weight sum is a FLOAT
+   reduction, so its fold is pinned exactly like every other reduction in
+   this tree (DEVIATION 28, `dbscan/impl/vertexdeg/algo.mojo`);
+   an unpinned fold would put an AMD fit and a CUDA fit on opposite sides of
+   `>= min_samples` for a point sitting on the threshold, which is a
+   different MODEL and not a last-bit difference in a reported number.
+   Passing all-ones is INTENDED to reproduce the unweighted labels exactly.
+   `check_dbscan_uniform_weight_matches_unweighted` gates that, and it RAN
+   FOR THE FIRST TIME on 2026-09-01. Until that morning it had never
+   compiled: building the four weighted gates raised
+   `DeadArgumentElimination surveyUse failed`, an LLVM pass assertion, and
+   `sample_weight` here was IMPLEMENTED AND UNGATED for its whole life. The
+   cure was the build's optimization level, not this lane's source --
+   `check-dbscan` runs at `-O1`. It passes on both the brute and the ball
+   cover arms, and its sabotage moves: weight 5 turns all twelve noise
+   points core. Apple M4 only.
+
+6. **`metric` CARRIES AN L1 ARM AND IT IS ORIGINAL WORK** (added
+   2026-09-01, DEVIATION 27). `metric = DBSCAN_METRIC_L2` is the implemented
+   arm. `DBSCAN_METRIC_L1` is not an implementation of anything: cuML's DBSCAN offers
+   euclidean, cosine and precomputed and no Manhattan
+   (`dbscan.pyx:110-115`), so there is no reference eps-neighbourhood kernel
+   to be faithful to and nothing here follows a reference file.
+   The per-pair arithmetic IS credited, to RAFT's `l1.cuh:49`. The one thing
+   a reader must know before touching it: the L2 arm compares a SQUARED
+   distance against `eps * eps`, and an L1 sum has no squared form, so the
+   threshold is not squared on that arm. `dbscan_metric_threshold` is the
+   only place that decides which.
+
+WHAT IS NOT HERE YET, NAMED SO IT IS NOT MISTAKEN FOR DONE
+----------------------------------------------------------
+
+- The L1 arm on the BALL COVER. `neighbors/impl/ball_cover/`
+  computes Euclidean distances for its landmark radii and its three pruning
+  bounds, so `metric='manhattan'` is served by `algorithm='brute'` and
+  refused by name on `'rbc'`. The ball cover's pruning rests on the triangle
+  inequality, which L1 satisfies, so this is reachable work in that lane and
+  not a property of the algorithm.
+- `metric='cosine'` and `metric='precomputed'`, cuML's other two
+  (`dbscan.pyx:110-115`); the Cosine arm is two `matrixVectorOp` passes plus
+  `eps2 = 2 * eps` around the same kernel (`algo.cuh:186-223`).
+- `core_sample_indices_`. scikit-learn exposes it; the implementation does not compute
+  it separately (`dbscan.cuh:171-173` notes theirs is not returned either).
+- `eps_nn_method` and `max_iterations` cross the CPython binding since
+  2026-08-23 (`bindings/_anonlib_estimators.mojo`, slots 5 and 6;
+  `python/anonlib/density.py` `algorithm=` / `max_iterations=`).
+  `metric` and `sample_weight` cross it since 2026-09-01 (slot 7 and the
+  `weight_addr` argument).
+"""
+
+from max.gpu.host import DeviceContext
+
+from dbscan.impl.dbscan import dbscan_fit_impl_weighted
+from std.os import getenv
+from dbscan.impl.runner import EPS_NN_BRUTE_FORCE, EPS_NN_RBC
+from dbscan.impl.neighbors.epsilon_neighborhood import (
+    DBSCAN_METRIC_COSINE,
+    DBSCAN_METRIC_L1,
+    DBSCAN_METRIC_L2,
+    DBSCAN_METRIC_PRECOMPUTED,
+)
+from core.cosine_rows import cosine_unit_rows
+from checks.numerics import (
+    GLOBAL_NUMERIC_MODE,
+    NUMERIC_IDENTICAL,
+    NUMERIC_FAST,
+    ftz,
+    identical_div,
+    identical_mul,
+    identical_sqrt,
+)
+from std.atomic import Atomic
+from std.gpu import block_dim, block_idx, thread_idx
+from std.sys.compile import is_defined
+from std.sys.info import has_apple_gpu_accelerator
+
+
+#: fam2-cluster (2026-10-04), IDENTICAL, every column: metric='cosine'
+#: scales the rows to unit length on the device. The host copy of X, the
+#: host fold over every element and the second host array are gone; the
+#: kernel is `core/cosine_rows.mojo::cosine_unit_rows` statement for
+#: statement (the same ascending fold of pinned products, `identical_sqrt`,
+#: `identical_div`, every intermediate flushed), one thread per row, so the
+#: unit rows carry the bits the host column's call of that function gives.
+#: A row it must refuse is reported through one Int32 cell and refused by
+#: name with the host function's sentence (without the squared norm value).
+#: `-D ANONLIB_IDN_DBSCAN_COSINE_DEVICE_OFF=1` restores the host scaling.
+comptime IDN_DBSCAN_COSINE_DEVICE = (
+    GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL
+    and not (
+        is_defined["ANONLIB_IDN_DBSCAN_COSINE_DEVICE_OFF"]()
+        or is_defined["ANONLIB_IDN_ALL_OFF"]()
+    )
+)
+
+#: fam2-cluster (2026-10-04), IDENTICAL, every column: the labels (and the
+#: core mask of `prediction_data=True`) are downloaded straight into the
+#: caller's arrays, without a host staging buffer and a per-element host
+#: copy loop. Same bytes. `-D ANONLIB_IDN_DBSCAN_DIRECT_OUT_OFF=1`
+#: restores the staged copy.
+comptime IDN_DBSCAN_DIRECT_OUT = (
+    GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL
+    and not (
+        is_defined["ANONLIB_IDN_DBSCAN_DIRECT_OUT_OFF"]()
+        or is_defined["ANONLIB_IDN_ALL_OFF"]()
+    )
+# MEASURED M3 FAST; broader workload evidence remains separate.
+# F15/dbscan-outputs M3 2026-10-06: 6 scored caller times; B/A
+# 0.9371..1.7658 (mixed/regressing); FAST candidate remains OFF.
+# Scored FAST quality 3/3 within existing bands; PASS.
+# One warmup/one score; caller67d0efb29; exact cases/builds/hashes:
+# ~/anonlib-evidence/ab-overnight-20261006/m3/artifacts/results/F15/dbscan-outputs.
+# Compilation/identity reused. No combined-toggle/full-board claim.
+) or (GLOBAL_NUMERIC_MODE == NUMERIC_FAST and has_apple_gpu_accelerator() and is_defined["ANONLIB_DBSCAN_FAST_DIRECT_OUT"]())
+
+comptime COSINE_TPB = 256
+comptime COSINE_NO_BAD_ROW = Int32(2147483647)
+
+
+def cosine_unit_rows_kernel(
+    x: MutPointer[Float32, MutAnyOrigin],
+    bad: MutPointer[Int32, MutAnyOrigin],
+    n_rows_in: Int32,
+    n_cols_in: Int32,
+):
+    """`cosine_unit_rows` in place, one thread per row.
+
+    The fold order, the pinned product, the root and the quotient are that
+    function's, so the result is its result bit for bit. A row whose squared
+    norm is not a positive finite number is left untouched and its index
+    goes to `bad[0]` through `Atomic.min` (the lowest such row, which is the
+    row the host function names).
+    """
+    var row = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if row >= Int(n_rows_in):
+        return
+    var n_cols = Int(n_cols_in)
+    var base = row * n_cols
+    var n2 = Float32(0)
+    for f in range(n_cols):
+        var v = ftz(x.unsafe_load(base + f))
+        n2 = ftz(n2 + ftz(identical_mul(v, v)))
+    # `not (n2 > 0) or not isfinite(n2)`: NaN fails the first compare and
+    # +inf fails the second.
+    if not (n2 > Float32(0)) or not (n2 <= Float32(3.4028234663852886e38)):
+        _ = Atomic.min(bad, Int32(row))
+        return
+    var norm = identical_sqrt(n2)
+    for f2 in range(n_cols):
+        x.unsafe_store(
+            base + f2, ftz(identical_div(ftz(x.unsafe_load(base + f2)), norm))
+        )
+
+
+def _cosine_unit_rows_host(
+    x_ptr: MutPointer[Float32, MutUntrackedOrigin],
+    n_samples: Int,
+    n_features: Int,
+) raises -> List[Float32]:
+    """DEVIATION 5113's host scaling, the `IDN_DBSCAN_COSINE_DEVICE` off
+    arm (and every non-IDENTICAL mode): unchanged."""
+    var raw = List[Float32](length=n_samples * n_features, fill=Float32(0))
+    for i in range(n_samples * n_features):
+        raw[i] = x_ptr.unsafe_load(i)
+    return cosine_unit_rows(raw, n_samples, n_features, "dbscan_fit")
+
+
+def dbscan_fit(
+    ctx: DeviceContext,
+    x_ptr: MutPointer[Float32, MutUntrackedOrigin],
+    n_samples: Int,
+    n_features: Int,
+    eps: Float64,
+    min_samples: Int,
+    out_labels_ptr: MutPointer[Int32, MutUntrackedOrigin],
+    max_mbytes_per_batch: Int = 0,
+    max_iterations: Int = 0,
+    eps_nn_method: Int = EPS_NN_RBC,
+    metric: Int = DBSCAN_METRIC_L2,
+    sample_weight_addr: Int = 0,
+    out_core_addr: Int = 0,
+) raises -> Int:
+    """Cluster host-resident row-major data. Returns the PROPAGATION PASSES.
+
+    `max_iterations <= 0` (THE DEFAULT since DEVIATION 519, 2026-08-23)
+    means RUN TO THE FIXED POINT, which is cuML's behaviour: their
+    `weak_cc_batched` and `MergeLabels` loops are `do { } while (host_m)`
+    with no cap at all (`csr.cuh:133`; `csr.mojo`'s own docstring says so).
+    The 200 that `dbscan_fit_impl` still defaults to is THIS IMPLEMENTATION's number,
+    not theirs, and on a 1,000-point chain at spacing 1/8, eps 3/16,
+    min_samples 2 -- a thin trail of points, an ordinary input -- it
+    returned SEVEN clusters where the fixed point is ONE (731 passes),
+    silently, under FAST (`tools/e2u_matrix_fit.py`, `dbscan_chain_default`
+    vs `dbscan_chain_iter5000`). Under IDENTICAL the same cap RAISES
+    (DEVIATION 507), which is loud but is still a default that fails on an
+    input cuML handles. The fixed point is reached in at most `n_samples`
+    passes per call -- each pass moves the minimum label of a component at
+    least one hop and no component has a path longer than `n_samples` --
+    so the cap passed down is `n_samples + 1`, a bound and not a guess. An
+    EXPLICIT positive cap is honoured as before, and under IDENTICAL a cap
+    that binds still raises.
+
+    THE RETURN VALUE WAS DOCUMENTED WRONG until 2026-08-23 ("Returns the
+    batch count"). It is `dbscan_fit_impl`'s return, which that function's
+    own docstring names correctly: the total number of `weak_cc` passes
+    summed over the batches. The batch count is not returned by anything;
+    it reaches the outside world only through the identity-trace header
+    (`batches=`) and the `phase_timing` lines. The wrong sentence was
+    load-bearing -- `check_dbscan_batch_count_invariance` named the value
+    `batches` and printed it as one, so its diagnostics reported pass
+    counts as batch counts and it never checked that its budgets moved the
+    batch count at all.
+
+    `x_ptr` is `n_samples x n_features`, row-major, float32.
+    `out_labels_ptr` is `n_samples` Int32 and is written with scikit-learn's
+    convention: `-1` for noise, `0..n_clusters-1` otherwise.
+
+    Raises rather than clamping on a shape the kernels cannot serve, because
+    a clamp returns a wrong answer quietly.
+    """
+    if n_samples < 1 or n_features < 1:
+        raise Error(
+            "dbscan_fit needs n_samples and n_features >= 1: got "
+            + String(n_samples)
+            + ", "
+            + String(n_features)
+        )
+    if not (eps > 0.0):
+        raise Error(
+            "dbscan_fit needs eps > 0, got " + String(eps)
+        )
+    if min_samples < 1:
+        raise Error(
+            "dbscan_fit needs min_samples >= 1, got " + String(min_samples)
+        )
+    if eps_nn_method != EPS_NN_RBC and eps_nn_method != EPS_NN_BRUTE_FORCE:
+        raise Error(
+            "dbscan_fit: eps_nn_method must be EPS_NN_RBC (1) or"
+            " EPS_NN_BRUTE_FORCE (0), got " + String(eps_nn_method)
+        )
+    if metric < DBSCAN_METRIC_L2 or metric > DBSCAN_METRIC_PRECOMPUTED:
+        raise Error(
+            "dbscan_fit: metric must be DBSCAN_METRIC_L2 (0), L1 (1),"
+            " COSINE (2) or PRECOMPUTED (3), got " + String(metric)
+        )
+    if metric == DBSCAN_METRIC_PRECOMPUTED and n_features != n_samples:
+        raise Error(
+            "dbscan_fit: metric='precomputed' needs the n x n distance"
+            " matrix, got " + String(n_samples) + " x " + String(n_features)
+        )
+
+    # DEVIATION 519: the fixed point, bounded by the path length.
+    var cap = max_iterations
+    if cap <= 0:
+        cap = n_samples + 1
+
+    var x = ctx.enqueue_create_buffer[DType.float32](n_samples * n_features)
+    var labels = ctx.enqueue_create_buffer[DType.int32](n_samples)
+    # `sample_weight_addr == 0` IS THEIR `sample_weight == nullptr`. Mojo
+    # has no null `DeviceBuffer`, so the address arrives as an Int, the
+    # decision is made once, here, and everything downstream carries a
+    # `has_weights` Bool beside a buffer that is a one-element placeholder
+    # when there are none.
+    var has_weights = sample_weight_addr != 0
+    var w = ctx.enqueue_create_buffer[DType.float32](
+        n_samples if has_weights else 1
+    )
+    ctx.synchronize()
+
+    # DEVIATION 5113: cosine runs on unit rows scaled on the host by the
+    # code the CPU binding runs too (`core/cosine_rows.mojo`).
+    var unit = List[Float32]()
+    var cosine_on_device = False
+    comptime if IDN_DBSCAN_COSINE_DEVICE:
+        cosine_on_device = True
+    if metric == DBSCAN_METRIC_COSINE and cosine_on_device:
+        var d_bad = ctx.enqueue_create_buffer[DType.int32](1)
+        var h_bad = ctx.enqueue_create_host_buffer[DType.int32](1)
+        h_bad.unsafe_ptr().unsafe_store(0, COSINE_NO_BAD_ROW)
+        ctx.enqueue_copy(dst_buf=d_bad, src_ptr=h_bad.unsafe_ptr())
+        ctx.enqueue_copy(dst_buf=x, src_ptr=x_ptr)
+        ctx.enqueue_function[cosine_unit_rows_kernel](
+            x.unsafe_ptr(),
+            d_bad.unsafe_ptr(),
+            Int32(n_samples),
+            Int32(n_features),
+            grid_dim=((n_samples + COSINE_TPB - 1) // COSINE_TPB, 1, 1),
+            block_dim=(COSINE_TPB, 1, 1),
+        )
+        ctx.enqueue_copy(dst_ptr=h_bad.unsafe_ptr(), src_buf=d_bad)
+        ctx.synchronize()
+        var bad_row = h_bad.unsafe_ptr().unsafe_load(0)
+        _ = d_bad^
+        _ = h_bad^
+        if bad_row != COSINE_NO_BAD_ROW:
+            # `cosine_unit_rows`' refusal, by name. The squared norm it
+            # also prints stays on the device; the row is the lowest
+            # refused row, the one the host function names.
+            raise Error(
+                "dbscan_fit: metric='cosine' needs every row to have a"
+                " positive, finite norm; row " + String(Int(bad_row))
+                + " does not. The cosine distance of a zero row is"
+                " undefined (cuML divides by zero and carries NaN), so it is"
+                " refused by name"
+            )
+    elif metric == DBSCAN_METRIC_COSINE:
+        unit = _cosine_unit_rows_host(x_ptr, n_samples, n_features)
+        ctx.enqueue_copy(dst_buf=x, src_ptr=unit.unsafe_ptr())
+    else:
+        ctx.enqueue_copy(dst_buf=x, src_ptr=x_ptr)
+    if has_weights:
+        ctx.enqueue_copy(
+            dst_buf=w,
+            src_ptr=MutPointer[Float32, MutUntrackedOrigin](
+                unsafe_from_address=sample_weight_addr
+            ),
+        )
+    ctx.synchronize()
+    _ = unit^
+
+    var passes = dbscan_fit_impl_weighted(
+        ctx,
+        x,
+        labels,
+        w,
+        n_samples,
+        n_features,
+        eps,
+        min_samples,
+        max_mbytes_per_batch,
+        cap,
+        eps_nn_method,
+        String(getenv("ANONLIB_DBSCAN_PHASES")) == "1",
+        metric,
+        has_weights,
+        out_core_addr,
+    )
+
+    comptime if IDN_DBSCAN_DIRECT_OUT:
+        ctx.enqueue_copy(dst_ptr=out_labels_ptr, src_buf=labels)
+        ctx.synchronize()
+    else:
+        var hl = ctx.enqueue_create_host_buffer[DType.int32](n_samples)
+        ctx.synchronize()
+        ctx.enqueue_copy(dst_ptr=hl.unsafe_ptr(), src_buf=labels)
+        ctx.synchronize()
+
+        for i in range(n_samples):
+            out_labels_ptr.unsafe_store(i, hl.unsafe_ptr().unsafe_load(i))
+
+    return passes

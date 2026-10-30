@@ -1,0 +1,759 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 the authors. Part of anonlib, DOI-WITHHELD
+"""IVF-FLAT's parameters, its index, and every refusal by name.
+
+Reference: `cuvs/include/cuvs/neighbors/ivf_flat.hpp` (`index_params` :28-66,
+`search_params` :76-82, `index` :137-274) and
+`cuvs/src/neighbors/ivf_flat_index.cpp` (the constructor's
+`check_consistency` at :206-215) (cuVS `6ba2ce2`). Partial.
+
+WHAT AN IVF-FLAT INDEX IS, IN THE REFERENCE AND HERE
+----------------------------------------------------
+The reference index is `n_lists` centroids plus `n_lists` separately allocated lists,
+each holding its members' vectors in INTERLEAVED GROUPS of
+`kIndexGroupSize = 32` (`ivf_flat.hpp:25`, `list_spec::make_list_extents`
+at `:110-115`) so that `ivfflat_interleaved_scan` can issue vectorized
+loads of `veclen` elements per lane. This index is the same centroids plus ONE
+CSR-shaped triple -- offsets, carried original indices, and the permuted
+vectors -- because the layout exists to feed a scan, and the scan we run
+is not the reference scan. **DEVIATION 1782**, and `ivf/README.md` carries the whole
+reason.
+
+THE FIELD THAT IS THE WHOLE LANE
+--------------------------------
+`list_indices`. Their `build_index_kernel` writes
+`list_index[inlist_id] = source_ix` (`ivf_flat_build.cuh:135`), so the
+ORIGINAL row id travels with the vector into the layout and their
+`postprocess_neighbors` reads it back out (`ivf_common.cuh:133`). This index does
+the same thing and then does the thing the reference does not: it puts that original
+id into the SELECTION KEY, which is what makes `n_probe == n_lists` reduce
+to brute force bit for bit. **DEVIATION 1784**, and IVF's classic identity
+bug is the version of this file where `list_indices` holds a position
+within a list instead. `check_index_carry` sabotages exactly that.
+
+WHAT IS REFUSED HERE, AND WHY IT IS REFUSED HERE
+-------------------------------------------------
+Every unimplemented neighbour of IVF-FLAT in the cuVS tree raises BY NAME from
+`ivf_refuse_algorithm` rather than by absence, because absence is a silent
+answer and this repository has paid for those. HNSW is refused
+PERMANENTLY (`ivf/README.md`, and `cpp/include/cuvs/neighbors/hnsw.hpp` is
+the header a future reader will find and wonder about); IVF-PQ, IVF-SQ,
+IVF-RaBitQ, CAGRA, ScaNN, Vamana and NN-Descent are refused as UNIMPLEMENTED,
+which is a different sentence and `ivf/NOT_IMPLEMENTED.tsv` says which is which.
+"""
+
+from std.memory import bitcast
+from std.sys.compile import is_defined
+from std.sys.info import has_apple_gpu_accelerator
+from checks.numerics import GLOBAL_NUMERIC_MODE, NUMERIC_FAST
+from x_ann.switches import ANN3_HOST_PASSES
+
+from cluster.impl.kmeans_params import (
+    METRIC_L2_EXPANDED,
+    METRIC_L2_SQRT_EXPANDED,
+)
+
+
+comptime METRIC_COSINE_EXPANDED = 2
+"""`cuvs::distance::DistanceType::CosineExpanded`, IVF's OWN copy of the code.
+
+IT USED TO BE IMPORTED FROM `cluster/impl/kmeans_params.mojo`, which deleted
+it on 2026-09-18 (lane/kmeans-cosine-capability). IVF DOES NOT FOLLOW, and the
+difference is real rather than bookkeeping:
+
+  * k-means's cosine was deleted because cuVS refuses cosine k-means too
+    (`pairwise_distance_kmeans` ends in `RAFT_FAIL`, `kmeans_common.cuh:320`),
+    so there was no reference arm and nothing to be a gap against.
+  * IVF's cosine is a GENUINE unimplemented arm of a reference that HAS one:
+    `search_impl`'s switch (`ivf_flat_search.cuh:109-146`) gives CosineExpanded
+    its own arm. Refusing it BY NAME is therefore an honest statement about
+    this tree, and the code has to exist for the refusal to name it.
+
+So this constant is reachable here and only here, through `ivf_metric_name`,
+`ivf_metric_from_name` and `ivf_index_params_validate` below. Deleting it
+would turn a named refusal into a silently accepted metric.
+"""
+
+
+comptime IVF_GROUP_SIZE = 32
+"""`ivf_flat.hpp:25`'s `kIndexGroupSize`. Recorded, NOT USED: it is the
+interleaved layout's group width and DEVIATION 1782 does not lay data out
+that way. It is here so a reader diffing against their header finds the
+constant and this sentence rather than an unexplained absence."""
+
+comptime IVF_DEFAULT_N_LISTS = 1024
+comptime IVF_DEFAULT_KMEANS_N_ITERS = 20
+comptime IVF_DEFAULT_KMEANS_TRAINSET_FRACTION = Float64(0.5)
+comptime IVF_DEFAULT_N_PROBES = 20
+"""`ivf_flat.hpp:30,32,34,78`, unchanged."""
+
+
+#: lane gap-ivf (2026-10-08, docs/plans/gaps-2026-10-08.md section 6 item 2):
+#: THE COARSE QUANTIZER TRAINS ON A FIXED-STRIDE SUBSAMPLE, IDENTICAL on every
+#: column (NVIDIA, AMD, Apple and the host restatement in ivf/host/ivf_host.mojo)
+#: and FAST off Apple; FAST on Apple keeps its measured seeded sample
+#: (`IVF_FAST_TRAINSET`, ivf_flat_build.mojo). This is DEVIATION 1781's closure
+#: as its refusal text asks: cuVS's strided trainset (`ivf_flat_build.cuh:414-437`,
+#: `trainset_ratio = max(1, n_rows / max(fraction * n_rows, n_lists))`, rows
+#: `0, ratio, 2 ratio, ...`) in EXACT INTEGER arithmetic, so no float truncation
+#: can pick different rows on two hosts. `kmeans_trainset_fraction` stays 1.0 at
+#: the entries (its refusal is unchanged); the rule below is the build's own.
+#: Every row is still assigned to the trained centroids and laid into the lists.
+#: -D ANONLIB_IVF_TRAINSET_STRIDE_OFF trains on every row again.
+# TOMBSTONE: ANONLIB_IVF_FAST_STRIDED_COARSE (DROPPED-noise: M4 IVFSQIndex 500k x 128 3276 -> 3260 ms, recall@8 0.8194 -> 0.8183) deleted 2026-10-15 by 1a76955b5; code recoverable at 1a76955b5^.
+# Restore: git apply experiments/removed/ANONLIB_IVF_FAST_STRIDED_COARSE.patch
+comptime IVF_TRAINSET_STRIDE = (
+    not (GLOBAL_NUMERIC_MODE == NUMERIC_FAST and has_apple_gpu_accelerator())
+    and not is_defined["ANONLIB_IVF_TRAINSET_STRIDE_OFF"]()
+)
+#: lane fg-ivf (read_ivf.md idea B2), DEFAULT ON outside FAST
+#: (`-D ANONLIB_IVF_IDN_RECLUSTER_CAP_OFF` restores KMeansParams.default()'s
+#: 300): the coarse quantizer's k-means|| recluster (the fit of the
+#: oversampled candidate set back to n_lists centres,
+#: `init_scalable_kmeans_plus_plus`) runs at most `kmeans_n_iters` Lloyd
+#: iterations, the caller's own budget for the main fit (cuVS's balanced
+#: k-means bounds every inner fit by n_iters too). Cost: each recluster
+#: iteration is a candidates x n_lists x dim distance pass (the candidate set
+#: is ~ oversampling x rounds x n_lists rows), so up to 300 - kmeans_n_iters
+#: such passes go. Scoped to the IVF builds (`KMeansParams.recluster_max_iter`
+#: is 0, "no cap", for every other k-means). Bits CHANGE when the recluster
+#: had not converged by kmeans_n_iters: device (NVIDIA, AMD) and the host
+#: column (ivf/host/ivf_host.mojo -> host_fit_main) together; recall gate.
+comptime IVF_IDN_RECLUSTER_CAP = (
+    GLOBAL_NUMERIC_MODE != NUMERIC_FAST and not is_defined["ANONLIB_IVF_IDN_RECLUSTER_CAP_OFF"]()
+)
+#: lane fg-ivf (read_ivf.md idea B1), DEFAULT ON outside FAST since lane
+#: postmerge-act-3 (2026-10-09; `-D ANONLIB_IVF_IDN_STRIDED_INIT_OFF`
+#: restores k-means|| seeding). Post-merge A/B on main a47bd9fb2, one run per
+#: arm (default nv2 v0996 / amd a1131, arm nv2 v0993 / amd a1134): ivf-pq
+#: istella NV 1008.1 -> 756.9 ms (0.75x) / AMD 853.1 -> 542.2 ms (0.64x),
+#: recall@10 0.7489 -> 0.8021 on both; taxi NV 157.2 -> 100.0 ms (0.64x) /
+#: AMD 195.0 -> 83.9 ms (0.43x), recall@10 0.98125 equal. NV digest == AMD
+#: digest (istella 7a39a98cdca7dc6e, taxi 5c793de3ec021c64). The coarse quantizer starts from
+#: strided training rows, centre c = training row (c x n_train) // n_lists
+#: (exact integers), instead of k-means|| seeding (up to 8 rounds of
+#: distance passes with ~14 syncs plus the recluster fit). cuVS's balanced
+#: k-means seeds the same way (rows of the trainset, no k-means++). No RNG
+#: and no host read: the rows are gathered on the device
+#: (`ivf_strided_init_kernel`); the host column gathers the same rows. A
+#: function of n_train and n_lists only. Bits CHANGE on every column
+#: (device + ivf/host/ivf_host.mojo); recall gate against cuVS. Applies to
+#: IVF-Flat and to IVF-PQ's coarse step (the same build). B2 is moot with it.
+# TOMBSTONE: ANONLIB_IVF_FAST_STRIDED_COARSE (DROPPED-noise: M4 IVFSQIndex 500k x 128 3276 -> 3260 ms, recall@8 0.8194 -> 0.8183) deleted 2026-10-15 by 1a76955b5; code recoverable at 1a76955b5^.
+# Restore: git apply experiments/removed/ANONLIB_IVF_FAST_STRIDED_COARSE.patch
+comptime IVF_IDN_STRIDED_INIT = (
+    GLOBAL_NUMERIC_MODE != NUMERIC_FAST and not is_defined["ANONLIB_IVF_IDN_STRIDED_INIT_OFF"]()
+)
+
+
+def ivf_strided_init_row(c: Int, n_train: Int, n_lists: Int) -> Int:
+    """`IVF_IDN_STRIDED_INIT`'s start row of centre c: (c n_train) // n_lists,
+    distinct and ascending for n_train >= n_lists."""
+    return (c * n_train) // n_lists
+
+
+#: The training-row target per list. FAISS's `max_points_per_centroid` (256):
+#: past ~256 rows per centroid Lloyd's centroids stop moving measurably, so more
+#: rows only cost time. A cost rule over every shape, not a board size.
+comptime IVF_TRAIN_ROWS_PER_LIST = 256
+#: The floor per list. FAISS warns below 39 training points per centroid (its
+#: `min_points_per_centroid`): fewer rows than that leave centroids poorly
+#: placed, so a dataset with at most 39 rows per list trains on every row.
+comptime IVF_TRAIN_MIN_ROWS_PER_LIST = 39
+
+
+def ivf_trainset_stride(n_rows: Int, n_lists: Int) -> Int:
+    """The training rows' stride under `IVF_TRAINSET_STRIDE`: rows
+    `0, s, 2 s, ..., (n_rows // s - 1) s` train the quantizer.
+
+    The target row count is cuVS's default fraction 1/2 of the rows (as the
+    integer `n_rows // 2`), capped at `IVF_TRAIN_ROWS_PER_LIST * n_lists`
+    (FAISS's rule), and never below `min(n_rows, IVF_TRAIN_MIN_ROWS_PER_LIST
+    * n_lists)` (FAISS's floor; also at least `n_lists`, cuVS's, so k-means
+    always has a row per centroid): `s = max(1, n_rows // target)`. The count
+    `n_rows // s` is at least `target`. Integers only: a function of
+    `(n_rows, n_lists)` alone, the same on every vendor and the host column."""
+    if n_rows <= 1 or n_lists < 1:
+        return 1
+    var target = min(n_rows // 2, IVF_TRAIN_ROWS_PER_LIST * n_lists)
+    var low = min(n_rows, IVF_TRAIN_MIN_ROWS_PER_LIST * n_lists)
+    if target < low:
+        target = low
+    if target < n_lists:
+        target = n_lists
+    if target <= 0:
+        return 1
+    return max(1, n_rows // target)
+
+
+def ivf_explicit_train_rows(n_rows: Int, n_lists: Int, rows_per_list: Int) -> Int:
+    """The training-row count a caller sets with `rows_per_list` (release-0845;
+    cuVS ivf_sq `max_train_points_per_cluster`, ivf_sq_build.cuh:461-470):
+    `min(n_rows, rows_per_list * n_lists)`. The rows are `0, s, ..., (count - 1) s`
+    with `s = ivf_explicit_train_stride(...)` (cuVS draws them at random; ours keeps
+    the integer stride, the same on every vendor and the host column). Only
+    called with `rows_per_list > 0`; 0 means the default rule above."""
+    if n_rows <= 0:
+        return n_rows
+    return min(n_rows, max(1, rows_per_list) * max(1, n_lists))
+
+
+def ivf_explicit_train_stride(n_rows: Int, n_lists: Int, rows_per_list: Int) -> Int:
+    """The stride of `ivf_explicit_train_rows`' rows: `max(1, n_rows // count)`,
+    so `count * s <= n_rows` and every strided row exists."""
+    var count = ivf_explicit_train_rows(n_rows, n_lists, rows_per_list)
+    if count <= 0:
+        return 1
+    return max(1, n_rows // count)
+
+
+@fieldwise_init
+struct IvfFlatIndexParams(Copyable, ImplicitlyCopyable, Movable):
+    """`ivf_flat::index_params`, `ivf_flat.hpp:28-66`.
+
+    Every field theirs has is here, including the three this implementation REFUSES,
+    because a parameter that silently does not exist is a parameter a
+    caller assumes is honoured. `ivf_index_params_validate` names each one.
+    """
+
+    var n_lists: Int
+    var kmeans_n_iters: Int
+    var kmeans_trainset_fraction: Float64
+    var adaptive_centers: Bool
+    var conservative_memory_allocation: Bool
+    var add_data_on_build: Bool
+    var metric: Int
+    var seed: UInt64
+    """NOT THEIRS AT THIS LEVEL. cuVS's `index_params` carries no seed; the
+    seed reaches their quantizer through `kmeans::balanced_params`. Ours
+    reaches `KMeansParams.seed`, and it is surfaced because k-means++ draws
+    from it and a reproducible index needs the number written down."""
+    var train_rows_per_list: Int
+    """release-0845: cuVS ivf_sq's `max_train_points_per_cluster` (theirs at
+    ivf_sq, not ivf_flat). 0 (the default) keeps the training-row rule of the
+    build (`ivf_trainset_stride`, or FAST's sample); `m > 0` trains on
+    `ivf_explicit_train_rows(n_rows, n_lists, m)` strided rows in every mode."""
+
+    @staticmethod
+    def default() -> Self:
+        return Self(
+            IVF_DEFAULT_N_LISTS,
+            IVF_DEFAULT_KMEANS_N_ITERS,
+            IVF_DEFAULT_KMEANS_TRAINSET_FRACTION,
+            False,
+            False,
+            True,
+            METRIC_L2_EXPANDED,
+            UInt64(0),
+            0,
+        )
+
+
+@fieldwise_init
+struct IvfFlatSearchParams(Copyable, ImplicitlyCopyable, Movable):
+    """`ivf_flat::search_params`, `ivf_flat.hpp:76-82`.
+
+    `n_probes` IS A NUMERIC PARAMETER (DEVIATION 1787). It decides which
+    vectors are summed over, so it is part of the answer and not a tuning
+    knob: it goes in the identity card's header, `ivf/README.md`'s identity
+    table has a row for it, and two runs at different `n_probes` are two
+    different computations that must not be compared as if they were one.
+
+    `metric_udf` (`:80`) is not implemented: it is a JIT string compiled into
+    their scan.
+    """
+
+    var n_probes: Int
+
+    @staticmethod
+    def default() -> Self:
+        return Self(IVF_DEFAULT_N_PROBES)
+
+
+struct IvfFlatIndex(Movable):
+    """`ivf_flat::index`, `ivf_flat.hpp:137-274`, CSR instead of their lists.
+
+    DEVIATION 1804, RETIRED (lane/py-dn-ann, 2026-09-28). This struct is
+    the index's host arrays; it used to be ALL there was between build and
+    search, so every search uploaded the centroids and the list data again
+    (theirs lives on the device from `build` to the last `search`). The
+    closure condition this note named is met one level up: `IvfFlatDevice`
+    (ivf_flat_search.mojo) holds the `DeviceBuffer`s, and `ivf/resident.mojo`
+    keeps one per handle for the life of the Python estimator on the
+    binding's process-lifetime context, so a search uploads only its queries.
+    A one-shot search (`ivf_flat_search_host`, the traced gates) still
+    prepares its own; the bits are the same either way, the preparation is
+    the same kernels over the same bytes.
+    """
+
+    var n_lists: Int
+    var dim: Int
+    var n_rows: Int
+    var metric: Int
+
+    var centers: List[Float32]
+    """`index::centers()`, `[n_lists, dim]`, row-major. Produced by the
+    implemented k-means; see `ivf_flat_build.mojo` for which entry point."""
+
+    var center_norms: List[Float32]
+    """`index::center_norms()`, `[n_lists]`. SQUARED on `L2Expanded` and
+    `L2SqrtExpanded` alike, because the expanded form wants the square and
+    the root is taken at the end -- their `:117-118` comment on the k-NN
+    side, and `core/row_norms.mojo` is the kernel in both places."""
+
+    var list_offsets: List[Int32]
+    """`[n_lists + 1]`, the CSR row pointer. `list_offsets[l+1] -
+    list_offsets[l]` is `index::list_sizes()(l)`. An EMPTY list is
+    `list_offsets[l+1] == list_offsets[l]` and is a normal state, not an
+    error: `check_empty_list` gates that it corrupts nothing."""
+
+    var list_indices: List[UInt32]
+    """`[n_rows]`, the ORIGINAL row id of each stored vector, ASCENDING
+    within every list (DEVIATIONS 1783/1784). Their
+    `list_index[inlist_id] = source_ix` with the arrival order removed."""
+
+    var list_data: List[Float32]
+    """`[n_rows, dim]`, the vectors in list order. A PERMUTATION of the
+    input, and a permutation changes nothing only because `list_indices`
+    travels beside it."""
+
+    var labels: List[UInt32]
+    """`[n_rows]`, the assignment. Not a field of theirs -- their labels are
+    workspace inside `extend` -- and kept because it is a card stage
+    (`ivf.assign`) and because `check_assignment_ties` reads it."""
+
+    def __init__(
+        out self,
+        n_lists: Int,
+        dim: Int,
+        n_rows: Int,
+        metric: Int,
+        var centers: List[Float32],
+        var center_norms: List[Float32],
+        var list_offsets: List[Int32],
+        var list_indices: List[UInt32],
+        var list_data: List[Float32],
+        var labels: List[UInt32],
+    ):
+        self.n_lists = n_lists
+        self.dim = dim
+        self.n_rows = n_rows
+        self.metric = metric
+        self.centers = centers^
+        self.center_norms = center_norms^
+        self.list_offsets = list_offsets^
+        self.list_indices = list_indices^
+        self.list_data = list_data^
+        self.labels = labels^
+
+    def list_size(self, list_id: Int) -> Int:
+        """`index::list_sizes()(list_id)`."""
+        return Int(self.list_offsets[list_id + 1]) - Int(
+            self.list_offsets[list_id]
+        )
+
+    def size(self) -> Int:
+        """`index::size()`, `ivf_flat_index.cpp:133`."""
+        return self.n_rows
+
+
+def ivf_metric_name(metric: Int) -> String:
+    if metric == METRIC_L2_EXPANDED:
+        return String("L2Expanded")
+    if metric == METRIC_L2_SQRT_EXPANDED:
+        return String("L2SqrtExpanded")
+    if metric == METRIC_COSINE_EXPANDED:
+        return String("CosineExpanded")
+    return String("<unknown metric ") + String(metric) + ">"
+
+
+def ivf_metric_from_name(name: String) raises -> Int:
+    """The two metrics this implementation carries, by their cuVS names.
+
+    `search_impl`'s switch (`ivf_flat_search.cuh:109-146`) has three arms:
+    L2Expanded / L2SqrtExpanded share one (`alpha=-2, beta=1` over the
+    query norms), CosineExpanded is its own, and `default` is the
+    inner-product fall-through. Only the first arm is implemented, so cosine and
+    inner product raise here rather than run a different arm's arithmetic.
+    """
+    if name == "l2_expanded" or name == "euclidean" or name == "sqeuclidean":
+        return METRIC_L2_EXPANDED
+    if name == "l2_sqrt_expanded" or name == "l2":
+        return METRIC_L2_SQRT_EXPANDED
+    if name == "cosine" or name == "cosine_expanded":
+        raise Error(
+            "ivf_flat: metric 'cosine' is CosineExpanded, which is"
+            " ivf_flat_search.cuh:130-141's own arm (a per-cell divide by"
+            " the norm product) and is NOT IMPLEMENTED. See ivf/NOT_IMPLEMENTED.tsv."
+        )
+    if name == "inner_product" or name == "ip":
+        raise Error(
+            "ivf_flat: metric 'inner_product' takes ivf_flat_search.cuh"
+            ":142-145's default arm (alpha=1, beta=0, select_max) and is"
+            " NOT IMPLEMENTED. See ivf/NOT_IMPLEMENTED.tsv."
+        )
+    raise Error(
+        "ivf_flat: unknown metric '"
+        + name
+        + "'. This implementation carries l2_expanded and l2_sqrt_expanded."
+    )
+
+
+def ivf_refuse_algorithm(name: String) raises:
+    """Every neighbour of IVF-FLAT in the cuVS tree, refused BY NAME.
+
+    Scope is IVF-FLAT ONLY. This function exists so that a caller who asks
+    for one of the others gets a sentence naming the thing and its status
+    instead of an attribute error four layers down.
+    """
+    if name == "hnsw":
+        raise Error(
+            "hnsw: NOT IMPLEMENTED HERE. cuVS's"
+            " cpp/include/cuvs/neighbors/hnsw.hpp is a CPU search over a"
+            " graph built on the GPU (hnsw::from_cagra). It is assigned to"
+            " the ann expansion lane as CAGRA's CPU-serving form"
+            " (algorithm expansion lane 9). The"
+            " sentence that stood here, that CONTRIBUTING.md forbids a CPU"
+            " path, was wrong: CONTRIBUTING has no such rule, and CPU-only"
+            " installs train and predict (corrected 2026-09-27)."
+        )
+    if name == "ivf_pq" or name == "ivfpq":
+        raise Error(
+            "ivf_pq: NOT IMPLEMENTED. cuvs/src/neighbors/ivf_pq/ is a different"
+            " algorithm (product quantization, a codebook per subspace and"
+            " a LUT scan), out of this lane's scope by its brief. See"
+            " ivf/NOT_IMPLEMENTED.tsv."
+        )
+    if name == "cagra":
+        raise Error(
+            "cagra: NOT IMPLEMENTED. cuvs/src/neighbors/cagra.cuh is a graph"
+            " index, out of this lane's scope by its brief. See"
+            " ivf/NOT_IMPLEMENTED.tsv."
+        )
+    if name == "ivf_sq":
+        raise Error(
+            "ivf_sq: NOT IMPLEMENTED (cuvs/src/neighbors/ivf_sq/, scalar"
+            " quantization over an IVF index). See ivf/NOT_IMPLEMENTED.tsv."
+        )
+    if name == "ivf_rabitq":
+        raise Error(
+            "ivf_rabitq: NOT IMPLEMENTED (cuvs/src/neighbors/ivf_rabitq/). See"
+            " ivf/NOT_IMPLEMENTED.tsv."
+        )
+    if name == "scann":
+        raise Error("scann: NOT IMPLEMENTED. See ivf/NOT_IMPLEMENTED.tsv.")
+    if name == "vamana":
+        raise Error("vamana: NOT IMPLEMENTED. See ivf/NOT_IMPLEMENTED.tsv.")
+    if name == "nn_descent":
+        raise Error("nn_descent: NOT IMPLEMENTED. See ivf/NOT_IMPLEMENTED.tsv.")
+    if name == "ivf_flat":
+        return
+    raise Error(
+        "ivf_flat: unknown algorithm '"
+        + name
+        + "'. This lane implements ivf_flat and refuses the rest by name."
+    )
+
+
+comptime IVF_MAGNITUDE_BOUND = Float32(9.2233720368547758e18)
+"""2^63. The same bound `kde/impl/neighbors/kernel_density.mojo` uses for
+the same reason: an expanded L2 forms `||x||^2`, so a coordinate at or above
+2^63 overflows the square to `+inf` and every downstream stage then carries
+a vendor-payload NaN rather than a number (IDENTITY_PATHS row 39, FACT 2)."""
+
+
+@always_inline
+def ivf_is_finite(v: Float32) -> Bool:
+    """NaN and both infinities, by bits. `v != v` catches NaN and an
+    exponent of `0xFF` with a zero mantissa is an infinity; testing the
+    exponent field catches both in one read and does not depend on how a
+    backend orders a comparison against NaN."""
+    var u = bitcast[DType.uint32](v)
+    return ((u >> UInt32(23)) & UInt32(0xFF)) != UInt32(0xFF)
+
+
+def ivf_validate_data(
+    values: List[Float32], n_rows: Int, dim: Int, where: String
+) raises:
+    """DEVIATION 1793's finiteness half, refused BEFORE any upload.
+
+    cuVS's `build` checks `n_rows > 0 && dim > 0` and `n_rows >=
+    n_lists` (`ivf_flat_build.cuh:403-405`) and nothing about the VALUES.
+    We check the values because every stage of this lane is a recorded card
+    stage and a computed NaN carries the vendor's payload, so one non-finite
+    input turns a cross-vendor comparison into a comparison of NaN payloads.
+    Same rule, same wording, same reason as `kde_validate_data`.
+    """
+    if len(values) != n_rows * dim:
+        raise Error(
+            "ivf_flat: "
+            + where
+            + " has "
+            + String(len(values))
+            + " values, expected n_rows * dim = "
+            + String(n_rows * dim)
+        )
+    # lane ann-apple3: one pass without an exit first. By bits, |v| >= 2^63,
+    # an infinity and a NaN are exactly the words whose low 31 bits are at or
+    # above 2^63's (the order of nonnegative floats is the order of their
+    # words), so a count of zero here is the loop below finding nothing; the
+    # loop below still names the first offender when there is one.
+    # Behind `ANN3_HOST_PASSES` (x_ann/switches.mojo).
+    comptime if ANN3_HOST_PASSES:
+        var bound_bits = bitcast[DType.uint32](IVF_MAGNITUDE_BOUND)
+        var vp = values.unsafe_ptr()
+        var refused = 0
+        for i in range(n_rows * dim):
+            if (bitcast[DType.uint32](vp.unsafe_load(i)) & UInt32(0x7FFFFFFF)) >= bound_bits:
+                refused += 1
+        if refused == 0:
+            return
+    for i in range(n_rows * dim):
+        var v = values[i]
+        if not ivf_is_finite(v):
+            raise Error(
+                "ivf_flat: "
+                + where
+                + " value at flat position "
+                + String(i)
+                + " (row "
+                + String(i // dim)
+                + ", column "
+                + String(i % dim)
+                + ") is not finite. Every stage here is a card stage and a"
+                " computed NaN carries the vendor's payload"
+                " (IDENTITY_PATHS row 39)."
+            )
+        if abs(v) >= IVF_MAGNITUDE_BOUND:
+            raise Error(
+                "ivf_flat: "
+                + where
+                + " value at flat position "
+                + String(i)
+                + " has magnitude at or above 2^63; the expanded L2 squares"
+                " it and the square overflows to +inf."
+            )
+
+
+def ivf_validate_index_arrays(
+    n_lists: Int,
+    dim: Int,
+    n_rows: Int,
+    metric: Int,
+    centers: List[Float32],
+    center_norms: List[Float32],
+    offsets: List[Int32],
+    list_indices: List[UInt32],
+    list_data: List[Float32],
+    partial_storage: Bool = False,
+) raises:
+    """A BUILT index handed back from outside (a saved file, a caller's
+    arrays), refused BY NAME unless it is a layout `ivf_flat_build` could
+    have written (lane/inference-embedding-ivf-cholesky, 2026-09-15): the
+    extents, the metric, finite values under the magnitude bound, a CSR
+    row pointer from 0 to `n_rows` that never decreases, and carried ids
+    that are a permutation of `[0, n_rows)` ascending within every list
+    (DEVIATIONS 1783/1784). The search trusts every one of these; a file
+    that breaks one would read past a list or answer ids nobody stored.
+    `center_norms` is not recomputed: a norm that is not the centre's own
+    gives a deterministic but wrong coarse step, the caller's file."""
+    if n_lists < 1 or dim < 1 or n_rows < 1:
+        raise Error(
+            "ivf_flat index: n_lists, dim and n_rows must all be at least 1,"
+            " got n_lists=" + String(n_lists) + " dim=" + String(dim)
+            + " n_rows=" + String(n_rows)
+        )
+    if n_rows < n_lists and not partial_storage:
+        raise Error(
+            "ivf_flat index: number of rows (" + String(n_rows)
+            + ") can't be less than n_lists (" + String(n_lists) + ")"
+        )
+    if metric != METRIC_L2_EXPANDED and metric != METRIC_L2_SQRT_EXPANDED:
+        raise Error(
+            "ivf_flat index: metric code " + String(metric)
+            + " is not 0 (L2Expanded) or 1 (L2SqrtExpanded)"
+        )
+    ivf_validate_data(centers, n_lists, dim, "index centers")
+    ivf_validate_data(center_norms, n_lists, 1, "index center norms")
+    ivf_validate_data(list_data, n_rows, dim, "index list data")
+    if len(offsets) != n_lists + 1:
+        raise Error(
+            "ivf_flat index: list offsets has " + String(len(offsets))
+            + " entries, expected n_lists + 1 = " + String(n_lists + 1)
+        )
+    if len(list_indices) != n_rows:
+        raise Error(
+            "ivf_flat index: list indices has " + String(len(list_indices))
+            + " entries, expected n_rows = " + String(n_rows)
+        )
+    if Int(offsets[0]) != 0 or Int(offsets[n_lists]) != n_rows:
+        raise Error(
+            "ivf_flat index: list offsets must run from 0 to n_rows = "
+            + String(n_rows) + ", got " + String(Int(offsets[0])) + " to "
+            + String(Int(offsets[n_lists]))
+        )
+    var seen = List[Bool](length=n_rows, fill=False)
+    for l in range(n_lists):
+        var lo = Int(offsets[l])
+        var hi = Int(offsets[l + 1])
+        if hi < lo:
+            raise Error(
+                "ivf_flat index: list offsets decrease at list " + String(l)
+                + " (" + String(lo) + " then " + String(hi) + ")"
+            )
+        for s in range(lo, hi):
+            var id = Int(list_indices[s])
+            if id >= n_rows:
+                raise Error(
+                    "ivf_flat index: slot " + String(s) + " carries row id "
+                    + String(id) + ", outside [0, " + String(n_rows) + ")"
+                )
+            if seen[id]:
+                raise Error(
+                    "ivf_flat index: row id " + String(id)
+                    + " is stored twice; the carried ids must be a permutation"
+                )
+            seen[id] = True
+            if s > lo and Int(list_indices[s - 1]) >= id:
+                raise Error(
+                    "ivf_flat index: list " + String(l)
+                    + " does not carry its ids ascending at slot " + String(s)
+                    + " (DEVIATION 1783)"
+                )
+
+
+def ivf_index_params_validate(
+    params: IvfFlatIndexParams, n_rows: Int, dim: Int
+) raises:
+    """Their `RAFT_EXPECTS` block (`ivf_flat_build.cuh:403-407`) plus the
+    three parameters this implementation refuses.
+
+    Theirs, unchanged:
+        n_rows > 0 && dim > 0                      (:403)
+        n_rows >= params.n_lists                   (:404)
+        metric != CosineExpanded || dim > 1        (:405)
+
+    Ours, added, each with the sentence saying why:
+        n_lists >= 1
+        kmeans_n_iters >= 1
+        kmeans_trainset_fraction == 1.0            DEVIATION 1781
+        adaptive_centers == False                  DEVIATION 1793
+        conservative_memory_allocation == False    DEVIATION 1782
+        add_data_on_build == True                  DEVIATION 1793
+    """
+    if n_rows <= 0 or dim <= 0:
+        raise Error(
+            "ivf_flat build: empty dataset (n_rows="
+            + String(n_rows)
+            + ", dim="
+            + String(dim)
+            + "), their RAFT_EXPECTS at ivf_flat_build.cuh:403"
+        )
+    if params.n_lists < 1:
+        raise Error(
+            "ivf_flat build: n_lists must be at least 1, got "
+            + String(params.n_lists)
+        )
+    if n_rows < params.n_lists:
+        raise Error(
+            "ivf_flat build: number of rows ("
+            + String(n_rows)
+            + ") can't be less than n_lists ("
+            + String(params.n_lists)
+            + "), their RAFT_EXPECTS at ivf_flat_build.cuh:404"
+        )
+    if params.kmeans_n_iters < 1:
+        raise Error(
+            "ivf_flat build: kmeans_n_iters must be at least 1, got "
+            + String(params.kmeans_n_iters)
+        )
+    if params.metric != METRIC_L2_EXPANDED and (
+        params.metric != METRIC_L2_SQRT_EXPANDED
+    ):
+        raise Error(
+            "ivf_flat build: metric "
+            + ivf_metric_name(params.metric)
+            + " is not implemented; this implementation carries L2Expanded and"
+            " L2SqrtExpanded (ivf_flat_search.cuh:110-129's arm)."
+        )
+    if params.kmeans_trainset_fraction != Float64(1.0):
+        # DEVIATION 1781. Their trainset is a STRIDED SUBSAMPLE whose row
+        # count is `n_rows / max(1, n_rows / max(fraction * n_rows,
+        # n_lists))` (`ivf_flat_build.cuh:416-418`) -- a float product
+        # truncated to an integer, which is IDENTITY_PATHS row 18's class
+        # exactly: near an integer boundary the truncation flips WHICH rows
+        # train the quantizer, and the quantizer decides list membership,
+        # and list membership decides the summation set. Their own comment
+        # on the line below it is "TODO: a proper sampling".
+        raise Error(
+            "ivf_flat build: kmeans_trainset_fraction = "
+            + String(params.kmeans_trainset_fraction)
+            + " is REFUSED (DEVIATION 1781). Their trainset row count"
+            " (ivf_flat_build.cuh:416-418) is a truncated float product,"
+            " so near an integer boundary two hosts train the quantizer on"
+            " DIFFERENT ROWS and the whole index differs. Only 1.0 (the"
+            " whole dataset, no truncation) is accepted. Closure: implementation"
+            " their stride as exact integer arithmetic, the way"
+            " IDENTITY_PATHS row 18 closed compute_max_features."
+        )
+    if params.adaptive_centers:
+        raise Error(
+            "ivf_flat build: adaptive_centers=True is NOT IMPLEMENTED"
+            " (DEVIATION 1793). Their own header says it makes the"
+            " centroids depend on the ORDER new data is added in"
+            " (ivf_flat.hpp:41-46); that is an order dependence in the"
+            " index itself, and extend() is not implemented either."
+        )
+    if params.conservative_memory_allocation:
+        raise Error(
+            "ivf_flat build: conservative_memory_allocation is NOT IMPLEMENTED"
+            " (DEVIATION 1782). It selects `align_max` for their"
+            " per-list allocation (ivf_flat.hpp:96-100); this implementation lays the"
+            " lists out CSR and has no per-list allocation to align."
+        )
+    if not params.add_data_on_build:
+        raise Error(
+            "ivf_flat build: add_data_on_build=False is NOT IMPLEMENTED"
+            " (DEVIATION 1793). It leaves the index trained and empty for a"
+            " later extend(), and extend() is not implemented. See"
+            " ivf/NOT_IMPLEMENTED.tsv."
+        )
+
+
+def ivf_search_params_validate(
+    sp: IvfFlatSearchParams, n_lists: Int, n_queries: Int, k: Int
+) raises:
+    """Their `RAFT_EXPECTS` at `ivf_flat_search.cuh:329-331` plus the two
+    shape refusals this implementation owes its own selector.
+
+    THEIRS CLAMPS AND OURS REFUSES, and that is DEVIATION 1793's second
+    half. `search_with_filtering` does `n_probes = std::min(params.n_probes,
+    index.n_lists())` (`:331`), so asking for more probes than there are
+    lists silently becomes "probe everything". Because `n_probes` is a
+    NUMERIC parameter here (DEVIATION 1787), a silent clamp would mean two
+    callers who wrote different numbers get one answer and neither can tell
+    from the card which computation ran. So it raises.
+    """
+    if sp.n_probes <= 0:
+        raise Error(
+            "ivf_flat search: n_probes (number of clusters to probe) must"
+            " be positive, their RAFT_EXPECTS at ivf_flat_search.cuh:329"
+        )
+    if sp.n_probes > n_lists:
+        raise Error(
+            "ivf_flat search: n_probes ("
+            + String(sp.n_probes)
+            + ") exceeds n_lists ("
+            + String(n_lists)
+            + "). Theirs clamps at ivf_flat_search.cuh:331; this implementation"
+            " REFUSES, because n_probes is a numeric parameter"
+            " (DEVIATION 1787) and a clamped one is a card that does not"
+            " say which computation ran."
+        )
+    if n_queries <= 0:
+        raise Error(
+            "ivf_flat search: n_queries must be positive, got "
+            + String(n_queries)
+        )
+    if k <= 0:
+        raise Error("ivf_flat search: k must be positive, got " + String(k))

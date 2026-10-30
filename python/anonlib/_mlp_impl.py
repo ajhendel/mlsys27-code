@@ -1,0 +1,957 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Bounded 8→16→3 FP32 training composition; host code only packs/validates.
+
+All forward, backward, loss and update arithmetic executes in the existing
+IDENTICAL GPU GEMM/training bindings; the fused step's backward runs on the
+native autograd tape. This is a small fixed architecture, not a general
+neural-network trainer or a Llama checkpoint format.
+Composed cross-vendor identity requires its own retained qualification.
+
+NUMPY-FREE (numpy-free-0.7, DEVIATIONS 2423-2427). Inputs are read through
+the buffer protocol (`_buffer.view`): a NumPy array, an `array.array`, a
+`anonlib.Array`. Every array this class hands back -- logits, gradients,
+the state snapshot -- is a `anonlib.Array` (`numpy.asarray` on it is
+zero-copy). THE CHECKPOINT BYTES ARE UNCHANGED: the JSON/hex envelope,
+its canonical serialization and its SHA-256 are produced from the same
+little-endian `<f4` / `<i4` bytes the NumPy spelling emitted
+(`_bufcheck.le_bytes`), so a file written by 0.6.x loads here and a file
+written here loads there, byte for byte (see `_encode_array`).
+"""
+import hashlib
+import json
+from . import _portable_math as math
+import operator
+import os
+from pathlib import Path
+import struct
+import tempfile
+import threading
+
+from . import _backend, _linalg_impl, _training_impl
+from ._array import Array
+from ._buffer import (
+    addr, addr_ro, all_finite, as_f32_c, as_i32_c, empty, frombytes, zeros,
+)
+from ._bufcheck import (
+    flat_view, is_int32, is_integer, is_native_f32, le_bytes, probe,
+)
+
+_NAMES = ('weight1', 'bias1', 'weight2', 'bias2')
+_SHAPES = ((16, 8), (16,), (3, 16), (3,))
+_TOTAL = 195
+_MAX_STEP = (1 << 31) - 1
+_STATE_SCHEMA = 'anonlib.small-mlp-trainer.v1'
+#: `mlp_train_step`'s modes (mirrored in `training/mlp_ops.mojo`).
+_MODE_FORWARD, _MODE_GRADS, _MODE_TRAIN = 0, 1, 2
+_FILE_SCHEMA = 'anonlib.small-mlp-checkpoint.v1'
+_FILE_LIMIT = 32768
+#: `numpy.finfo(numpy.float32).max`, as a Python float.
+_F32_MAX = 3.4028234663852886e+38
+
+
+def _canonical(value):
+    return json.dumps(value, sort_keys=True, separators=(',', ':'),
+                      ensure_ascii=True, allow_nan=False).encode('ascii')
+
+
+def _schedule(value):
+    if not isinstance(value, dict) or not value:
+        raise ValueError('SmallMLPTrainer data_schedule must be a nonempty JSON object')
+    remaining = [128]
+
+    def visit(item, depth=0):
+        remaining[0] -= 1
+        if depth > 8 or remaining[0] < 0:
+            raise ValueError('SmallMLPTrainer data_schedule is too complex')
+        if type(item) is dict:
+            if any(type(key) is not str for key in item):  # glue: validates schedule config keys
+                raise ValueError('SmallMLPTrainer data_schedule keys must be strings')
+            if len(item) > 128 or any(len(key) > 2048 for key in item):  # glue: validates schedule config keys
+                raise ValueError('SmallMLPTrainer data_schedule object is too large')
+            for child in item.values():  # glue: walks schedule config tree
+                visit(child, depth + 1)
+        elif type(item) is list:
+            if len(item) > 128:
+                raise ValueError('SmallMLPTrainer data_schedule list is too large')
+            for child in item:  # glue: walks schedule config tree
+                visit(child, depth + 1)
+        elif type(item) is str and len(item) > 2048:
+            raise ValueError('SmallMLPTrainer data_schedule string is too large')
+        elif type(item) is int and item.bit_length() > 4096:
+            raise ValueError('SmallMLPTrainer data_schedule integer is too large')
+        elif item is not None and type(item) not in (str, int, float, bool):
+            raise ValueError('SmallMLPTrainer data_schedule must contain JSON values')
+    visit(value)
+    try:
+        encoded = _canonical(value)
+    except (ValueError, OverflowError) as exc:
+        raise ValueError('SmallMLPTrainer data_schedule must be finite JSON') from exc
+    if len(encoded) > 2048:
+        raise ValueError('SmallMLPTrainer data_schedule exceeds 2048 bytes')
+    return json.loads(encoded)
+
+
+def _is_bool(value):
+    # `bool` and NumPy's `bool_` (which is not a `bool` subclass), judged by
+    # name so that numpy need not be importable here.
+    return isinstance(value, bool) or type(value).__name__ == 'bool_'
+
+
+def _round_f32(value):
+    # DEVIATION 2423: `float(np.float32(value))` is one round-to-nearest-even
+    # to binary32 and back, which is exactly what `struct` does.
+    return struct.unpack('<f', struct.pack('<f', value))[0]
+
+
+def _scalar(value, name):
+    if _is_bool(value):
+        raise ValueError('SmallMLPTrainer ' + name + ' must be a finite float32 scalar')
+    try:
+        value = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError('SmallMLPTrainer ' + name + ' must be a scalar') from exc
+    if not math.isfinite(value) or abs(value) > _F32_MAX:
+        raise ValueError('SmallMLPTrainer ' + name + ' must be finite float32')
+    return _round_f32(value)
+
+
+def _config(lr, betas, eps, weight_decay):
+    try:
+        beta1, beta2 = betas
+    except (TypeError, ValueError) as exc:
+        raise ValueError('SmallMLPTrainer betas must contain two scalars') from exc
+    result = {name: _scalar(value, name) for name, value in  # glue: validates five scalar hyperparameters
+              (('lr', lr), ('beta1', beta1), ('beta2', beta2),
+               ('eps', eps), ('weight_decay', weight_decay))}
+    if result['lr'] <= 0 or result['eps'] <= 0 or result['weight_decay'] < 0:
+        raise ValueError('SmallMLPTrainer requires lr > 0, eps > 0 and weight_decay >= 0')
+    if not 0 <= result['beta1'] < 1 or not 0 <= result['beta2'] < 1:
+        raise ValueError('SmallMLPTrainer betas must remain in [0, 1) in float32')
+    return result
+
+
+def _array(value, shape, name, dtype='<f4'):
+    """An OWNED, C-contiguous, exactly-shaped copy of `value` as a
+    `anonlib.Array` (DEVIATION 2424). The dtype is judged from the
+    buffer's format and REFUSED rather than converted, as the NumPy
+    spelling refused a dtype mismatch; `_buffer.as_f32_c` / `as_i32_c`
+    then supply the layout, and a borrowed buffer is copied so that the
+    trainer never aliases caller memory."""
+    kind = 'float32' if dtype == '<f4' else 'int32'
+    try:
+        pb = probe(value)
+    except TypeError:
+        raise TypeError('SmallMLPTrainer ' + name + ' must be a ' + kind
+                        + ' array (a NumPy array, an array.array or a anonlib Array)') from None
+    ok = is_native_f32(pb.format) if dtype == '<f4' else is_int32(pb.format, pb.itemsize)
+    if not ok:
+        raise TypeError('SmallMLPTrainer ' + name + ' must be a ' + kind
+                        + ' array (a NumPy array, an array.array or a anonlib Array)')
+    if pb.shape != shape:
+        raise ValueError('SmallMLPTrainer ' + name + ' must have shape ' + repr(shape))
+    convert = as_f32_c if dtype == '<f4' else as_i32_c
+    arr, copied = convert(value, ndim=len(shape), name=name)
+    if not copied:
+        arr = arr.copy()
+    if dtype == '<f4' and not all_finite(arr):
+        raise ValueError('SmallMLPTrainer ' + name + ' must be finite')
+    return arr
+
+
+def _batch(value):
+    try:
+        pb = probe(value)
+    except TypeError:
+        # A nested list of the right shape used to be told its SHAPE was
+        # wrong. The fault is the type: this surface reads float32 buffers
+        # only (the same refusal a float64 array gets from `_array`).
+        raise TypeError('SmallMLPTrainer X must be a float32 array of shape (batch, 8) '
+                        '(a NumPy array, an array.array or a anonlib Array), got '
+                        + type(value).__name__) from None
+    if pb.ndim != 2 or pb.shape[1] != 8:
+        raise ValueError('SmallMLPTrainer X must have shape (batch, 8)')
+    if not 1 <= pb.shape[0] <= 256:
+        raise ValueError('SmallMLPTrainer batch must be in [1, 256]')
+    return _array(value, pb.shape, 'X')
+
+
+def _targets(value, rows):
+    try:
+        pb = probe(value)
+    except TypeError:
+        raise TypeError('SmallMLPTrainer targets must be an integer array') from None
+    if not is_integer(pb.format):
+        raise TypeError('SmallMLPTrainer targets must be an integer array')
+    if pb.shape != (rows,):
+        raise ValueError('SmallMLPTrainer targets must have shape (batch,) with classes 0..2')
+    try:
+        arr, copied = as_i32_c(value, ndim=1, name='targets')
+    except OverflowError:
+        # DEVIATION 2467: a label outside int32 is a bad class, not a
+        # conversion accident; the documented refusal is this ValueError.
+        raise ValueError('SmallMLPTrainer targets must have shape (batch,) with classes 0..2') from None
+    if not copied:
+        arr = arr.copy()
+    # The range scan runs in the core Mojo helpers (Array.min/max).
+    labels = Array.from_buffer(arr)
+    if labels.min() < 0 or labels.max() >= 3:
+        raise ValueError('SmallMLPTrainer targets must have shape (batch,) with classes 0..2')
+    return arr
+
+
+def _require_mode():
+    """The process-selected tier, IDENTICAL or FAST (lane neural, 2026-09-27:
+    FAST runs the same kernels with the pins on the free schedule and
+    promises quality, never bits). Returns it."""
+    mode = _backend.default_mode()
+    if mode not in ('identical', 'fast') or _backend.numeric_mode() != mode:
+        raise RuntimeError('SmallMLPTrainer requires process-selected IDENTICAL or FAST mode; select it before use')
+    return mode
+
+
+def _fused_enabled(binding):
+    """Whether the step runs as ONE binding call (`mlp_train_step`,
+    lane/apple-mlp-fused, 2026-09-30) or as the twelve calls it was.
+
+    Same kernels, same operands, same order, same bits either way (the
+    fused entry is those calls with the intermediates kept on the device);
+    what differs is the host round trips a step pays, which on a Metal box
+    is most of the step. `ANONLIB_MLP_FUSED=0` restores the per-operation
+    path (the A/B, `tools/mlp_step_check.py`); a multi-device optimizer
+    count keeps it too, that route living in the per-operation optimizer.
+    A binding without the entry (an older build, the test fakes) takes the
+    per-operation path."""
+    if os.environ.get('ANONLIB_MLP_FUSED', '1') == '0':
+        return False
+    if os.environ.get('ANONLIB_OPTIMIZER_DEVICE_COUNT', '1') != '1':
+        return False
+    return callable(getattr(binding, 'mlp_train_step', None))
+
+
+def _resident_enabled(binding):
+    """lane afn-mlp (2026-10-03): whether the step runs on a DEVICE-RESIDENT
+    session (`mlp_resident_open` .. `mlp_resident_close`, compiled into the
+    Apple FAST binding under `-D ANONLIB_AFN_MLP_RESIDENT`, `_MULTISTEP`
+    or `_ALL` only): the weights and moments stay on the device between
+    steps, a step uploads the batch and downloads the loss, the logits and
+    the gradients, one wait. The same switches as `_fused_enabled` turn it
+    off; a binding without the entry (every other build) never takes it."""
+    return _fused_enabled(binding) and callable(getattr(binding, 'mlp_resident_open', None))
+
+
+def _native_step(entry, *args):
+    """One fused/resident step call. The native step refuses a non-finite
+    result on the device (cpu2-l11-neural); that refusal surfaces as the
+    RuntimeError the host scans raised before."""
+    try:
+        return entry(*args)
+    except Exception as exc:
+        if 'nonfinite' in str(exc) or 'not finite' in str(exc):
+            raise RuntimeError('SmallMLPTrainer step returned an invalid result: ' + str(exc)) from exc
+        raise
+
+
+def _optimizer(parameters, config, state=None):
+    # `resident=False`: this trainer builds an optimizer object per step
+    # (transactional publication), so device-resident moments would be
+    # opened and closed every step; the fused step keeps them on the device
+    # for the length of the call instead.
+    opt = _training_impl.AdamW(
+        parameters, lr=config['lr'], betas=(config['beta1'], config['beta2']),
+        eps=config['eps'], weight_decay=config['weight_decay'], numeric_mode=_require_mode(),
+        resident=False)
+    if state is not None:
+        opt.load_state_dict({'t': state['step'], 'exp_avg': state['m'].copy(),
+                             'exp_avg_sq': state['v'].copy(),
+                             'buf_initialized': state['flags'].copy()})
+    return opt
+
+
+def _state(weights, opt, config, schedule):
+    return dict(schema=_STATE_SCHEMA, architecture=[8, 16, 3], numeric_mode=_require_mode(),
+                parameter_order=list(_NAMES),
+                weights={name: array.copy() for name, array in zip(_NAMES, weights)},  # glue: copies each named weight
+                optimizer=dict(kind='AdamW', step=int(opt.t), m=opt.exp_avg.copy(),
+                               v=opt.exp_avg_sq.copy(), flags=opt.buf_initialized.copy()),
+                config=dict(config), data_schedule=_schedule(schedule))
+
+
+def _validate_state(state):
+    required = {'schema', 'architecture', 'numeric_mode', 'parameter_order',
+                'weights', 'optimizer', 'config', 'data_schedule'}
+    if not isinstance(state, dict) or set(state) != required:
+        raise ValueError('SmallMLPTrainer state has missing or unknown fields')
+    if (state['schema'] != _STATE_SCHEMA or state['architecture'] != [8, 16, 3]
+            or state['numeric_mode'] != _require_mode() or state['parameter_order'] != list(_NAMES)):
+        raise ValueError('SmallMLPTrainer state schema/architecture/mode/order mismatch')
+    if not isinstance(state['weights'], dict) or set(state['weights']) != set(_NAMES):
+        raise ValueError('SmallMLPTrainer state requires all four named parameters')
+    weights = [_array(state['weights'][name], shape, name) for name, shape in zip(_NAMES, _SHAPES)]  # glue: validates each named weight
+    cfg = state['config']
+    if not isinstance(cfg, dict) or set(cfg) != {'lr', 'beta1', 'beta2', 'eps', 'weight_decay'}:
+        raise ValueError('SmallMLPTrainer state optimizer configuration mismatch')
+    config = _config(cfg['lr'], (cfg['beta1'], cfg['beta2']), cfg['eps'], cfg['weight_decay'])
+    opt = state['optimizer']
+    if not isinstance(opt, dict) or set(opt) != {'kind', 'step', 'm', 'v', 'flags'} or opt['kind'] != 'AdamW':
+        raise ValueError('SmallMLPTrainer state optimizer mismatch')
+    if _is_bool(opt['step']):
+        raise ValueError('SmallMLPTrainer step must be an integer')
+    try:
+        step = operator.index(opt['step'])
+    except TypeError as exc:
+        raise ValueError('SmallMLPTrainer step must be an integer') from exc
+    if not 0 <= step <= _MAX_STEP:
+        raise ValueError('SmallMLPTrainer step is outside its supported range')
+    moments = dict(step=step, m=_array(opt['m'], (_TOTAL,), 'm'),
+                   v=_array(opt['v'], (_TOTAL,), 'v'),
+                   flags=_array(opt['flags'], (4,), 'flags', '<i4'))
+    # DEVIATION 2425: `np.any(v < 0)` and the binary-flags test are min/max
+    # scans in the core Mojo helpers (Array.min/max).
+    flags = Array.from_buffer(moments['flags'])
+    if Array.from_buffer(moments['v']).min() < 0 or flags.min() < 0 or flags.max() > 1:
+        raise ValueError('SmallMLPTrainer state requires nonnegative v and binary flags')
+    return weights, moments, config, _schedule(state['data_schedule'])
+
+
+# data_schedule: retained exactly with the step counter; contents are never compared with the
+# batches passed, so it is tamper-evident inside a checkpoint envelope and otherwise only as true as
+# the caller made it (lane/data-ordering-determinism). A step is one binding call when the training
+# binding offers `mlp_train_step` (same kernels, operands and order as the per-operation calls; seven
+# host round trips instead of about forty); ANONLIB_MLP_FUSED=0 restores the per-operation calls.
+# State changes are serialized and published only after the whole step succeeds. A checkpoint is a
+# separate bounded MLP format, not a Llama file.
+class SmallMLPTrainer:
+    """Trainer for a fixed 8-16-3 ReLU network with mean cross-entropy and AdamW.
+
+    The model is ``Linear(8, 16) -> ReLU -> Linear(16, 3)``. Pass `weight1` (16, 8),
+    `bias1` (16,), `weight2` (3, 16) and `bias2` (3,) as float32 buffers (NumPy arrays or
+    `anonlib.Array`); parameters and inputs are copied. Each batch has 1 to 256 rows
+    of 8 features, with labels 0, 1 or 2. All arithmetic runs on the GPU in the numeric
+    mode selected for the process (identical by default); there is no CPU fallback, and
+    a state saved under one mode loads only under the same mode. Every array returned is
+    a `anonlib.Array`.
+
+    A step either completes or leaves the state unchanged. No clipping, dropout, mixed
+    precision, automatic differentiation or other layer shapes are supported.
+
+    Parameters
+    ----------
+    weight1, bias1, weight2, bias2 : buffers
+        Initial parameters, shapes as above.
+    data_schedule : dict
+        A small JSON-serializable description of your data order (for example a dataset
+        hash, sample order and batch size). It is stored with the step counter and in
+        checkpoints, so a resumed run can continue with the right next batch. It is not
+        validated against the batches you pass; the trainer never fetches or reorders
+        data.
+    lr : float, default 0.001
+        AdamW learning rate.
+    betas : tuple of float, default (0.9, 0.999)
+        AdamW moment decay rates.
+    eps : float, default 1e-8
+        AdamW epsilon.
+    weight_decay : float, default 0.01
+        AdamW decoupled weight decay.
+
+    Examples
+    --------
+    >>> import numpy as np, anonlib
+    >>> rng = np.random.default_rng(0)
+    >>> w1 = rng.standard_normal((16, 8)).astype(np.float32) * 0.1
+    >>> w2 = rng.standard_normal((3, 16)).astype(np.float32) * 0.1
+    >>> trainer = anonlib.SmallMLPTrainer(w1, np.zeros(16, np.float32), w2, np.zeros(3, np.float32),
+    ...                                     data_schedule={"batch_size": 32})
+    >>> X = rng.random((32, 8), dtype=np.float32)
+    >>> y = rng.integers(0, 3, 32)
+    >>> out = trainer.train_step(X, y)
+    """
+
+    def __init__(self, weight1, bias1, weight2, bias2, *, data_schedule,
+                 lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.01):
+        weights = [_array(value, shape, name) for value, shape, name in  # glue: validates each named weight
+                   zip((weight1, bias1, weight2, bias2), _SHAPES, _NAMES)]
+        config = _config(lr, betas, eps, weight_decay)
+        schedule = _schedule(data_schedule)
+        _require_mode()
+        self._lock = threading.RLock()
+        self._config = config
+        self._schedule = schedule
+        self._opt = _optimizer(weights, config)
+        # lane afn-mlp: the resident session (handle, its binding, cap_k)
+        self._session = None
+
+    @property
+    def step_(self):
+        """Number of optimizer steps taken."""
+        with self._lock:
+            return int(self._opt.t)
+
+    @property
+    def weights_(self):
+        """Current parameters as a dict: `weight1`, `bias1`, `weight2`, `bias2`."""
+        return self.state_dict()['weights']
+
+    def state_dict(self):
+        """Return an independent snapshot of the full resumable state (weights, optimizer moments, settings, data schedule)."""
+        with self._lock:
+            self._session_sync_host()
+            return _state(self._opt.params, self._opt, self._config, self._schedule)
+
+    def load_state_dict(self, state):
+        """Restore a snapshot from `state_dict`. The snapshot is validated and copied before any live state changes."""
+        with self._lock:
+            weights, moments, config, schedule = _validate_state(state)
+            _require_mode()
+            replacement = _optimizer(weights, config, moments)
+            self._session_close()
+            self._opt, self._config, self._schedule = replacement, config, schedule
+        return self
+
+    # -- lane afn-mlp: the device-resident session (Apple FAST, behind its
+    # -- define; `_resident_enabled`). The session is the truth for the
+    # -- weights and moments while it is open; `_session_sync_host` brings
+    # -- them into `self._opt`'s arrays before anything on the host reads
+    # -- them, and a failed step restores the pre-step state on the device.
+
+    def _session_open(self, binding, cap_k=1):
+        """The open session's handle, (re)opened with capacity `cap_k`."""
+        if self._session is not None:
+            handle, owner, cap = self._session
+            if owner is binding and cap >= cap_k:
+                return handle
+            self._session_sync_host()
+            self._session_close()
+        opt = self._opt
+        addresses = [addr(w, name=n) for w, n in zip(opt.params, _NAMES)]  # glue: packs the six parameter addresses
+        addresses += [addr(opt.exp_avg, name='m'), addr(opt.exp_avg_sq, name='v')]
+        handle = int(binding.mlp_resident_open(addresses, [int(cap_k)]))
+        self._session = (handle, binding, int(cap_k))
+        return handle
+
+    def _session_sync_host(self):
+        if self._session is None:
+            return
+        handle, binding, _ = self._session
+        opt = self._opt
+        addresses = [addr(w, name=n) for w, n in zip(opt.params, _NAMES)]  # glue: packs the six parameter addresses
+        addresses += [addr(opt.exp_avg, name='m'), addr(opt.exp_avg_sq, name='v')]
+        binding.mlp_resident_download(handle, addresses)
+
+    def _session_close(self):
+        if self._session is None:
+            return
+        handle, binding, _ = self._session
+        self._session = None
+        binding.mlp_resident_close(handle)
+
+    def __del__(self):
+        try:
+            self._session_close()
+        except Exception:
+            pass
+
+    def _resident_steps(self, binding, x, y, k, mode, return_input_grad=False):
+        """`k` steps on the session; returns `(losses, logits, grads,
+        input_grad)` (the logits and gradients are the last step's)."""
+        rows = len(x) // k
+        opt, config = self._opt, self._config
+        handle = self._session_open(binding, k)
+        losses = zeros((k,), '<f4')
+        logits = empty((rows, 3), '<f4')
+        grads = [empty(shape, '<f4') for shape in _SHAPES]  # glue: allocates the four gradient outputs
+        dx = empty((rows, 8), '<f4') if return_input_grad else zeros((1,), '<f4')
+        t = opt.t + 1
+        # `addresses` and `params` in this exact order (mirrored word for word
+        # in `bindings/_anonlib_training.mojo::mlp_resident_steps_binding`):
+        #
+        #     addresses: x, y, losses, logits, dw1, db1, dw2, db2, dx
+        #     params:    rows, k, mode, t, lr, beta1, beta2, eps,
+        #                weight_decay, want_input_grad
+        addresses = [addr_ro(x, name='X'), addr_ro(y, name='targets'),
+                     addr(losses, name='losses'), addr(logits, name='logits')]
+        addresses += [addr(g, name=n + ' gradient') for g, n in zip(grads, _NAMES)]  # glue: packs the four gradient addresses
+        addresses += [addr(dx, name='input_grad')]
+        params = [int(rows), int(k), int(mode), int(t), float(config['lr']),
+                  float(config['beta1']), float(config['beta2']), float(config['eps']),
+                  float(config['weight_decay']), 1 if return_input_grad else 0]
+        entry = binding.mlp_resident_steps if k > 1 else binding.mlp_resident_step
+        # cpu2-l11-neural (2026-10-04): the session scans the logits, losses,
+        # gradients and dx on the device (one flag word) and raises; no host
+        # walk of the results here.
+        written = _native_step(entry, handle, addresses, params)
+        if written != logits.size:
+            raise RuntimeError('SmallMLPTrainer step returned an invalid result')
+        if mode == _MODE_FORWARD:
+            return None, logits, None, None
+        values = [float(v) for v in flat_view(losses, 'f')]  # glue: converts the k returned step losses
+        input_grad = dx if return_input_grad else None
+        if mode == _MODE_TRAIN:
+            opt.t = t + k - 1
+            opt.packed_ = True
+            opt.total_norm_ = None
+            opt.clip_coef_ = None
+            opt.lr_ = float(_training_impl._round_f32(config['lr']))
+        return values, logits, grads, input_grad
+
+    # lane afn-mlp: k consecutive train_steps as one binding call on the resident session (Apple FAST
+    # under -D ANONLIB_AFN_MLP_MULTISTEP or _ALL; elsewhere a RuntimeError names the build). X is
+    # (k * batch, 8) and targets (k * batch,), minibatch i the rows [i * batch, (i + 1) * batch), each
+    # 1..256 rows. Returns step, losses (one per minibatch), and loss, logits and gradients of the last.
+    def train_steps(self, X, targets, k):
+        """Run `k` consecutive training steps in one call.
+
+        Available only on builds that provide it; otherwise raises `RuntimeError`.
+        """
+        with self._lock:
+            if type(k) is not int or k < 1:
+                raise ValueError('SmallMLPTrainer train_steps k must be a positive int')
+            binding = self._binding()
+            if not (_resident_enabled(binding)
+                    and callable(getattr(binding, 'mlp_resident_steps', None))):
+                raise RuntimeError('SmallMLPTrainer.train_steps needs the Apple FAST training '
+                                   'binding built with -D ANONLIB_AFN_MLP_MULTISTEP')
+            pb = probe(X)
+            if pb.ndim != 2 or pb.shape[1] != 8 or pb.shape[0] % k != 0:
+                raise ValueError('SmallMLPTrainer train_steps X must have shape (k * batch, 8)')
+            batch = pb.shape[0] // k
+            if not 1 <= batch <= 256:
+                raise ValueError('SmallMLPTrainer batch must be in [1, 256]')
+            x = _array(X, pb.shape, 'X')
+            y = _targets(targets, len(x))
+            if self._opt.t + k > _MAX_STEP:
+                raise ValueError('SmallMLPTrainer step counter is exhausted')
+            losses, logits, grads, _ = self._resident_steps(binding, x, y, k, _MODE_TRAIN)
+            _require_mode()
+            return dict(step=int(self._opt.t), losses=losses, loss=losses[-1],
+                        logits=logits.copy(),
+                        gradients={name: value.copy() for name, value in zip(_NAMES, grads)})  # glue: names the four returned gradients
+
+    @staticmethod
+    def _binding():
+        mode = _require_mode()
+        if mode == 'identical':
+            _linalg_impl.require_identical()
+        binding = _training_impl._load(mode)
+        for name in ('mlp_bias_activation', 'mlp_relu_backward', 'mlp_sum_rows'):  # glue: checks binding entry names
+            if not callable(getattr(binding, name, None)):
+                raise ImportError('SmallMLPTrainer requires updated training binding: missing ' + name)
+        return binding
+
+    @staticmethod
+    def _matmul(a, b, **kwargs):
+        mode = _require_mode()
+        if mode != 'identical':
+            result = _linalg_impl.matmul(a, b, identical=False, **kwargs)
+        else:
+            # API shell only: admit layouts, select the neural binding and
+            # borrow buffers. The native entry owns every data operation.
+            unknown = kwargs.keys() - {'transpose_a', 'transpose_b', 'out'}
+            if unknown:
+                raise TypeError('SmallMLPTrainer GEMM received unsupported options')
+            ta, tb = bool(kwargs.get('transpose_a', False)), bool(kwargs.get('transpose_b', False))
+            if ta and tb:
+                raise ValueError('SmallMLPTrainer GEMM supports NN, NT and TN only')
+            left = _linalg_impl._operand(a, 'a')
+            right = _linalg_impl._operand(b, 'b')
+            k, m = left.shape if ta else (left.shape[1], left.shape[0])
+            n, kb = right.shape if tb else (right.shape[1], right.shape[0])
+            if k != kb:
+                raise ValueError('SmallMLPTrainer GEMM contracted dimensions disagree')
+            result = kwargs.get('out')
+            if result is None:
+                result = empty((m, n), '<f4')
+            else:
+                pb = probe(result)
+                if not is_native_f32(pb.format) or pb.shape != (m, n):
+                    raise ValueError('SmallMLPTrainer GEMM output must be float32 with shape (m, n)')
+                if not pb.c_contiguous or pb.readonly:
+                    raise ValueError('SmallMLPTrainer GEMM output must be writable and C-contiguous')
+            binding = _training_impl._load(mode)
+            entry = getattr(binding, 'neural_gemm', None)
+            if not callable(entry):
+                raise ImportError('SmallMLPTrainer requires updated training binding: missing neural_gemm')
+            written = entry(addr_ro(left, name='a'), addr_ro(right, name='b'),
+                            addr(result, name='result'), [m, n, k, 2 if ta else (1 if tb else 0)])
+            if written != m * n:
+                raise RuntimeError('SmallMLPTrainer neural GEMM returned an incomplete result')
+        # DEVIATION 2426: the product is a anonlib.Array; finiteness via
+        # the native `all_finite` helper.
+        if result.dtype != '<f4' or not all_finite(result):
+            raise RuntimeError('SmallMLPTrainer GEMM returned an invalid result')
+        return result
+
+    @staticmethod
+    def _bias(binding, values, bias, relu):
+        result = empty(values.shape, '<f4')
+        written = binding.mlp_bias_activation(
+            addr_ro(values, name='values'), addr_ro(bias, name='bias'),
+            addr(result, name='result'),
+            [values.shape[0], values.shape[1], int(relu)])
+        if written != result.size or not all_finite(result):
+            raise RuntimeError('SmallMLPTrainer bias/activation returned an invalid result')
+        return result
+
+    @staticmethod
+    def _sum(binding, values):
+        result = empty((values.shape[1],), '<f4')
+        written = binding.mlp_sum_rows(addr_ro(values, name='values'),
+                                       addr(result, name='result'), list(values.shape))
+        if written != result.size or not all_finite(result):
+            raise RuntimeError('SmallMLPTrainer bias gradient returned an invalid result')
+        return result
+
+    def _forward(self, x, weights, binding):
+        w1, b1, w2, b2 = weights
+        activation = self._bias(binding, self._matmul(x, w1, transpose_b=True), b1, True)
+        logits = self._bias(binding, self._matmul(activation, w2, transpose_b=True), b2, False)
+        return activation, logits
+
+    # NN64 selects one packed model execution; its control runs each session projection separately.
+    def predict_logits_sessions(self, inputs):
+        """Logits of several independent batches with the current model, concatenated in the
+        order given.
+
+        Parameters
+        ----------
+        inputs : list of buffers
+            float32 batches, each (rows_i, 8).
+        """
+        with self._lock:
+            return _training_impl.mlp_inference_sessions(
+                inputs, *self._opt.params, numeric_mode=_require_mode())
+
+    def predict_logits(self, X):
+        """Logits (n_rows, 3) of `X` (n_rows, 8) with the current weights."""
+        with self._lock:
+            x = _batch(X)
+            binding = self._binding()
+            if _resident_enabled(binding):
+                _, result, _, _ = self._resident_steps(
+                    binding, x, zeros((len(x),), '<i4'), 1, _MODE_FORWARD)
+            elif _fused_enabled(binding):
+                _, result, _, _ = self._fused(x, zeros((len(x),), '<i4'), self._opt.params,
+                                              self._opt, self._config, binding, _MODE_FORWARD)
+            else:
+                _, result = self._forward(x, self._opt.params, binding)
+            _require_mode()
+            return result
+
+    def _gradient(self, x, y, weights, binding, return_input_grad=False):
+        activation, logits = self._forward(x, weights, binding)
+        loss, dlogits = _training_impl.cross_entropy(
+            logits, y, reduction='mean', return_grad=True, numeric_mode=_require_mode())
+        if not math.isfinite(loss):
+            raise RuntimeError('SmallMLPTrainer loss is not finite')
+        dlogits = _array(dlogits, (len(x), 3), 'logit gradient')
+        dw2 = self._matmul(dlogits, activation, transpose_a=True)
+        db2 = self._sum(binding, dlogits)
+        incoming = self._matmul(dlogits, weights[2])
+        dhidden = empty(activation.shape, '<f4')
+        written = binding.mlp_relu_backward(
+            addr_ro(activation, name='activation'), addr_ro(incoming, name='incoming'),
+            addr(dhidden, name='dhidden'), list(activation.shape))
+        if written != dhidden.size or not all_finite(dhidden):
+            raise RuntimeError('SmallMLPTrainer ReLU gradient returned an invalid result')
+        dw1 = self._matmul(dhidden, x, transpose_a=True)
+        db1 = self._sum(binding, dhidden)
+        grads = [_array(value, shape, name + ' gradient') for value, shape, name in  # glue: validates each named gradient
+                 zip((dw1, db1, dw2, db2), _SHAPES, _NAMES)]
+        input_grad = self._matmul(dhidden, weights[0]) if return_input_grad else None
+        if input_grad is not None and input_grad.shape != x.shape:
+            raise RuntimeError('SmallMLPTrainer input gradient shape mismatch')
+        return loss, logits, grads, input_grad
+
+    @staticmethod
+    def _fused(x, y, weights, opt, config, binding, mode, return_input_grad=False):
+        """`_forward` (mode 0), `_gradient` (mode 1) or `_gradient` and
+        `opt.step(grads)` (mode 2) as ONE binding call; see `_fused_enabled`.
+        Returns `(loss, logits, grads, input_grad)` shaped as `_gradient`
+        returns them (`loss` is 0.0 and `grads` is None under mode 0).
+        Under mode 2 the weights, `opt.exp_avg`, `opt.exp_avg_sq` and
+        `opt.buf_initialized` are written in place and `opt.t` advances,
+        which is what `opt.step` did through `_unpack_into`."""
+        rows = len(x)
+        train = mode == _MODE_TRAIN
+        loss = zeros((1,), '<f4')
+        logits = empty((rows, 3), '<f4')
+        grads = [empty(shape, '<f4') for shape in _SHAPES]  # glue: allocates each named gradient
+        dx = empty((rows, 8), '<f4') if return_input_grad else zeros((1,), '<f4')
+        info = zeros((3,), '<f4')
+        if train:
+            m, v, flags, t = opt.exp_avg, opt.exp_avg_sq, opt.buf_initialized, opt.t + 1
+        else:
+            m, v, flags, t = zeros((1,), '<f4'), zeros((1,), '<f4'), zeros((4,), '<i4'), 1
+        weight_addr = addr if train else addr_ro
+        # `addresses` and `params` are, in this exact order (mirrored word
+        # for word in `bindings/_anonlib_training.mojo::mlp_train_step_binding`):
+        #
+        #     addresses: x, y, w1, b1, w2, b2, m, v, flags, loss, logits,
+        #                dw1, db1, dw2, db2, dx, info
+        #     params:    rows, mode, t, lr, beta1, beta2, eps, weight_decay,
+        #                want_input_grad
+        #
+        # A silent reorder here is a WRONG ANSWER and not a crash. If you
+        # change either list, change the binding's comment in the same edit.
+        addresses = [addr_ro(x, name='X'), addr_ro(y, name='targets')]
+        addresses += [weight_addr(w, name=n) for w, n in zip(weights, _NAMES)]  # glue: one address per weight tensor
+        addresses += [addr(m, name='m'), addr(v, name='v'), addr(flags, name='flags'),
+                      addr(loss, name='loss'), addr(logits, name='logits')]
+        addresses += [addr(g, name=n + ' gradient') for g, n in zip(grads, _NAMES)]  # glue: one address per gradient tensor
+        addresses += [addr(dx, name='input_grad'), addr(info, name='info')]
+        params = [int(rows), int(mode), int(t), float(config['lr']), float(config['beta1']),
+                  float(config['beta2']), float(config['eps']), float(config['weight_decay']),
+                  1 if return_input_grad else 0]
+        # cpu2-l11-neural (2026-10-04): the fused step refuses a non-finite
+        # logit, loss, gradient or dx on the device before anything comes
+        # down; no host walk of the results here.
+        written = _native_step(binding.mlp_train_step, addresses, params)
+        if written != logits.size:
+            raise RuntimeError('SmallMLPTrainer step returned an invalid result')
+        if mode == _MODE_FORWARD:
+            return 0.0, logits, None, None
+        value = float(loss[0])
+        if not math.isfinite(value):
+            raise RuntimeError('SmallMLPTrainer loss is not finite')
+        input_grad = dx if return_input_grad else None
+        if train:
+            # What `opt.step` records beside the buffers it wrote.
+            opt.t = t
+            opt.packed_ = True
+            opt.total_norm_ = None
+            opt.clip_coef_ = None
+            opt.lr_ = float(_training_impl._round_f32(config['lr']))
+        return value, logits, grads, input_grad
+
+    def loss_and_grads(self, X, targets):
+        """Mean cross-entropy loss and parameter gradients of a batch, without a step.
+
+        Use it with `apply_gradients` to accumulate microbatches yourself.
+
+        Returns
+        -------
+        loss : float
+        gradients : sequence of Arrays
+            Gradients of `weight1`, `bias1`, `weight2`, `bias2`, in that order.
+        """
+        with self._lock:
+            x = _batch(X)
+            y = _targets(targets, len(x))
+            binding = self._binding()
+            if _resident_enabled(binding):
+                losses, _, grads, _ = self._resident_steps(binding, x, y, 1, _MODE_GRADS)
+                loss = losses[0]
+            elif _fused_enabled(binding):
+                loss, _, grads, _ = self._fused(x, y, self._opt.params, self._opt,
+                                                self._config, binding, _MODE_GRADS)
+            else:
+                loss, _, grads, _ = self._gradient(x, y, self._opt.params, binding)
+            return loss, grads
+
+    def apply_gradients(self, gradients):
+        """Apply one already-combined gradient with AdamW; returns the new step count.
+
+        `gradients` must hold exactly the four parameter gradients, in the order `weight1`,
+        `bias1`, `weight2`, `bias2`, otherwise `ValueError`.
+        The update either completes or leaves the state unchanged.
+        """
+        with self._lock:
+            gradients = list(gradients)
+            if len(gradients) != len(_NAMES):
+                raise ValueError('SmallMLPTrainer requires exactly four gradients')
+            grads = [_array(g, shape, name + ' gradient')
+                     for g, shape, name in zip(gradients, _SHAPES, _NAMES)]  # glue: validates each named gradient
+            self._session_sync_host()
+            self._session_close()
+            weights, moments, config, schedule = _validate_state(self.state_dict())
+            if moments['step'] == _MAX_STEP:
+                raise ValueError('SmallMLPTrainer step counter is exhausted')
+            working = _optimizer(weights, config, moments)
+            working.step(grads)
+            _validate_state(_state(weights, working, config, schedule))
+            if working.t != moments['step'] + 1:
+                raise RuntimeError('SmallMLPTrainer optimizer did not advance exactly one step')
+            self._opt = working
+            return int(working.t)
+
+    def train_step(self, X, targets, *, return_input_grad=False):
+        """One AdamW training step on a batch.
+
+        Parameters
+        ----------
+        X : buffer, shape (n_rows, 8)
+            float32 batch, 1 to 256 rows.
+        targets : buffer, shape (n_rows,)
+            Labels 0, 1 or 2.
+        return_input_grad : bool, default False
+            Also return the gradient with respect to `X`.
+
+        Returns
+        -------
+        dict
+            `step` (the new step count), `loss` and `logits` from before the update,
+            `gradients` (the four parameter gradients), and `input_grad` when requested.
+        """
+        with self._lock:
+            x = _batch(X)
+            y = _targets(targets, len(x))
+            if type(return_input_grad) is not bool:
+                raise TypeError('SmallMLPTrainer return_input_grad must be a bool')
+            binding = self._binding()
+            if _resident_enabled(binding):
+                # lane afn-mlp: the state stays on the device; the binding
+                # restores the pre-step state on the device when the step
+                # fails, so nothing is published unless the step succeeded.
+                if self._opt.t == _MAX_STEP:
+                    raise ValueError('SmallMLPTrainer step counter is exhausted')
+                losses, logits, grads, input_grad = self._resident_steps(
+                    binding, x, y, 1, _MODE_TRAIN, return_input_grad)
+                _require_mode()
+                result = dict(step=int(self._opt.t), loss=losses[0], logits=logits.copy(),
+                              gradients={name: value.copy() for name, value in zip(_NAMES, grads)})  # glue: names the four returned gradients
+                if return_input_grad:
+                    result['input_grad'] = input_grad.copy()
+                return result
+            weights, moments, config, schedule = _validate_state(self.state_dict())
+            if moments['step'] == _MAX_STEP:
+                raise ValueError('SmallMLPTrainer step counter is exhausted')
+            working = _optimizer(weights, config, moments)
+            if _fused_enabled(binding):
+                loss, logits, grads, input_grad = self._fused(
+                    x, y, weights, working, config, binding, _MODE_TRAIN, return_input_grad)
+            else:
+                loss, logits, grads, input_grad = self._gradient(x, y, weights, binding, return_input_grad)
+                working.step(grads)
+            # Validation and all potentially allocating result construction
+            # precede the single live optimizer-pointer publication.
+            _validate_state(_state(weights, working, config, schedule))
+            if working.t != moments['step'] + 1:
+                raise RuntimeError('SmallMLPTrainer optimizer did not advance exactly one step')
+            _require_mode()
+            result = dict(step=int(working.t), loss=float(loss), logits=logits.copy(),
+                          gradients={name: value.copy() for name, value in zip(_NAMES, grads)})  # glue: copies each named gradient
+            if return_input_grad:
+                result['input_grad'] = input_grad.copy()
+            self._opt = working
+            return result
+
+    def save_checkpoint(self, path):
+        """Atomically save the full state to `path` in a bounded, pickle-free MLP checkpoint format."""
+        state = self.state_dict()
+        payload = _encode_state(state)
+        envelope = dict(schema=_FILE_SCHEMA, payload=payload,
+                        payload_sha256=hashlib.sha256(_canonical(payload)).hexdigest())
+        profile = str(self._binding().neural_arithmetic_profile())
+        if profile != "anonlib.neural-training.fp32.v1":
+            envelope["arithmetic_profile"] = profile
+        encoded = _canonical(envelope) + b'\n'
+        if len(encoded) > _FILE_LIMIT:
+            raise ValueError('SmallMLPTrainer checkpoint exceeds its size bound')
+        path = Path(path)
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(dir=path.parent, prefix='.' + path.name + '.', delete=False) as stream:
+                temporary = stream.name
+                stream.write(encoded)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+            temporary = None
+        finally:
+            if temporary is not None:
+                os.unlink(temporary)
+
+    @classmethod
+    def from_checkpoint(cls, path):
+        """Restore a trainer from `save_checkpoint` output, after checking its schema, size and hash."""
+        with Path(path).open('rb') as stream:
+            encoded = stream.read(_FILE_LIMIT + 1)
+        if len(encoded) > _FILE_LIMIT:
+            raise ValueError('SmallMLPTrainer checkpoint exceeds its size bound')
+        try:
+            envelope = json.loads(encoded, object_pairs_hook=_unique_object)
+        except (ValueError, UnicodeDecodeError, RecursionError) as exc:
+            raise ValueError('SmallMLPTrainer checkpoint is not valid bounded JSON') from exc
+        if not isinstance(envelope, dict) or set(envelope) not in ({'schema', 'payload', 'payload_sha256'}, {'schema', 'payload', 'payload_sha256', 'arithmetic_profile'}):
+            raise ValueError('SmallMLPTrainer checkpoint envelope mismatch')
+        if envelope['schema'] != _FILE_SCHEMA:
+            raise ValueError('SmallMLPTrainer checkpoint schema mismatch')
+        if hashlib.sha256(_canonical(envelope['payload'])).hexdigest() != envelope['payload_sha256']:
+            raise ValueError('SmallMLPTrainer checkpoint integrity mismatch')
+        expected_profile = str(_training_impl._load(_require_mode()).neural_arithmetic_profile())
+        if envelope.get('arithmetic_profile', 'anonlib.neural-training.fp32.v1') != expected_profile:
+            raise ValueError('SmallMLPTrainer checkpoint arithmetic profile mismatch')
+        state = _decode_state(envelope['payload'])
+        weights, _, config, schedule = _validate_state(state)
+        result = cls(*weights, data_schedule=schedule, lr=config['lr'],
+                     betas=(config['beta1'], config['beta2']), eps=config['eps'],
+                     weight_decay=config['weight_decay'])
+        return result.load_state_dict(state)
+
+
+def _unique_object(pairs):
+    result = {}
+    for key, value in pairs:  # glue: checkpoint json key pairs
+        if key in result:
+            raise ValueError('Duplicate checkpoint key')
+        result[key] = value
+    return result
+
+
+def _encode_array(value):
+    """The on-disk tensor descriptor, BYTE-IDENTICAL to the NumPy spelling
+    (DEVIATION 2427). `np.asarray(value, dtype='<f4', order='C').tobytes()`
+    emitted the C-order LITTLE-ENDIAN bytes whatever the host;
+    `_bufcheck.le_bytes` emits the same bytes (a `byteswap` on a big-endian
+    host, a no-op elsewhere), so `hex`, the canonical JSON around it and
+    the SHA-256 over that JSON are unchanged. `value` is one of this
+    module's own Arrays (`<f4` or `<i4`), which is all the NumPy version
+    ever saw here too."""
+    integer = value.dtype == '<i4'
+    dtype = '<i4' if integer else '<f4'
+    return dict(dtype=dtype, shape=list(value.shape),
+                hex=le_bytes(value, 'i' if integer else 'f').hex())
+
+
+def _encode_state(state):
+    state['weights'] = {name: _encode_array(value) for name, value in state['weights'].items()}  # glue: encodes each named weight
+    for key in ('m', 'v', 'flags'):  # glue: encodes three optimizer arrays
+        state['optimizer'][key] = _encode_array(state['optimizer'][key])
+    return state
+
+
+def _decode_array(value, shape, dtype):
+    if (not isinstance(value, dict) or set(value) != {'dtype', 'shape', 'hex'}
+            or value['dtype'] != dtype or value['shape'] != list(shape)
+            or not isinstance(value['hex'], str)):
+        raise ValueError('SmallMLPTrainer checkpoint tensor descriptor mismatch')
+    cells = math.prod(shape)  # glue: product of shape dims
+    if len(value['hex']) != cells * 8:
+        raise ValueError('SmallMLPTrainer checkpoint tensor length mismatch')
+    try:
+        raw = bytes.fromhex(value['hex'])
+    except ValueError as exc:
+        raise ValueError('SmallMLPTrainer checkpoint tensor is not hexadecimal') from exc
+    if len(raw) != cells * 4:
+        raise ValueError('SmallMLPTrainer checkpoint tensor byte count mismatch')
+    # `np.frombuffer(raw, dtype='<f4').astype(native, copy=True)`:
+    # `_buffer.frombytes` reads the little-endian bytes into a fresh
+    # native Array (DEVIATION 2427).
+    return frombytes(raw, dtype, tuple(shape))
+
+
+def _decode_state(payload):
+    if not isinstance(payload, dict):
+        raise ValueError('SmallMLPTrainer checkpoint payload must be an object')
+    # Bound expected descriptors before looking at any caller-controlled shape.
+    try:
+        if not isinstance(payload['weights'], dict) or set(payload['weights']) != set(_NAMES):
+            raise ValueError('SmallMLPTrainer checkpoint parameter registry mismatch')
+        payload['weights'] = {name: _decode_array(payload['weights'][name], shape, '<f4')
+                              for name, shape in zip(_NAMES, _SHAPES)}  # glue: decodes each named weight
+        for key in ('m', 'v', 'flags'):  # glue: decodes three optimizer arrays
+            payload['optimizer'][key] = _decode_array(
+                payload['optimizer'][key], (4,) if key == 'flags' else (_TOTAL,),
+                '<i4' if key == 'flags' else '<f4')
+    except (KeyError, TypeError) as exc:
+        raise ValueError('SmallMLPTrainer checkpoint state is incomplete') from exc
+    return payload

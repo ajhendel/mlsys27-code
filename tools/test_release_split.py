@@ -1,0 +1,354 @@
+"""THE SPLIT LINUX PACKAGES IN `pixi run release` (the only Linux layout),
+proved without a rental: the per-package
+pipelines and their gates (each plugin on its own vendor's column, the core
+LAST, after both plugins published, so only when both columns passed), the pack of the
+three wheels through audit.sh and the strip, the columns' --plugin, and the
+per-package publication. The runner stands in for every process; the pack
+stand-in is the real packer (profile split) over test_split_wheels.py's
+inert fake sets, so split_audit reads real split wheels."""
+import hashlib
+import json
+import os
+import pathlib
+import shutil
+import subprocess
+import sys
+import threading
+import unittest
+import zipfile
+from unittest import mock
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "tools"))
+sys.path.insert(0, str(ROOT / "packaging" / "linux"))
+import release  # noqa: E402
+import test_release_severable as sev  # noqa: E402
+
+HEAD = sev.HEAD
+
+
+class SplitBase(sev.Base):
+    def release(self, commit=sev.Y, **kw):
+        return super().release(commit=commit, **kw)
+
+
+class Switch(SplitBase):
+    def test_the_split_layout_is_the_only_one(self):
+        """The combined Linux wheel is gone (2026-09-26, after 0.8.22
+        went out split end to end); so are --split-linux and --combined-linux."""
+        r = self.release()
+        self.assertEqual(r.STEPS, release.Release.STEPS)
+        self.assertIn("publish-core-linux", r.STEPS)
+        self.assertNotIn("publish-linux", r.STEPS)
+        self.assertNotIn("gpu-columns", r.STEPS)
+        self.assertFalse(hasattr(release, "SPLIT_LINUX_ENV"))
+        for flag in ("--combined-linux", "--split-linux"):
+            with self.assertRaises(SystemExit) as cm, mock.patch("sys.stderr"):
+                release.main(["0.8.99", "--dry-run", flag, "--state-dir", str(self.tmp / "s")])
+            self.assertEqual(cm.exception.code, 2)
+
+    def test_a_release_packed_combined_is_refused_until_repacked(self):
+        r = self.release()
+        r.state["linux_layout"] = "combined"
+        r.save()
+        with self.assertRaisesRegex(SystemExit, "--redo linux-pack"):
+            self.release()
+        self.release(redo="linux-pack")
+
+    def test_the_split_pipelines(self):
+        r = self.release()
+        self.assertEqual(list(r.PIPELINES), ["macos", "core-linux", "nvidia", "nvidia-ptx", "amd"])
+        for p in r.PIPELINES.values():
+            for s in p["builds"] + p["checks"] + [p["publish"]]:
+                self.assertIn(s, r.STEPS)
+        # THE PLUGINS FIRST, THE CORE LAST: the core requires both plugins
+        # the author 2026-10-10: identity runs ONCE; linux-joint-diff is deleted
+        self.assertEqual(set(r.NEEDS["publish-nvidia"]), {"gpu-column-nvidia", "gpu-column-nvidia-hopper", "publish-nvidia-ptx"})
+        self.assertEqual(set(r.NEEDS["publish-amd"]), {"gpu-column-amd"})
+        self.assertEqual(set(r.NEEDS["publish-core-linux"]), {"publish-nvidia", "publish-amd"})
+        self.assertNotIn("linux-joint-diff", r.AFTER)
+
+
+class Gates(SplitBase):
+    """Every step stood in for; which packages publish when a column or the
+    core's publish fails."""
+
+    def staged(self, fail=()):
+        r = self.release(publish="pypi")
+        order, lock = [], threading.Lock()
+
+        def make(step):
+            def fn():
+                with lock:
+                    order.append(step)
+                if step in fail:
+                    raise release.StepFailed("boom " + step)
+                if step.startswith("publish-"):
+                    return "pypi via alpha-api-tag"
+                if step in ("finish-line", "record"):
+                    got = r.published_platforms()
+                    return f"{step} for {','.join(got)}", dict(platforms=got)
+                return "ok"
+            return fn
+        for step in r.STEPS:
+            setattr(r, "step_" + step.replace("-", "_"), make(step))
+        return r, order
+
+    def published(self, r):
+        return sorted(r.published_platforms())
+
+    def test_everything_passing_publishes_the_three_packages_and_macos(self):
+        r, order = self.staged()
+        self.assertEqual(r.go(), 0)
+        self.assertEqual(self.published(r), ["amd", "linux", "macos", "nvidia", "nvidia-ptx"])
+        self.assertLess(order.index("publish-nvidia-ptx"), order.index("publish-nvidia"))
+        # the plugins first, the core last: pip resolves anonlib==<v> only
+        # once both plugins at <v> are on the index
+        self.assertGreater(order.index("publish-core-linux"), order.index("publish-nvidia"))
+        self.assertGreater(order.index("publish-core-linux"), order.index("publish-amd"))
+
+    def test_a_failed_amd_column_holds_amd_and_the_core(self):
+        r, order = self.staged(fail={"gpu-column-amd"})
+        self.assertEqual(r.go(), 1)
+        # the NVIDIA plugin may upload (unresolvable alone, it requires the core)
+        self.assertEqual(self.published(r), ["macos", "nvidia", "nvidia-ptx"])
+        self.assertNotIn("publish-core-linux", order)
+        self.assertIn("amd: FAILED at gpu-column-amd", "\n".join(r.lines))
+
+    def test_a_failed_nvidia_column_holds_nvidia_and_the_core(self):
+        r, order = self.staged(fail={"gpu-column-nvidia"})
+        self.assertEqual(r.go(), 1)
+        self.assertEqual(self.published(r), ["amd", "macos"])
+        self.assertNotIn("publish-core-linux", order)
+
+    def test_failed_hopper_holds_its_payload_vendor_aggregate_and_core(self):
+        r, order = self.staged(fail={"gpu-column-nvidia-hopper"})
+        self.assertEqual(r.go(), 1)
+        self.assertEqual(self.published(r), ["amd", "macos", "nvidia-ptx"])
+        for step in ("publish-nvidia", "publish-core-linux"):
+            self.assertNotIn(step, order)
+
+    def test_a_failed_nvidia_publish_holds_the_core(self):
+        r, order = self.staged(fail={"publish-nvidia"})
+        self.assertEqual(r.go(), 1)
+        self.assertEqual(self.published(r), ["amd", "macos", "nvidia-ptx"])
+        self.assertNotIn("publish-core-linux", order)
+
+    def test_a_failed_amd_publish_holds_the_core(self):
+        r, order = self.staged(fail={"publish-amd"})
+        self.assertEqual(r.go(), 1)
+        self.assertEqual(self.published(r), ["macos", "nvidia", "nvidia-ptx"])
+        self.assertNotIn("publish-core-linux", order)
+
+    def test_a_failed_core_publish_leaves_both_plugins_published(self):
+        r, order = self.staged(fail={"publish-core-linux"})
+        self.assertEqual(r.go(), 1)
+        self.assertEqual(self.published(r), ["amd", "macos", "nvidia", "nvidia-ptx"])
+
+    def test_failed_ptx_publish_holds_nvidia_and_core(self):
+        r, order = self.staged(fail={"publish-nvidia-ptx"})
+        self.assertEqual(r.go(), 1)
+        self.assertEqual(self.published(r), ["amd", "macos"])
+        self.assertNotIn("publish-nvidia", order)
+        self.assertNotIn("publish-core-linux", order)
+
+class Pack(SplitBase):
+    """linux-pack: pack (the real packer over fake sets), audit
+    each wheel core first, strip each, split_audit the final set."""
+
+    def test_three_wheels_packed_audited_stripped_and_audited_as_a_set(self):
+        import test_split_wheels as tsw
+        sets_root = self.tmp / "fake"
+        set_dirs = tsw.make_sets(sets_root)
+        calls = []
+
+        def runner(cmd, env, log, detach=False):
+            cmd = [str(c) for c in cmd]
+            calls.append(cmd)
+            if "pack-linux-wheel" in cmd:
+                out = cmd[cmd.index("--out") + 1]
+                args = [a for s in set_dirs for a in ("--set", s)]
+                return tsw.pw.main(args + ["--out", out], _gates=False)
+            if cmd[:2] == ["bash", "packaging/linux/audit.sh"]:
+                whl = pathlib.Path(cmd[2])
+                (whl.parent / "audit" / "repaired").mkdir(parents=True, exist_ok=True)
+                shutil.copy2(whl, whl.parent / "audit" / "repaired" / whl.name)
+                return 0
+            if cmd[1].endswith("strip_wheel_dir_entries.py"):
+                shutil.copy2(cmd[2], cmd[3])
+                return 0
+            return 0
+        r = self.release(commit=HEAD)
+        r.runner = runner
+        r.pack_inputs = lambda: ([], [], ["m.json"])
+        r.assembly_needed = lambda: False
+        r.source_checkout = lambda create=True: ROOT
+        result = r.step_linux_pack()
+        finals = r.split_finals()
+        self.assertTrue(all(finals.values()), finals)
+        self.assertIn("--profile", calls[0])
+        self.assertEqual(calls[0][calls[0].index("--profile") + 1], "release-split")
+        audits = [pathlib.Path(c[2]).name.split("-")[0] for c in calls if c[:2] == ["bash", "packaging/linux/audit.sh"]]
+        self.assertEqual(audits, ["anonlib", "anonlib_nvidia", "anonlib_amd", "anonlib_nvidia_ptx"], "the core first")
+        self.assertEqual(sum(1 for c in calls if c[1].endswith("strip_wheel_dir_entries.py")), 4)
+        report = json.loads((r.rel / "linux" / "final" / "split-audit.json").read_text())
+        self.assertEqual(report["problems"], [])
+        self.assertEqual(r.state["linux_layout"], "split")
+        self.assertIn("anonlib_amd-", result)
+        # A rerun takes the six finals as they are
+        calls.clear()
+        self.assertTrue(r.step_linux_pack().startswith("have "))
+        self.assertEqual(calls, [])
+
+
+def fake_wheel(path, commit=None, data=b"x"):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(path, "w") as z:
+        if commit:
+            z.writestr("anonlib/identity_columns/COMMIT", commit + "\n")
+        z.writestr("payload", data)
+    return path
+
+
+class ColumnsAndPublish(SplitBase):
+    def finals(self, r):
+        final = r.rel / "linux" / "final"
+        core = fake_wheel(final / "anonlib-0.8.99-py3-none-manylinux_2_35_x86_64.whl", sev.Y)
+        cuda = fake_wheel(final / "anonlib_nvidia-0.8.99-py3-none-manylinux_2_35_x86_64.whl", data=b"cuda")
+        rocm = fake_wheel(final / "anonlib_amd-0.8.99-py3-none-manylinux_2_35_x86_64.whl", data=b"rocm")
+        ptx = fake_wheel(final / "anonlib_nvidia_ptx-0.8.99-py3-none-manylinux_2_35_x86_64.whl", data=b"ptx")
+        self.plugins = [cuda, rocm, ptx]
+        return core, cuda, rocm
+
+    def receipt(self, out, core, plugins, vendor, arch=None):
+        """A column receipt that installed `plugins` (one wheel or several)
+        beside the core; a real split column installs all five GPU distributions."""
+        plugins = plugins if isinstance(plugins, (list, tuple)) else [plugins]
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "results.json").write_text(json.dumps(dict(
+            status="PASSED", scope="expanded", source_commit=sev.Y, wheel=str(core), wheel_sha256=release.sha256(core),
+            installed=dict(vendor=vendor, gpu_arch=arch or ("sm_89" if vendor == "cuda" else "gfx942")),
+            plugins=[dict(wheel="/box/" + p.name, wheel_sha256=release.sha256(p)) for p in plugins])))
+
+    def test_each_column_installs_its_own_plugin(self):
+        r = self.release()
+        core, cuda, rocm = self.finals(r)
+        legs = {l.name: l for l in r.column_legs()}
+        nv, amd = legs["nvidia"].command, legs["amd"].command
+
+        def plugins(cmd):
+            return [cmd[i + 1] for i, a in enumerate(cmd) if a == "--plugin"]
+        # All native payloads and both aggregates on every column, its aggregate first
+        self.assertEqual(plugins(nv), [str(p) for p in self.plugins])
+        self.assertEqual(plugins(amd), [str(rocm), *[str(p) for p in self.plugins if p != rocm]])
+        self.assertEqual(plugins(legs["nvidia-hopper"].command), [str(p) for p in self.plugins])
+        self.assertEqual(legs["amd"].provenance["wheel_sha256"], release.sha256(r.split_final("amd")), "keyed to the native payload")
+        self.assertEqual(legs["amd"].provenance["core_sha256"], release.sha256(core))
+        self.assertEqual(r.column_legs(("amd",))[0].name, "amd")
+
+    def test_a_column_is_ok_only_with_its_own_plugin_in_the_receipt(self):
+        r = self.release()
+        core, cuda, rocm = self.finals(r)
+        self.assertFalse(r.nvidia_column_ok())
+        self.receipt(r.rel / "smoke-linux", core, cuda, "cuda")         # its own plugin alone: not what pip installs
+        self.assertFalse(r.nvidia_column_ok())
+        self.receipt(r.rel / "smoke-linux", core, self.plugins, "cuda")
+        self.assertTrue(r.nvidia_column_ok())
+        self.receipt(r.rel / "column-amd", core, cuda, "hip")          # the wrong plugin
+        self.assertFalse(r.amd_column_ok())
+        self.receipt(r.rel / "column-amd", core, rocm, "hip")          # its own alone
+        self.assertFalse(r.amd_column_ok())
+        other = fake_wheel(self.tmp / "other" / rocm.name, data=b"not the final")
+        self.receipt(r.rel / "column-amd", core, [other, *[p for p in self.plugins if p != rocm]], "hip")  # a plugin of other bytes
+        self.assertFalse(r.amd_column_ok())
+        self.receipt(r.rel / "column-amd", core, self.plugins, "hip")
+        self.assertTrue(r.amd_column_ok())
+
+    def test_complete_wheel_receipt_cannot_qualify_the_wrong_architecture(self):
+        r = self.release()
+        core, _, _ = self.finals(r)
+        self.receipt(r.rel / "column-nvidia-hopper", core, self.plugins, "cuda", "sm_89")
+        self.assertFalse(r.hopper_column_ok(), "Ada execution does not qualify Hopper payload")
+        self.receipt(r.rel / "column-nvidia-hopper", core, self.plugins, "cuda", "sm_90a")
+        self.assertTrue(r.hopper_column_ok())
+        self.receipt(r.rel / "smoke-linux", core, self.plugins, "cuda", "sm_90a")
+        self.assertFalse(r.nvidia_column_ok(), "Hopper execution does not qualify Ada payload")
+
+    def test_the_core_publishes_only_when_all_three_columns_passed(self):
+        r = self.release()
+        core, cuda, rocm = self.finals(r)
+        with self.assertRaisesRegex(release.StepFailed, "not PASSED: NVIDIA Ada, NVIDIA Hopper, AMD"):
+            r.core_receipt()
+        self.receipt(r.rel / "column-amd", core, self.plugins, "hip")
+        with self.assertRaisesRegex(release.StepFailed, "not PASSED: NVIDIA Ada, NVIDIA Hopper$"):
+            r.core_receipt()
+        self.receipt(r.rel / "smoke-linux", core, self.plugins, "cuda")
+        with self.assertRaisesRegex(release.StepFailed, "not PASSED: NVIDIA Hopper$"):
+            r.core_receipt()
+        self.receipt(r.rel / "column-nvidia-hopper", core, self.plugins, "cuda", "sm_90a")
+        self.assertEqual(r.core_receipt(), r.rel / "smoke-linux" / "results.json")
+        (r.rel / "column-amd" / "results.json").unlink()
+        with self.assertRaisesRegex(release.StepFailed, "not PASSED: AMD$"):
+            r.core_receipt()
+
+    def test_each_package_is_its_own_publication(self):
+        calls = []
+        r = self.release(publish="testpypi")
+        r.runner = lambda cmd, env, log, detach=False: calls.append([str(c) for c in cmd]) or 0
+        r.on_pypi = lambda wheel: False
+        core, cuda, rocm = self.finals(r)
+        self.receipt(r.rel / "smoke-linux", core, self.plugins, "cuda")
+        self.receipt(r.rel / "column-amd", core, self.plugins, "hip")
+        self.receipt(r.rel / "column-nvidia-hopper", core, self.plugins, "cuda", "sm_90a")
+        for step in ("publish_nvidia", "publish_amd", "publish_core_linux"):
+            result, data = getattr(r, "step_" + step)()
+            self.assertIn("testpypi via alpha-api-0.8.99-", result)
+        published = [(pathlib.Path(c[2]).name.split("-")[0], pathlib.Path(c[-1]).parent.name)
+                     for c in calls]
+        self.assertEqual(published, [("anonlib_nvidia", "smoke-linux"), ("anonlib_amd", "column-amd"),
+                                    ("anonlib", "smoke-linux")])
+
+    def test_a_plugin_is_not_published_on_a_receipt_that_did_not_install_it(self):
+        r = self.release(publish="testpypi")
+        r.runner = lambda cmd, env, log, detach=False: 0
+        r.on_pypi = lambda wheel: False
+        core, cuda, rocm = self.finals(r)
+        self.receipt(r.rel / "column-amd", core, cuda, "hip")
+        with self.assertRaisesRegex(release.StepFailed, "did not install anonlib_amd"):
+            r.step_publish_amd()
+
+    def test_on_pypi_asks_the_plugins_own_project(self):
+        r = self.release()
+        _, cuda, _ = self.finals(r)
+        seen = []
+
+        def urlopen(url, timeout=None):
+            seen.append(url)
+            raise OSError("offline")
+        with mock.patch.object(release.urllib.request, "urlopen", urlopen):
+            self.assertFalse(r.on_pypi(cuda))
+        self.assertEqual(seen, ["https://pypi.org/pypi/anonlib-nvidia/0.8.99/json"])
+
+
+class Reuse(unittest.TestCase):
+    def test_a_published_split_set_is_merged_back_for_the_assembly(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = pathlib.Path(tmp)
+            core = tmp / "anonlib-1-py3-none-manylinux_2_35_x86_64.whl"
+            with zipfile.ZipFile(core, "w") as z:
+                z.writestr("anonlib/__init__.py", "")
+                z.writestr("anonlib-1.dist-info/LINUX_PAYLOAD.json", json.dumps(dict(a=1, split=dict(role="core-linux"))))
+            cuda = tmp / "anonlib_nvidia-1-py3-none-manylinux_2_35_x86_64.whl"
+            with zipfile.ZipFile(cuda, "w") as z:
+                z.writestr("anonlib/cuda/sm_89/_anonlib_knn.so", "bin")
+                z.writestr("anonlib_nvidia-1.dist-info/METADATA", "x")
+            merged = release.merge_split([core, cuda], tmp / "out" / core.name)
+            with zipfile.ZipFile(merged) as z:
+                self.assertEqual(sorted(z.namelist()), ["anonlib-1.dist-info/LINUX_PAYLOAD.json",
+                                                        "anonlib/__init__.py", "anonlib/cuda/sm_89/_anonlib_knn.so"])
+                self.assertEqual(json.loads(z.read("anonlib-1.dist-info/LINUX_PAYLOAD.json")), dict(a=1))
+
+
+if __name__ == "__main__":
+    unittest.main()

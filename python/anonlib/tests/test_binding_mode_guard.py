@@ -1,0 +1,84 @@
+"""Call-time compiled-mode checks; no native learner execution."""
+from types import SimpleNamespace
+import pytest
+from anonlib import _backend
+
+
+@pytest.fixture(autouse=True)
+def _gpu_set_choke_point(monkeypatch):
+    # These tests exercise the GPU-set choke point (`binding` -> `load_set` and
+    # the compiled-mode read-back) against a stubbed `load_set`. On a CPU-only
+    # install `binding` answers from the host set before `load_set` is reached
+    # (`_backend._cpu_only_binding`, tested in test_byte_lm_host.py), so the
+    # GPU-set path is selected explicitly here.
+    monkeypatch.setattr(_backend, '_CPU_ONLY', None)
+
+
+@pytest.mark.parametrize('name', ['_anonlib', '_anonlib_gbdt', '_anonlib_rf', '_anonlib_trees', '_anonlib_estimators', '_anonlib_svm'])
+@pytest.mark.parametrize('mode,code', [('fast', 0), ('identical', 1)])
+def test_actual_module_mode(monkeypatch, name, mode, code):
+    if not _backend._offers(name, mode):
+        # The base binding (and every neural family) has no lower tier and
+        # refuses BY NAME before any set is loaded, so the sabotage below is
+        # unreachable there; that refusal is its own test.
+        monkeypatch.setattr(_backend, 'load_set', lambda _: pytest.fail('load_set reached'))
+        with pytest.raises(ValueError, match='has no .* tier'):
+            _backend.binding(name, mode)
+        return
+    prefix = _backend._vendor_fn(name).removesuffix('_vendor')
+    module = SimpleNamespace(**{prefix + '_numeric_mode': lambda: code})
+    selected = SimpleNamespace(mode=mode, **{name: module})
+    monkeypatch.setattr(_backend, 'load_set', lambda _: selected)
+    assert _backend.binding(name, mode) is module
+    # Sabotage the called extension inside an already cached, otherwise
+    # correctly labeled set. A sibling GBDT witness cannot detect this.
+    setattr(module, prefix + '_numeric_mode', lambda: 99)
+    with pytest.raises(RuntimeError, match='compiled for unknown'):
+        _backend.binding(name, mode)
+
+
+def test_identical_refuses_fast_binary(monkeypatch):
+    module = SimpleNamespace(rf_numeric_mode=lambda: 0)
+    monkeypatch.setattr(_backend, 'load_set', lambda _: SimpleNamespace(
+        mode='identical', _anonlib_rf=module))
+    with pytest.raises(RuntimeError, match='compiled for fast.*requested identical'):
+        _backend.binding('_anonlib_rf', 'identical')
+
+
+def test_legacy_without_readback(monkeypatch):
+    module = SimpleNamespace()
+    monkeypatch.setattr(_backend, 'load_set', lambda _: SimpleNamespace(
+        mode='fast', _anonlib_rf=module))
+    assert _backend.binding('_anonlib_rf', 'fast') is module
+
+
+@pytest.mark.parametrize('mode', ['', 0, False, 1, 'unknown', 'deterministic', []])
+def test_invalid_mode_never_falls_back(monkeypatch, mode):
+    def unexpected_load(_):
+        raise AssertionError('invalid mode reached loader')
+    monkeypatch.setattr(_backend, 'load_set', unexpected_load)
+    with pytest.raises(ValueError, match='numeric_mode'):
+        _backend.binding('_anonlib_rf', mode)
+
+
+def test_lanes_refuse_tiers_they_do_not_ship_by_name(monkeypatch):
+    """Trees, classical ML and the neural blocks ship fast, the byte LM ships fast too (2026-10-03). Every refusal happens
+    at the choke point, before any set is loaded, with a sentence that names
+    the rule and the binding."""
+    mode = 'fast'
+    monkeypatch.setattr(_backend, 'load_set', lambda _: pytest.fail('load_set reached'))
+    assert _backend._TIERED == frozenset({'_anonlib_gbdt', '_anonlib_rf', '_anonlib_trees'})
+    assert _backend._FAST_TIERED == _backend._TIERED | _backend._CLASSICAL_FAST
+    assert _backend._IDENTICAL_ONLY == frozenset(_backend._MODULES) - _backend._FAST_TIERED
+    # The neural blocks ship fast and identical (lane neural, 2026-09-27),
+    # and the byte LM joined FAST on 2026-10-03 (afn-lm, _backend.py), so
+    # FAST may refuse nothing at all.
+    for neural in ('_anonlib_byte_lm', '_anonlib_training', '_anonlib_mamba',
+                   '_anonlib_transformer', '_anonlib_embedding'):
+        assert neural in _backend._CLASSICAL_FAST, neural
+    refused = [n for n in _backend._MODULES if not _backend._offers(n, mode)]
+    for name in refused:
+        with pytest.raises(ValueError, match='IDENTICAL only') as info:
+            _backend.binding(name, mode)
+        assert name in str(info.value) and mode in str(info.value)
+    assert set(refused) == set(_backend._IDENTICAL_ONLY)

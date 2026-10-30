@@ -1,0 +1,3213 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 the authors. Part of anonlib, DOI-WITHHELD
+"""CPython boundary for the Mamba-1, Mamba-2 and Mamba-3 block lanes.
+
+A FOURTEENTH extension module, and a separate one on purpose, for the
+reason `bindings/_anonlib_estimators.mojo`'s header gives: an
+independently changing binding must not become a merge point. This file
+closes the "PyPI surface: NONE EXISTS" row of `archive/evidence/mamba/FEATURE_PARITY.md`'s
+consumer table -- the certified Mamba-1 block (profile
+`anonlib.identical.mamba1.fp32.v1`, three-vendor card) and the Mamba-2
+block (profile `anonlib.identical.mamba2.fp32.v1`, Apple-gated,
+cross-vendor legs owed) exported no Python symbol at all before it. The
+Mamba-3 entries (profile `anonlib.identical.mamba3.siso.fp32.v1`,
+Apple-gated at the kernel level 2026-09-01, cross-vendor legs owed)
+joined later the same day, under the same ABI.
+
+THE BINDING CALLS THE CERTIFIED ENTRY POINTS AND NOTHING ELSE. Every
+forward below goes through `mamba_block_forward`
+(`mamba/impl/modeling/modeling_mamba.mojo`),
+`mamba2_block_forward` (`mamba/impl/modules/mamba2.mojo`) or
+`mamba3_block_forward` (`mamba/impl/modules/mamba3.mojo`) --
+the SAME functions `mamba/checks/mamba_check.mojo`, `mamba2_check.mojo`
+and `mamba3_check.mojo` gate. NO arithmetic is respelled in this file: a
+binding-side copy of any seam would be a second spelling of a pinned
+rounding, which is the drift the whole lane exists to forbid. The decode
+entry points are the contract's own construction -- the block forward at
+`l = 1` with the state carried (mamba1 contract section 5; mamba2
+DEVIATION 786 and mamba3 DEVIATION 831, decode is PREFILL RESUMPTION) --
+exactly as `mamba2_step` and `mamba3_step` spell it ("no arithmetic of
+its own").
+
+DEVIATION 791 -- THE TWO-LIST ABI, ADOPTED UP FRONT. Each entry point
+takes exactly TWO Python lists, `addrs` (every NumPy buffer address, in
+an exact order written in each docstring and mirrored at the
+`_mamba_impl.py` call site) and `params` (the scalars). This is not a
+preference: `PythonModuleBuilder.def_function` stops elaborating above
+roughly nine arguments, MEASURED on 2026-09-01 when `gpr_fit`'s
+ten-positional first spelling failed at def_function elaboration
+(`bindings/_anonlib_gp.mojo`'s header carries the log path), and
+`mamba1_forward` needs FOURTEEN addresses. The fold is the tree's own
+precedent (knn_search's SCALARS-ARRIVE-AS-ONE-LIST banner; the gp
+binding's addrs list). Every array whose address goes into `addrs` MUST
+be bound to a Python local for the duration of the call: an address
+inside a list keeps nothing alive (`python/anonlib/_arrays.py`).
+
+DEVIATION 792 -- THE STATE CROSSES AS CALLER-OWNED BUFFERS, IN PLACE.
+The recurrent state is EXPLICIT ARGUMENTS, never hidden in an object on
+this side of the boundary (`archive/evidence/mamba/FEATURE_PARITY.md` section 3's SHIP
+NOW row says why: explicit buffers are strictly more testable, and the
+exact-state-handoff requirement is that a consumer can round-trip the
+bytes). Mamba-1 carries TWO pieces (contract section 5): the conv
+WINDOW `[B, d_inner, 4]` (last d_conv PRE-conv inputs, oldest first)
+and the SSM state h `[B, d_inner, 16]`. Mamba-2 carries THREE (its
+contract section 5): the conv window `[B, conv_dim, 4]` over the full
+xBC width, the chunk-BOUNDARY h `[B, H, 64, 128]`, and the open chunk's
+buffer -- post-conv/post-SiLU xBC rows `[B, 256, conv_dim]` plus raw dt
+rows `[B, 256, H]` -- with `buf_len` (how many buffer rows are valid)
+crossing as a params scalar IN and as the return value OUT, because it
+is the one piece of state that is an integer and not a float buffer.
+Every state buffer is READ at entry and WRITTEN BACK before return, so
+the caller's arrays always hold the post-call state; zeros in, for a
+fresh sequence, are `allocate_inference_cache`'s exact semantics.
+Nonzero h in IS the mamba2 `initial_states` path (ssd_minimal.py:64-66,
+prepended as chunk -1's state) -- no separate argument exists because
+no separate buffer exists. `h_last` `[B, H, 64, 128]` is additionally
+written out on every Mamba-2 call: it is the contract's REPORT stage
+(the S17 value after the final PADDED chunk), deliberately distinct
+from the resumption h, and the distinction is the contract's, not this
+file's.
+
+DEVIATION 793 -- WHAT THIS FILE REFUSES, AND WHAT IT LEAVES TO THE
+LANE. Refused HERE: a null address, an `addrs`/`params` list of the
+wrong length, and a `buf_len` outside `[0, 256)` -- each of which means
+the two sides of THIS boundary disagree and no lane refusal exists for
+it. Everything else goes down UNJUDGED so the lane's own refusals stay
+reachable from Python: non-finite inputs and weights are refused BY
+NAME on the device path (`mamba_refuse_bad_inputs` /
+`mamba2_refuse_bad_inputs`, contract section 6), B/L positivity and the
+shape cross-checks are `mamba_block_forward`'s and
+`mamba2_block_forward`'s, and a d_model that is not a multiple of 32 is
+`Mamba2Dims.of`'s refusal, raised in Mojo with the profile rule in the
+message. The dtype refusals (float32 ONLY; bf16/fp16/float64 refused BY
+NAME) live in `_mamba_impl.py`, because dtype is a NumPy property this
+side cannot see -- by the time bits arrive here they are float32 by
+construction or the wrapper has already refused. A SABOTAGED BUILD
+REFUSES TO INITIALIZE: every sabotage arm in the lane exists to be run
+by a gate and to FAIL, and a wheel that quietly served one would be the
+accepted-and-ignored failure at library scale, so `PyInit` aborts by
+name if any arm is compiled in.
+
+DEVIATION 794 -- THE MAMBA-3 STATE IS TEN BUFFERS PLUS TWO SCALARS, AND
+`pending` IS CONSUMED. DEVIATION 792's caller-owned-buffers rule extends
+to Mamba-3's DEVIATION-832 state, which has TEN float pieces: theta
+`[B, H, 32]`, the SEALED chunk-boundary h `[B, H, 64, 128]`, the six
+last-working-chunk buffers (rotated-unscaled q/k `[B, 64, H, 128]`, raw
+v `[B, 64, H, 64]`, dt / sigma(trap) / ADT `[B, 64, H]`), and the
+pending Input_States pair k `[B, H, 128]` / v `[B, H, 64]`. Two scalars
+cross in `params`: `buf_len`, whose valid range is [0, 64] INCLUSIVE --
+DELIBERATELY unlike mamba2's [0, 256) exclusive, because the mamba3
+buffer NEVER EMPTIES (DEVIATION 832(i): r in [1, Q] after every call; 0
+only before the first token) -- and `pending`, a 0/1 flag saying the
+k/v pair (with theta and h) is a reference Input_States continuation.
+`pending` crosses IN only: in a shipped binding it is ALWAYS False on
+return, because the unarmed core consumes it (`mamba3_block_forward`
+clears it after S22) and an armed build aborts at PyInit below -- so
+the return value stays `buf_len` alone, mamba2's shape, and the wrapper
+reassigns `state.pending = False` on that guarantee. The pending path
+goes through the lane's OWN `Mamba3DeviceState.set_input_states`, so
+its fresh-state refusal (Input_States only has reference meaning at
+buf_len 0) stays reachable from Python instead of being respelled here.
+FOUR report buffers are written on every Mamba-3 call -- h_last,
+k_last, v_last, theta_last, the contract's REPORT stages, distinct from
+the resumption state exactly as mamba2's h_last is.
+
+THE TIER SEMANTICS ARE THE BUILD'S, NOT THIS FILE'S. The numeric
+mode (fast / identical) is a compile-time define
+(`checks/numerics.mojo`), one binary per tier under
+`python/anonlib/[<tier>/]_anonlib_mamba.so`; `mamba_numeric_mode`
+below is the read-back `_mamba_impl.py` cross-checks so a wrong-arm
+measurement cannot be correctly labelled by accident.
+
+THE GIL is released around every device call, and nothing inside a
+`GILReleased` block touches a `PythonObject`.
+
+RUN LEDGER. The Mamba-1/Mamba-2 entries BUILT AND GATED 2026-09-01 (all
+three tiers green through `tests/test_mamba_surface.py`, the
+FEATURE_PARITY consumer table's PyPI row; one box, one vendor). The
+Mamba-3 entries, added later the same day, are BUILT AND GATED: green
+at `08a38a13` in all three tiers, corpus arm added 2026-09-03. ONE APPLE
+M4 -- this binding FAULTS on AMD in every tier (GPU memory access fault,
+rc 134), an open defect. Build:
+`bash bindings/build_mamba.sh` (per tier via ANONLIB_NUMERIC_MODE).
+"""
+
+# DEVIATION 2486: shared byte-preserving host copies.
+from bindings.hostptr import f32_ptr, read_f32, copy_f32
+from std.memory import bitcast, memcpy
+from std.time import perf_counter_ns
+from std.sys.compile import is_defined, get_defined_int
+# TOMBSTONE: ANONLIB_IDN_M1_SCAN=1 (NN34 affine_prefix: profile/state/branches in this file; LOSER avg 2.30x mamba1-forward) deleted 2026-10-11 by 291629888; code recoverable at 291629888^.
+# Restore: git apply experiments/removed/ANONLIB_IDN_M1_SCAN_1.patch
+from mamba.impl.ops.mamba3_siso import m3_phase_tick
+from mamba.impl.modules.mamba3_transfer import m3_upload, m3_download
+from std.os import abort, getenv
+from std.python import Python, PythonObject
+from std.python._cpython import GILReleased
+from std.python.bindings import PythonModuleBuilder
+
+from max.gpu.host import DeviceBuffer, DeviceContext
+
+from core.identity_trace import IdentityTrace
+from checks.numerics import GLOBAL_NUMERIC_MODE, NUMERIC_IDENTICAL
+from core.neural_context import neural_ctx
+from core.device_scan import device_first_nonfinite
+# One process-lifetime DeviceContext per binding and tier (core/neural_context.mojo).
+comptime _NEURAL_CTX = "MojoNeuralMambaContextIdentical" if GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL else "MojoNeuralMambaContextFast"
+from checks.vendor import COMPILED_VENDOR
+
+from mamba.checks.mamba_fixture import (
+    D_CONV,
+    D_STATE,
+    MambaDims,
+    MambaWeights,
+)
+from mamba.impl.modeling.modeling_mamba import (
+    BLOCK_ANY_SABOTAGE,
+    MAMBA_GUARD,
+    mamba_block_forward,
+    mamba_copy_in,
+    mamba_device_alloc,
+    mamba_download,
+    mamba_upload,
+    mamba_zeros,
+    MambaDeviceStages,
+    MambaDeviceState,
+    MambaDeviceWeights,
+)
+from mamba.impl.modules.mamba_simple import mamba_step
+#: lane afn-mamba (2026-10-03): under FAST + Apple + `-D ANONLIB_AFN_MAMBA_ARENA`
+#: every block call's device buffers are views of ONE arena and the caller's
+#: arrays are copied in with no per-buffer wait (`_mamba{1,2,3}_run_arena`).
+from mamba.impl.modules.afn_defines import AFN_MAMBA_ARENA, IDN_MAMBA_ALLOC_NOWAIT
+from mamba.impl.modules.afn_defines import IDN_MAMBA3_REPORTS_ON_REQUEST
+from mamba.impl.modules.afn_defines import IDN_M3_SESSION_STAGE_REUSE
+from mamba.impl.modules.afn_arena import MambaArena
+from mamba.impl.modeling.modeling_mamba import mamba1_arena_floats
+from mamba.impl.modules.mamba2 import mamba2_arena_floats
+from mamba.impl.modules.mamba3 import mamba3_arena_floats
+from mamba.checks.mamba2_fixture import (
+    M2_CHUNK_SIZE,
+    M2_D_CONV,
+    M2_D_STATE,
+    M2_HEADDIM,
+    Mamba2Dims,
+    Mamba2Weights,
+)
+from mamba.impl.modules.mamba2 import (
+    BLOCK2_ANY_SABOTAGE,
+    Mamba2DeviceStages,
+    Mamba2DeviceState,
+    Mamba2DeviceWeights,
+    mamba2_block_forward,
+)
+from mamba.checks.mamba3_fixture import (
+    M3_CHUNK_SIZE,
+    M3_D_STATE,
+    M3_HEADDIM,
+    M3_NUM_ROPE_ANGLES,
+    Mamba3Dims,
+    Mamba3Weights,
+)
+from mamba.impl.modules.mamba3 import (
+    BLOCK3_ANY_SABOTAGE,
+    Mamba3DeviceStages,
+    Mamba3DeviceState,
+    Mamba3DeviceWeights,
+    mamba3_block_forward,
+)
+
+
+from autograd.kernels.mamba2_proj import ANY_BWD2_SABOTAGE
+# TOMBSTONE: ANONLIB_AUTOGRAD_MAMBA3_OFF (the hand Mamba-3 prefill backward walk; superseded by the tape) deleted 2026-10-19 by bc0a9a24e; code recoverable at ba37327dc^.
+# Restore: git apply experiments/removed/ANONLIB_AUTOGRAD_MAMBA3_OFF.patch
+from autograd.kernels.mamba3_proj import ANY_BWD3_SABOTAGE
+# The Mamba-1 / Mamba-2 backward entries assemble the VJP on the tape
+# (autograd/rules_mamba.mojo), which launches the hand kernels in the hand order.
+# TOMBSTONE: ANONLIB_AUTOGRAD_MAMBA_OFF (hand Mamba-1/2 prefill backward glue, superseded by the tape) deleted 2026-10-19 by 47582a7fb; code recoverable at 47582a7fb^.
+# Restore: git apply experiments/removed/ANONLIB_AUTOGRAD_MAMBA_OFF.patch
+from autograd.rules_mamba import mamba1_tape_backward, mamba2_tape_backward
+from autograd.rules_mamba3 import mamba3_tape_backward, mamba3_tape_backward_on
+from autograd.kernels.mamba1_prefill import Mamba1PrefillGradients
+from autograd.kernels.mamba2_prefill import Mamba2PrefillGradients
+from autograd.kernels.mamba1_proj import ANY_BWD_SABOTAGE as M1_ANY_BWD_SABOTAGE
+from autograd.kernels.mamba1 import ANY_BWD_BLOCK_SABOTAGE
+from autograd.kernels.mamba1_scan import ANY_BWD_SCAN_SABOTAGE
+from gemm.checks.gemm_backward import ANY_BWD_SABOTAGE as GEMM_ANY_BWD_SABOTAGE
+from gemm.checks.gemm_identical import ANY_SABOTAGE as GEMM_ANY_SABOTAGE
+
+def _f32_ptr(addr: Int) raises -> MutPointer[Float32, MutUntrackedOrigin]:
+    return f32_ptr(addr)
+
+
+def _read_f32(addr: Int, n: Int) raises -> List[Float32]:
+    return read_f32(addr, max(0, n))
+
+
+def _write_f32(addr: Int, values: List[Float32]) raises:
+    copy_f32(values.unsafe_ptr(), _f32_ptr(addr), len(values))
+
+
+comptime M3_DIRECT_TRANSFER = not is_defined["ANONLIB_MAMBA3_LEGACY_DIRECT_TRANSFER"]()
+
+
+def _m3_read_f32(addr: Int, n: Int) raises -> List[Float32]:
+    return read_f32(addr, n)
+
+
+def _m3_write_f32(addr: Int, values: List[Float32]) raises:
+    var p = _f32_ptr(addr)
+    if len(values) > 0:
+        memcpy(dest=p, src=values.unsafe_ptr(), count=len(values))
+
+
+def _m3_upload_addr[wait: Bool = True](ctx: DeviceContext, addr: Int, n: Int) raises -> DeviceBuffer[DType.float32]:
+    """`wait=False` (lane/neural-apple, 2026-09-28) enqueues the copy and
+    returns: the caller's array outlives the call, every reader is enqueued
+    after it on the same in-order `ctx`, and the forward entry waits once
+    at its end."""
+    comptime if not M3_DIRECT_TRANSFER:
+        return m3_upload(ctx, _m3_read_f32(addr, n))
+    else:
+        var src = _f32_ptr(addr)
+        var count = max(n, 1)
+        var dev = mamba_device_alloc(ctx, count)
+        # DeviceContext accepts ordinary host pointers; the Python frame
+        # retains each NumPy array until the synchronized copy completes.
+        comptime if not is_defined["ANONLIB_MAMBA3_LEGACY_CALLER_TRANSFER"]():
+            if n > 0:
+                mamba_copy_in(ctx, dev, src, count)
+                comptime if wait:
+                    ctx.synchronize()
+                return dev^
+        var host = ctx.enqueue_create_host_buffer[DType.float32](count)
+        ctx.synchronize()
+        if n > 0:
+            memcpy(dest=host.unsafe_ptr(), src=src, count=n)
+        else:
+            host.unsafe_ptr().unsafe_store(0, Float32(0.0))
+        mamba_copy_in(ctx, dev, host.unsafe_ptr(), count)
+        ctx.synchronize()
+        _ = host^
+        return dev^
+
+
+def _m3_download_addr[wait: Bool = True](ctx: DeviceContext, mut buf: DeviceBuffer[DType.float32], n: Int, addr: Int) raises:
+    """`wait=False` (lane/neural-apple, 2026-09-28) enqueues the copy into
+    the caller's array and returns; the caller waits once after its last
+    download, before any buffer is released or the host reads."""
+    comptime if not M3_DIRECT_TRANSFER:
+        _m3_write_f32(addr, m3_download(ctx, buf, n))
+    else:
+        var dst = _f32_ptr(addr)
+        comptime if not is_defined["ANONLIB_MAMBA3_LEGACY_CALLER_TRANSFER"]():
+            if n == len(buf):
+                ctx.enqueue_copy(dst_ptr=dst, src_buf=buf)
+            else:
+                var direct_view = buf.create_sub_buffer[DType.float32](0, n)
+                ctx.enqueue_copy(dst_ptr=dst, src_buf=direct_view)
+            comptime if wait:
+                ctx.synchronize()
+            return
+        var host = ctx.enqueue_create_host_buffer[DType.float32](n)
+        ctx.synchronize()
+        if n == len(buf):
+            ctx.enqueue_copy(dst_ptr=host.unsafe_ptr(), src_buf=buf)
+        else:
+            var view = buf.create_sub_buffer[DType.float32](0, n)
+            ctx.enqueue_copy(dst_ptr=host.unsafe_ptr(), src_buf=view)
+        ctx.synchronize()
+        if n > 0:
+            memcpy(dest=dst, src=host.unsafe_ptr(), count=n)
+        _ = host^
+
+
+def mamba_numeric_mode_binding() raises -> PythonObject:
+    """THE BUILD'S TIER, as the `NUMERIC_*` code itself: 0 FAST, 1
+    IDENTICAL. The same shape as `gp_numeric_mode` and
+    for the same reason: `_mamba_impl.py` reads it once and refuses to
+    run if the binary it loaded disagrees with the mode the package
+    asked for."""
+    return PythonObject(GLOBAL_NUMERIC_MODE)
+
+
+def mamba_vendor_binding() raises -> PythonObject:
+    """'metal', 'cuda', 'hip' or 'none' -- the accelerator API this
+    binary was compiled for, folded in from `checks/vendor.mojo`. The
+    answer comes from the binary that actually loaded, never from the
+    directory it sat in."""
+    return PythonObject(String(COMPILED_VENDOR))
+
+
+# ===========================================================================
+# Mamba-1: profile anonlib.identical.mamba1.fp32.v1
+# ===========================================================================
+
+
+
+def mamba1_profile_binding() -> PythonObject:
+    return PythonObject(1)  # NN34 profile 2 (M1_SCAN=1) deleted 2026-10-11
+
+
+
+
+def _mamba1_run(a: List[Int], b: Int, l: Int, dm: Int, decode: Bool = False, absolute_start: Int = 0) raises:
+    """The GIL-free half of `mamba1_forward_binding`: everything after
+    the `PythonObject`s have been read. Builds the host weights, uploads
+    the caller's state, runs THE certified entry point once, and writes
+    the output and the post-call state back into the caller's buffers.
+
+    `[[mojo-buffer-freed-at-last-use]]`: every device buffer below is
+    still alive when `mamba_block_forward` returns because that function
+    synchronizes before it does, and the explicit transfers at the end
+    hold them past the last download anyway."""
+    comptime if AFN_MAMBA_ARENA:
+        _mamba1_run_arena(a, b, l, dm, decode)
+        return
+    var dims = MambaDims.of(dm)
+    var di = dims.d_inner
+    var r = dims.dt_rank
+    var xr = dims.x_proj_rows()
+
+    # Host weights, THROUGH the lane's own struct (its field table is the
+    # reference shape authority); values arrive as given bits, unjudged
+    # (the initializer rows of FEATURE_PARITY.md are REFUSED as bitwise
+    # claims; weights-in is what ships).
+    var w = MambaWeights(dims)
+    w.norm_w = _read_f32(a[1], dm)
+    w.w_in = _read_f32(a[2], 2 * di * dm)
+    w.conv_w = _read_f32(a[3], di * D_CONV)
+    w.conv_b = _read_f32(a[4], di)
+    w.w_x = _read_f32(a[5], xr * di)
+    w.w_dt = _read_f32(a[6], di * r)
+    w.b_dt = _read_f32(a[7], di)
+    w.a_log = _read_f32(a[8], di * D_STATE)
+    w.d_skip = _read_f32(a[9], di)
+    w.w_out = _read_f32(a[10], dm * di)
+
+    var ctx = neural_ctx[_NEURAL_CTX]()
+    var dw = MambaDeviceWeights(ctx, w)
+    # The caller's state, uploaded over the fresh zeros. Zeros in IS
+    # allocate_inference_cache; anything else is a carried sequence.
+    var dstate = MambaDeviceState(ctx, b, dims)
+    dstate.conv_win = mamba_upload(ctx, _read_f32(a[11], b * di * D_CONV))
+    dstate.h = mamba_upload(ctx, _read_f32(a[12], b * di * D_STATE))
+    var dstages = MambaDeviceStages(ctx, b, l, dims)
+    var dx = mamba_upload(ctx, _read_f32(a[0], b * l * dm))
+
+    var trace = IdentityTrace.disabled()
+    if decode:
+        mamba_step(ctx, dstages, dstate, dw, dx, b, trace, String("py"))
+    else:
+        mamba_block_forward(
+            ctx, dstages, dstate, dw, dx, b, l, trace, String("py")
+        )
+
+    # The block output is the residual stage (contract section 2's
+    # `hidden = residual + mixer(norm(residual))`), and the state buffers
+    # go back to their owners.
+    # Straight into the caller's arrays, one wait (lane/neural-apple,
+    # 2026-09-28; was a host List per piece, a wait and a second copy each).
+    _m3_download_addr[False](ctx, dstages.residual_out, b * l * dm, a[13])
+    _m3_download_addr[False](ctx, dstate.conv_win, b * di * D_CONV, a[11])
+    _m3_download_addr[False](ctx, dstate.h, b * di * D_STATE, a[12])
+    ctx.synchronize()
+    _ = dw^
+    _ = dstate^
+    _ = dstages^
+    _ = dx^
+    _ = ctx^
+
+
+def _mamba1_run_arena(a: List[Int], b: Int, l: Int, dm: Int, decode: Bool) raises:
+    """`_mamba1_run` under ANONLIB_AFN_MAMBA_ARENA (lane afn-mamba): one
+    arena allocation, every weight / state piece / stage / x a view of it,
+    the caller's arrays copied in directly (they outlive the call), ONE
+    wait at the end. The same certified entry point runs."""
+    var dims = MambaDims.of(dm)
+    var di = dims.d_inner
+    var r = dims.dt_rank
+    var xr = dims.x_proj_rows()
+    var ctx = neural_ctx[_NEURAL_CTX]()
+    var arena = MambaArena(ctx, mamba1_arena_floats(b, l, dims), MAMBA_GUARD)
+    var dw = MambaDeviceWeights(ctx, dims, arena)
+    mamba_copy_in(ctx, dw.norm_w, _f32_ptr(a[1]), dm)
+    mamba_copy_in(ctx, dw.w_in, _f32_ptr(a[2]), 2 * di * dm)
+    mamba_copy_in(ctx, dw.conv_w, _f32_ptr(a[3]), di * D_CONV)
+    mamba_copy_in(ctx, dw.conv_b, _f32_ptr(a[4]), di)
+    mamba_copy_in(ctx, dw.w_x, _f32_ptr(a[5]), xr * di)
+    mamba_copy_in(ctx, dw.w_dt, _f32_ptr(a[6]), di * r)
+    mamba_copy_in(ctx, dw.b_dt, _f32_ptr(a[7]), di)
+    mamba_copy_in(ctx, dw.a_log, _f32_ptr(a[8]), di * D_STATE)
+    mamba_copy_in(ctx, dw.d_skip, _f32_ptr(a[9]), di)
+    mamba_copy_in(ctx, dw.w_out, _f32_ptr(a[10]), dm * di)
+    var dstate = MambaDeviceState(ctx, b, dims, arena)
+    mamba_copy_in(ctx, dstate.conv_win, _f32_ptr(a[11]), b * di * D_CONV)
+    mamba_copy_in(ctx, dstate.h, _f32_ptr(a[12]), b * di * D_STATE)
+    var dstages = MambaDeviceStages(ctx, b, l, dims, arena)
+    var dx = arena.take(ctx, b * l * dm)
+    mamba_copy_in(ctx, dx, _f32_ptr(a[0]), b * l * dm)
+
+    var trace = IdentityTrace.disabled()
+    if decode:
+        mamba_step(ctx, dstages, dstate, dw, dx, b, trace, String("py"))
+    else:
+        mamba_block_forward(
+            ctx, dstages, dstate, dw, dx, b, l, trace, String("py")
+        )
+
+    _m3_download_addr[False](ctx, dstages.residual_out, b * l * dm, a[13])
+    _m3_download_addr[False](ctx, dstate.conv_win, b * di * D_CONV, a[11])
+    _m3_download_addr[False](ctx, dstate.h, b * di * D_STATE, a[12])
+    ctx.synchronize()
+    _ = dw^
+    _ = dstate^
+    _ = dstages^
+    _ = dx^
+    _ = arena^
+    _ = ctx^
+
+
+def _mamba1_backward_run(a: List[Int], b: Int, l: Int, dm: Int) raises:
+    var dims = MambaDims.of(dm)
+    var di = dims.d_inner
+    var r = dims.dt_rank
+    var xr = dims.x_proj_rows()
+
+    # Host weights, THROUGH the lane's own struct (its field table is the
+    # reference shape authority); values arrive as given bits, unjudged
+    # (the initializer rows of FEATURE_PARITY.md are REFUSED as bitwise
+    # claims; weights-in is what ships).
+    var w = MambaWeights(dims)
+    w.norm_w = _read_f32(a[1], dm)
+    w.w_in = _read_f32(a[2], 2 * di * dm)
+    w.conv_w = _read_f32(a[3], di * D_CONV)
+    w.conv_b = _read_f32(a[4], di)
+    w.w_x = _read_f32(a[5], xr * di)
+    w.w_dt = _read_f32(a[6], di * r)
+    w.b_dt = _read_f32(a[7], di)
+    w.a_log = _read_f32(a[8], di * D_STATE)
+    w.d_skip = _read_f32(a[9], di)
+    w.w_out = _read_f32(a[10], dm * di)
+
+    # TOMBSTONE: ANONLIB_AUTOGRAD_MAMBA_OFF (hand Mamba-1 prefill backward arm) deleted 2026-10-19 by 47582a7fb; code recoverable at 47582a7fb^.
+    # Restore: git apply experiments/removed/ANONLIB_AUTOGRAD_MAMBA_OFF.patch
+    var gradients: Mamba1PrefillGradients = mamba1_tape_backward(
+        w, _read_f32(a[0], b * l * dm), _read_f32(a[11], b * l * dm), b, l,
+        neural_ctx[_NEURAL_CTX](),
+    )
+    _write_f32(a[12], gradients.x)
+    _write_f32(a[13], gradients.norm_weight)
+    _write_f32(a[14], gradients.in_proj_weight)
+    _write_f32(a[15], gradients.conv1d_weight)
+    _write_f32(a[16], gradients.conv1d_bias)
+    _write_f32(a[17], gradients.x_proj_weight)
+    _write_f32(a[18], gradients.dt_proj_weight)
+    _write_f32(a[19], gradients.dt_proj_bias)
+    _write_f32(a[20], gradients.A_log)
+    _write_f32(a[21], gradients.D)
+    _write_f32(a[22], gradients.out_proj_weight)
+
+
+def mamba1_backward_binding(addrs: PythonObject, params: PythonObject) raises -> PythonObject:
+    """Zero-state synchronous IDENTICAL VJP. Addresses: x, ten weights in
+    forward order, grad_output, grad_x, ten weight gradients in forward
+    order (23 total). Scalars: B, L, d_model. No state/cache is accepted."""
+    if len(addrs) != 23 or len(params) != 3:
+        raise Error("mamba1 backward: expected 23 addresses and B, L, d_model")
+    var b = Int(py=params[0])
+    var l = Int(py=params[1])
+    var dm = Int(py=params[2])
+    if b <= 0 or l <= 0 or dm <= 0:
+        raise Error("mamba1 backward: B, L and d_model must be positive")
+    var a = List[Int]()
+    for i in range(23):
+        var address = Int(py=addrs[i])
+        if address == 0:
+            raise Error("mamba1 backward: null buffer address at slot " + String(i))
+        a.append(address)
+    with GILReleased(Python()):
+        _mamba1_backward_run(a, b, l, dm)
+    return PythonObject(0)
+
+
+def _mamba1_addrs(addrs: PythonObject, what: String) raises -> List[Int]:
+    comptime count = 14
+    if len(addrs) != count:
+        raise Error(
+            what
+            + ": addrs must contain 14 addresses (x, norm.weight,"
+            " in_proj.weight, conv1d.weight, conv1d.bias, x_proj.weight,"
+            " dt_proj.weight, dt_proj.bias, A_log, D, out_proj.weight,"
+            " conv_window, h, y_out), got "
+            + String(len(addrs))
+        )
+    var a = List[Int]()
+    for i in range(count):  # small-loop(count: buffer addresses of one block call): reads the pointer list, not data
+        a.append(Int(py=addrs[i]))
+    return a^
+
+
+def mamba1_forward_binding(
+    addrs: PythonObject,
+    params: PythonObject,
+) raises -> PythonObject:
+    """One Mamba-1 block call: prefill from the state the caller hands
+    in (zeros = a fresh sequence), any B and L. The decode step is this
+    SAME function at L = 1 (contract section 5: one spelling for both
+    paths is what makes gate D a theorem); `mamba1_decode_step` below is
+    that call spelled as their `step`'s name.
+
+    `addrs` is the FOURTEEN buffer addresses, in this exact order
+    (mirrored in `python/anonlib/_mamba_impl.py`; the module header
+    says why they are a list and not fourteen arguments):
+
+        0  x               B * L * d_model float32, read
+        1  norm.weight     d_model, read
+        2  in_proj.weight  2*d_inner * d_model, read
+        3  conv1d.weight   d_inner * 4, read (their [d_inner,1,4], the 1
+                            dropped -- same bytes)
+        4  conv1d.bias     d_inner, read
+        5  x_proj.weight   (dt_rank + 32) * d_inner, read
+        6  dt_proj.weight  d_inner * dt_rank, read
+        7  dt_proj.bias    d_inner, read
+        8  A_log           d_inner * 16, read
+        9  D               d_inner, read
+       10  out_proj.weight d_model * d_inner, read
+       11  conv_window     B * d_inner * 4, READ AND WRITTEN (state)
+       12  h               B * d_inner * 16, READ AND WRITTEN (state)
+       13  y_out           B * L * d_model, WRITTEN (the block output,
+                            residual add included -- mamba1 DEVIATION 735)
+
+    `params` is, in this exact order: 0 B, 1 L, 2 d_model. Profile
+    constants (d_state 16, d_conv 4, expand 2, dt_rank ceil(dm/16)) are
+    NOT parameters: changing one is a v2 profile, not a knob
+    (FEATURE_PARITY.md section 1's SHIP LATER rows).
+
+    Returns 0. Non-finite inputs/weights, B/L <= 0 and shape
+    disagreements are refused BY NAME in Mojo, downstream (DEVIATION
+    793's split)."""
+    var a = _mamba1_addrs(addrs, String("mamba1_forward"))
+    if len(params) != 3:
+        raise Error(
+            "mamba1_forward: params must contain 3 values (B, L, d_model),"
+            " got "
+            + String(len(params))
+        )
+    var b = Int(py=params[0])
+    var l = Int(py=params[1])
+    var dm = Int(py=params[2])
+    var position = 0
+    with GILReleased(Python()):
+        _mamba1_run(a, b, l, dm, False, position)
+    return PythonObject(0)
+
+
+def mamba1_decode_step_binding(
+    addrs: PythonObject,
+    params: PythonObject,
+) raises -> PythonObject:
+    """One decode token: `Mamba.step`'s semantics, the profile's
+    spelling -- the block forward at L = 1 with the state carried, NO
+    arithmetic of its own (`mamba_step`'s rule, mamba1 DEVIATIONS
+    721/732/733: the reference's step arm rounds differently and is the
+    lane's required-RED sabotage, so there is deliberately no second
+    entry path to drift).
+
+    `addrs`: the same FOURTEEN as `mamba1_forward` with L = 1 shapes
+    (x and y_out are B * d_model). `params`: 0 B, 1 d_model."""
+    var a = _mamba1_addrs(addrs, String("mamba1_decode_step"))
+    if len(params) != 2:
+        raise Error(
+            "mamba1_decode_step: params must contain 2 values (B, d_model),"
+            " got "
+            + String(len(params))
+        )
+    var b = Int(py=params[0])
+    var dm = Int(py=params[1])
+    var position = 0
+    with GILReleased(Python()):
+        _mamba1_run(a, b, 1, dm, True, position)
+    return PythonObject(0)
+
+
+# ===========================================================================
+# The Mamba-1 resident decode session (DEVIATION 2941, lane/infer-speed-
+# neural, 2026-09-17): device-owned weights, state and L = 1 stages that
+# live across decode steps. The transformer binding's DEVIATION 2940, the
+# same shape and the same reason it cannot move a bit: every step is
+# `mamba_step`, THE certified decode entry (the block at L = 1), on
+# `MambaDeviceWeights`, `MambaDeviceState` and `MambaDeviceStages` holding
+# the bytes the per-call entry uploads per token, built once instead. Stage
+# reuse across calls is the Mamba-1 stage struct's own contract (every stage
+# the block reads it writes first in the same call). Ownership: the session
+# COPIES the weights and the state at open; the caller's state arrays are
+# STALE until export_state or close; weights refresh is close and open.
+# ===========================================================================
+
+
+struct Mamba1DecodeSession(Movable, Writable):
+    var ctx: Optional[DeviceContext]
+    var w: Optional[MambaDeviceWeights]
+    var state: Optional[MambaDeviceState]
+    var stages: Optional[MambaDeviceStages]
+    var dx: Optional[DeviceBuffer[DType.float32]]
+    var b: Int
+    var dm: Int
+    var di: Int
+    var busy: Bool
+    var usable: Bool
+
+    def __init__(out self):
+        self.ctx = Optional[DeviceContext]()
+        self.w = Optional[MambaDeviceWeights]()
+        self.state = Optional[MambaDeviceState]()
+        self.stages = Optional[MambaDeviceStages]()
+        self.dx = Optional[DeviceBuffer[DType.float32]]()
+        self.b = 0
+        self.dm = 0
+        self.di = 0
+        self.busy = False
+        self.usable = True
+
+    def write_to(self, mut writer: Some[Writer]):
+        writer.write("Mamba1DecodeSession")
+
+    def write_repr_to(self, mut writer: Some[Writer]):
+        writer.write("Mamba1DecodeSession")
+
+    def is_open(self) -> Bool:
+        return Bool(self.ctx) and Bool(self.state)
+
+    def release(mut self):
+        self.stages = None
+        self.dx = None
+        self.state = None
+        self.w = None
+        if self.ctx:
+            try:
+                self.ctx.value().synchronize()
+            except:
+                pass
+        self.ctx = None
+
+    def __deinit__(deinit self):
+        self.release()
+
+    def close(mut self) raises:
+        if self.busy:
+            raise Error("mamba1 session: busy")
+        self.usable = False
+        self.release()
+
+
+def _m1_require_session_open(s: Mamba1DecodeSession) raises:
+    if s.busy:
+        raise Error("mamba1 session: busy")
+    if not s.is_open():
+        raise Error("mamba1 session: not open (mamba1_session_open first)")
+    if not s.usable:
+        raise Error("mamba1 session: lost after a failed call; close it and open a new one")
+
+
+def _m1_session_open_run(mut s: Mamba1DecodeSession, a: List[Int], b: Int, dm: Int, position: Int = 0) raises:
+    """The GIL-free half of `mamba1_session_open`: the host weight lists
+    through the lane's own struct, one context, the device weights, the
+    state over fresh zeros, the L = 1 stages and the resident x buffer."""
+    var dims = MambaDims.of(dm)
+    var di = dims.d_inner
+    var r = dims.dt_rank
+    var xr = dims.x_proj_rows()
+    var w = MambaWeights(dims)
+    w.norm_w = _read_f32(a[1], dm)
+    w.w_in = _read_f32(a[2], 2 * di * dm)
+    w.conv_w = _read_f32(a[3], di * D_CONV)
+    w.conv_b = _read_f32(a[4], di)
+    w.w_x = _read_f32(a[5], xr * di)
+    w.w_dt = _read_f32(a[6], di * r)
+    w.b_dt = _read_f32(a[7], di)
+    w.a_log = _read_f32(a[8], di * D_STATE)
+    w.d_skip = _read_f32(a[9], di)
+    w.w_out = _read_f32(a[10], dm * di)
+    s.ctx = neural_ctx[_NEURAL_CTX]()
+    s.w = MambaDeviceWeights(s.ctx.value(), w)
+    var dstate = MambaDeviceState(s.ctx.value(), b, dims)
+    dstate.conv_win = mamba_upload(s.ctx.value(), _read_f32(a[11], b * di * D_CONV))
+    dstate.h = mamba_upload(s.ctx.value(), _read_f32(a[12], b * di * D_STATE))
+    s.state = dstate^
+    s.stages = MambaDeviceStages(s.ctx.value(), b, 1, dims)
+    s.dx = mamba_zeros(s.ctx.value(), b * dm)
+    s.b = b
+    s.dm = dm
+    s.di = di
+
+
+def _m1_session_step_run(mut s: Mamba1DecodeSession, px: Int, py: Int) raises:
+    """One decode token on the resident structs, one completion wait."""
+    ref ctx = s.ctx.value()
+    var n = s.b * s.dm
+    mamba_copy_in(ctx, s.dx.value(), f32_ptr(px), n)
+    var trace = IdentityTrace.disabled()
+    mamba_step(ctx, s.stages.value(), s.state.value(), s.w.value(), s.dx.value(), s.b, trace,
+               String("py.session"))
+    comptime if MAMBA_GUARD > 0:
+        var body = s.stages.value().residual_out.create_sub_buffer[DType.float32](0, n)
+        ctx.enqueue_copy(dst_ptr=f32_ptr(py), src_buf=body)
+        ctx.synchronize()
+        _ = body^
+    else:
+        if n != len(s.stages.value().residual_out):
+            raise Error("mamba1 session: the L = 1 stages hold a different output length")
+        ctx.enqueue_copy(dst_ptr=f32_ptr(py), src_buf=s.stages.value().residual_out)
+        ctx.synchronize()
+
+
+def _m1_session_export_run(mut s: Mamba1DecodeSession, pw: Int, ph: Int) raises:
+    ref ctx = s.ctx.value()
+    _write_f32(pw, mamba_download(ctx, s.state.value().conv_win, s.b * s.di * D_CONV))
+    _write_f32(ph, mamba_download(ctx, s.state.value().h, s.b * s.di * D_STATE))
+
+
+def _m1_session_load_run(mut s: Mamba1DecodeSession, pw: Int, ph: Int) raises:
+    ref ctx = s.ctx.value()
+    s.state.value().conv_win = mamba_upload(ctx, _read_f32(pw, s.b * s.di * D_CONV))
+    s.state.value().h = mamba_upload(ctx, _read_f32(ph, s.b * s.di * D_STATE))
+
+
+def mamba1_session_create_binding() raises -> PythonObject:
+    """A closed session. Creation performs no GPU operation."""
+    return PythonObject(alloc=Mamba1DecodeSession())
+
+
+def mamba1_session_open_binding(
+    session: PythonObject, addrs: PythonObject, params: PythonObject,
+) raises -> PythonObject:
+    """Open a closed session: `addrs` is TWELVE addresses, the ten weights
+    in `mamba1_forward`'s order (slots 1 to 10 there), then conv_window and
+    h; `params` is [B, d_model]. Everything is COPIED to the device."""
+    var owner = session.downcast_value_ptr[Mamba1DecodeSession]()
+    var count = 12
+    if len(addrs) != count or len(params) != 2:
+        raise Error("mamba1_session_open: expected 12 addresses and 2 scalars")
+    if owner[].busy:
+        raise Error("mamba1 session: busy")
+    if owner[].is_open():
+        raise Error("mamba1 session: already open; close it first")
+    var a = List[Int]()
+    a.append(0)
+    for i in range(count):  # small-loop(count: session buffer addresses): reads the pointer list, not data
+        var address = Int(py=addrs[i])
+        if address == 0:
+            raise Error("mamba1_session_open: null buffer address at slot " + String(i))
+        a.append(address)
+    var b = Int(py=params[0])
+    var dm = Int(py=params[1])
+    if b <= 0:
+        raise Error("mamba1_session_open: B must be positive")
+    var position = 0
+    owner[].busy = True
+    owner[].usable = False
+    try:
+        with GILReleased(Python()):
+            _m1_session_open_run(owner[], a, b, dm, position)
+    except error:
+        owner[].busy = False
+        owner[].release()
+        raise error
+    owner[].busy = False
+    owner[].usable = True
+    return PythonObject(0)
+
+
+def mamba1_session_step_binding(
+    session: PythonObject, addrs: PythonObject,
+) raises -> PythonObject:
+    """One decode token on an open session: `addrs` = [x, y_out], both
+    B * d_model float32. A failed call marks the session lost."""
+    var owner = session.downcast_value_ptr[Mamba1DecodeSession]()
+    if len(addrs) != 2:
+        raise Error("mamba1_session_step: expected 2 addresses")
+    var px = Int(py=addrs[0])
+    var py = Int(py=addrs[1])
+    if px == 0 or py == 0:
+        raise Error("mamba1_session_step: null buffer address")
+    _m1_require_session_open(owner[])
+    owner[].busy = True
+    try:
+        with GILReleased(Python()):
+            _m1_session_step_run(owner[], px, py)
+    except error:
+        owner[].busy = False
+        owner[].usable = False
+        raise error
+    owner[].busy = False
+    return PythonObject(0)
+
+
+def mamba1_session_export_state_binding(
+    session: PythonObject, addrs: PythonObject,
+) raises -> PythonObject:
+    """Copy the resident state into the caller's buffers: `addrs` =
+    [conv_window, h]. The session stays open."""
+    var owner = session.downcast_value_ptr[Mamba1DecodeSession]()
+    if len(addrs) != 2:
+        raise Error("mamba1_session_export_state: expected 2 addresses")
+    var pw = Int(py=addrs[0])
+    var ph = Int(py=addrs[1])
+    if pw == 0 or ph == 0:
+        raise Error("mamba1_session_export_state: null buffer address")
+    _m1_require_session_open(owner[])
+    owner[].busy = True
+    try:
+        with GILReleased(Python()):
+            _m1_session_export_run(owner[], pw, ph)
+    except error:
+        owner[].busy = False
+        owner[].usable = False
+        raise error
+    owner[].busy = False
+    return PythonObject(0)
+
+
+def mamba1_session_load_state_binding(
+    session: PythonObject, addrs: PythonObject,
+) raises -> PythonObject:
+    """Replace the resident state with the caller's bytes: `addrs` =
+    [conv_window, h]. The explicit refresh for the state half."""
+    var owner = session.downcast_value_ptr[Mamba1DecodeSession]()
+    if len(addrs) != 2:
+        raise Error("mamba1_session_load_state: expected 2 addresses")
+    var pw = Int(py=addrs[0])
+    var ph = Int(py=addrs[1])
+    if pw == 0 or ph == 0:
+        raise Error("mamba1_session_load_state: null buffer address")
+    _m1_require_session_open(owner[])
+    var position = 0
+    owner[].busy = True
+    try:
+        with GILReleased(Python()):
+            _m1_session_load_run(owner[], pw, ph)
+    except error:
+        owner[].busy = False
+        owner[].usable = False
+        raise error
+    owner[].busy = False
+    return PythonObject(0)
+
+
+def mamba1_session_info_binding(session: PythonObject) raises -> PythonObject:
+    """[open, usable, B, d_model] as ints."""
+    var owner = session.downcast_value_ptr[Mamba1DecodeSession]()
+    var out = Python.list()
+    out.append(PythonObject(1 if owner[].is_open() else 0))
+    out.append(PythonObject(1 if owner[].usable else 0))
+    out.append(PythonObject(owner[].b))
+    out.append(PythonObject(owner[].dm))
+    return out
+
+
+def mamba1_session_close_binding(session: PythonObject) raises -> PythonObject:
+    var owner = session.downcast_value_ptr[Mamba1DecodeSession]()
+    owner[].close()
+    return PythonObject(0)
+
+
+# ===========================================================================
+# Mamba-2: profile anonlib.identical.mamba2.fp32.v1
+# ===========================================================================
+
+
+def _mamba2_run(
+    a: List[Int],
+    b: Int,
+    l: Int,
+    dm: Int,
+    q0: Int,
+    dt_lo: Float32,
+    dt_hi: Float32,
+) raises -> Int:
+    """The GIL-free half of the two Mamba-2 entry points. Returns the
+    post-call `buf_len` (DEVIATION 792: the one integer piece of the
+    three-piece state)."""
+    comptime if AFN_MAMBA_ARENA:
+        return _mamba2_run_arena(a, b, l, dm, q0, dt_lo, dt_hi)
+    # Mamba2Dims.of REFUSES a d_model that is not a multiple of 32, by
+    # name, with the profile rule -- reached BEFORE any buffer size below
+    # is computed from it, which is why nothing here pre-judges dm.
+    var dims = Mamba2Dims.of(dm)
+    var di = dims.d_inner
+    var cd = dims.conv_dim()
+    var dip = dims.d_in_proj()
+    var nh = dims.nheads
+    if q0 < 0 or q0 >= M2_CHUNK_SIZE:
+        raise Error(
+            String("mamba2: buf_len must be in [0, ")
+            + String(M2_CHUNK_SIZE)
+            + "), got "
+            + String(q0)
+            + "; the open-chunk buffer holds at most CHUNK_SIZE - 1 rows"
+            " between calls (contract section 5), so the two sides of this"
+            " boundary disagree about the state"
+        )
+
+    var w = Mamba2Weights(dims)
+    w.norm_w = _read_f32(a[1], dm)
+    w.w_in = _read_f32(a[2], dip * dm)
+    w.conv_w = _read_f32(a[3], cd * M2_D_CONV)
+    w.conv_b = _read_f32(a[4], cd)
+    w.dt_bias = _read_f32(a[5], nh)
+    w.a_log = _read_f32(a[6], nh)
+    w.d_skip = _read_f32(a[7], nh)
+    w.gnorm_w = _read_f32(a[8], di)
+    w.w_out = _read_f32(a[9], dm * di)
+
+    var h_n = b * nh * M2_HEADDIM * M2_D_STATE
+
+    var ctx = neural_ctx[_NEURAL_CTX]()
+    var dw = Mamba2DeviceWeights(ctx, w)
+    # The caller's three-piece state over the fresh zeros. A nonzero h
+    # with q0 == 0 IS the initial_states path (module header, DEVIATION
+    # 792).
+    var dstate = Mamba2DeviceState(ctx, b, dims)
+    # Keep the constructor's state allocations. Replacing these fields
+    # triggers an AMD HIP memory fault on the B2/L4/DM32 Python path;
+    # copying the same incoming bytes into the retained buffers passes
+    # the forward, decode and carried-state gates without changing math.
+    var incoming_conv = mamba_upload(ctx, _read_f32(a[10], b * cd * M2_D_CONV))
+    var incoming_h = mamba_upload(ctx, _read_f32(a[11], h_n))
+    var incoming_xbc = mamba_upload(ctx, _read_f32(a[12], b * M2_CHUNK_SIZE * cd))
+    var incoming_dt = mamba_upload(ctx, _read_f32(a[13], b * M2_CHUNK_SIZE * nh))
+    ctx.enqueue_copy(dst_buf=dstate.conv_win, src_buf=incoming_conv)
+    ctx.enqueue_copy(dst_buf=dstate.h, src_buf=incoming_h)
+    ctx.enqueue_copy(dst_buf=dstate.buf_xbc, src_buf=incoming_xbc)
+    ctx.enqueue_copy(dst_buf=dstate.buf_dtraw, src_buf=incoming_dt)
+    ctx.synchronize()
+    _ = incoming_conv^
+    _ = incoming_h^
+    _ = incoming_xbc^
+    _ = incoming_dt^
+    dstate.buf_len = q0
+    var dstages = Mamba2DeviceStages(ctx, b, l, q0, dims)
+    var dx = mamba_upload(ctx, _read_f32(a[0], b * l * dm))
+
+    var trace = IdentityTrace.disabled()
+    mamba2_block_forward(
+        ctx, dstages, dstate, dw, dx, b, l, dt_lo, dt_hi, trace, String("py")
+    )
+
+    # Straight into the caller's arrays, one wait (lane/neural-apple,
+    # 2026-09-28; was a host List per piece, a wait and a second copy each).
+    _m3_download_addr[False](ctx, dstages.residual_out, b * l * dm, a[14])
+    # h_last: the REPORT stage (S17 after the final PADDED chunk), NOT
+    # the resumption state -- contract section 5's distinction, kept.
+    _m3_download_addr[False](ctx, dstages.h_last, h_n, a[15])
+    _m3_download_addr[False](ctx, dstate.conv_win, b * cd * M2_D_CONV, a[10])
+    _m3_download_addr[False](ctx, dstate.h, h_n, a[11])
+    _m3_download_addr[False](ctx, dstate.buf_xbc, b * M2_CHUNK_SIZE * cd, a[12])
+    _m3_download_addr[False](ctx, dstate.buf_dtraw, b * M2_CHUNK_SIZE * nh, a[13])
+    ctx.synchronize()
+    var out_len = dstate.buf_len
+    _ = dw^
+    _ = dstate^
+    _ = dstages^
+    _ = dx^
+    _ = ctx^
+    return out_len
+
+
+def _mamba2_run_arena(
+    a: List[Int],
+    b: Int,
+    l: Int,
+    dm: Int,
+    q0: Int,
+    dt_lo: Float32,
+    dt_hi: Float32,
+) raises -> Int:
+    """`_mamba2_run` under ANONLIB_AFN_MAMBA_ARENA (lane afn-mamba): one
+    arena, views, direct copies in, ONE wait at the end."""
+    var dims = Mamba2Dims.of(dm)
+    var di = dims.d_inner
+    var cd = dims.conv_dim()
+    var dip = dims.d_in_proj()
+    var nh = dims.nheads
+    if q0 < 0 or q0 >= M2_CHUNK_SIZE:
+        raise Error(
+            String("mamba2: buf_len must be in [0, ")
+            + String(M2_CHUNK_SIZE)
+            + "), got "
+            + String(q0)
+            + "; the open-chunk buffer holds at most CHUNK_SIZE - 1 rows"
+            " between calls (contract section 5), so the two sides of this"
+            " boundary disagree about the state"
+        )
+    var h_n = b * nh * M2_HEADDIM * M2_D_STATE
+    var ctx = neural_ctx[_NEURAL_CTX]()
+    var arena = MambaArena(ctx, mamba2_arena_floats(b, l, q0, dims), MAMBA_GUARD)
+    var dw = Mamba2DeviceWeights(ctx, dims, arena)
+    mamba_copy_in(ctx, dw.norm_w, _f32_ptr(a[1]), dm)
+    mamba_copy_in(ctx, dw.w_in, _f32_ptr(a[2]), dip * dm)
+    mamba_copy_in(ctx, dw.conv_w, _f32_ptr(a[3]), cd * M2_D_CONV)
+    mamba_copy_in(ctx, dw.conv_b, _f32_ptr(a[4]), cd)
+    mamba_copy_in(ctx, dw.dt_bias, _f32_ptr(a[5]), nh)
+    mamba_copy_in(ctx, dw.a_log, _f32_ptr(a[6]), nh)
+    mamba_copy_in(ctx, dw.d_skip, _f32_ptr(a[7]), nh)
+    mamba_copy_in(ctx, dw.gnorm_w, _f32_ptr(a[8]), di)
+    mamba_copy_in(ctx, dw.w_out, _f32_ptr(a[9]), dm * di)
+    var dstate = Mamba2DeviceState(ctx, b, dims, arena)
+    mamba_copy_in(ctx, dstate.conv_win, _f32_ptr(a[10]), b * cd * M2_D_CONV)
+    mamba_copy_in(ctx, dstate.h, _f32_ptr(a[11]), h_n)
+    mamba_copy_in(ctx, dstate.buf_xbc, _f32_ptr(a[12]), b * M2_CHUNK_SIZE * cd)
+    mamba_copy_in(ctx, dstate.buf_dtraw, _f32_ptr(a[13]), b * M2_CHUNK_SIZE * nh)
+    dstate.buf_len = q0
+    var dstages = Mamba2DeviceStages(ctx, b, l, q0, dims, arena)
+    var dx = arena.take(ctx, b * l * dm)
+    mamba_copy_in(ctx, dx, _f32_ptr(a[0]), b * l * dm)
+
+    var trace = IdentityTrace.disabled()
+    mamba2_block_forward(
+        ctx, dstages, dstate, dw, dx, b, l, dt_lo, dt_hi, trace, String("py")
+    )
+
+    _m3_download_addr[False](ctx, dstages.residual_out, b * l * dm, a[14])
+    _m3_download_addr[False](ctx, dstages.h_last, h_n, a[15])
+    _m3_download_addr[False](ctx, dstate.conv_win, b * cd * M2_D_CONV, a[10])
+    _m3_download_addr[False](ctx, dstate.h, h_n, a[11])
+    _m3_download_addr[False](ctx, dstate.buf_xbc, b * M2_CHUNK_SIZE * cd, a[12])
+    _m3_download_addr[False](ctx, dstate.buf_dtraw, b * M2_CHUNK_SIZE * nh, a[13])
+    ctx.synchronize()
+    var out_len = dstate.buf_len
+    _ = dw^
+    _ = dstate^
+    _ = dstages^
+    _ = dx^
+    _ = arena^
+    _ = ctx^
+    return out_len
+
+
+def _mamba2_addrs(addrs: PythonObject, what: String) raises -> List[Int]:
+    if len(addrs) != 16:
+        raise Error(
+            what
+            + ": addrs must contain 16 addresses (x, norm.weight,"
+            " in_proj.weight, conv1d.weight, conv1d.bias, dt_bias, A_log,"
+            " D, gated norm.weight, out_proj.weight, conv_window, h,"
+            " buffer_xbc, buffer_dtraw, y_out, h_last_out), got "
+            + String(len(addrs))
+        )
+    var a = List[Int]()
+    for i in range(16):
+        a.append(Int(py=addrs[i]))
+    return a^
+
+
+def mamba2_forward_binding(
+    addrs: PythonObject,
+    params: PythonObject,
+) raises -> PythonObject:
+    """One Mamba-2 block call: prefill from the state the caller hands
+    in -- fresh (all zeros, buf_len 0), resumed (a carried three-piece
+    state: chunked-prefill continuation), or with `initial_states` (a
+    nonzero h at buf_len 0). Returns the post-call `buf_len`.
+
+    `addrs` is the SIXTEEN buffer addresses, in this exact order
+    (mirrored in `python/anonlib/_mamba_impl.py`; H = d_inner/64 =
+    d_model/32, CD = d_inner + 256):
+
+        0  x                 B * L * d_model float32, read
+        1  norm.weight       d_model, read (the BLOCK norm; the corpus
+                              calls it block_norm.weight)
+        2  in_proj.weight    (2*d_inner + 256 + H) * d_model, read
+                              (column order z | xBC | dt, mamba2.py:211-215)
+        3  conv1d.weight     CD * 4, read (their [CD,1,4], the 1 dropped)
+        4  conv1d.bias       CD, read
+        5  dt_bias           H, read
+        6  A_log             H, read (PER HEAD -- not per state)
+        7  D                 H, read (D_has_hdim False)
+        8  norm.weight       d_inner, read (the GATED norm, RMSNormGated)
+        9  out_proj.weight   d_model * d_inner, read
+       10  conv_window       B * CD * 4, READ AND WRITTEN (state piece 1)
+       11  h                 B * H * 64 * 128, READ AND WRITTEN (state
+                              piece 2, the chunk-BOUNDARY state)
+       12  buffer_xbc        B * 256 * CD, READ AND WRITTEN (state piece
+                              3a, the open chunk's post-conv/post-SiLU rows)
+       13  buffer_dtraw      B * 256 * H, READ AND WRITTEN (state piece 3b,
+                              raw in_proj dt rows)
+       14  y_out             B * L * d_model, WRITTEN (the block output,
+                              residual add included)
+       15  h_last_out        B * H * 64 * 128, WRITTEN (the REPORT stage;
+                              NOT the resumption state -- contract section 5)
+
+    `params` is, in this exact order:
+
+        0  B
+        1  L
+        2  d_model     must be a multiple of 32; refused otherwise BY
+                        NAME in Mojo (Mamba2Dims.of)
+        3  buf_len     valid rows of the open-chunk buffer, 0 for a
+                        fresh or chunk-aligned sequence
+        4  dt_lo       the dt_limit clamp's lower bound (runtime INPUT,
+        5  dt_hi        default (0, +inf); seam S9, DEVIATION 788 --
+                        crosses UNJUDGED, the clamp defines its own
+                        NaN/zero-sign behavior by construction)
+
+    Profile constants (d_state 128, d_conv 4, expand 2, headdim 64,
+    ngroups 1, CHUNK_SIZE 256 -- PART OF THE ARITHMETIC, DEVIATION 783)
+    are NOT parameters; changing one is a v2."""
+    var a = _mamba2_addrs(addrs, String("mamba2_forward"))
+    if len(params) != 6:
+        raise Error(
+            "mamba2_forward: params must contain 6 values (B, L, d_model,"
+            " buf_len, dt_lo, dt_hi), got "
+            + String(len(params))
+        )
+    var b = Int(py=params[0])
+    var l = Int(py=params[1])
+    var dm = Int(py=params[2])
+    var q0 = Int(py=params[3])
+    var dt_lo = Float32(Float64(py=params[4]))
+    var dt_hi = Float32(Float64(py=params[5]))
+    var out_len = 0
+    with GILReleased(Python()):
+        out_len = _mamba2_run(a, b, l, dm, q0, dt_lo, dt_hi)
+    return PythonObject(out_len)
+
+
+def mamba2_decode_step_binding(
+    addrs: PythonObject,
+    params: PythonObject,
+) raises -> PythonObject:
+    """One decode token: `Mamba2.step`'s semantics, the profile's
+    spelling -- PREFILL RESUMPTION at L = 1 (DEVIATION 786), through the
+    same `mamba2_block_forward` the forward entry calls, with NO
+    arithmetic of its own (`mamba2_step`'s rule; the reference per-token
+    recurrence rounds differently and is the required-RED
+    STEP_UPSTREAM_RECURRENCE arm, never a mode).
+
+    `addrs`: the same SIXTEEN as `mamba2_forward` with L = 1 shapes
+    (x and y_out are B * d_model). `params`: 0 B, 1 d_model, 2 buf_len,
+    3 dt_lo, 4 dt_hi. Returns the post-call buf_len."""
+    var a = _mamba2_addrs(addrs, String("mamba2_decode_step"))
+    if len(params) != 5:
+        raise Error(
+            "mamba2_decode_step: params must contain 5 values (B, d_model,"
+            " buf_len, dt_lo, dt_hi), got "
+            + String(len(params))
+        )
+    var b = Int(py=params[0])
+    var dm = Int(py=params[1])
+    var q0 = Int(py=params[2])
+    var dt_lo = Float32(Float64(py=params[3]))
+    var dt_hi = Float32(Float64(py=params[4]))
+    var out_len = 0
+    with GILReleased(Python()):
+        out_len = _mamba2_run(a, b, 1, dm, q0, dt_lo, dt_hi)
+    return PythonObject(out_len)
+
+
+# Resident Mamba-2 decode.  The arithmetic entry remains
+# `mamba2_block_forward(..., L=1)`.  Only the device context, immutable
+# weights, recurrent state, and input allocation survive between calls.
+# Stages are rebuilt because their working extents depend on buf_len.
+struct Mamba2DecodeSession(Movable, Writable):
+    var ctx: Optional[DeviceContext]
+    var w: Optional[Mamba2DeviceWeights]
+    var state: Optional[Mamba2DeviceState]
+    var dx: Optional[DeviceBuffer[DType.float32]]
+    var b: Int
+    var dm: Int
+    var dt_lo: Float32
+    var dt_hi: Float32
+    var busy: Bool
+    var usable: Bool
+
+    def __init__(out self):
+        self.ctx = None
+        self.w = None
+        self.state = None
+        self.dx = None
+        self.b = 0
+        self.dm = 0
+        self.dt_lo = 0.0
+        self.dt_hi = 0.0
+        self.busy = False
+        self.usable = True
+
+    def write_to(self, mut writer: Some[Writer]):
+        writer.write("Mamba2DecodeSession")
+
+    def write_repr_to(self, mut writer: Some[Writer]):
+        writer.write("Mamba2DecodeSession")
+
+    def is_open(self) -> Bool:
+        return Bool(self.ctx) and Bool(self.state)
+
+    def release(mut self):
+        self.dx = None
+        self.state = None
+        self.w = None
+        if self.ctx:
+            try:
+                self.ctx.value().synchronize()
+            except:
+                pass
+        self.ctx = None
+
+    def __deinit__(deinit self):
+        self.release()
+
+    def close(mut self) raises:
+        if self.busy:
+            raise Error("mamba2 session: busy")
+        self.usable = False
+        self.release()
+
+
+def _m2_require_session_open(s: Mamba2DecodeSession) raises:
+    if s.busy:
+        raise Error("mamba2 session: busy")
+    if not s.is_open():
+        raise Error("mamba2 session: not open")
+    if not s.usable:
+        raise Error("mamba2 session: lost after a failed call")
+
+
+def _m2_session_open_run(
+    mut s: Mamba2DecodeSession, a: List[Int], b: Int, dm: Int, q0: Int,
+    dt_lo: Float32, dt_hi: Float32,
+) raises:
+    var dims = Mamba2Dims.of(dm)
+    var di = dims.d_inner
+    var cd = dims.conv_dim()
+    var dip = dims.d_in_proj()
+    var nh = dims.nheads
+    if q0 < 0 or q0 >= M2_CHUNK_SIZE:
+        raise Error("mamba2_session_open: buf_len out of range")
+    var hw = Mamba2Weights(dims)
+    hw.norm_w = _read_f32(a[0], dm)
+    hw.w_in = _read_f32(a[1], dip * dm)
+    hw.conv_w = _read_f32(a[2], cd * M2_D_CONV)
+    hw.conv_b = _read_f32(a[3], cd)
+    hw.dt_bias = _read_f32(a[4], nh)
+    hw.a_log = _read_f32(a[5], nh)
+    hw.d_skip = _read_f32(a[6], nh)
+    hw.gnorm_w = _read_f32(a[7], di)
+    hw.w_out = _read_f32(a[8], dm * di)
+    s.ctx = neural_ctx[_NEURAL_CTX]()
+    ref ctx = s.ctx.value()
+    s.w = Mamba2DeviceWeights(ctx, hw)
+    s.state = Mamba2DeviceState(ctx, b, dims)
+    ref state = s.state.value()
+    mamba_copy_in(ctx, state.conv_win, f32_ptr(a[9]), b * cd * M2_D_CONV)
+    mamba_copy_in(ctx, state.h, f32_ptr(a[10]), b * nh * M2_HEADDIM * M2_D_STATE)
+    mamba_copy_in(ctx, state.buf_xbc, f32_ptr(a[11]), b * M2_CHUNK_SIZE * cd)
+    mamba_copy_in(ctx, state.buf_dtraw, f32_ptr(a[12]), b * M2_CHUNK_SIZE * nh)
+    ctx.synchronize()
+    state.buf_len = q0
+    s.dx = mamba_zeros(ctx, b * dm)
+    s.b = b
+    s.dm = dm
+    s.dt_lo = dt_lo
+    s.dt_hi = dt_hi
+
+
+def _m2_session_step_run(mut s: Mamba2DecodeSession, px: Int, py: Int, ph: Int) raises -> Int:
+    ref ctx = s.ctx.value()
+    ref state = s.state.value()
+    var dims = Mamba2Dims.of(s.dm)
+    var stages = Mamba2DeviceStages(ctx, s.b, 1, state.buf_len, dims)
+    mamba_copy_in(ctx, s.dx.value(), f32_ptr(px), s.b * s.dm)
+    var trace = IdentityTrace.disabled()
+    mamba2_block_forward(ctx, stages, state, s.w.value(), s.dx.value(), s.b, 1,
+                         s.dt_lo, s.dt_hi, trace, String("py.session"))
+    _write_f32(py, mamba_download(ctx, stages.residual_out, s.b * s.dm))
+    _write_f32(ph, mamba_download(ctx, stages.h_last,
+        s.b * dims.nheads * M2_HEADDIM * M2_D_STATE))
+    return state.buf_len
+
+
+def _m2_session_export_run(mut s: Mamba2DecodeSession, a: List[Int]) raises -> Int:
+    ref ctx = s.ctx.value()
+    ref state = s.state.value()
+    var dims = Mamba2Dims.of(s.dm)
+    var cd = dims.conv_dim()
+    var nh = dims.nheads
+    _write_f32(a[0], mamba_download(ctx, state.conv_win, s.b * cd * M2_D_CONV))
+    _write_f32(a[1], mamba_download(ctx, state.h, s.b * nh * M2_HEADDIM * M2_D_STATE))
+    _write_f32(a[2], mamba_download(ctx, state.buf_xbc, s.b * M2_CHUNK_SIZE * cd))
+    _write_f32(a[3], mamba_download(ctx, state.buf_dtraw, s.b * M2_CHUNK_SIZE * nh))
+    return state.buf_len
+
+
+def _m2_session_load_run(mut s: Mamba2DecodeSession, a: List[Int], q0: Int) raises:
+    if q0 < 0 or q0 >= M2_CHUNK_SIZE:
+        raise Error("mamba2_session_load_state: buf_len out of range")
+    ref ctx = s.ctx.value()
+    ref state = s.state.value()
+    var dims = Mamba2Dims.of(s.dm)
+    var cd = dims.conv_dim()
+    var nh = dims.nheads
+    # Retain constructor-owned buffers; replacing them faults on AMD.
+    mamba_copy_in(ctx, state.conv_win, f32_ptr(a[0]), s.b * cd * M2_D_CONV)
+    mamba_copy_in(ctx, state.h, f32_ptr(a[1]), s.b * nh * M2_HEADDIM * M2_D_STATE)
+    mamba_copy_in(ctx, state.buf_xbc, f32_ptr(a[2]), s.b * M2_CHUNK_SIZE * cd)
+    mamba_copy_in(ctx, state.buf_dtraw, f32_ptr(a[3]), s.b * M2_CHUNK_SIZE * nh)
+    ctx.synchronize()
+    state.buf_len = q0
+
+
+def mamba2_session_create_binding() raises -> PythonObject:
+    return PythonObject(alloc=Mamba2DecodeSession())
+
+
+def mamba2_session_open_binding(session: PythonObject, addrs: PythonObject,
+                                params: PythonObject) raises -> PythonObject:
+    var owner = session.downcast_value_ptr[Mamba2DecodeSession]()
+    if len(addrs) != 13 or len(params) != 5:
+        raise Error("mamba2_session_open: expected 13 addresses and 5 scalars")
+    if Int(py=params[0]) <= 0 or Int(py=params[1]) <= 0:
+        raise Error("mamba2_session_open: B and d_model must be positive")
+    if owner[].busy or owner[].is_open():
+        raise Error("mamba2_session_open: session is busy or already open")
+    var a = List[Int]()
+    for i in range(13):
+        var p = Int(py=addrs[i])
+        if p == 0:
+            raise Error("mamba2_session_open: null buffer address")
+        a.append(p)
+    owner[].busy = True
+    owner[].usable = False
+    try:
+        with GILReleased(Python()):
+            _m2_session_open_run(owner[], a, Int(py=params[0]), Int(py=params[1]),
+                Int(py=params[2]), Float32(Float64(py=params[3])), Float32(Float64(py=params[4])))
+    except error:
+        owner[].busy = False
+        owner[].release()
+        raise error
+    owner[].busy = False
+    owner[].usable = True
+    return PythonObject(0)
+
+
+def mamba2_session_step_binding(session: PythonObject, addrs: PythonObject) raises -> PythonObject:
+    var owner = session.downcast_value_ptr[Mamba2DecodeSession]()
+    if len(addrs) != 3:
+        raise Error("mamba2_session_step: expected x, y, h_last addresses")
+    var px = Int(py=addrs[0]); var py = Int(py=addrs[1]); var ph = Int(py=addrs[2])
+    if px == 0 or py == 0 or ph == 0:
+        raise Error("mamba2_session_step: null buffer address")
+    _m2_require_session_open(owner[])
+    owner[].busy = True
+    var q = 0
+    try:
+        with GILReleased(Python()):
+            q = _m2_session_step_run(owner[], px, py, ph)
+    except error:
+        owner[].busy = False
+        owner[].usable = False
+        raise error
+    owner[].busy = False
+    return PythonObject(q)
+
+
+def mamba2_session_export_state_binding(session: PythonObject, addrs: PythonObject) raises -> PythonObject:
+    var owner = session.downcast_value_ptr[Mamba2DecodeSession]()
+    if len(addrs) != 4:
+        raise Error("mamba2_session_export_state: expected 4 addresses")
+    var a = List[Int]()
+    for i in range(4):
+        var p = Int(py=addrs[i])
+        if p == 0: raise Error("mamba2_session_export_state: null buffer address")
+        a.append(p)
+    _m2_require_session_open(owner[])
+    owner[].busy = True
+    var q = 0
+    try:
+        with GILReleased(Python()): q = _m2_session_export_run(owner[], a)
+    except error:
+        owner[].busy = False; owner[].usable = False; raise error
+    owner[].busy = False
+    return PythonObject(q)
+
+
+def mamba2_session_load_state_binding(session: PythonObject, addrs: PythonObject,
+                                      params: PythonObject) raises -> PythonObject:
+    var owner = session.downcast_value_ptr[Mamba2DecodeSession]()
+    if len(addrs) != 4 or len(params) != 1:
+        raise Error("mamba2_session_load_state: expected 4 addresses and buf_len")
+    var a = List[Int]()
+    for i in range(4):
+        var p = Int(py=addrs[i])
+        if p == 0: raise Error("mamba2_session_load_state: null buffer address")
+        a.append(p)
+    _m2_require_session_open(owner[])
+    owner[].busy = True
+    try:
+        with GILReleased(Python()): _m2_session_load_run(owner[], a, Int(py=params[0]))
+    except error:
+        owner[].busy = False; owner[].usable = False; raise error
+    owner[].busy = False
+    return PythonObject(0)
+
+
+def mamba2_session_close_binding(session: PythonObject) raises -> PythonObject:
+    session.downcast_value_ptr[Mamba2DecodeSession]()[].close()
+    return PythonObject(0)
+
+
+# ===========================================================================
+# Mamba-3: profile anonlib.identical.mamba3.siso.fp32.v1
+# ===========================================================================
+
+
+def _m3_load_weights[wait: Bool = True](ctx: DeviceContext, a: List[Int], dims: Mamba3Dims) raises -> Mamba3DeviceWeights:
+    var dm = dims.d_model
+    var di = dims.d_inner
+    var dip = dims.d_in_proj()
+    var nh = dims.nheads
+    comptime if M3_DIRECT_TRANSFER:
+        var norm_w = _m3_upload_addr[wait](ctx, a[1], dm)
+        var w_in = _m3_upload_addr[wait](ctx, a[2], dip * dm)
+        var dt_bias = _m3_upload_addr[wait](ctx, a[3], nh)
+        var bnorm_w = _m3_upload_addr[wait](ctx, a[4], M3_D_STATE)
+        var cnorm_w = _m3_upload_addr[wait](ctx, a[5], M3_D_STATE)
+        var b_bias = _m3_upload_addr[wait](ctx, a[6], nh * M3_D_STATE)
+        var c_bias = _m3_upload_addr[wait](ctx, a[7], nh * M3_D_STATE)
+        var d_skip = _m3_upload_addr[wait](ctx, a[8], nh)
+        var w_out = _m3_upload_addr[wait](ctx, a[9], dm * di)
+        return Mamba3DeviceWeights(dims, norm_w^, w_in^, dt_bias^, bnorm_w^, cnorm_w^, b_bias^, c_bias^, d_skip^, w_out^)
+    else:
+        var w = Mamba3Weights(dims)
+        w.norm_w = _m3_read_f32(a[1], dm)
+        w.w_in = _m3_read_f32(a[2], dip * dm)
+        w.dt_bias = _m3_read_f32(a[3], nh)
+        w.bnorm_w = _m3_read_f32(a[4], M3_D_STATE)
+        w.cnorm_w = _m3_read_f32(a[5], M3_D_STATE)
+        w.b_bias = _m3_read_f32(a[6], nh * M3_D_STATE)
+        w.c_bias = _m3_read_f32(a[7], nh * M3_D_STATE)
+        w.d_skip = _m3_read_f32(a[8], nh)
+        w.w_out = _m3_read_f32(a[9], dm * di)
+        return Mamba3DeviceWeights(ctx, w)
+
+
+def _mamba3_run[discard_state: Bool = False](
+    a: List[Int], b: Int, l: Int, dm: Int, q0: Int, pend: Int
+) raises -> Int:
+    """The GIL-free half of the two Mamba-3 entry points. Returns the
+    post-call `buf_len` (DEVIATION 794: `pending` needs no return slot
+    because a shipped binding always consumes it)."""
+    comptime if AFN_MAMBA_ARENA:
+        return _mamba3_run_arena[discard_state](a, b, l, dm, q0, pend)
+    # Mamba3Dims.of REFUSES a d_model that is not a multiple of 32, by
+    # name -- reached BEFORE any buffer size below is computed from it.
+    var dims = Mamba3Dims.of(dm)
+    var di = dims.d_inner
+    var dip = dims.d_in_proj()
+    var nh = dims.nheads
+    if q0 < 0 or q0 > M3_CHUNK_SIZE:
+        raise Error(
+            String("mamba3: buf_len must be in [0, ")
+            + String(M3_CHUNK_SIZE)
+            + "] (INCLUSIVE -- the buffer never empties, DEVIATION"
+            " 832(i): r in [1, Q] after every call, 0 only before the"
+            " first token), got "
+            + String(q0)
+            + "; the two sides of this boundary disagree about the state"
+        )
+    if pend != 0 and pend != 1:
+        raise Error(
+            "mamba3: pending must be 0 or 1, got "
+            + String(pend)
+            + "; the two sides of this boundary disagree about the state"
+        )
+
+    var phase_tick = 0
+    comptime if is_defined["ANONLIB_MAMBA3_PHASE_TIMERS"]():
+        phase_tick = Int(perf_counter_ns())
+
+    var theta_n = b * nh * M3_NUM_ROPE_ANGLES
+    var h_n = b * nh * M3_HEADDIM * M3_D_STATE
+    var qrow_n = b * M3_CHUNK_SIZE * nh
+    var k_n = b * nh * M3_D_STATE
+    var v_n = b * nh * M3_HEADDIM
+
+    var ctx = neural_ctx[_NEURAL_CTX]()
+    m3_phase_tick(ctx, phase_tick, String("surface.weight_lists_and_context"))
+    var dw = _m3_load_weights[False](ctx, a, dims)
+    m3_phase_tick(ctx, phase_tick, String("surface.weight_upload"))
+    # The caller's ten-piece state over the fresh zeros (DEVIATION 794).
+    var dstate = Mamba3DeviceState(ctx, b, dims)
+    comptime if not discard_state:
+        dstate.buf_qrot = _m3_upload_addr[False](ctx, a[12], qrow_n * M3_D_STATE)
+        dstate.buf_krot = _m3_upload_addr[False](ctx, a[13], qrow_n * M3_D_STATE)
+        dstate.buf_v = _m3_upload_addr[False](ctx, a[14], qrow_n * M3_HEADDIM)
+        dstate.buf_dt = _m3_upload_addr[False](ctx, a[15], qrow_n)
+        dstate.buf_sig = _m3_upload_addr[False](ctx, a[16], qrow_n)
+        dstate.buf_adt = _m3_upload_addr[False](ctx, a[17], qrow_n)
+        dstate.buf_len = q0
+        if pend == 1:
+            # THROUGH the lane's own helper, AFTER buf_len is set, so its
+            # fresh-state refusal (buf_len must be 0) fires from Python by
+            # the lane's own words (DEVIATION 794).
+            dstate.set_input_states(
+                ctx,
+                _m3_read_f32(a[10], theta_n),
+                _m3_read_f32(a[11], h_n),
+                _m3_read_f32(a[18], k_n),
+                _m3_read_f32(a[19], v_n),
+            )
+        else:
+            dstate.theta = _m3_upload_addr[False](ctx, a[10], theta_n)
+            dstate.h = _m3_upload_addr[False](ctx, a[11], h_n)
+            # Idle outside a pending continuation, uploaded anyway so the
+            # caller's bytes round-trip unchanged (DEVIATION 792's rule).
+            dstate.pend_k = _m3_upload_addr[False](ctx, a[18], k_n)
+            dstate.pend_v = _m3_upload_addr[False](ctx, a[19], v_n)
+    m3_phase_tick(ctx, phase_tick, String("surface.state_upload"))
+    var dstages = Mamba3DeviceStages(ctx, b, l, q0, dims)
+    m3_phase_tick(ctx, phase_tick, String("surface.stage_allocations"))
+    var dx = _m3_upload_addr[False](ctx, a[0], b * l * dm)
+
+    m3_phase_tick(ctx, phase_tick, String("surface.x_upload"))
+    var trace = IdentityTrace.disabled()
+    mamba3_block_forward(
+        ctx, dstages, dstate, dw, dx, b, l, trace, String("py")
+    )
+
+    m3_phase_tick(ctx, phase_tick, String("surface.block"))
+    _m3_download_addr[False](ctx, dstages.residual_out, b * l * dm, a[20])
+    # The FOUR reports (contract section 7's ssd.* stages), NOT the
+    # resumption state -- DEVIATION 794's last clause.
+    _m3_download_addr[False](ctx, dstages.h_last, h_n, a[21])
+    _m3_download_addr[False](ctx, dstages.k_last, k_n, a[22])
+    _m3_download_addr[False](ctx, dstages.v_last, v_n, a[23])
+    _m3_download_addr[False](ctx, dstages.theta_last, theta_n, a[24])
+    comptime if not discard_state:
+        _m3_download_addr[False](ctx, dstate.theta, theta_n, a[10])
+        _m3_download_addr[False](ctx, dstate.h, h_n, a[11])
+        _m3_download_addr[False](ctx, dstate.buf_qrot, qrow_n * M3_D_STATE, a[12])
+        _m3_download_addr[False](ctx, dstate.buf_krot, qrow_n * M3_D_STATE, a[13])
+        _m3_download_addr[False](ctx, dstate.buf_v, qrow_n * M3_HEADDIM, a[14])
+        _m3_download_addr[False](ctx, dstate.buf_dt, qrow_n, a[15])
+        _m3_download_addr[False](ctx, dstate.buf_sig, qrow_n, a[16])
+        _m3_download_addr[False](ctx, dstate.buf_adt, qrow_n, a[17])
+        _m3_download_addr[False](ctx, dstate.pend_k, k_n, a[18])
+        _m3_download_addr[False](ctx, dstate.pend_v, v_n, a[19])
+    # One wait for every download above (and anything still in flight).
+    ctx.synchronize()
+    m3_phase_tick(ctx, phase_tick, String("surface.downloads"))
+    var out_len = dstate.buf_len
+    _ = dw^
+    _ = dstate^
+    _ = dstages^
+    _ = dx^
+    m3_phase_tick(ctx, phase_tick, String("surface.buffer_destruction"))
+    _ = ctx^
+    comptime if is_defined["ANONLIB_MAMBA3_PHASE_TIMERS"]():
+        print("M3_PHASE", "surface.context_destruction", Float64(Int(perf_counter_ns()) - phase_tick) / 1e6)
+    return out_len
+
+
+def _mamba3_run_arena[discard_state: Bool = False](
+    a: List[Int], b: Int, l: Int, dm: Int, q0: Int, pend: Int
+) raises -> Int:
+    """`_mamba3_run` under ANONLIB_AFN_MAMBA_ARENA (lane afn-mamba): one
+    arena, views, direct copies in, ONE wait at the end."""
+    var dims = Mamba3Dims.of(dm)
+    var di = dims.d_inner
+    var dip = dims.d_in_proj()
+    var nh = dims.nheads
+    if q0 < 0 or q0 > M3_CHUNK_SIZE:
+        raise Error(
+            String("mamba3: buf_len must be in [0, ")
+            + String(M3_CHUNK_SIZE)
+            + "] (INCLUSIVE -- the buffer never empties, DEVIATION"
+            " 832(i): r in [1, Q] after every call, 0 only before the"
+            " first token), got "
+            + String(q0)
+            + "; the two sides of this boundary disagree about the state"
+        )
+    if pend != 0 and pend != 1:
+        raise Error(
+            "mamba3: pending must be 0 or 1, got "
+            + String(pend)
+            + "; the two sides of this boundary disagree about the state"
+        )
+    var theta_n = b * nh * M3_NUM_ROPE_ANGLES
+    var h_n = b * nh * M3_HEADDIM * M3_D_STATE
+    var qrow_n = b * M3_CHUNK_SIZE * nh
+    var k_n = b * nh * M3_D_STATE
+    var v_n = b * nh * M3_HEADDIM
+
+    var ctx = neural_ctx[_NEURAL_CTX]()
+    var arena = MambaArena(ctx, mamba3_arena_floats(b, l, q0, dims), MAMBA_GUARD)
+    var dw = Mamba3DeviceWeights(ctx, dims, arena)
+    mamba_copy_in(ctx, dw.norm_w, _f32_ptr(a[1]), dm)
+    mamba_copy_in(ctx, dw.w_in, _f32_ptr(a[2]), dip * dm)
+    mamba_copy_in(ctx, dw.dt_bias, _f32_ptr(a[3]), nh)
+    mamba_copy_in(ctx, dw.bnorm_w, _f32_ptr(a[4]), M3_D_STATE)
+    mamba_copy_in(ctx, dw.cnorm_w, _f32_ptr(a[5]), M3_D_STATE)
+    mamba_copy_in(ctx, dw.b_bias, _f32_ptr(a[6]), nh * M3_D_STATE)
+    mamba_copy_in(ctx, dw.c_bias, _f32_ptr(a[7]), nh * M3_D_STATE)
+    mamba_copy_in(ctx, dw.d_skip, _f32_ptr(a[8]), nh)
+    mamba_copy_in(ctx, dw.w_out, _f32_ptr(a[9]), dm * di)
+    var dstate = Mamba3DeviceState(ctx, b, dims, arena)
+    comptime if not discard_state:
+        mamba_copy_in(ctx, dstate.buf_qrot, _f32_ptr(a[12]), qrow_n * M3_D_STATE)
+        mamba_copy_in(ctx, dstate.buf_krot, _f32_ptr(a[13]), qrow_n * M3_D_STATE)
+        mamba_copy_in(ctx, dstate.buf_v, _f32_ptr(a[14]), qrow_n * M3_HEADDIM)
+        mamba_copy_in(ctx, dstate.buf_dt, _f32_ptr(a[15]), qrow_n)
+        mamba_copy_in(ctx, dstate.buf_sig, _f32_ptr(a[16]), qrow_n)
+        mamba_copy_in(ctx, dstate.buf_adt, _f32_ptr(a[17]), qrow_n)
+        dstate.buf_len = q0
+        if pend == 1:
+            # THROUGH the lane's own helper (its fresh-state refusal fires
+            # by the lane's own words); it copies into the views.
+            dstate.set_input_states(
+                ctx,
+                _m3_read_f32(a[10], theta_n),
+                _m3_read_f32(a[11], h_n),
+                _m3_read_f32(a[18], k_n),
+                _m3_read_f32(a[19], v_n),
+            )
+        else:
+            mamba_copy_in(ctx, dstate.theta, _f32_ptr(a[10]), theta_n)
+            mamba_copy_in(ctx, dstate.h, _f32_ptr(a[11]), h_n)
+            mamba_copy_in(ctx, dstate.pend_k, _f32_ptr(a[18]), k_n)
+            mamba_copy_in(ctx, dstate.pend_v, _f32_ptr(a[19]), v_n)
+    var dstages = Mamba3DeviceStages(ctx, b, l, q0, dims, arena)
+    var dx = arena.take(ctx, b * l * dm)
+    mamba_copy_in(ctx, dx, _f32_ptr(a[0]), b * l * dm)
+
+    var trace = IdentityTrace.disabled()
+    mamba3_block_forward(
+        ctx, dstages, dstate, dw, dx, b, l, trace, String("py")
+    )
+
+    _m3_download_addr[False](ctx, dstages.residual_out, b * l * dm, a[20])
+    _m3_download_addr[False](ctx, dstages.h_last, h_n, a[21])
+    _m3_download_addr[False](ctx, dstages.k_last, k_n, a[22])
+    _m3_download_addr[False](ctx, dstages.v_last, v_n, a[23])
+    _m3_download_addr[False](ctx, dstages.theta_last, theta_n, a[24])
+    comptime if not discard_state:
+        _m3_download_addr[False](ctx, dstate.theta, theta_n, a[10])
+        _m3_download_addr[False](ctx, dstate.h, h_n, a[11])
+        _m3_download_addr[False](ctx, dstate.buf_qrot, qrow_n * M3_D_STATE, a[12])
+        _m3_download_addr[False](ctx, dstate.buf_krot, qrow_n * M3_D_STATE, a[13])
+        _m3_download_addr[False](ctx, dstate.buf_v, qrow_n * M3_HEADDIM, a[14])
+        _m3_download_addr[False](ctx, dstate.buf_dt, qrow_n, a[15])
+        _m3_download_addr[False](ctx, dstate.buf_sig, qrow_n, a[16])
+        _m3_download_addr[False](ctx, dstate.buf_adt, qrow_n, a[17])
+        _m3_download_addr[False](ctx, dstate.pend_k, k_n, a[18])
+        _m3_download_addr[False](ctx, dstate.pend_v, v_n, a[19])
+    ctx.synchronize()
+    var out_len = dstate.buf_len
+    _ = dw^
+    _ = dstate^
+    _ = dstages^
+    _ = dx^
+    _ = arena^
+    _ = ctx^
+    return out_len
+
+
+def _mamba3_addrs(addrs: PythonObject, what: String) raises -> List[Int]:
+    if len(addrs) != 25:
+        raise Error(
+            what
+            + ": addrs must contain 25 addresses (x, block norm.weight,"
+            " in_proj.weight, dt_bias, B_norm.weight, C_norm.weight,"
+            " B_bias, C_bias, D, out_proj.weight, theta, h, buffer_qrot,"
+            " buffer_krot, buffer_v, buffer_dt, buffer_sig, buffer_adt,"
+            " pending_k, pending_v, y_out, h_last_out, k_last_out,"
+            " v_last_out, theta_last_out), got "
+            + String(len(addrs))
+        )
+    var a = List[Int]()
+    for i in range(25):
+        a.append(Int(py=addrs[i]))
+    return a^
+
+
+def mamba3_forward_binding(
+    addrs: PythonObject,
+    params: PythonObject,
+) raises -> PythonObject:
+    """One Mamba-3 (SISO) block call: prefill from the state the caller
+    hands in -- fresh (all zeros, buf_len 0, pending 0), resumed (a
+    carried ten-piece state: chunked-prefill continuation), or a
+    reference Input_States continuation (pending 1 on a FRESH state; the
+    lane's own set_input_states refuses anything else by name). Returns
+    the post-call `buf_len`.
+
+    `addrs` is the TWENTY-FIVE buffer addresses, in this exact order
+    (mirrored in `python/anonlib/_mamba_impl.py`; H = d_inner/64 =
+    d_model/32 heads, N = 128, P = 64, R = 32, Q = 64, d_in_proj =
+    2*d_inner + 256 + 3*H + 32):
+
+        0  x                 B * L * d_model float32, read
+        1  norm.weight       d_model, read (the BLOCK norm; the fixture
+                              calls it block_norm.weight)
+        2  in_proj.weight    d_in_proj * d_model, read (column order
+                              z | x | B | C | dd_dt | dd_A | trap |
+                              angle, mamba3.py:106-107)
+        3  dt_bias           H, read
+        4  B_norm.weight     N, read (the S21 B RMSNorm, eps 1e-5)
+        5  C_norm.weight     N, read (the S21 C RMSNorm)
+        6  B_bias            H * N, read (per-head, AFTER the norm)
+        7  C_bias            H * N, read
+        8  D                 H, read
+        9  out_proj.weight   d_model * d_inner, read
+       10  theta             B * H * R, READ AND WRITTEN (state: the
+                              serial rotary angles, always in [0, 2pi))
+       11  h                 B * H * P * N, READ AND WRITTEN (state: the
+                              SEALED chunk-boundary h, DEVIATION 832)
+       12  buffer_qrot       B * Q * H * N, READ AND WRITTEN (state:
+                              rotated-UNSCALED q rows of the last
+                              working chunk)
+       13  buffer_krot       B * Q * H * N, READ AND WRITTEN (state)
+       14  buffer_v          B * Q * H * P, READ AND WRITTEN (state: raw
+                              v = the x split, there is NO conv)
+       15  buffer_dt         B * Q * H, READ AND WRITTEN (state)
+       16  buffer_sig        B * Q * H, READ AND WRITTEN (state:
+                              sigma(trap))
+       17  buffer_adt        B * Q * H, READ AND WRITTEN (state)
+       18  pending_k         B * H * N, READ AND WRITTEN (the
+                              Input_States pair, live only under
+                              pending = 1; round-trips otherwise)
+       19  pending_v         B * H * P, READ AND WRITTEN
+       20  y_out             B * L * d_model, WRITTEN (the block output,
+                              residual add included)
+       21  h_last_out        B * H * P * N, WRITTEN (REPORT stage)
+       22  k_last_out        B * H * N, WRITTEN (REPORT stage)
+       23  v_last_out        B * H * P, WRITTEN (REPORT stage)
+       24  theta_last_out    B * H * R, WRITTEN (REPORT stage)
+
+    `params` is, in this exact order:
+
+        0  B
+        1  L
+        2  d_model     must be a multiple of 32; refused otherwise BY
+                        NAME in Mojo (Mamba3Dims.of)
+        3  buf_len     valid rows of the last-working-chunk buffer, in
+                        [0, 64] INCLUSIVE (DEVIATION 794); 0 for a
+                        fresh sequence ONLY
+        4  pending     0 or 1; 1 marks theta/h/pending_k/pending_v as
+                        a reference Input_States continuation, consumed
+                        by this call (DEVIATION 794)
+
+    There is NO dt clamp parameter: mamba3 S6 is bias -> softplus and
+    nothing else (contract section 0; do not import mamba2's dt_lo /
+    dt_hi here). Profile constants (d_state 128, headdim 64, ngroups 1,
+    rope_fraction 0.5 = 32 angles, A_floor 1e-4, CHUNK_SIZE 64 -- PART
+    OF THE ARITHMETIC, DEVIATIONS 827/783) are NOT parameters; changing
+    one is a v2."""
+    var a = _mamba3_addrs(addrs, String("mamba3_forward"))
+    if len(params) != 5:
+        raise Error(
+            "mamba3_forward: params must contain 5 values (B, L, d_model,"
+            " buf_len, pending), got "
+            + String(len(params))
+        )
+    var b = Int(py=params[0])
+    var l = Int(py=params[1])
+    var dm = Int(py=params[2])
+    var q0 = Int(py=params[3])
+    var pend = Int(py=params[4])
+    var out_len = 0
+    with GILReleased(Python()):
+        out_len = _mamba3_run(a, b, l, dm, q0, pend)
+    return PythonObject(out_len)
+
+
+def mamba3_forward_fresh_binding(addrs: PythonObject, params: PythonObject) raises -> PythonObject:
+    """Fresh zero-state prefill whose resumption state has no caller owner.
+
+    The 15 pointers are x, nine weights, y, and four public reports. The
+    ordinary device state constructor supplies exact zeros; the same block
+    and ordered refusals run. No discarded state crosses the host boundary.
+    """
+    if len(addrs) != 15 or len(params) != 3:
+        raise Error("mamba3_forward_fresh: expected 15 addresses and 3 parameters (B, L, d_model)")
+    var a = List[Int]()
+    for i in range(10):
+        a.append(Int(py=addrs[i]))
+    for i in range(10):
+        a.append(0)
+    for i in range(10, 15):
+        a.append(Int(py=addrs[i]))
+    var b = Int(py=params[0])
+    var l = Int(py=params[1])
+    var dm = Int(py=params[2])
+    if b < 1 or l < 1:
+        raise Error("mamba3_forward_fresh: B and L must be positive")
+    var out_len = 0
+    with GILReleased(Python()):
+        out_len = _mamba3_run[True](a, b, l, dm, 0, 0)
+    return PythonObject(out_len)
+
+
+def mamba3_decode_step_binding(
+    addrs: PythonObject,
+    params: PythonObject,
+) raises -> PythonObject:
+    """One decode token: `Mamba3.step`'s semantics, the profile's
+    spelling -- PREFILL RESUMPTION at L = 1 (DEVIATION 831), through the
+    same `mamba3_block_forward` the forward entry calls, with NO
+    arithmetic of its own (`mamba3_step`'s rule; the reference per-token
+    recurrence rounds differently and is the required-RED
+    STEP_UPSTREAM_RECURRENCE arm, never a mode).
+
+    `addrs`: the same TWENTY-FIVE as `mamba3_forward` with L = 1 shapes
+    (x and y_out are B * d_model). `params`: 0 B, 1 d_model, 2 buf_len,
+    3 pending. Returns the post-call buf_len."""
+    var a = _mamba3_addrs(addrs, String("mamba3_decode_step"))
+    if len(params) != 4:
+        raise Error(
+            "mamba3_decode_step: params must contain 4 values (B,"
+            " d_model, buf_len, pending), got "
+            + String(len(params))
+        )
+    var b = Int(py=params[0])
+    var dm = Int(py=params[1])
+    var q0 = Int(py=params[2])
+    var pend = Int(py=params[3])
+    var out_len = 0
+    with GILReleased(Python()):
+        out_len = _mamba3_run(a, b, 1, dm, q0, pend)
+    return PythonObject(out_len)
+
+
+# Resident Mamba-3 decode, parallel to Mamba-1/2.  Stages are rebuilt at
+# each step because their working dimensions include the carried buf_len;
+# context, weights, ten-piece state, and x allocation remain resident.
+struct Mamba3DecodeSession(Movable, Writable):
+    var ctx: Optional[DeviceContext]
+    var w: Optional[Mamba3DeviceWeights]
+    var state: Optional[Mamba3DeviceState]
+    var dx: Optional[DeviceBuffer[DType.float32]]
+    var decode_stages: Optional[Mamba3DeviceStages]
+    var b: Int
+    var dm: Int
+    var busy: Bool
+    var usable: Bool
+
+    def __init__(out self):
+        self.ctx = None
+        self.w = None
+        self.state = None
+        self.dx = None
+        self.decode_stages = None
+        self.b = 0
+        self.dm = 0
+        self.busy = False
+        self.usable = True
+
+    def write_to(self, mut writer: Some[Writer]): writer.write("Mamba3DecodeSession")
+    def write_repr_to(self, mut writer: Some[Writer]): writer.write("Mamba3DecodeSession")
+    def is_open(self) -> Bool: return Bool(self.ctx) and Bool(self.state)
+
+    def release(mut self):
+        self.decode_stages = None
+        self.dx = None
+        self.state = None
+        self.w = None
+        if self.ctx:
+            try: self.ctx.value().synchronize()
+            except: pass
+        self.ctx = None
+
+    def __deinit__(deinit self): self.release()
+    def close(mut self) raises:
+        if self.busy: raise Error("mamba3 session: busy")
+        self.usable = False
+        self.release()
+
+
+def _m3_require_session_open(s: Mamba3DecodeSession) raises:
+    if s.busy: raise Error("mamba3 session: busy")
+    if not s.is_open(): raise Error("mamba3 session: not open")
+    if not s.usable: raise Error("mamba3 session: lost after a failed call")
+
+
+def _m3_session_copy_in(mut s: Mamba3DecodeSession, a: List[Int], q0: Int, pend: Int) raises:
+    if q0 < 0 or q0 > M3_CHUNK_SIZE:
+        raise Error("mamba3 session: buf_len out of range")
+    if pend != 0 and pend != 1:
+        raise Error("mamba3 session: pending must be 0 or 1")
+    if pend == 1 and q0 != 0:
+        raise Error("mamba3 session: Input_States pending requires a fresh state")
+    ref ctx = s.ctx.value()
+    ref st = s.state.value()
+    var dims = Mamba3Dims.of(s.dm)
+    var nh = dims.nheads
+    var theta_n = s.b * nh * M3_NUM_ROPE_ANGLES
+    var h_n = s.b * nh * M3_HEADDIM * M3_D_STATE
+    var qrow_n = s.b * M3_CHUNK_SIZE * nh
+    var k_n = s.b * nh * M3_D_STATE
+    var v_n = s.b * nh * M3_HEADDIM
+    mamba_copy_in(ctx, st.theta, f32_ptr(a[0]), theta_n)
+    mamba_copy_in(ctx, st.h, f32_ptr(a[1]), h_n)
+    mamba_copy_in(ctx, st.buf_qrot, f32_ptr(a[2]), qrow_n * M3_D_STATE)
+    mamba_copy_in(ctx, st.buf_krot, f32_ptr(a[3]), qrow_n * M3_D_STATE)
+    mamba_copy_in(ctx, st.buf_v, f32_ptr(a[4]), qrow_n * M3_HEADDIM)
+    mamba_copy_in(ctx, st.buf_dt, f32_ptr(a[5]), qrow_n)
+    mamba_copy_in(ctx, st.buf_sig, f32_ptr(a[6]), qrow_n)
+    mamba_copy_in(ctx, st.buf_adt, f32_ptr(a[7]), qrow_n)
+    mamba_copy_in(ctx, st.pend_k, f32_ptr(a[8]), k_n)
+    mamba_copy_in(ctx, st.pend_v, f32_ptr(a[9]), v_n)
+    ctx.synchronize()
+    st.buf_len = q0
+    st.pending = pend == 1
+
+
+def _m3_session_open_run(mut s: Mamba3DecodeSession, a: List[Int], b: Int,
+                         dm: Int, q0: Int, pend: Int) raises:
+    var dims = Mamba3Dims.of(dm)
+    s.ctx = neural_ctx[_NEURAL_CTX]()
+    var weight_addrs = List[Int]()
+    weight_addrs.append(0)
+    for i in range(9): weight_addrs.append(a[i])
+    s.w = _m3_load_weights(s.ctx.value(), weight_addrs, dims)
+    s.state = Mamba3DeviceState(s.ctx.value(), b, dims)
+    s.b = b
+    s.dm = dm
+    var state_addrs = List[Int]()
+    for i in range(10): state_addrs.append(a[9 + i])
+    _m3_session_copy_in(s, state_addrs, q0, pend)
+    s.dx = mamba_zeros(s.ctx.value(), b * dm)
+
+
+# NI47 same-graph boundary scheduling: retained capacity for one physical
+# open chunk plus a new token; extent comes from the model state contract,
+# never a board row. Default OFF. Cold allocation, repeated decode and maximum
+# zero-fill traffic must all be included in later A/B. Existing host state and
+# arithmetic remain the S counterpart. All validation/quality/timing NOT RUN.
+comptime IDN_M3_DECODE_WINDOW_REUSE = (
+    GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL
+    and is_defined["ANONLIB_IDN_M3_DECODE_WINDOW_REUSE"]()
+    and not is_defined["ANONLIB_IDN_ALL_OFF"]()
+    and MAMBA_GUARD == 0
+)
+
+
+def _m3_session_step_run(mut s: Mamba3DecodeSession, a: List[Int]) raises -> Int:
+    ref ctx = s.ctx.value()
+    ref st = s.state.value()
+    var dims = Mamba3Dims.of(s.dm)
+    var stages: Mamba3DeviceStages
+    comptime if IDN_M3_DECODE_WINDOW_REUSE:
+        if s.decode_stages:
+            stages = s.decode_stages.take()
+        else:
+            stages = Mamba3DeviceStages(ctx, s.b, 1, M3_CHUNK_SIZE, dims)
+        stages.reuse_decode_window(st.buf_len)
+    else:
+        stages = Mamba3DeviceStages(ctx, s.b, 1, st.buf_len, dims)
+    mamba_copy_in(ctx, s.dx.value(), f32_ptr(a[0]), s.b * s.dm)
+    var trace = IdentityTrace.disabled()
+    mamba3_block_forward(ctx, stages, st, s.w.value(), s.dx.value(), s.b, 1,
+                         trace, String("py.session"))
+    var nh = dims.nheads
+    _write_f32(a[1], mamba_download(ctx, stages.residual_out, s.b * s.dm))
+    _write_f32(a[2], mamba_download(ctx, stages.h_last, s.b * nh * M3_HEADDIM * M3_D_STATE))
+    _write_f32(a[3], mamba_download(ctx, stages.k_last, s.b * nh * M3_D_STATE))
+    _write_f32(a[4], mamba_download(ctx, stages.v_last, s.b * nh * M3_HEADDIM))
+    _write_f32(a[5], mamba_download(ctx, stages.theta_last, s.b * nh * M3_NUM_ROPE_ANGLES))
+    comptime if IDN_M3_DECODE_WINDOW_REUSE:
+        # Every report download above completes before capacity is retained.
+        s.decode_stages = stages^
+    return st.buf_len
+
+
+def _m3_session_export_run(mut s: Mamba3DecodeSession, a: List[Int]) raises -> Int:
+    ref ctx = s.ctx.value()
+    ref st = s.state.value()
+    var dims = Mamba3Dims.of(s.dm)
+    var nh = dims.nheads
+    var theta_n = s.b * nh * M3_NUM_ROPE_ANGLES
+    var h_n = s.b * nh * M3_HEADDIM * M3_D_STATE
+    var qrow_n = s.b * M3_CHUNK_SIZE * nh
+    _write_f32(a[0], mamba_download(ctx, st.theta, theta_n))
+    _write_f32(a[1], mamba_download(ctx, st.h, h_n))
+    _write_f32(a[2], mamba_download(ctx, st.buf_qrot, qrow_n * M3_D_STATE))
+    _write_f32(a[3], mamba_download(ctx, st.buf_krot, qrow_n * M3_D_STATE))
+    _write_f32(a[4], mamba_download(ctx, st.buf_v, qrow_n * M3_HEADDIM))
+    _write_f32(a[5], mamba_download(ctx, st.buf_dt, qrow_n))
+    _write_f32(a[6], mamba_download(ctx, st.buf_sig, qrow_n))
+    _write_f32(a[7], mamba_download(ctx, st.buf_adt, qrow_n))
+    _write_f32(a[8], mamba_download(ctx, st.pend_k, s.b * nh * M3_D_STATE))
+    _write_f32(a[9], mamba_download(ctx, st.pend_v, s.b * nh * M3_HEADDIM))
+    return st.buf_len
+
+
+# ===========================================================================
+# lane/neural-net-experiment (2026-09-30): the Mamba-3 PREFILL session.
+#
+# `mamba3_forward_fresh` uploaded the nine weights (nine allocations and
+# copies with a wait), built the zero state and the stages, uploaded x, ran
+# the block, downloaded the five reports and freed everything, on EVERY
+# call; Samba runs two such blocks per forward and the board's
+# `mamba3-forward` cell is exactly this call. The prefill session keeps
+# the WEIGHTS on the device across calls, reused when the caller's bytes
+# are unchanged (an exact integer compare, as the transformer session
+# does), recopied into the same buffers when they moved (the block's own
+# non-finite refusal re-runs: `weights_checked` is cleared), and keeps the
+# x buffer. The zero state and the stages are still built per call: the
+# decode session builds its stages per step too, nothing resets them, and
+# a fresh construction is the certified zero state. Same kernels, same
+# launches, same order.
+# ===========================================================================
+
+
+# NN40 explicit owned snapshots, not pointer identity or caller promises.
+# A snapshot is copied into session-owned device storage by install/update;
+# owned forward/backward never read the original external weight addresses.
+comptime NN40_OWNED_WEIGHTS = GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL and is_defined["ANONLIB_NN40_OWNED_WEIGHTS"]() and not is_defined["ANONLIB_IDN_ALL_OFF"]()
+
+struct Mamba3PrefillSession(Movable, Writable):
+    var ctx: Optional[DeviceContext]
+    var w: Optional[Mamba3DeviceWeights]
+    var w_host: List[Float32]
+    var dm: Int
+    var dx: Optional[DeviceBuffer[DType.float32]]
+    var busy: Bool
+    var usable: Bool
+    var weight_uploads: Int
+    var weight_recopies: Int
+    var weight_reuses: Int
+    var owned_weights: Bool
+    var weight_generation: Int
+    # lane/neural-net-experiment (backward session): the last forward's
+    # recorded stages and zero state, kept for the backward that follows it
+    # in a training step. `stages_valid` is cleared whenever the retained
+    # weights change (recopy or upload), since the stages were computed on
+    # the old bytes. `x_stage` is the host staging list the backward
+    # downloads `dx` into to compare against the caller's x.
+    var stages: Optional[Mamba3DeviceStages]
+    var state: Optional[Mamba3DeviceState]
+    var stages_b: Int
+    var stages_l: Int
+    var stages_valid: Bool
+    var x_stage: List[Float32]
+    var backward_reuses: Int
+    var backward_recomputes: Int
+
+    def __init__(out self):
+        self.ctx = None
+        self.w = None
+        self.w_host = List[Float32]()
+        self.owned_weights = False
+        self.dm = 0
+        self.dx = None
+        self.busy = False
+        self.usable = True
+        self.weight_uploads = 0
+        self.weight_recopies = 0
+        self.weight_reuses = 0
+        self.owned_weights = False
+        self.weight_generation = 0
+        self.stages = None
+        self.state = None
+        self.stages_b = 0
+        self.stages_l = 0
+        self.stages_valid = False
+        self.x_stage = List[Float32]()
+        self.backward_reuses = 0
+        self.backward_recomputes = 0
+
+    def write_to(self, mut writer: Some[Writer]): writer.write("Mamba3PrefillSession")
+    def write_repr_to(self, mut writer: Some[Writer]): writer.write("Mamba3PrefillSession")
+
+    def release(mut self):
+        self.drop_stages()
+        self.x_stage = List[Float32]()
+        self.dx = None
+        self.w = None
+        self.w_host = List[Float32]()
+        self.owned_weights = False
+        self.dm = 0
+        if self.ctx:
+            try: self.ctx.value().synchronize()
+            except: pass
+        self.ctx = None
+
+    def drop_stages(mut self):
+        self.stages_valid = False
+        self.stages = None
+        self.state = None
+        self.stages_b = 0
+        self.stages_l = 0
+
+    def __deinit__(deinit self): self.release()
+
+
+def _m3_retain_stages() -> Bool:
+    """ANONLIB_MAMBA3_RETAIN_STAGES=0 drops the forward's stages at the
+    end of the forward (the pre-session behaviour: every backward recomputes
+    the forward). Default on: the stages stay on the device for the
+    backward of the same training step."""
+    return String(getenv("ANONLIB_MAMBA3_RETAIN_STAGES")) != "0"
+
+
+def _m3_weight_lens(dims: Mamba3Dims) -> List[Int]:
+    """Element counts of the nine weights in slot order 1..9."""
+    var dm = dims.d_model
+    var di = dims.d_inner
+    var dip = dims.d_in_proj()
+    var nh = dims.nheads
+    var lens: List[Int] = [dm, dip * dm, nh, M3_D_STATE, M3_D_STATE, nh * M3_D_STATE,
+                           nh * M3_D_STATE, nh, dm * di]
+    return lens^
+
+
+def _m3_weights_same_bits(a: List[Int], host: List[Float32], lens: List[Int]) raises -> Bool:
+    """Whether the caller's nine weight arrays hold exactly the bytes in
+    `host` (their concatenation in slot order): an integer compare of the
+    bit patterns, eight lanes at a time."""
+    comptime W = 8
+    var off = 0
+    for s in range(9):
+        var n = lens[s]
+        var p = _f32_ptr(a[s + 1])
+        var hp = host.unsafe_ptr()
+        var i = 0
+        var body = n - n % W
+        while i < body:
+            var x = bitcast[DType.uint32, W](p.unsafe_load[width=W](i))
+            var y = bitcast[DType.uint32, W](hp.unsafe_load[width=W](off + i))
+            if (x ^ y).reduce_or() != UInt32(0):
+                return False
+            i += W
+        while i < n:
+            if bitcast[DType.uint32](p.unsafe_load(i)) != bitcast[DType.uint32](hp.unsafe_load(off + i)):
+                return False
+            i += 1
+        off += n
+    return True
+
+
+def _m3_weights_host_copy(a: List[Int], lens: List[Int]) raises -> List[Float32]:
+    var total = 0
+    for s in range(9):
+        total += lens[s]
+    var out = List[Float32](length=total, fill=Float32(0))
+    var off = 0
+    for s in range(9):
+        var n = lens[s]
+        if n > 0:
+            memcpy(dest=out.unsafe_ptr() + off, src=_f32_ptr(a[s + 1]), count=n)
+        off += n
+    return out^
+
+
+def _m3_weights_recopy(ctx: DeviceContext, mut w: Mamba3DeviceWeights, a: List[Int]) raises:
+    """Changed caller bytes into the RETAINED device buffers, slot order,
+    one wait; `weights_checked` cleared so the block's own named refusal of
+    non-finite weights runs again on the next forward."""
+    ctx.enqueue_copy(dst_buf=w.norm_w, src_ptr=_f32_ptr(a[1]))
+    ctx.enqueue_copy(dst_buf=w.w_in, src_ptr=_f32_ptr(a[2]))
+    ctx.enqueue_copy(dst_buf=w.dt_bias, src_ptr=_f32_ptr(a[3]))
+    ctx.enqueue_copy(dst_buf=w.bnorm_w, src_ptr=_f32_ptr(a[4]))
+    ctx.enqueue_copy(dst_buf=w.cnorm_w, src_ptr=_f32_ptr(a[5]))
+    ctx.enqueue_copy(dst_buf=w.b_bias, src_ptr=_f32_ptr(a[6]))
+    ctx.enqueue_copy(dst_buf=w.c_bias, src_ptr=_f32_ptr(a[7]))
+    ctx.enqueue_copy(dst_buf=w.d_skip, src_ptr=_f32_ptr(a[8]))
+    ctx.enqueue_copy(dst_buf=w.w_out, src_ptr=_f32_ptr(a[9]))
+    ctx.synchronize()
+    w.weights_checked = False
+
+
+def _m3_prefill_weights(mut s: Mamba3PrefillSession, a: List[Int], dims: Mamba3Dims, use_owned: Bool = False) raises:
+    """Leave `s.w` holding this call's weights: reused, recopied, or freshly
+    uploaded (see the section header)."""
+    if use_owned:
+        comptime if NN40_OWNED_WEIGHTS:
+            if not s.owned_weights or not s.w or s.dm != dims.d_model:
+                raise Error("mamba3 owned weights: install a matching snapshot first")
+            s.weight_reuses += 1
+            return
+        else:
+            raise Error("mamba3 owned weights: NN40 arm is disabled")
+    # Normal APIs continue inspecting the weights passed on THIS call.
+    # They relinquish the explicit snapshot route instead of silently
+    # ignoring changed external buffers supplied through the ordinary API.
+    s.owned_weights = False
+    ref ctx = s.ctx.value()
+    var lens = _m3_weight_lens(dims)
+    # ANONLIB_MAMBA3_RETAIN_WEIGHTS=0: the per-call upload (the A/B
+    # against the byte compare).
+    if String(getenv("ANONLIB_MAMBA3_RETAIN_WEIGHTS")) == "0":
+        s.stages_valid = False
+        s.w = None
+        s.w_host = List[Float32]()
+        s.dm = 0
+        s.w = _m3_load_weights(ctx, a, dims)
+        s.weight_uploads += 1
+        return
+    if s.w and s.dm == dims.d_model:
+        if _m3_weights_same_bits(a, s.w_host, lens):
+            s.weight_reuses += 1
+            return
+        s.stages_valid = False
+        var fresh = _m3_weights_host_copy(a, lens)
+        try:
+            ref retained = s.w.value()
+            _m3_weights_recopy(ctx, retained, a)
+        except error:
+            s.w = None
+            s.w_host = List[Float32]()
+            s.dm = 0
+            raise error
+        s.w_host = fresh^
+        s.weight_recopies += 1
+        return
+    s.stages_valid = False
+    s.w = None
+    s.w_host = List[Float32]()
+    s.dm = 0
+    var host = _m3_weights_host_copy(a, lens)
+    s.w = _m3_load_weights(ctx, a, dims)
+    s.w_host = host^
+    s.dm = dims.d_model
+    s.weight_uploads += 1
+
+
+def _m3_prefill_run(mut s: Mamba3PrefillSession, a: List[Int], b: Int, l: Int, dm: Int, use_owned: Bool = False, force_retain: Bool = False) raises -> Int:
+    """`_mamba3_run[True]` on the session: `a` is the fresh entry's 25-slot
+    list (state slots zero, never read)."""
+    var dims = Mamba3Dims.of(dm)
+    var nh = dims.nheads
+    var theta_n = b * nh * M3_NUM_ROPE_ANGLES
+    var h_n = b * nh * M3_HEADDIM * M3_D_STATE
+    var k_n = b * nh * M3_D_STATE
+    var v_n = b * nh * M3_HEADDIM
+    if not s.ctx:
+        s.ctx = neural_ctx[_NEURAL_CTX]()
+    var phase_tick = 0
+    comptime if is_defined["ANONLIB_MAMBA3_PHASE_TIMERS"]():
+        phase_tick = Int(perf_counter_ns())
+    _m3_prefill_weights(s, a, dims, use_owned)
+    # lane/fam2-lm (IDN_M3_SESSION_STAGE_REUSE): the retained stages and
+    # state serve this call when they have its shape; they are refilled with
+    # zeros below. (`stages_valid` is not asked: stale VALUES do not matter,
+    # every buffer is refilled.)
+    var reuse = False
+    comptime if IDN_M3_SESSION_STAGE_REUSE and MAMBA_GUARD == 0:
+        if s.stages and s.state:
+            reuse = (
+                s.stages_b == b
+                and s.stages_l == l
+                and s.stages.value().dims.d_model == dm
+            )
+    # The previous forward's stages go before this call's are built.
+    if not reuse:
+        s.drop_stages()
+    ref ctx = s.ctx.value()
+    ref dw = s.w.value()
+    m3_phase_tick(ctx, phase_tick, String("surface.weight_upload"))
+    # The certified zero state and this call's stages, built per call (or
+    # the retained ones, zeroed).
+    var dstate: Mamba3DeviceState
+    var dstages: Mamba3DeviceStages
+    if reuse:
+        dstate = s.state.take()
+        dstages = s.stages.take()
+        s.stages_valid = False
+        dstate.rezero()
+        dstages.rezero()
+    else:
+        dstate = Mamba3DeviceState(ctx, b, dims)
+        dstages = Mamba3DeviceStages(ctx, b, l, 0, dims)
+    m3_phase_tick(ctx, phase_tick, String("surface.stage_allocations"))
+    var n_x = b * l * dm
+    var have_dx = False
+    if s.dx:
+        have_dx = len(s.dx.value()) == n_x
+    if not have_dx:
+        s.dx = None
+        s.dx = mamba_device_alloc(ctx, max(n_x, 1))
+    ref dx = s.dx.value()
+    ctx.enqueue_copy(dst_buf=dx, src_ptr=_f32_ptr(a[0]))
+    # lane fam-lm (IDN_MAMBA_ALLOC_NOWAIT, IDENTICAL): the caller's x array
+    # outlives this call and the copy is ahead of every reader on the
+    # in-order context, so the upload's own wait ordered nothing.
+    comptime if not IDN_MAMBA_ALLOC_NOWAIT:
+        ctx.synchronize()
+    m3_phase_tick(ctx, phase_tick, String("surface.x_upload"))
+    var trace = IdentityTrace.disabled()
+    mamba3_block_forward(
+        ctx, dstages, dstate, dw, dx, b, l, trace, String("py")
+    )
+    m3_phase_tick(ctx, phase_tick, String("surface.block"))
+    _m3_download_addr[False](ctx, dstages.residual_out, n_x, a[20])
+    # lane/fam2-lm (IDN_MAMBA3_REPORTS_ON_REQUEST): a report comes down only
+    # where the caller gave it an address; the session forward entry admits
+    # a null report address only under that switch, so with it off every
+    # address here is non-null and all four copies run as before.
+    if a[21] != 0:
+        _m3_download_addr[False](ctx, dstages.h_last, h_n, a[21])
+    if a[22] != 0:
+        _m3_download_addr[False](ctx, dstages.k_last, k_n, a[22])
+    if a[23] != 0:
+        _m3_download_addr[False](ctx, dstages.v_last, v_n, a[23])
+    if a[24] != 0:
+        _m3_download_addr[False](ctx, dstages.theta_last, theta_n, a[24])
+    ctx.synchronize()
+    m3_phase_tick(ctx, phase_tick, String("surface.downloads"))
+    var out_len = dstate.buf_len
+    ctx.synchronize()
+    if force_retain or _m3_retain_stages():
+        s.stages = dstages^
+        s.state = dstate^
+        s.stages_b = b
+        s.stages_l = l
+        s.stages_valid = True
+    else:
+        _ = dstate^
+        _ = dstages^
+    return out_len
+
+
+def _m3_x_same_bits(mut s: Mamba3PrefillSession, addr: Int, n: Int) raises -> Bool:
+    """Whether the caller's x (`n` floats at `addr`) holds exactly the
+    bytes of the retained device `s.dx`: `dx` comes down into `s.x_stage`
+    (one wait) and the two are compared as integers, eight lanes at a
+    time. Paid only by a backward, never by a forward-only workload."""
+    if len(s.x_stage) != n:
+        s.x_stage = List[Float32](length=n, fill=Float32(0))
+    if n == 0:
+        return True
+    ref ctx = s.ctx.value()
+    ref dx = s.dx.value()
+    if n == len(dx):
+        ctx.enqueue_copy(dst_ptr=s.x_stage.unsafe_ptr(), src_buf=dx)
+    else:
+        var view = dx.create_sub_buffer[DType.float32](0, n)
+        ctx.enqueue_copy(dst_ptr=s.x_stage.unsafe_ptr(), src_buf=view)
+    ctx.synchronize()
+    comptime W = 8
+    var p = _f32_ptr(addr)
+    var hp = s.x_stage.unsafe_ptr()
+    var i = 0
+    var body = n - n % W
+    while i < body:
+        var x = bitcast[DType.uint32, W](p.unsafe_load[width=W](i))
+        var y = bitcast[DType.uint32, W](hp.unsafe_load[width=W](i))
+        if (x ^ y).reduce_or() != UInt32(0):
+            return False
+        i += W
+    while i < n:
+        if bitcast[DType.uint32](p.unsafe_load(i)) != bitcast[DType.uint32](hp.unsafe_load(i)):
+            return False
+        i += 1
+    return True
+
+
+def _m3_prefill_backward_forward(mut s: Mamba3PrefillSession, a: List[Int], b: Int, l: Int,
+                                 dims: Mamba3Dims) raises:
+    """The forward `mamba3_tape_backward` runs before its VJP, on the
+    session: x uploaded into the retained `dx`, a fresh zero state and
+    fresh stages (the same constructions as the entry's), the block
+    forward on the retained weights; the stages then held for the VJP."""
+    s.drop_stages()
+    var n_x = b * l * dims.d_model
+    var have_dx = False
+    if s.dx:
+        have_dx = len(s.dx.value()) == n_x
+    if not have_dx:
+        s.dx = None
+        s.dx = mamba_device_alloc(s.ctx.value(), max(n_x, 1))
+    ref ctx = s.ctx.value()
+    ref dw = s.w.value()
+    ref dx = s.dx.value()
+    ctx.enqueue_copy(dst_buf=dx, src_ptr=_f32_ptr(a[0]))
+    ctx.synchronize()
+    var dstate = Mamba3DeviceState(ctx, b, dims)
+    var dstages = Mamba3DeviceStages(ctx, b, l, 0, dims)
+    var trace = IdentityTrace.disabled()
+    mamba3_block_forward(
+        ctx, dstages, dstate, dw, dx, b, l, trace, String("m3.backward.tail")
+    )
+    ctx.synchronize()
+    s.stages = dstages^
+    s.state = dstate^
+    s.stages_b = b
+    s.stages_l = l
+    s.stages_valid = True
+
+
+comptime _M3_BWD_NONFINITE_DY = "mamba3 backward: non-finite grad_output at flat index "
+
+
+def _m3_prefill_backward_run(mut s: Mamba3PrefillSession, a: List[Int], b: Int, l: Int, dm: Int, use_owned: Bool = False) raises:
+    """`mamba3_backward` on the session: `a` is the entry's 21-slot list
+    (x, nine weights, grad_output, grad_x, nine weight gradients).
+
+    The weights are the session's (reused when their bytes are unchanged,
+    as the forward does). The forward is recomputed only when it has to
+    be: when the session holds no stages, when they were recorded on
+    other weights, at another (B, L), or on an x whose bytes differ from
+    this call's. Otherwise the VJP runs on the stages the last forward
+    recorded -- the same buffers the entry's own recompute would fill
+    with the same bits, since the same kernels run on the same inputs.
+    The ten gradients come down straight into the caller's arrays."""
+    var dims = Mamba3Dims.of(dm)
+    var n_x = b * l * dm
+    if not s.ctx:
+        s.ctx = neural_ctx[_NEURAL_CTX]()
+    # cpu2-l11-neural (2026-10-04): the entry's refusal of a non-finite
+    # grad_output is a DEVICE scan of the uploaded buffer (one launch, one
+    # partials copy; the same first flat index the host walk reported), run
+    # before the weights or the stages are touched, so the refusal leaves
+    # the session as it was (the entry keeps it usable).
+    var d_output = _m3_upload_addr(s.ctx.value(), a[10], n_x)
+    var bad_dy = device_first_nonfinite(s.ctx.value(), d_output, n_x)
+    if bad_dy >= 0:
+        raise Error(String(_M3_BWD_NONFINITE_DY) + String(bad_dy))
+    _m3_prefill_weights(s, a, dims, use_owned)
+    var reuse = False
+    if s.stages_valid and s.stages and s.stages_b == b and s.stages_l == l and s.dx:
+        if len(s.dx.value()) == n_x:
+            reuse = _m3_x_same_bits(s, a[0], n_x)
+    if reuse:
+        s.backward_reuses += 1
+    else:
+        s.backward_recomputes += 1
+        _m3_prefill_backward_forward(s, a, b, l, dims)
+    ref ctx = s.ctx.value()
+    ref dw = s.w.value()
+    ref stages = s.stages.value()
+    ref dx = s.dx.value()
+    var ton = String(getenv("ANONLIB_MAMBA_TIMING")) != ""
+    var g = mamba3_tape_backward_on(ctx, dw, stages, dx, d_output, b, l, dims, ton)
+    _m3_download_addr[False](ctx, g.x, n_x, a[11])
+    _m3_download_addr[False](ctx, g.block_norm_weight, dm, a[12])
+    _m3_download_addr[False](ctx, g.in_proj_weight, dims.d_in_proj() * dm, a[13])
+    _m3_download_addr[False](ctx, g.dt_bias, dims.nheads, a[14])
+    _m3_download_addr[False](ctx, g.B_norm_weight, M3_D_STATE, a[15])
+    _m3_download_addr[False](ctx, g.C_norm_weight, M3_D_STATE, a[16])
+    _m3_download_addr[False](ctx, g.B_bias, dims.nheads * M3_D_STATE, a[17])
+    _m3_download_addr[False](ctx, g.C_bias, dims.nheads * M3_D_STATE, a[18])
+    _m3_download_addr[False](ctx, g.D, dims.nheads, a[19])
+    _m3_download_addr[False](ctx, g.out_proj_weight, dm * dims.d_inner, a[20])
+    ctx.synchronize()
+    _ = g^
+    _ = d_output^
+
+
+def mamba3_owned_weights_enabled_binding() raises -> PythonObject:
+    return PythonObject(NN40_OWNED_WEIGHTS)
+
+
+def mamba3_prefill_session_install_weights_binding(session: PythonObject, addrs: PythonObject, d_model: PythonObject) raises -> PythonObject:
+    """Copy nine tensors into an immutable session-owned generation.
+    Complete all uploads before replacing the previous snapshot. External
+    arrays may mutate afterwards: owned calls no longer consult them."""
+    comptime if not NN40_OWNED_WEIGHTS:
+        raise Error("mamba3 owned weights: NN40 arm is disabled")
+    var owner = session.downcast_value_ptr[Mamba3PrefillSession]()
+    if owner[].busy or not owner[].usable:
+        raise Error("mamba3 owned weights: session is busy or unusable")
+    if len(addrs) != 9:
+        raise Error("mamba3 owned weights: expected nine weight addresses")
+    var native_d_model = Int(py=d_model)
+    var dims = Mamba3Dims.of(native_d_model)
+    var a = List[Int]()
+    a.append(0)
+    for i in range(9):
+        var address = Int(py=addrs[i])
+        if address == 0:
+            raise Error("mamba3 owned weights: null weight address")
+        a.append(address)
+    owner[].busy = True
+    try:
+        with GILReleased(Python()):
+            if not owner[].ctx:
+                owner[].ctx = neural_ctx[_NEURAL_CTX]()
+            var fresh = _m3_load_weights(owner[].ctx.value(), a, dims)
+            owner[].ctx.value().synchronize()
+            # Copy-on-install is the ownership boundary. Drop stages before
+            # exposing the new generation, never reusing old-weight activations.
+            owner[].drop_stages()
+            owner[].w = fresh^
+            owner[].w_host = List[Float32]()
+            owner[].dm = native_d_model
+            owner[].owned_weights = True
+            owner[].weight_generation += 1
+            owner[].weight_uploads += 1
+    except error:
+        owner[].busy = False
+        raise error
+    owner[].busy = False
+    return PythonObject(owner[].weight_generation)
+
+
+def mamba3_prefill_session_forward_owned_binding(session: PythonObject, addrs: PythonObject, params: PythonObject) raises -> PythonObject:
+    """[x,y,h_last,k_last,v_last,theta_last], [B,L,d_model,generation].
+    A null report follows the existing reports-optional contract."""
+    var owner = session.downcast_value_ptr[Mamba3PrefillSession]()
+    if len(addrs) != 6 or len(params) != 4:
+        raise Error("mamba3 owned forward: expected six addresses and four scalars")
+    if owner[].busy or not owner[].usable or not owner[].owned_weights:
+        raise Error("mamba3 owned forward: session is not ready")
+    var generation = Int(py=params[3])
+    if generation != owner[].weight_generation:
+        raise Error("mamba3 owned forward: stale weight generation")
+    var b = Int(py=params[0]); var l = Int(py=params[1]); var dm = Int(py=params[2])
+    if b <= 0 or l <= 0 or dm != owner[].dm:
+        raise Error("mamba3 owned forward: invalid shape or configuration")
+    var a = List[Int](length=25, fill=0)
+    a[0] = Int(py=addrs[0])
+    a[20] = Int(py=addrs[1])
+    if a[0] == 0 or a[20] == 0:
+        raise Error("mamba3 owned forward: null input/output")
+    for i in range(4):
+        a[21 + i] = Int(py=addrs[2 + i])
+        comptime if not IDN_MAMBA3_REPORTS_ON_REQUEST:
+            if a[21 + i] == 0:
+                raise Error("mamba3 owned forward: report address required")
+    owner[].busy = True
+    var out_len = 0
+    try:
+        with GILReleased(Python()):
+            out_len = _m3_prefill_run(owner[], a, b, l, dm, True)
+    except error:
+        owner[].busy = False
+        owner[].usable = False
+        owner[].release()
+        raise error
+    owner[].busy = False
+    return PythonObject(out_len)
+
+
+def mamba3_prefill_session_backward_owned_binding(session: PythonObject, addrs: PythonObject, params: PythonObject) raises -> PythonObject:
+    """[x,dy,dx,nine dWeights], [B,L,d_model,generation]. Explicit stale
+    generation refusal prevents differentiating a different snapshot."""
+    var owner = session.downcast_value_ptr[Mamba3PrefillSession]()
+    if len(addrs) != 12 or len(params) != 4:
+        raise Error("mamba3 owned backward: expected twelve addresses and four scalars")
+    if owner[].busy or not owner[].usable or not owner[].owned_weights:
+        raise Error("mamba3 owned backward: session is not ready")
+    if Int(py=params[3]) != owner[].weight_generation:
+        raise Error("mamba3 owned backward: stale weight generation")
+    var b = Int(py=params[0]); var l = Int(py=params[1]); var dm = Int(py=params[2])
+    if b <= 0 or l <= 0 or dm != owner[].dm:
+        raise Error("mamba3 owned backward: invalid shape or configuration")
+    var a = List[Int](length=21, fill=0)
+    a[0] = Int(py=addrs[0])
+    for i in range(1, 12):
+        a[9 + i] = Int(py=addrs[i])
+        if a[9 + i] == 0:
+            raise Error("mamba3 owned backward: null buffer address")
+    if a[0] == 0:
+        raise Error("mamba3 owned backward: null input")
+    owner[].busy = True
+    try:
+        with GILReleased(Python()):
+            _m3_prefill_backward_run(owner[], a, b, l, dm, True)
+    except error:
+        owner[].busy = False
+        owner[].usable = False
+        owner[].release()
+        raise error
+    owner[].busy = False
+    return PythonObject(None)
+
+# NI48: default-OFF owned forward tape. A tape has exactly one fresh session;
+# input, weights and stages are native owned copies from the actual forward.
+# There is no mutable external generation to compare: this tape's generation
+# is its immutable snapshot and it can be consumed once. Future forwards use
+# other owners. Native close/failure invalidates this owner before release.
+# This removes both forward recomputation and device-to-host input comparison.
+# Arithmetic is unchanged; CPU retains its equivalent recompute path. No
+# compilation, identity, quality or end-to-end measurements have been run.
+comptime IDN_SAMBA_M3_FORWARD_TAPE = (
+    GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL
+    and not is_defined["ANONLIB_IDN_ACT_RETAIN_OFF"]()
+    and get_defined_int["ANONLIB_IDN_ACT_RETAIN", 2]() == 3  # NI48 arm (default 2 since 2026-10-08)
+    and not is_defined["ANONLIB_IDN_ALL_OFF"]()
+)
+
+
+struct Mamba3ForwardTape(Movable, Writable):
+    var owner: Mamba3PrefillSession
+    var consumed: Bool
+
+    def __init__(out self, var owner: Mamba3PrefillSession):
+        self.owner = owner^
+        self.consumed = False
+
+    def write_to(self, mut writer: Some[Writer]): writer.write("Mamba3ForwardTape")
+    def write_repr_to(self, mut writer: Some[Writer]): writer.write("Mamba3ForwardTape")
+
+
+def mamba3_forward_tape_enabled_binding() raises -> PythonObject:
+    return PythonObject(IDN_SAMBA_M3_FORWARD_TAPE)
+
+
+def mamba3_forward_tape_binding(addrs: PythonObject, params: PythonObject) raises -> PythonObject:
+    """11 addresses: x, nine immutable-at-call weights, y. Params B,L,DM.
+    Returns an opaque single-use native snapshot; reports are not requested."""
+    comptime if not IDN_SAMBA_M3_FORWARD_TAPE:
+        raise Error("mamba3 forward tape: experiment disabled")
+    if len(addrs) != 11 or len(params) != 3:
+        raise Error("mamba3 forward tape: expected 11 addresses and 3 shape scalars")
+    var b = Int(py=params[0]); var l = Int(py=params[1]); var dm = Int(py=params[2])
+    if b < 1 or l < 1 or dm < 1:
+        raise Error("mamba3 forward tape: positive B, L and d_model required")
+    var a = List[Int]()
+    for i in range(10):
+        var address = Int(py=addrs[i])
+        if address == 0: raise Error("mamba3 forward tape: null input or weight")
+        a.append(address)
+    for i in range(10): a.append(0)
+    var output = Int(py=addrs[10])
+    if output == 0: raise Error("mamba3 forward tape: null output")
+    a.append(output)
+    for i in range(4): a.append(0)
+    var owner = Mamba3PrefillSession()
+    owner.busy = True
+    try:
+        with GILReleased(Python()):
+            _ = _m3_prefill_run(owner, a, b, l, dm, force_retain=True)
+    except error:
+        owner.busy = False
+        owner.usable = False
+        owner.release()
+        raise error
+    owner.busy = False
+    return PythonObject(alloc=Mamba3ForwardTape(owner^))
+
+
+def _m3_backward_tape_run(mut s: Mamba3PrefillSession, a: List[Int]) raises:
+    var b = s.stages_b; var l = s.stages_l
+    var dims = s.stages.value().dims.copy()
+    var dm = dims.d_model
+    var n_x = b * l * dm
+    ref ctx = s.ctx.value()
+    var d_output = _m3_upload_addr(ctx, a[0], n_x)
+    var bad_dy = device_first_nonfinite(ctx, d_output, n_x)
+    if bad_dy >= 0:
+        raise Error(String(_M3_BWD_NONFINITE_DY) + String(bad_dy))
+    ref dw = s.w.value()
+    ref stages = s.stages.value()
+    ref dx = s.dx.value()
+    var ton = String(getenv("ANONLIB_MAMBA_TIMING")) != ""
+    var g = mamba3_tape_backward_on(ctx, dw, stages, dx, d_output, b, l, dims, ton)
+    _m3_download_addr[False](ctx, g.x, n_x, a[1])
+    _m3_download_addr[False](ctx, g.block_norm_weight, dm, a[2])
+    _m3_download_addr[False](ctx, g.in_proj_weight, dims.d_in_proj() * dm, a[3])
+    _m3_download_addr[False](ctx, g.dt_bias, dims.nheads, a[4])
+    _m3_download_addr[False](ctx, g.B_norm_weight, M3_D_STATE, a[5])
+    _m3_download_addr[False](ctx, g.C_norm_weight, M3_D_STATE, a[6])
+    _m3_download_addr[False](ctx, g.B_bias, dims.nheads * M3_D_STATE, a[7])
+    _m3_download_addr[False](ctx, g.C_bias, dims.nheads * M3_D_STATE, a[8])
+    _m3_download_addr[False](ctx, g.D, dims.nheads, a[9])
+    _m3_download_addr[False](ctx, g.out_proj_weight, dm * dims.d_inner, a[10])
+    ctx.synchronize()
+    s.backward_reuses += 1
+    _ = g^
+    _ = d_output^
+
+
+def mamba3_backward_tape_binding(tape: PythonObject, addrs: PythonObject) raises -> PythonObject:
+    """11 addresses: dy, dx and nine forward-order parameter gradients."""
+    comptime if not IDN_SAMBA_M3_FORWARD_TAPE:
+        raise Error("mamba3 backward tape: experiment disabled")
+    var handle = tape.downcast_value_ptr[Mamba3ForwardTape]()
+    if handle[].consumed: raise Error("mamba3 backward tape: consumed or closed")
+    if handle[].owner.busy: raise Error("mamba3 backward tape: busy")
+    if not handle[].owner.usable or not handle[].owner.stages_valid:
+        raise Error("mamba3 backward tape: invalid forward snapshot")
+    if len(addrs) != 11:
+        raise Error("mamba3 backward tape: expected 11 addresses")
+    var a = List[Int]()
+    for i in range(11):
+        var address = Int(py=addrs[i])
+        if address == 0: raise Error("mamba3 backward tape: null gradient buffer")
+        a.append(address)
+    handle[].owner.busy = True
+    # A failed backward also consumes the tape: no retry can accidentally use
+    # a partially mutated stage. The caller may repeat the original forward.
+    handle[].consumed = True
+    try:
+        with GILReleased(Python()):
+            _m3_backward_tape_run(handle[].owner, a)
+    except error:
+        handle[].owner.busy = False
+        handle[].owner.usable = False
+        handle[].owner.release()
+        raise error
+    handle[].owner.busy = False
+    handle[].owner.usable = False
+    handle[].owner.release()
+    return PythonObject(0)
+
+
+def mamba3_close_tape_binding(tape: PythonObject) raises -> PythonObject:
+    var handle = tape.downcast_value_ptr[Mamba3ForwardTape]()
+    if handle[].owner.busy: raise Error("mamba3 close tape: busy")
+    handle[].consumed = True
+    handle[].owner.usable = False
+    handle[].owner.release()
+    return PythonObject(0)
+
+
+def mamba3_prefill_session_create_binding() raises -> PythonObject:
+    return PythonObject(alloc=Mamba3PrefillSession())
+
+
+def mamba3_prefill_session_close_binding(session: PythonObject) raises -> PythonObject:
+    var owner = session.downcast_value_ptr[Mamba3PrefillSession]()
+    if owner[].busy: raise Error("mamba3 prefill session: busy")
+    owner[].usable = False
+    owner[].release()
+    return PythonObject(0)
+
+
+def mamba3_prefill_session_forward_binding(session: PythonObject, addrs: PythonObject,
+                                           params: PythonObject) raises -> PythonObject:
+    """`mamba3_forward_fresh` on a session: the same 15 pointers (x, nine
+    weights, y, and the four public reports) and 3 parameters (B, L,
+    d_model); the weights retained across calls."""
+    var owner = session.downcast_value_ptr[Mamba3PrefillSession]()
+    if len(addrs) != 15 or len(params) != 3:
+        raise Error("mamba3_prefill_session_forward: expected 15 addresses and 3 parameters (B, L, d_model)")
+    if owner[].busy: raise Error("mamba3 prefill session: busy")
+    if not owner[].usable: raise Error("mamba3 prefill session: lost after a failed call")
+    var a = List[Int]()
+    for i in range(10):
+        var p = Int(py=addrs[i])
+        if p == 0: raise Error("mamba3_prefill_session_forward: null buffer address")
+        a.append(p)
+    for i in range(10):
+        a.append(0)
+    for i in range(10, 15):
+        var p = Int(py=addrs[i])
+        if p == 0:
+            # lane/fam2-lm: a null REPORT address (11..14) means "do not
+            # download this report"; y (10) is always required.
+            var report_optional = False
+            comptime if IDN_MAMBA3_REPORTS_ON_REQUEST:
+                report_optional = i >= 11
+            if not report_optional:
+                raise Error("mamba3_prefill_session_forward: null buffer address")
+        a.append(p)
+    var b = Int(py=params[0])
+    var l = Int(py=params[1])
+    var dm = Int(py=params[2])
+    if b < 1 or l < 1:
+        raise Error("mamba3_prefill_session_forward: B and L must be positive")
+    owner[].busy = True
+    var out_len = 0
+    try:
+        with GILReleased(Python()):
+            out_len = _m3_prefill_run(owner[], a, b, l, dm)
+    except error:
+        owner[].busy = False
+        owner[].usable = False
+        owner[].release()
+        raise error
+    owner[].busy = False
+    return PythonObject(out_len)
+
+
+def mamba3_prefill_session_backward_binding(session: PythonObject, addrs: PythonObject,
+                                            params: PythonObject) raises -> PythonObject:
+    """`mamba3_backward` on a session: the same 21 pointers and 3
+    parameters (B, L, d_model); the weights and the last forward's stages
+    retained across calls (see `_m3_prefill_backward_run`)."""
+    var owner = session.downcast_value_ptr[Mamba3PrefillSession]()
+    if len(addrs) != 21 or len(params) != 3:
+        raise Error("mamba3_prefill_session_backward: expected 21 addresses and 3 scalars")
+    if owner[].busy: raise Error("mamba3 prefill session: busy")
+    if not owner[].usable: raise Error("mamba3 prefill session: lost after a failed call")
+    var b = Int(py=params[0])
+    var l = Int(py=params[1])
+    var dm = Int(py=params[2])
+    if b <= 0 or l <= 0 or dm <= 0:
+        raise Error("mamba3_prefill_session_backward: B, L and d_model must be positive")
+    var a = List[Int]()
+    for i in range(21):
+        var address = Int(py=addrs[i])
+        if address == 0:
+            raise Error("mamba3_prefill_session_backward: null buffer address at slot " + String(i))
+        a.append(address)
+    # The entry's own refusal of a non-finite grad_output now runs on the
+    # device, first thing in `_m3_prefill_backward_run` (cpu2-l11-neural);
+    # that refusal touched nothing, so the session stays usable.
+    owner[].busy = True
+    try:
+        with GILReleased(Python()):
+            _m3_prefill_backward_run(owner[], a, b, l, dm)
+    except error:
+        owner[].busy = False
+        if String(error).startswith(_M3_BWD_NONFINITE_DY):
+            raise error
+        owner[].usable = False
+        owner[].release()
+        raise error
+    owner[].busy = False
+    return PythonObject(0)
+
+
+def mamba3_prefill_session_reports_optional_binding() raises -> PythonObject:
+    """True where `mamba3_prefill_session_forward` admits a null report
+    address (IDN_MAMBA3_REPORTS_ON_REQUEST); the Python block asks before
+    it passes one."""
+    comptime if IDN_MAMBA3_REPORTS_ON_REQUEST:
+        return PythonObject(True)
+    else:
+        return PythonObject(False)
+
+
+def mamba3_prefill_session_info_binding(session: PythonObject) raises -> PythonObject:
+    """[weight_uploads, weight_recopies, weight_reuses, backward_reuses,
+    backward_recomputes, stages_held] as ints: the A/B evidence for the
+    byte compares (how often the weights and the forward were reused)."""
+    var owner = session.downcast_value_ptr[Mamba3PrefillSession]()
+    var out = Python.list()
+    out.append(PythonObject(owner[].weight_uploads))
+    out.append(PythonObject(owner[].weight_recopies))
+    out.append(PythonObject(owner[].weight_reuses))
+    out.append(PythonObject(owner[].backward_reuses))
+    out.append(PythonObject(owner[].backward_recomputes))
+    out.append(PythonObject(1 if owner[].stages_valid else 0))
+    return out
+
+
+def mamba3_session_create_binding() raises -> PythonObject:
+    return PythonObject(alloc=Mamba3DecodeSession())
+
+
+def mamba3_session_open_binding(session: PythonObject, addrs: PythonObject,
+                                params: PythonObject) raises -> PythonObject:
+    var owner = session.downcast_value_ptr[Mamba3DecodeSession]()
+    if len(addrs) != 19 or len(params) != 4:
+        raise Error("mamba3_session_open: expected 19 addresses and 4 scalars")
+    if Int(py=params[0]) <= 0 or Int(py=params[1]) <= 0:
+        raise Error("mamba3_session_open: B and d_model must be positive")
+    if owner[].busy or owner[].is_open(): raise Error("mamba3 session: busy or open")
+    var a = List[Int]()
+    for i in range(19):
+        var p = Int(py=addrs[i])
+        if p == 0: raise Error("mamba3_session_open: null buffer address")
+        a.append(p)
+    owner[].busy = True
+    owner[].usable = False
+    try:
+        with GILReleased(Python()):
+            _m3_session_open_run(owner[], a, Int(py=params[0]), Int(py=params[1]),
+                                 Int(py=params[2]), Int(py=params[3]))
+    except error:
+        owner[].busy = False; owner[].release(); raise error
+    owner[].busy = False
+    owner[].usable = True
+    return PythonObject(0)
+
+
+def mamba3_session_step_binding(session: PythonObject, addrs: PythonObject) raises -> PythonObject:
+    var owner = session.downcast_value_ptr[Mamba3DecodeSession]()
+    if len(addrs) != 6: raise Error("mamba3_session_step: expected 6 addresses")
+    var a = List[Int]()
+    for i in range(6):
+        var p = Int(py=addrs[i])
+        if p == 0: raise Error("mamba3_session_step: null buffer address")
+        a.append(p)
+    _m3_require_session_open(owner[])
+    owner[].busy = True
+    var q = 0
+    try:
+        with GILReleased(Python()): q = _m3_session_step_run(owner[], a)
+    except error:
+        owner[].busy = False; owner[].usable = False; raise error
+    owner[].busy = False
+    return PythonObject(q)
+
+
+def mamba3_session_export_state_binding(session: PythonObject, addrs: PythonObject) raises -> PythonObject:
+    var owner = session.downcast_value_ptr[Mamba3DecodeSession]()
+    if len(addrs) != 10: raise Error("mamba3_session_export_state: expected 10 addresses")
+    var a = List[Int]()
+    for i in range(10):
+        var p = Int(py=addrs[i])
+        if p == 0: raise Error("mamba3_session_export_state: null buffer address")
+        a.append(p)
+    _m3_require_session_open(owner[])
+    owner[].busy = True
+    var q = 0
+    try:
+        with GILReleased(Python()): q = _m3_session_export_run(owner[], a)
+    except error:
+        owner[].busy = False; owner[].usable = False; raise error
+    owner[].busy = False
+    var result = Python.list()
+    result.append(PythonObject(q))
+    result.append(PythonObject(1 if owner[].state.value().pending else 0))
+    return result
+
+
+def mamba3_session_load_state_binding(session: PythonObject, addrs: PythonObject,
+                                      params: PythonObject) raises -> PythonObject:
+    var owner = session.downcast_value_ptr[Mamba3DecodeSession]()
+    if len(addrs) != 10 or len(params) != 2:
+        raise Error("mamba3_session_load_state: expected 10 addresses and 2 scalars")
+    var a = List[Int]()
+    for i in range(10):
+        var p = Int(py=addrs[i])
+        if p == 0: raise Error("mamba3_session_load_state: null buffer address")
+        a.append(p)
+    _m3_require_session_open(owner[])
+    owner[].busy = True
+    try:
+        with GILReleased(Python()):
+            _m3_session_copy_in(owner[], a, Int(py=params[0]), Int(py=params[1]))
+    except error:
+        owner[].busy = False; owner[].usable = False; raise error
+    owner[].busy = False
+    return PythonObject(0)
+
+
+def mamba3_session_close_binding(session: PythonObject) raises -> PythonObject:
+    session.downcast_value_ptr[Mamba3DecodeSession]()[].close()
+    return PythonObject(0)
+
+
+def _mamba2_backward_run(a: List[Int], b: Int, l: Int, dm: Int, dt_lo: Float32, dt_hi: Float32) raises:
+    var dims = Mamba2Dims.of(dm)
+    var di = dims.d_inner
+    var cd = dims.conv_dim()
+    var dip = dims.d_in_proj()
+    var nh = dims.nheads
+    var w = Mamba2Weights(dims)
+    w.norm_w = _read_f32(a[1], dm)
+    w.w_in = _read_f32(a[2], dip * dm)
+    w.conv_w = _read_f32(a[3], cd * M2_D_CONV)
+    w.conv_b = _read_f32(a[4], cd)
+    w.dt_bias = _read_f32(a[5], nh)
+    w.a_log = _read_f32(a[6], nh)
+    w.d_skip = _read_f32(a[7], nh)
+    w.gnorm_w = _read_f32(a[8], di)
+    w.w_out = _read_f32(a[9], dm * di)
+    # TOMBSTONE: ANONLIB_AUTOGRAD_MAMBA_OFF (hand Mamba-2 prefill backward arm) deleted 2026-10-19 by 47582a7fb; code recoverable at 47582a7fb^.
+    # Restore: git apply experiments/removed/ANONLIB_AUTOGRAD_MAMBA_OFF.patch
+    var gradients: Mamba2PrefillGradients = mamba2_tape_backward(
+        w, _read_f32(a[0], b*l*dm), _read_f32(a[10], b*l*dm), b, l, dt_lo, dt_hi,
+        neural_ctx[_NEURAL_CTX](),
+    )
+    _write_f32(a[11], gradients.x)
+    _write_f32(a[12], gradients.block_norm_weight)
+    _write_f32(a[13], gradients.in_proj_weight)
+    _write_f32(a[14], gradients.conv1d_weight)
+    _write_f32(a[15], gradients.conv1d_bias)
+    _write_f32(a[16], gradients.dt_bias)
+    _write_f32(a[17], gradients.A_log)
+    _write_f32(a[18], gradients.D)
+    _write_f32(a[19], gradients.norm_weight)
+    _write_f32(a[20], gradients.out_proj_weight)
+
+
+def mamba2_backward_binding(addrs: PythonObject, params: PythonObject) raises -> PythonObject:
+    """Zero-state IDENTICAL VJP: x, nine forward-order weights, grad_output,
+    grad_x, nine weight gradients (21 addresses); B, L, d_model, dt_lo, dt_hi."""
+    if len(addrs) != 21 or len(params) != 5:
+        raise Error("mamba2 backward: expected 21 addresses and 5 scalars")
+    var b = Int(py=params[0])
+    var l = Int(py=params[1])
+    var dm = Int(py=params[2])
+    if b <= 0 or l <= 0 or dm <= 0:
+        raise Error("mamba2 backward: B, L and d_model must be positive")
+    var a = List[Int]()
+    for i in range(21):
+        var address = Int(py=addrs[i])
+        if address == 0:
+            raise Error("mamba2 backward: null buffer address at slot " + String(i))
+        a.append(address)
+    var dt_lo = Float32(Float64(py=params[3]))
+    var dt_hi = Float32(Float64(py=params[4]))
+    with GILReleased(Python()):
+        _mamba2_backward_run(a, b, l, dm, dt_lo, dt_hi)
+    return PythonObject(0)
+
+
+def _mamba3_backward_run(a: List[Int], b: Int, l: Int, dm: Int) raises:
+    var dims = Mamba3Dims.of(dm)
+    var di = dims.d_inner
+    var dip = dims.d_in_proj()
+    var nh = dims.nheads
+    var w = Mamba3Weights(dims)
+    w.norm_w = _read_f32(a[1], dm)
+    w.w_in = _read_f32(a[2], dip * dm)
+    w.dt_bias = _read_f32(a[3], nh)
+    w.bnorm_w = _read_f32(a[4], M3_D_STATE)
+    w.cnorm_w = _read_f32(a[5], M3_D_STATE)
+    w.b_bias = _read_f32(a[6], nh * M3_D_STATE)
+    w.c_bias = _read_f32(a[7], nh * M3_D_STATE)
+    w.d_skip = _read_f32(a[8], nh)
+    w.w_out = _read_f32(a[9], dm * di)
+    var gradients = mamba3_tape_backward(
+        w, _read_f32(a[0], b*l*dm), _read_f32(a[10], b*l*dm), b, l,
+        neural_ctx[_NEURAL_CTX](),
+    )
+    _write_f32(a[11], gradients.x)
+    _write_f32(a[12], gradients.block_norm_weight)
+    _write_f32(a[13], gradients.in_proj_weight)
+    _write_f32(a[14], gradients.dt_bias)
+    _write_f32(a[15], gradients.B_norm_weight)
+    _write_f32(a[16], gradients.C_norm_weight)
+    _write_f32(a[17], gradients.B_bias)
+    _write_f32(a[18], gradients.C_bias)
+    _write_f32(a[19], gradients.D)
+    _write_f32(a[20], gradients.out_proj_weight)
+
+
+def mamba3_backward_binding(addrs: PythonObject, params: PythonObject) raises -> PythonObject:
+    """Zero-state IDENTICAL VJP: x, nine forward-order weights, grad_output,
+    grad_x, nine weight gradients (21 addresses); B, L, d_model."""
+    if len(addrs) != 21 or len(params) != 3:
+        raise Error("mamba3 backward: expected 21 addresses and 3 scalars")
+    var b = Int(py=params[0])
+    var l = Int(py=params[1])
+    var dm = Int(py=params[2])
+    if b <= 0 or l <= 0 or dm <= 0:
+        raise Error("mamba3 backward: B, L and d_model must be positive")
+    var a = List[Int]()
+    for i in range(21):
+        var address = Int(py=addrs[i])
+        if address == 0:
+            raise Error("mamba3 backward: null buffer address at slot " + String(i))
+        a.append(address)
+    with GILReleased(Python()):
+        _mamba3_backward_run(a, b, l, dm)
+    return PythonObject(0)
+
+
+@export
+def PyInit__anonlib_mamba() abi("C") -> PythonObject:
+    # FAST AND IDENTICAL (lane neural, 2026-09-27). This lane was
+    # IDENTICAL-only from 2026-09-10 because its fused kernels were once gated
+    # on IDENTICAL and the lower tiers fell back to slower unfused arms. Those
+    # fallbacks are gone: FAST runs the same kernels and the same launches with
+    # the pins in checks/numerics.mojo compiled to the free schedule. FAST
+    # promises quality, never bits.
+    # DEVIATION 793's last clause: a sabotage arm exists to be run by a
+    # gate and to FAIL; a Python surface that quietly served one would
+    # be a wrong answer wearing a green label. Refuse to exist instead.
+    comptime if (BLOCK_ANY_SABOTAGE or BLOCK2_ANY_SABOTAGE or BLOCK3_ANY_SABOTAGE
+                 or M1_ANY_BWD_SABOTAGE or ANY_BWD2_SABOTAGE or ANY_BWD3_SABOTAGE
+                 or ANY_BWD_BLOCK_SABOTAGE
+                 or ANY_BWD_SCAN_SABOTAGE or GEMM_ANY_BWD_SABOTAGE
+                 or GEMM_ANY_SABOTAGE):
+        abort(
+            String(
+                "_anonlib_mamba: refusing to initialize -- a sabotage"
+                " arm is compiled into this binary. Sabotage defines are"
+                " for the lane gates (mamba/checks/), never for a shipped"
+                " binding; rebuild with bash bindings/build_mamba.sh and"
+                " no ANONLIB_MAMBA_SABOTAGE_*,"
+                " ANONLIB_MAMBA2_SABOTAGE_* or"
+                " ANONLIB_MAMBA3_SABOTAGE_* or GEMM sabotage define."
+            )
+        )
+    try:
+        var m = PythonModuleBuilder("_anonlib_mamba")
+        m.def_function[mamba_vendor_binding]("mamba_vendor")
+        m.def_function[mamba_numeric_mode_binding]("mamba_numeric_mode")
+        m.def_function[mamba1_profile_binding]("mamba1_profile")
+        m.def_function[mamba1_forward_binding]("mamba1_forward")
+        m.def_function[mamba1_backward_binding]("mamba1_backward")
+        m.def_function[mamba1_decode_step_binding]("mamba1_decode_step")
+        # DEVIATION 2941: the Mamba-1 resident decode session.
+        _ = m.add_type[Mamba1DecodeSession]("_Mamba1DecodeSession")
+        m.def_function[mamba1_session_create_binding]("mamba1_session_create")
+        m.def_function[mamba1_session_open_binding]("mamba1_session_open")
+        m.def_function[mamba1_session_step_binding]("mamba1_session_step")
+        m.def_function[mamba1_session_export_state_binding]("mamba1_session_export_state")
+        m.def_function[mamba1_session_load_state_binding]("mamba1_session_load_state")
+        m.def_function[mamba1_session_info_binding]("mamba1_session_info")
+        m.def_function[mamba1_session_close_binding]("mamba1_session_close")
+        m.def_function[mamba2_backward_binding]("mamba2_backward")
+        m.def_function[mamba2_forward_binding]("mamba2_forward")
+        m.def_function[mamba2_decode_step_binding]("mamba2_decode_step")
+        _ = m.add_type[Mamba2DecodeSession]("_Mamba2DecodeSession")
+        m.def_function[mamba2_session_create_binding]("mamba2_session_create")
+        m.def_function[mamba2_session_open_binding]("mamba2_session_open")
+        m.def_function[mamba2_session_step_binding]("mamba2_session_step")
+        m.def_function[mamba2_session_export_state_binding]("mamba2_session_export_state")
+        m.def_function[mamba2_session_load_state_binding]("mamba2_session_load_state")
+        m.def_function[mamba2_session_close_binding]("mamba2_session_close")
+        m.def_function[mamba3_backward_binding]("mamba3_backward")
+        _ = m.add_type[Mamba3ForwardTape]("_Mamba3ForwardTape")
+        m.def_function[mamba3_forward_tape_enabled_binding]("mamba3_forward_tape_enabled")
+        m.def_function[mamba3_forward_tape_binding]("mamba3_forward_tape")
+        m.def_function[mamba3_backward_tape_binding]("mamba3_backward_tape")
+        m.def_function[mamba3_close_tape_binding]("mamba3_close_tape")
+        m.def_function[mamba3_forward_binding]("mamba3_forward")
+        comptime if GLOBAL_NUMERIC_MODE <= NUMERIC_IDENTICAL and not is_defined["ANONLIB_MAMBA3_LEGACY_FRESH_PREFILL"]():
+            m.def_function[mamba3_forward_fresh_binding]("mamba3_forward_fresh")
+            # lane/neural-net-experiment: the fresh prefill on a session.
+            _ = m.add_type[Mamba3PrefillSession]("_Mamba3PrefillSession")
+            m.def_function[mamba3_prefill_session_create_binding]("mamba3_prefill_session_create")
+            m.def_function[mamba3_prefill_session_export_weights_binding]("mamba3_prefill_session_export_weights")
+            m.def_function[mamba3_owned_weights_enabled_binding]("mamba3_owned_weights_enabled")
+            m.def_function[mamba3_prefill_session_install_weights_binding]("mamba3_prefill_session_install_weights")
+            m.def_function[mamba3_prefill_session_forward_owned_binding]("mamba3_prefill_session_forward_owned")
+            m.def_function[mamba3_prefill_session_backward_owned_binding]("mamba3_prefill_session_backward_owned")
+            m.def_function[mamba3_prefill_session_close_binding]("mamba3_prefill_session_close")
+            m.def_function[mamba3_prefill_session_forward_binding]("mamba3_prefill_session_forward")
+            m.def_function[mamba3_prefill_session_backward_binding]("mamba3_prefill_session_backward")
+            m.def_function[mamba3_prefill_session_info_binding]("mamba3_prefill_session_info")
+            m.def_function[mamba3_prefill_session_reports_optional_binding](
+                "mamba3_prefill_session_reports_optional"
+            )
+        m.def_function[mamba3_decode_step_binding]("mamba3_decode_step")
+        _ = m.add_type[Mamba3DecodeSession]("_Mamba3DecodeSession")
+        m.def_function[mamba3_session_create_binding]("mamba3_session_create")
+        m.def_function[mamba3_session_open_binding]("mamba3_session_open")
+        m.def_function[mamba3_session_step_binding]("mamba3_session_step")
+        m.def_function[mamba3_session_export_state_binding]("mamba3_session_export_state")
+        m.def_function[mamba3_session_load_state_binding]("mamba3_session_load_state")
+        m.def_function[mamba3_session_close_binding]("mamba3_session_close")
+        return m.finalize()
+    except e:
+        abort(String("failed to create _anonlib_mamba: ", e))
+
+
+def mamba3_prefill_session_export_weights_binding(session: PythonObject, addrs: PythonObject, generation: PythonObject) raises -> PythonObject:
+    """Download the installed immutable generation, never borrowed arrays."""
+    var owner = session.downcast_value_ptr[Mamba3PrefillSession]()
+    if owner[].busy or not owner[].usable or not owner[].owned_weights or not owner[].w or Int(py=generation) != owner[].weight_generation:
+        raise Error("mamba3 owned export: missing, busy, unusable or stale generation")
+    if len(addrs) != 9:
+        raise Error("mamba3 owned export: expected nine writable buffers")
+    var a = List[Int]()
+    for i in range(9):
+        var address = Int(py=addrs[i])
+        if address == 0:
+            raise Error("mamba3 owned export: null output address")
+        a.append(address)
+    var dm = owner[].dm
+    var dims = Mamba3Dims.of(dm)
+    owner[].busy = True
+    try:
+        with GILReleased(Python()):
+            ref ctx = owner[].ctx.value()
+            ref w = owner[].w.value()
+            _m3_download_addr[False](ctx, w.norm_w, dm, a[0])
+            _m3_download_addr[False](ctx, w.w_in, dims.d_in_proj() * dm, a[1])
+            _m3_download_addr[False](ctx, w.dt_bias, dims.nheads, a[2])
+            _m3_download_addr[False](ctx, w.bnorm_w, M3_D_STATE, a[3])
+            _m3_download_addr[False](ctx, w.cnorm_w, M3_D_STATE, a[4])
+            _m3_download_addr[False](ctx, w.b_bias, dims.nheads * M3_D_STATE, a[5])
+            _m3_download_addr[False](ctx, w.c_bias, dims.nheads * M3_D_STATE, a[6])
+            _m3_download_addr[False](ctx, w.d_skip, dims.nheads, a[7])
+            _m3_download_addr[False](ctx, w.w_out, dm * dims.d_inner, a[8])
+            ctx.synchronize()
+    except error:
+        owner[].busy = False
+        raise error
+    owner[].busy = False
+    return generation

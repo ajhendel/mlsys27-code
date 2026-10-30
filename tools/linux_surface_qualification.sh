@@ -1,0 +1,469 @@
+#!/usr/bin/env bash
+# Main-lane only. Build a COMPLETE vendor set, or qualify an already packed,
+# repaired wheel with COMPLETE advertised vendor sets. Never publishes or rents.
+#
+# build: tools/linux_surface_qualification.sh build /absolute/artifacts
+# build-tier: tools/linux_surface_qualification.sh build-tier OUT fast|identical
+# qualify: tools/linux_surface_qualification.sh qualify WHEEL SHA256 cuda|hip OUT BUILD_PROVENANCE_JSON
+# qualify-release-linux3: same first four args, then PROOF_DIRECTORY ARCH
+#   (qualify-release-0.6.1 is its deprecated alias, DEVIATION 2290; the version
+#   qualified is whatever python/anonlib/_version.py says, read by release_audit)
+# Proof filenames: cuda-sm_89.json, cuda-sm_90.json, hip-gfx942.json.
+# Parent must impose the lease/work timeout and retain its fetch reserve.
+set -euo pipefail
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+ACTION=${1:?build or qualify}
+shift
+PY=${ANONLIB_QUALIFY_PYTHON:-python3}
+[[ $(uname -s) = Linux ]] || { echo 'Qualification requires remote Linux' >&2; exit 2; }
+command -v taskset >/dev/null || { echo 'taskset required for CPU cap' >&2; exit 2; }
+# Fixed limits override inherited broad job settings. Child builds inherit this
+# affinity; build_sets.sh selects a subset of it and cannot expand it itself.
+export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1
+export OMP_THREAD_LIMIT=1 OMP_MAX_ACTIVE_LEVELS=1 BLIS_NUM_THREADS=1 NUMEXPR_MAX_THREADS=1
+export ANONLIB_COMPILE_JOBS=2 MAX_JOBS=2 CMAKE_BUILD_PARALLEL_LEVEL=2 ANONLIB_CPU_THREADS=2
+# DEVIATION 2501: the build action runs ANONLIB_BUILD_JOBS extension
+# builds at a time (default 4) on 2 x jobs cores; each build keeps the
+# two-worker, one-BLAS-thread caps above. Qualification stays serial on two.
+BUILD_JOBS=1
+if [[ "$ACTION" = build ]]; then BUILD_JOBS=${ANONLIB_BUILD_JOBS:-4}; fi
+[[ "$BUILD_JOBS" =~ ^[1-9][0-9]?$ && "$BUILD_JOBS" -le 16 ]] || { echo 'ANONLIB_BUILD_JOBS must be 1..16' >&2; exit 2; }
+BUILD_CORES=$((2 * BUILD_JOBS))
+export ANONLIB_BUILD_JOBS=$BUILD_JOBS CARGO_BUILD_JOBS=2 RAYON_NUM_THREADS=2
+export MAKEFLAGS=-j2 MFLAGS=-j2 GNUMAKEFLAGS=
+cores=$("$PY" -c 'import os, sys; print(",".join(map(str, sorted(os.sched_getaffinity(0))[:int(sys.argv[1])])))' "$BUILD_CORES")
+[[ -n "$cores" ]] || { echo 'Empty CPU affinity' >&2; exit 2; }
+taskset -pc "$cores" $$
+"$PY" - "$cores" "$BUILD_CORES" <<'PYCAP'
+import os, sys
+expected = {int(cpu) for cpu in sys.argv[1].split(',')}
+actual = os.sched_getaffinity(0)
+if not 1 <= len(actual) <= int(sys.argv[2]) or actual != expected:
+    raise SystemExit('CPU affinity cap failed')
+PYCAP
+# RESOURCE_CAPS_END: source-only test extracts only the admission prefix.
+if [[ "$ACTION" = build || "$ACTION" = build-tier ]]; then
+    DEST=${1:?artifact directory}
+    mkdir -p "$DEST"
+    DEST=$(cd "$DEST" && pwd)
+    cd "$ROOT"
+    # Preserve the admitted build concurrency and per-compiler affinity caps.
+    [[ -z $(ls -A "$DEST") ]] || { echo 'Refusing reused build directory'; exit 2; }
+    unset ANONLIB_BUILD_SCRIPTS ANONLIB_BUILD_TIERS
+    if [[ "$ACTION" = build-tier ]]; then
+        tier=${2:?tier}
+        case "$tier" in fast|identical) ;; *) exit 2 ;; esac
+        export ANONLIB_BUILD_TIERS="$tier"
+        echo 'PARTIAL SINGLE TIER: retain for assembly; never publish or claim installed-wheel qualification' > "$DEST/PARTIAL.txt"
+    fi
+    commit=${ANONLIB_COMMIT:-}
+    if [[ -z "$commit" && -s "$ROOT/commit.txt" ]]; then read -r commit < "$ROOT/commit.txt"; fi
+    if [[ -z "$commit" ]]; then commit=$(git rev-parse HEAD); fi
+    [[ "$commit" =~ ^[0-9a-f]{40}$ ]] || { echo 'Full source commit SHA required'; exit 2; }
+    {
+        echo "source_commit=$commit"
+        # DEVIATION 2490: trees only below identical; the counts come from the verifier.
+        "$PY" - <<'PYCOUNTS'
+import sys
+sys.path.insert(0, 'tools')
+from verify_linux_surface_qualification import MODES, expected_bindings
+import os
+byte_lm = os.environ.get('ANONLIB_PACKAGE_BYTE_LM', '0') == '1'
+print(' '.join(f'expected_bindings_{m}={len(expected_bindings(m, byte_lm))}' for m in MODES))
+PYCOUNTS
+        echo "expected_tiers=${ANONLIB_BUILD_TIERS:-fast identical}"
+        echo "build_jobs=$BUILD_JOBS cpu_affinity_max=$BUILD_CORES compiler_jobs=2 blas_threads=1"
+        echo "cpu_affinity=$cores"
+        echo "artifact=$ACTION vendor set; not a wheel or publication"
+    } > "$DEST/source-provenance.txt"
+    command -v objdump >/dev/null || { echo 'objdump required for CPU ISA qualification'; exit 2; }
+    "$PY" - "$ROOT" "$DEST" <<'PYPROVENANCE'
+import hashlib, json, os, pathlib, sys
+root, out = map(pathlib.Path, sys.argv[1:])
+files = []
+for directory, dirs, names in os.walk(root):
+    dirs[:] = sorted(d for d in dirs if d not in ('.git', '.pixi', '.venv', '__pycache__', 'results', 'dist', 'archive', 'upstream') and not d.startswith('.'))
+    for name in sorted(names):
+        path = pathlib.Path(directory) / name
+        rel = path.relative_to(root).as_posix()
+        # python/anonlib/tests/ neither ships nor builds (native_inventory).
+        if rel.startswith('python/anonlib/tests/'):
+            continue
+        if (name.endswith('.mojo') or rel.startswith(('bindings/', 'packaging/linux/', 'python/anonlib/', 'tokenizer/tools/')) and name.endswith(('.py', '.sh'))
+                or rel in ('pixi.toml', 'pixi.lock', 'tools/linux_surface_qualification.sh')):
+            files.append([rel, hashlib.sha256(path.read_bytes()).hexdigest()])
+files.sort()
+(out / 'source-inventory.json').write_text(json.dumps(files, indent=2) + '\n')
+PYPROVENANCE
+    status=0
+    bash packaging/linux/build_sets.sh "$DEST" || status=$?
+    "$PY" - "$ROOT" "$DEST" "$status" "$ACTION" <<'PYBUILT'
+import hashlib, json, os, pathlib, sys
+root, out = map(pathlib.Path, sys.argv[1:3])
+status, action = int(sys.argv[3]), sys.argv[4]
+files = json.loads((out / 'source-inventory.json').read_text())
+assert all(hashlib.sha256((root / p).read_bytes()).hexdigest() == h for p, h in files), 'Sources changed during build'
+outputs = {}
+host_outputs = {}
+for path in sorted((out / 'sets').rglob('_anonlib*.so')):
+    member = 'anonlib/' + path.relative_to(out / 'sets').as_posix()
+    # DEVIATION 2680: the CPU TRAINING binding is vendor-neutral and sits at
+    # <vendor>/<arch>/host/, BESIDE the tiers rather than inside one. It is not
+    # part of the per-tier GPU inventory that expected_bindings() counts, and
+    # folding it in there breaks `len(outputs) == expected_count` below and
+    # `len(proof['extensions']) == 45` in the audit. Counted separately.
+    if '/host/' in member:
+        host_outputs[member] = hashlib.sha256(path.read_bytes()).hexdigest()
+        continue
+    outputs[member] = hashlib.sha256(path.read_bytes()).hexdigest()
+commit = next(line.split('=', 1)[1] for line in (out / 'source-provenance.txt').read_text().splitlines() if line.startswith('source_commit='))
+byte_lm = os.environ.get('ANONLIB_PACKAGE_BYTE_LM', '0')
+assert byte_lm in ('0', '1'), 'Invalid byte-LM build flag'
+sys.path.insert(0, str(root / 'tools'))
+from verify_linux_surface_qualification import MODES, expected_bindings
+full_count = sum(len(expected_bindings(mode, byte_lm == '1')) for mode in MODES)
+expected_count = full_count if action == 'build' else len(expected_bindings(os.environ['ANONLIB_BUILD_TIERS'], byte_lm == '1'))
+byte_members = [n for n in outputs if n.endswith('/_anonlib_byte_lm.so')]
+assert len(byte_members) == (1 if byte_lm == '1' and (action == 'build' or os.environ.get('ANONLIB_BUILD_TIERS') == 'identical') else 0), 'Incorrect byte-LM inventory'
+assert all('/identical/' in n for n in byte_members), 'Byte-LM is IDENTICAL only'
+host_members = sorted(host_outputs)
+from verify_linux_surface_qualification import wheel_host_bindings
+want_host = {n + '.so' for n in wheel_host_bindings()} if byte_lm == '1' and (action == 'build' or os.environ.get('ANONLIB_BUILD_TIERS') == 'identical') else set()
+assert all('/host/' + n.rsplit('/', 1)[1] == n[n.index('/host/'):] for n in host_members), ('Unexpected host binding', host_members)
+assert {n.rsplit('/', 1)[1] for n in host_members} == want_host and len(host_members) == len(want_host), ('Incorrect host binding inventory', host_members, sorted(want_host))
+record = dict(schema='anonlib.linux.build-provenance.v1', source_commit=commit, action=action, build_exit=status,
+              source_inventory=files, source_sha256=hashlib.sha256(json.dumps(files, separators=(',', ':')).encode()).hexdigest(),
+              extensions=outputs, host_extension=host_outputs,
+              complete=(status == 0 and action == 'build' and len(outputs) == full_count))
+# THE BOX'S BUILD SIZING (tools/build_sizing.py via release061_remote_build.sh):
+# jobs, RSS cap, usable cores and available memory. Scheduling only; the
+# binaries do not depend on it (ANONLIB_BUILD_JOBS is byte-neutral, bincache).
+sizing_file = os.environ.get('RELEASE_BUILD_SIZING_FILE')
+if sizing_file and pathlib.Path(sizing_file).is_file():
+    record['build_resources'] = json.loads(pathlib.Path(sizing_file).read_text())
+# THE BINDING CACHE, PER BINARY (packaging/linux/build_sets.sh, 2026-09-22).
+# Present only when the build ran through tools/bincache.py. For every shipped
+# member: how it was obtained (a build, or a hit and from where), the cache
+# key (sha256 of every input that reaches the compiler: the source closure,
+# the scripts, the toolchain, the build variables, the OS and the path), the
+# unstaged digest, and the commit whose build compiled those bytes: this
+# build's commit for a miss, the archive's recorded commit for a hit. A hit
+# is the same bytes an identical-input build of that commit produced, and the
+# key equality is the proof that the inputs were identical.
+cache_rows = out / 'bincache' / 'provenance.tsv'
+if cache_rows.is_file():
+    placed = {}
+    placements = out / 'bincache' / 'placements.jsonl'
+    if placements.is_file():
+        for line in placements.read_text().splitlines():
+            row = json.loads(line)
+            for f in row['files']:
+                placed[(row['key'], f['path'])] = row.get('archive_source_commit', '')
+    by_path = {}
+    for line in cache_rows.read_text().splitlines():
+        cols = line.split('\t')
+        if len(cols) != 6 or cols[5] == '-':
+            continue
+        for item in cols[5].split(' '):
+            path, _, digest = item.partition('=')
+            hit = cols[2] in ('hit', 'hot-hit')
+            by_path[path] = dict(outcome=cols[2], key=cols[3], unstaged_sha256=digest,
+                                 compiled_from_commit=(placed.get((cols[3], path), '') if hit else commit))
+    cache = {}
+    for member in list(outputs) + list(host_outputs):
+        parts = member.split('/')          # anonlib/<vendor>/<arch>/[tier/]name.so
+        rel = 'python/' + '/'.join([parts[0]] + parts[3:])
+        cache[member] = by_path.get(rel, dict(outcome='not-recorded'))
+    record['bincache'] = cache
+(out / 'build-provenance.json').write_text(json.dumps(record, indent=2) + '\n')
+assert status == 0, 'Build/staging failed; retained provenance is not admissible'
+assert len(outputs) == expected_count, 'Incomplete build outputs'
+PYBUILT
+    exit "$status"
+fi
+# DEVIATION 2290: the three-architecture action is qualify-release-linux3; the
+# name it was authored under, qualify-release-0.6.1, is a deprecated alias.
+if [[ "$ACTION" = qualify-release-0.6.1 ]]; then ACTION=qualify-release-linux3; fi
+[[ "$ACTION" = qualify || "$ACTION" = qualify-release-linux3 ]] || { echo 'Unknown qualification action'; exit 2; }
+WHEEL=${1:?wheel} EXPECTED=${2:?sha256} VENDOR=${3:?cuda or hip} DEST=${4:?artifact directory}
+PROVENANCE=${5:?build-provenance.json from the complete vendor build}
+[[ "$VENDOR" = cuda || "$VENDOR" = hip ]] || exit 2
+WHEEL=$(cd "$(dirname "$WHEEL")" && pwd)/$(basename "$WHEEL")
+mkdir -p "$DEST"
+DEST=$(cd "$DEST" && pwd)
+[[ -z $(ls -A "$DEST") ]] || { echo 'Refusing nonempty qualification directory'; exit 2; }
+# An interrupted/preflight-failed run must never leave a successful marker.
+printf '1\n' > "$DEST/exit_code"
+"$PY" "$ROOT/tools/verify_linux_surface_qualification.py" snapshot "$ROOT" "$DEST"
+
+# Do not call a three-extension probe a complete vendor artifact.
+# Audit every RECORD hash and require each embedded architecture to have all
+# 15 extension names in all three modes. A CUDA-only/HIP-only wheel is
+# admitted for that vendor and labelled explicitly; no universal claim.
+if [[ "$ACTION" = qualify-release-linux3 ]]; then
+    ARCH=${6:?actual runtime architecture sm_89, sm_90, sm_90a or gfx942}
+    "$PY" - "$ROOT" "$WHEEL" "$EXPECTED" "$PROVENANCE" "$VENDOR/$ARCH" "$DEST" <<'PYMULTI'
+import json, pathlib, shutil, sys
+root, wheel, expected, proof_root, key, out = sys.argv[1:]
+sys.path.insert(0, str(pathlib.Path(root) / 'tools'))
+from check_linux_release_qualification import release_audit
+audit = release_audit(wheel, root, proof_root, key)
+if audit['sha256'] != expected:
+    raise SystemExit('Wheel SHA mismatch')
+dest = pathlib.Path(out)
+(dest / 'wheel-audit.json').write_text(json.dumps(audit, indent=2) + '\n')
+shutil.copyfile(pathlib.Path(proof_root) / (key.replace('/', '-') + '.json'), dest / 'build-provenance.json')
+PYMULTI
+else
+"$PY" - "$WHEEL" "$EXPECTED" "$ROOT" "$VENDOR" "$PROVENANCE" > "$DEST/wheel-audit.json" <<'PYAUDIT'
+import base64, csv, hashlib, io, json, pathlib, re, sys, zipfile
+wheel, expected, root, required_vendor, provenance = sys.argv[1:]
+wheel, root = pathlib.Path(wheel), pathlib.Path(root)
+assert re.fullmatch(r'[0-9a-f]{64}', expected), 'Invalid expected SHA256'
+assert hashlib.sha256(wheel.read_bytes()).hexdigest() == expected, 'Wheel SHA mismatch'
+assert 'manylinux_' in wheel.name, 'Require repaired manylinux wheel, not raw linux_x86_64'
+names = {'_anonlib', '_anonlib_gbdt', '_anonlib_estimators', '_anonlib_rf',
+         '_anonlib_trees', '_anonlib_svm', '_anonlib_solver', '_anonlib_metrics',
+         '_anonlib_tsa', '_anonlib_linalg', '_anonlib_arima', '_anonlib_training',
+         '_anonlib_gp', '_anonlib_mamba', '_anonlib_transformer'}
+sets = {}
+extension_hashes = {}
+host_extension_hashes = {}
+sys.path.insert(0, str(root / 'tools'))
+from verify_linux_surface_qualification import wheel_host_members
+host_members_wanted = set(wheel_host_members())
+proof_path = pathlib.Path(provenance)
+proof = json.loads(proof_path.read_text())
+assert proof.get('schema') == 'anonlib.linux.build-provenance.v1' and proof.get('complete') is True
+assert proof.get('build_exit') == 0 and proof.get('action') == 'build'
+assert re.fullmatch(r'[0-9a-f]{40}', proof.get('source_commit', '')), 'Missing source commit'
+inventory = proof['source_inventory']
+assert proof['source_sha256'] == hashlib.sha256(json.dumps(inventory, separators=(',', ':')).encode()).hexdigest()
+assert len(inventory) == len({p for p, h in inventory}) and inventory, 'Invalid source inventory'
+for p, h in inventory:
+    assert not pathlib.PurePosixPath(p).is_absolute() and '..' not in pathlib.PurePosixPath(p).parts
+    assert hashlib.sha256((root / p).read_bytes()).hexdigest() == h, ('Source differs from build', p)
+assert len(proof['extensions']) == 45, 'Provenance is not a complete vendor set'
+with zipfile.ZipFile(wheel) as z:
+    paths = z.namelist()
+    assert len(paths) == len(set(paths)), 'Duplicate wheel member'
+    records = [p for p in paths if p.endswith('.dist-info/RECORD')]
+    assert len(records) == 1
+    declared = set()
+    for path, hashed, size in csv.reader(io.StringIO(z.read(records[0]).decode())):
+        assert path not in declared, ('Duplicate RECORD row', path)
+        declared.add(path)
+        if path == records[0]:
+            continue
+        assert hashed.startswith('sha256='), ('Missing SHA256', path)
+        value = z.read(path)
+        actual = base64.urlsafe_b64encode(hashlib.sha256(value).digest()).rstrip(b'=').decode()
+        assert hashed == 'sha256=' + actual and int(size) == len(value), ('Bad RECORD', path)
+    assert declared == set(paths), 'RECORD does not cover whole archive'
+    for p in paths:
+        match = re.fullmatch(r'anonlib/(cuda|hip)/(sm_[0-9]+a?|gfx[0-9a-f]+)/(?:(identical)/)?(_anonlib[^/]*)\.so', p)
+        if match:
+            vendor, arch, mode, extension = match.groups()
+            extension_hashes[p.removeprefix('anonlib/')] = hashlib.sha256(z.read(p)).hexdigest()
+            if vendor == required_vendor:
+                assert p in proof['extensions'], ('Unproven extension', p)
+                assert hashlib.sha256(z.read(p)).hexdigest() == proof['extensions'][p], ('Built/wheel binary differs', p)
+            sets.setdefault((vendor, arch, mode or 'fast'), set()).add(extension)
+        elif p in host_members_wanted:
+            # DEVIATION 2680. The wheel carries ONE vendor-neutral copy of each
+            # host binding; each architecture leg proves its own under
+            # <vendor>/<arch>/host/, so this is proven BY DIGEST, not by name.
+            digest = hashlib.sha256(z.read(p)).hexdigest()
+            host_extension_hashes[p.removeprefix('anonlib/')] = digest
+            proven = proof.get('host_extension') or {}
+            assert proven.get(next((k for k in proven if k.endswith('/host/' + p.rsplit('/', 1)[1])), None)) == digest, ('Unproven host binding', p)
+        elif p.endswith('.so') and '/_anonlib' in p:
+            raise AssertionError('Unexpected extension location: ' + p)
+    vendors = {v for v, _, _ in sets}
+    assert required_vendor in vendors, 'Wheel lacks requested vendor'
+    for vendor, arch in {(v, a) for v, a, _ in sets}:
+        for mode in ('fast', 'identical'):
+            assert sets.get((vendor, arch, mode)) == names, ('Incomplete set', vendor, arch, mode)
+    assert set(proof['extensions']) == {p for p in paths if p.startswith('anonlib/' + required_vendor + '/') and p.endswith('.so') and '/_anonlib' in p}, 'Provenance/wheel vendor coverage differs'
+    assert {'anonlib/' + m for m in host_extension_hashes} == host_members_wanted, ('Wheel host binding inventory differs from the manifest', sorted(host_extension_hashes))
+    # Current wrappers must match the source whose tests will execute.
+    for source in (root / 'python/anonlib').glob('*.py'):
+        assert z.read('anonlib/' + source.name) == source.read_bytes(), ('Stale wrapper', source.name)
+print(json.dumps({'sha256': expected, 'wheel': str(wheel),
+                  'advertised_vendors': sorted(vendors),
+                  'qualification_vendor': required_vendor,
+                  'build_provenance_sha256': hashlib.sha256(proof_path.read_bytes()).hexdigest(),
+                  'source_sha256': proof['source_sha256'],
+                  'extension_hashes': extension_hashes,
+                  'host_extension_hashes': host_extension_hashes,
+                  'sets': {'/'.join(k): len(v) for k, v in sorted(sets.items())}}, indent=2))
+PYAUDIT
+fi
+
+timeout -k 10 60 "$PY" -m venv "$DEST/venv"
+VPY="$DEST/venv/bin/python"
+timeout -k 10 180 "$VPY" -m pip install --disable-pip-version-check --only-binary=:all: \
+    "$WHEEL" > "$DEST/install.log" 2>&1
+"$VPY" -m pip check > "$DEST/dependency-check.log" 2>&1
+"$VPY" -m pip freeze > "$DEST/installed-dependencies.txt"
+(cd "$DEST" && env -u PYTHONPATH -u PYTHONHOME "$VPY" \
+    "$ROOT/tools/check_numpy_free_runtime.py" --installed) \
+    > "$DEST/numpy-free-runtime.log" 2>&1
+# Only after the dependency-free installed GPU path passes, add the oracle.
+timeout -k 10 180 "$VPY" -m pip install --disable-pip-version-check --only-binary=:all: \
+    'numpy>=1.24' > "$DEST/oracle-install.log" 2>&1
+"$VPY" -m pip freeze > "$DEST/test-dependencies.txt"
+
+cat > "$DEST/run_installed.py" <<'PYRUN'
+import hashlib, json, os, pathlib, runpy, sys
+import anonlib
+audit = json.loads(pathlib.Path(os.environ['ANONLIB_WHEEL_AUDIT']).read_text())
+installed = pathlib.Path(anonlib.__file__).resolve()
+assert installed.is_relative_to(pathlib.Path(sys.prefix).resolve()), ('Checkout shadowing', installed)
+assert 'site-packages' in installed.parts
+assert anonlib.vendor() == os.environ['ANONLIB_EXPECT_VENDOR']
+assert anonlib.numeric_mode() == os.environ['ANONLIB_NUMERIC_MODE']
+print(json.dumps({'package': str(installed), 'version': anonlib.__version__,
+                  'vendor': anonlib.vendor(), 'mode': anonlib.numeric_mode()}), flush=True)
+from anonlib import _backend
+architecture = {}
+# DEVIATION 2290: release_audit writes assembly_profile 'release-linux3';
+# 'release-0.6.1' is the deprecated alias retained audits may still carry.
+release_profile = audit.get('assembly_profile') in ('release-linux3', 'release-0.6.1')
+if release_profile:
+    assert not os.environ.get('ANONLIB_GPU_ARCH'), 'Architecture override forbidden'
+    device_arch, probe = _backend._device_arch(os.environ['ANONLIB_EXPECT_VENDOR'])
+    selected = _backend.gpu_arch()
+    # DEVIATION 2293: the selected binding may be the architecture-specific
+    # build for this exact device (device sm_90 -> selected sm_90a), which is
+    # what _backend.py prefers. The audit's runtime_architecture is the name
+    # the wheel carries, so it must equal the SELECTED one; the device must be
+    # the chip that selection targets. Anything else is still refused.
+    assert selected == audit['runtime_architecture'], ('Wrong actual GPU architecture', device_arch, selected)
+    assert selected in (device_arch, device_arch + 'a'), ('Wrong actual GPU architecture', device_arch, selected)
+    architecture = dict(device_architecture=device_arch, selected_architecture=selected,
+                        architecture_probe=probe, architecture_override_absent=True)
+# Older bindings expose vendor but no tier getter; report that gap explicitly.
+getters = {'_anonlib': 'anonlib_numeric_mode', '_anonlib_gbdt': 'gbdt_numeric_mode',
+           '_anonlib_svm': 'svm_numeric_mode', '_anonlib_metrics': 'umap_numeric_mode',
+           '_anonlib_linalg': 'linalg_numeric_mode', '_anonlib_arima': 'arima_numeric_mode',
+           '_anonlib_training': 'training_numeric_mode', '_anonlib_gp': 'gp_numeric_mode',
+           '_anonlib_mamba': 'mamba_numeric_mode', '_anonlib_transformer': 'transformer_numeric_mode'}
+if release_profile and anonlib.numeric_mode() == 'identical':  # DEVIATION 2290
+    getters['_anonlib_byte_lm'] = 'byte_lm_numeric_mode'
+all_bindings = set(getters) | {'_anonlib_estimators', '_anonlib_rf', '_anonlib_trees', '_anonlib_solver', '_anonlib_tsa'}
+readback = {}
+for name in sorted(all_bindings):
+    binding = _backend.binding(name)
+    path = pathlib.Path(binding.__file__).resolve()
+    assert path.is_relative_to(installed.parent), ('Noninstalled extension', path)
+    assert _backend.read_vendor(binding) == os.environ['ANONLIB_EXPECT_VENDOR']
+    row = {'path': str(path), 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()}
+    member = path.relative_to(installed.parent).as_posix()
+    if architecture:
+        assert member.startswith(os.environ['ANONLIB_EXPECT_VENDOR'] + '/' + architecture['selected_architecture'] + '/')
+    assert audit['extension_hashes'].get(member) == row['sha256'], ('Installed binary differs from wheel', member)
+    if name in getters:
+        row['mode_code'] = int(getattr(binding, getters[name])())
+        assert row['mode_code'] == {'fast': 0, 'identical': 1}[os.environ['ANONLIB_NUMERIC_MODE']]
+    else:
+        row['mode_readback'] = 'unavailable; build provenance and functional gate required'
+    readback[name] = row
+record = {'package': str(installed), 'version': anonlib.__version__,
+          'vendor': anonlib.vendor(), 'mode': anonlib.numeric_mode(),
+          'wheel_sha256': audit['sha256'], 'installed_bindings': readback}
+# DEVIATION 2680: the CPU TRAINING binding, under its own key. It cannot join
+# `readback` above, whose loop asserts read_vendor() == the GPU vendor of this
+# leg; this one reads back 'cpu' by design and is reached through its own path
+# helper rather than _backend.binding() for the same reason.
+if release_profile and anonlib.numeric_mode() == 'identical':
+    from anonlib import _byte_lm_host
+    host_path = pathlib.Path(_byte_lm_host.binary_path()).resolve()
+    assert host_path.is_relative_to(installed.parent), ('Noninstalled CPU training binding', host_path)
+    host_member = host_path.relative_to(installed.parent).as_posix()
+    host_digest = hashlib.sha256(host_path.read_bytes()).hexdigest()
+    assert audit.get('host_extension_hashes', {}).get(host_member) == host_digest, \
+        ('Installed CPU training binding differs from wheel', host_member)
+    host_module = _byte_lm_host._load()
+    assert int(host_module.byte_lm_host_numeric_mode()) == 1, 'CPU training binding is not IDENTICAL'
+    assert str(host_module.byte_lm_host_vendor()) == 'cpu', 'CPU training binding vendor read-back'
+    assert callable(getattr(host_module, 'byte_lm_host_train_step', None)), \
+        'CPU training binding has no train step; the wheel carries an inference-only build'
+    record['installed_host_binding'] = {'path': str(host_path), 'sha256': host_digest,
+                                        'numeric_mode': 1, 'vendor': 'cpu'}
+    # EVERY host binding the manifest ships (the packaging lane, 2026-09-14),
+    # each loaded through the package's own host loader and read back as
+    # vendor cpu, IDENTICAL and the CPU column, each with the digest of the
+    # installed file, which must be the audited wheel's member.
+    from anonlib import _backend, host_surface
+    rows = {}
+    for name in host_surface.wheel_bindings():
+        path = pathlib.Path(_backend.host_module_path(name)).resolve()
+        assert path.is_relative_to(installed.parent), ('Noninstalled host binding', path)
+        member = path.relative_to(installed.parent).as_posix()
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        assert audit.get('host_extension_hashes', {}).get(member) == digest, ('Installed host binding differs from wheel', member)
+        module = _backend.load_host_module(name)
+        prefix = name[len('_anonlib_'):]
+        rows[name] = {'path': str(path), 'sha256': digest,
+                      'numeric_mode': int(getattr(module, prefix + '_numeric_mode')()),
+                      'vendor': str(getattr(module, prefix + '_vendor')()),
+                      'column': str(getattr(module, prefix + '_column')())}
+        assert rows[name]['numeric_mode'] == 1 and rows[name]['vendor'] == 'cpu' and rows[name]['column'] == 'cpu', ('Host binding read-back', name, rows[name])
+    record['installed_host_bindings'] = rows
+record.update(architecture)
+pathlib.Path(os.environ['ANONLIB_INSTALLED_RECORD']).write_text(json.dumps(record, indent=2) + '\n')
+print(json.dumps(record), flush=True)
+target = sys.argv[1]
+sys.argv = sys.argv[1:]
+runpy.run_path(target, run_name='__main__')
+PYRUN
+rc=0
+: > "$DEST/results.tsv"
+unset PYTHONPATH PYTHONHOME ANONLIB_VENDOR ANONLIB_ARIMA_GATE_QUICK ANONLIB_ARIMA_GATE_N_OBS
+export ANONLIB_WHEEL_AUDIT="$DEST/wheel-audit.json"
+export PYTHONNOUSERSITE=1 PYTHONUNBUFFERED=1 ANONLIB_EXPECT_VENDOR="$VENDOR" ANONLIB_REPO="$ROOT"
+cd "$DEST"
+for mode in fast identical; do
+    export ANONLIB_NUMERIC_MODE="$mode"
+    # DEVIATION 2490: the job set per tier comes from the verifier's
+    # expected_jobs so the on-box loop and the admission side cannot drift.
+    read -r -a surfaces <<< "$("$PY" - "$mode" "$ACTION" <<'PYJOBS'
+import os, sys
+sys.path.insert(0, os.environ['ANONLIB_REPO'] + '/tools')
+from verify_linux_surface_qualification import RELEASE_PROFILE, expected_jobs
+mode, action = sys.argv[1:3]
+audit = {'assembly_profile': RELEASE_PROFILE} if action == 'qualify-release-linux3' else {}
+order = ('smoke', 'umap', 'umap-transform', 'umap-quality', 'ordered-rmse', 'mamba', 'transformer', 'arima', 'byte-lm')
+print(' '.join(s for s in order if (s, mode) in expected_jobs(audit)))
+PYJOBS
+)"
+    for surface in "${surfaces[@]}"; do
+        export ANONLIB_INSTALLED_RECORD="$DEST/$surface-$mode.installed.json"
+        args=()
+        if [[ "$surface" = smoke ]]; then
+            test="$ROOT/packaging/linux/smoke.py"
+            args=(--vendor "$VENDOR" --json "$DEST/smoke-$mode.json")
+        elif [[ "$surface" = byte-lm ]]; then
+            test="$ROOT/tools/byte_lm_installed_step.py"
+        elif [[ "$surface" = ordered-rmse ]]; then
+            test="$ROOT/tools/ordered_rmse_surface_check.py"
+        elif [[ "$surface" = umap-transform ]]; then
+            test="$ROOT/python/anonlib/tests/test_umap_transform.py"
+        elif [[ "$surface" = umap-quality ]]; then
+            test="$ROOT/tools/umap_transform_quality_check.py"
+            args=(--mode "$mode" --device "${ANONLIB_QUALIFY_DEVICE:-$VENDOR}" --profile expanded
+                  --source-root "$ROOT" --output "$DEST/$surface-$mode.json")
+        else
+            test="$ROOT/python/anonlib/tests/test_${surface}_surface.py"
+        fi
+        status=0
+        timeout -k 10 "${ANONLIB_SURFACE_TIMEOUT:-300}" "$VPY" \
+            "$DEST/run_installed.py" "$test" "${args[@]}" > "$DEST/$surface-$mode.log" 2>&1 || status=$?
+        printf '%s\t%s\t%s\n' "$surface" "$mode" "$status" | tee -a "$DEST/results.tsv"
+        [[ "$status" = 0 ]] || rc=1
+    done
+done
+"$PY" "$ROOT/tools/verify_linux_surface_qualification.py" verify "$ROOT" "$DEST" || rc=1
+printf '%s\n' "$rc" > "$DEST/exit_code"
+exit "$rc"

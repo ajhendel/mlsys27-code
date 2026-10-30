@@ -1,0 +1,562 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 the authors. Part of anonlib, DOI-WITHHELD
+"""Cyclic Jacobi eigendecomposition ON THE DEVICE."""
+
+from core.pinned_reduce import pinned_block_sum
+from checks.kernel_matrix import (
+    K_LIB_JACOBI_EIGH,
+    TARGET_COLUMN,
+    lib_block_size_for,
+)
+from checks.numerics import (
+    GLOBAL_NUMERIC_MODE,
+    NUMERIC_IDENTICAL,
+    ftz,
+    identical_mul_add,
+    identical_sqrt,
+)
+
+
+from std.bit import log2_floor
+from std.sys.compile import is_defined
+from std.sys.info import has_apple_gpu_accelerator
+from std.gpu import thread_idx
+from max.gpu.memory import AddressSpace
+from max.gpu.sync import barrier
+from std.memory import stack_allocation
+from std.sys import llvm_intrinsic
+from std.sys.info import is_apple_gpu
+
+
+@always_inline
+def _jacobi_device_barrier():
+    """The rotation kernel's block barrier, which must also order DEVICE
+    memory: lanes hand `a` and `v` cells to each other through device
+    buffers (tid 0 reads the (p, q) block the lane owning p and the lane
+    owning q' wrote; the basis init strides by launch width). On Apple
+    `barrier()` is `llvm.air.wg.barrier(2, 1)`, threadgroup memory only, so
+    Apple gets flags 3 (mem_device | mem_threadgroup, x_linear's
+    `team_barrier`), in the stdlib's own `llvm_intrinsic` spelling so the
+    declaration never conflicts with `barrier()`'s (lane/apple2-merged,
+    2026-09-28). NVIDIA and AMD keep `barrier()`, which already orders
+    global memory within the block. Same stores, same order: no bit moves."""
+    comptime if is_apple_gpu():
+        llvm_intrinsic["llvm.air.wg.barrier", NoneType](Int32(3), Int32(1))
+    else:
+        barrier()
+
+
+comptime JACOBI_TPB = lib_block_size_for[K_LIB_JACOBI_EIGH, TARGET_COLUMN]()
+
+#: DEVIATION 2680 (2026-09-12, lane jacobi-speed). THE LAUNCH WIDTH, WHICH IS
+#: NOT THE FOLD WIDTH, AND THE WHOLE POINT IS THAT THE TWO ARE DIFFERENT
+#: QUESTIONS.
+#:
+#: `JACOBI_TPB` is a NUMERIC row: it is the width of the fold that decides the
+#: sweep count AND the stride that cuts the matrix into per-thread partials
+#: (`check_jacobi_fold_width_is_pinned`, IDENTITY_PATHS row 31). It is 32 on
+#: the identity floor and must stay there.
+#:
+#: The number of threads the block is LAUNCHED with is a different number and
+#: it is pure SCHEDULING. Inside a rotation, lane `k` reads and writes only
+#: cells `(k, p)`, `(k, q)`, `(p, k)`, `(q, k)` of the matrix and `(k, p)`,
+#: `(k, q)` of the basis; two lanes with different `k` share no cell except
+#: in the 2 x 2 block `{p, q} x {p, q}`, which ONE lane (`k == p`) does alone
+#: in a fixed order (DEVIATION 2671, `_rotate_pair_block`). So WHICH lane does
+#: which `k`, and how many lanes there are, cannot change a stored value: no
+#: cell is written by two lanes and no lane reads a cell another lane of the
+#: same phase writes. The fold, which CAN move bits, keeps striding by
+#: `JACOBI_TPB` over the first `JACOBI_TPB` lanes whatever the launch width is
+#: (`_fold_lead_lanes_and_broadcast`), so its partials and its association are
+#: untouched.
+#:
+#: WHY IT PAYS. At Istella-S's 220 columns a rotation is 220 lanes of work and
+#: the block was 32, so every rotation ran seven serial passes of six
+#: dependent global accesses each, on ONE warp of ONE SM, 24,090 times a sweep
+#: and twelve sweeps deep. Widening the block does not remove a barrier or an
+#: instruction; it removes the serialization.
+#:
+#: A LADDER, NOT A NUMBER: `jacobi_eigh_kernel` is parametric on this so
+#: `check_jacobi_is_launch_invariant` can run the SAME matrix at
+#: `JACOBI_TPB`, 2x, 4x, 8x and 16x and hold all of them equal at every
+#: output cell and all three info slots. That check is the evidence for the
+#: paragraph above; the paragraph is only the argument.
+#:
+#: FAST KEEPS TODAY'S GEOMETRY. Under FAST the fold IS the library call
+#: (`block.sum`), whose contract requires every thread of the block to call it
+#: at the block's own width, so a launch wider than the fold has no FAST
+#: spelling that does not move FAST's bits. FAST therefore launches at
+#: `JACOBI_TPB` exactly as before, and this deviation is IDENTICAL-only.
+comptime JACOBI_ROT_TPB = (
+    256 if (GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL or (has_apple_gpu_accelerator() and not is_defined["ANONLIB_JACOBI_FAST_NARROW"]())) else JACOBI_TPB
+)
+"""lane/neighbors-apple (2026-09-28): FAST on Apple takes the 256-wide
+launch too (Nystroem.fit 4,000 rows / 300 components ran 3.06 s under FAST
+against 1.06 s under IDENTICAL on the M3 Ultra, the only difference being
+the rotation launch width). The width is scheduling (DEVIATION 2680), so
+FAST's words do not move."""
+
+comptime JACOBI_TOL = 1.0e-7
+comptime JACOBI_SWEEPS = 15
+
+
+@always_inline
+def _folded_and_broadcast[tpb: Int](value: Float32) -> Float32:
+    """`pinned_block_sum` plus the broadcast the sweep loop cannot do without."""
+    var s = pinned_block_sum[tpb](value)
+    var slot = stack_allocation[
+        1,
+        Scalar[DType.float32],
+        address_space = AddressSpace.SHARED,
+    ]()
+    if Int(thread_idx.x) == 0:
+        slot.unsafe_store(0, s)
+    barrier()
+    var out = slot.unsafe_load(0)
+    barrier()
+    return out
+
+
+@always_inline
+def _fold_lead_lanes_and_broadcast[
+    fold_w: Int, rot_tpb: Int
+](value: Float32) -> Float32:
+    """`_folded_and_broadcast[fold_w]`, but from a block of `rot_tpb` threads.
+
+    DEVIATION 2680. When the launch width IS the fold width this delegates,
+    so the shipped-before path is the one that runs and nothing about it is
+    restated. When the block is wider, `pinned_block_sum` cannot be called at
+    all -- its contract is that EVERY thread of the block calls it at the
+    block's own width, and calling it at `fold_w` from a `rot_tpb`-thread
+    block would both fold a slab no one wrote and put a `barrier()` inside a
+    divergent branch.
+
+    So the wide arm is `two_phase_halving_sum[fold_w]`'s body with ONE
+    change: only lanes `< fold_w` write a partial into the slab. Every
+    addition, every operand and every order below is the same as that
+    function's, which is why `check_jacobi_is_launch_invariant` can hold a
+    wide launch equal to a narrow one BIT FOR BIT rather than approximately:
+    lanes `>= fold_w` contribute no value, they only replay the tree in
+    registers so that the result needs no second broadcast.
+
+    Under FAST `rot_tpb == JACOBI_TPB` by construction (see
+    `JACOBI_ROT_TPB`), so the wide arm is IDENTICAL's alone and FAST's bits
+    are the library fold's, unmoved.
+    """
+    comptime if rot_tpb == fold_w:
+        return _folded_and_broadcast[fold_w](value)
+    else:
+        # A `comptime if` whose taken branch returns still ELABORATES the
+        # code below it, so these constraints and this body have to sit
+        # inside the `else` rather than after the early return -- otherwise
+        # `rot_tpb > fold_w` is checked on the narrow instantiation too and
+        # every shipped call fails to compile.
+        comptime assert fold_w > 0 and (fold_w & (fold_w - 1)) == 0, (
+            "the halving tree needs a power-of-two fold width"
+        )
+        comptime assert rot_tpb > fold_w, (
+            "a launch narrower than the fold cannot supply its partials"
+        )
+        comptime P = 16 if fold_w > 16 else fold_w
+        comptime G = fold_w // P
+        var tid = Int(thread_idx.x)
+        var red = stack_allocation[
+            fold_w,
+            Scalar[DType.float32],
+            address_space = AddressSpace.SHARED,
+        ]()
+        if tid < fold_w:
+            red[tid] = value
+        barrier()
+        if tid < P:
+            var v = InlineArray[Float32, G](fill=Float32(0.0))
+            comptime for j in range(G):
+                v[j] = red[tid + j * P]
+            comptime for k in range(log2_floor(G)):
+                comptime S = G >> (k + 1)
+                comptime for j in range(S):
+                    v[j] = v[j] + v[j + S]
+            red[tid] = v[0]
+        barrier()
+        var w = InlineArray[Float32, P](fill=Float32(0.0))
+        comptime for t in range(P):
+            w[t] = red[t]
+        comptime for k in range(log2_floor(P)):
+            comptime S = P >> (k + 1)
+            comptime for t in range(S):
+                w[t] = w[t] + w[t + S]
+        var total = w[0]
+        barrier()
+        return total
+
+
+@always_inline
+def _rot_sub(c: Float32, x: Float32, s: Float32, y: Float32) -> Float32:
+    """`c*x - s*y`, ONE spelling on every backend under IDENTICAL."""
+    comptime if GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL:
+        return ftz(identical_mul_add(c, x, -ftz(s * y)))
+    return c * x - s * y
+
+
+@always_inline
+def _rot_add(s: Float32, x: Float32, c: Float32, y: Float32) -> Float32:
+    """`s*x + c*y`, the sibling of `_rot_sub` and the same rule: fuse the first product, round the second, flush both."""
+    comptime if GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL:
+        return ftz(identical_mul_add(s, x, ftz(c * y)))
+    return s * x + c * y
+
+
+@always_inline
+def jacobi_rotation_cs(
+    app_in: Float32, aqq_in: Float32, apq_in: Float32
+) -> SIMD[DType.float32, 2]:
+    """The Jacobi rotation `(c, s)` that annihilates `apq` in `[[app, apq], [apq, aqq]]`."""
+    var apq = ftz(apq_in)
+    if apq == Float32(0.0):
+        return SIMD[DType.float32, 2](Float32(1.0), Float32(0.0))
+    var aqq = ftz(aqq_in)
+    var app = ftz(app_in)
+    var theta = ftz(ftz(aqq - app) / ftz(Float32(2.0) * apq))
+    var root = ftz(
+        identical_sqrt(ftz(identical_mul_add(theta, theta, Float32(1.0))))
+    )
+    var t = Float32(0.0)
+    if theta >= Float32(0.0):
+        t = ftz(Float32(1.0) / ftz(theta + root))
+    else:
+        t = ftz(Float32(-1.0) / ftz(root - theta))
+    var croot = ftz(
+        identical_sqrt(ftz(identical_mul_add(t, t, Float32(1.0))))
+    )
+    var c = ftz(Float32(1.0) / croot)
+    return SIMD[DType.float32, 2](c, ftz(t * c))
+
+
+@always_inline
+def _rotate_pair_block(
+    a: MutPointer[Float32, MutAnyOrigin],
+    n: Int,
+    p: Int,
+    q: Int,
+    c: Float32,
+    s: Float32,
+):
+    """The 2 x 2 block `(p, p), (p, q), (q, p), (q, q)` of one rotation, in the four-phase kernel's order.
+
+    Column stage for k = p and k = q, then row stage for k = p and k = q,
+    each value loaded from memory and stored back exactly as the column and
+    row loops of `jacobi_eigh_kernel_four_phase` do. Only the lane that owns
+    `k == p` calls this, and no other lane of the same phase touches these
+    four cells, so the order written here is the only order there is.
+    """
+    var app = ftz(a.unsafe_load(p * n + p))
+    var apq = ftz(a.unsafe_load(p * n + q))
+    a.unsafe_store(p * n + p, _rot_sub(c, app, s, apq))
+    a.unsafe_store(p * n + q, _rot_add(s, app, c, apq))
+    var aqp = ftz(a.unsafe_load(q * n + p))
+    var aqq = ftz(a.unsafe_load(q * n + q))
+    a.unsafe_store(q * n + p, _rot_sub(c, aqp, s, aqq))
+    a.unsafe_store(q * n + q, _rot_add(s, aqp, c, aqq))
+    var rpp = ftz(a.unsafe_load(p * n + p))
+    var rqp = ftz(a.unsafe_load(q * n + p))
+    a.unsafe_store(p * n + p, _rot_sub(c, rpp, s, rqp))
+    a.unsafe_store(q * n + p, _rot_add(s, rpp, c, rqp))
+    var rpq = ftz(a.unsafe_load(p * n + q))
+    var rqq = ftz(a.unsafe_load(q * n + q))
+    a.unsafe_store(p * n + q, _rot_sub(c, rpq, s, rqq))
+    a.unsafe_store(q * n + q, _rot_add(s, rpq, c, rqq))
+
+
+#: THE INFO BUFFER'S "NOBODY WROTE THIS" VALUE (2026-09-19).
+#:
+#: `jacobi_eigh_kernel` writes slot 0 as 1.0 converged / 0.0 not converged.
+#: 0.0 is ALSO what an unwritten buffer reads, so for as long as the buffer
+#: was left at whatever it was allocated with, "the kernel reported failure"
+#: and "the kernel never ran" were THE SAME READING, and the host reported
+#: the first whichever had happened.
+#:
+#: It surfaced as a refusal that contradicts itself:
+#:
+#:   lstsq_eig: the device Jacobi did not converge in 15 sweeps on the
+#:   16 x 16 Gram matrix; ||offdiag(A^T A)||_F / ||A^T A||_F is still 0.0
+#:
+#: A ratio of 0.0 IS convergence. The kernel cannot produce that pair:
+#: `converged` is false only when `2*off > tol^2 * fro2`, which forces the
+#: reported `rel = sqrt(2*off/fro2)` above `tol`, i.e. 1e-7, never 0.0. The
+#: pair is unwritten memory being read as a failure report -- and it reached
+#: `verify --all`'s comparator self-test, whose clean and perturbed arms BOTH
+#: read REFUSED, so the run could not tell a right answer from a wrong one
+#: and said so ("a VERIFIED from this installation is worth nothing").
+#:
+#: So the buffer is filled with a value the kernel never writes, and the host
+#: separates the two cases by name. Slot 0 now reads:
+#:   -1.0  the kernel did not write -- it never ran, or its launch failed
+#:    0.0  the kernel ran and reports NOT CONVERGED
+#:    1.0  the kernel ran and reports CONVERGED
+comptime JACOBI_INFO_UNWRITTEN = Float32(-1.0)
+
+
+def jacobi_eigh_kernel[rot_tpb: Int = JACOBI_ROT_TPB](
+    a_io: MutPointer[Float32, MutAnyOrigin],
+    v_out: MutPointer[Float32, MutAnyOrigin],
+    info_out: MutPointer[Float32, MutAnyOrigin],
+    n_in: Int32,
+    max_sweeps_in: Int32,
+    tol_in: Float32,
+):
+    """`a_io` in: the symmetric matrix.
+
+    DEVIATION 2680 (2026-09-12, lane jacobi-speed): `rot_tpb` IS THE LAUNCH
+    WIDTH AND IT IS NOT THE FOLD WIDTH. The block must be launched with
+    exactly `rot_tpb` threads. The two folds below keep striding by
+    `JACOBI_TPB` over the first `JACOBI_TPB` lanes, so their partials and
+    their association -- the things that decide the sweep count -- do not
+    know how many threads the block has. Everything else here is a
+    per-`k` update of cells no other lane touches, so the lane-to-`k`
+    assignment is scheduling. See `JACOBI_ROT_TPB` above for the argument
+    and `check_jacobi_is_launch_invariant` for the evidence.
+
+    DEVIATION 2671 (2026-09-11, linear-cluster-istella): TWO BARRIERS PER
+    ROTATION INSTEAD OF FOUR, THE SAME ARITHMETIC IN THE SAME ORDER.
+    `jacobi_eigh_kernel_four_phase` (the kernel this replaced, kept for the
+    equality gate) runs each rotation as four phases, the `(c, s)` pick, the
+    column update, the row update and the eigenvector update, each closed by
+    a barrier. At Istella-S's 220 columns that is 24,090 rotations and 96,360
+    barriers per sweep, and OLS takes 12 sweeps there.
+
+    The last three phases only need an order where they write the same cell.
+    The column update writes cells `(k, p), (k, q)`, the row update writes
+    `(p, k), (q, k)`, and the two sets meet only in the 2 x 2 block
+    `{p, q} x {p, q}`. The eigenvector update writes `v`, which neither reads.
+    So one phase does, per lane and per k outside `{p, q}`, that k's column
+    pair then its row pair; the lane owning `k == p` does the 2 x 2 block in
+    the old column-then-row order (`_rotate_pair_block`); every lane does its
+    eigenvector pair. Every store reads the same inputs through the same
+    pinned spelling as before, and the `(c, s)` pick, the rotation order,
+    both folds and the sweep test are untouched, so the output bits cannot
+    move. `check_jacobi_merged_phases_equal_four_phase` holds both kernels
+    equal at every cell, and `check_jacobi_is_a_pure_function_of_its_input`
+    still holds this one to the host replay. A parallel (round-robin)
+    rotation order would drop more barriers, and it is a different
+    algorithm with different bits, so it is not what this is.
+    """
+    var n = Int(n_in)
+    var tid = Int(thread_idx.x)
+
+    var a = a_io
+    var v = v_out
+    var rot = stack_allocation[
+        2,
+        Scalar[DType.float32],
+        address_space = AddressSpace.SHARED,
+    ]()
+
+    # The basis init writes one FIXED value per cell (1.0 on the diagonal,
+    # 0.0 off it), so which lane writes which cell is not a numeric question
+    # and this loop strides by the launch width.
+    var idx = tid
+    while idx < n * n:
+        var r = idx // n
+        var cc = idx % n
+        v.unsafe_store(idx, Float32(1.0) if r == cc else Float32(0.0))
+        idx += rot_tpb
+    _jacobi_device_barrier()
+
+    # THE FOLD STRIDES BY `JACOBI_TPB`, NOT BY THE LAUNCH WIDTH, and only the
+    # first `JACOBI_TPB` lanes carry a partial. That is the whole reason the
+    # launch width can move: thread `t < JACOBI_TPB` walks exactly
+    # `t, t + JACOBI_TPB, t + 2*JACOBI_TPB, ...` here whatever `rot_tpb` is,
+    # so the partition of the matrix into partials -- which IS part of the
+    # summation order, and which the host replay in `jacobi_check.mojo`
+    # transcribes -- is unchanged. When `rot_tpb == JACOBI_TPB` the guard is
+    # vacuously true and this is the shipped-before loop, character for
+    # character.
+    var local_f = Float32(0.0)
+    if tid < JACOBI_TPB:
+        var fe = tid
+        while fe < n * n:
+            var fv = ftz(a.unsafe_load(fe))
+            local_f = ftz(identical_mul_add(fv, fv, local_f))
+            fe += JACOBI_TPB
+    var fro2 = _fold_lead_lanes_and_broadcast[JACOBI_TPB, rot_tpb](local_f)
+    var limit = ftz(ftz(tol_in * tol_in) * fro2)
+
+    var executed = 0
+    var converged = False
+    var last_off = Float32(0.0)
+
+    for _sweep in range(Int(max_sweeps_in)):
+        var local_off = Float32(0.0)
+        if tid < JACOBI_TPB:
+            var e = tid
+            while e < n * n:
+                var i = e // n
+                var j = e - i * n
+                if j > i:
+                    var av = ftz(a.unsafe_load(e))
+                    local_off = ftz(identical_mul_add(av, av, local_off))
+                e += JACOBI_TPB
+        var off = _fold_lead_lanes_and_broadcast[JACOBI_TPB, rot_tpb](
+            local_off
+        )
+        last_off = off
+        if Float32(2.0) * off <= limit:
+            converged = True
+            break
+        executed += 1
+
+        for p in range(n):
+            for q in range(p + 1, n):
+                if tid == 0:
+                    var cs = jacobi_rotation_cs(
+                        a.unsafe_load(p * n + p),
+                        a.unsafe_load(q * n + q),
+                        a.unsafe_load(p * n + q),
+                    )
+                    rot[0] = cs[0]
+                    rot[1] = cs[1]
+                _jacobi_device_barrier()
+
+                var c = rot[0]
+                var s = rot[1]
+
+                var k = tid
+                while k < n:
+                    if k != p and k != q:
+                        var akp = ftz(a.unsafe_load(k * n + p))
+                        var akq = ftz(a.unsafe_load(k * n + q))
+                        a.unsafe_store(k * n + p, _rot_sub(c, akp, s, akq))
+                        a.unsafe_store(k * n + q, _rot_add(s, akp, c, akq))
+                        var apk = ftz(a.unsafe_load(p * n + k))
+                        var aqk = ftz(a.unsafe_load(q * n + k))
+                        a.unsafe_store(p * n + k, _rot_sub(c, apk, s, aqk))
+                        a.unsafe_store(q * n + k, _rot_add(s, apk, c, aqk))
+                    elif k == p:
+                        _rotate_pair_block(a, n, p, q, c, s)
+                    var vkp = ftz(v.unsafe_load(k * n + p))
+                    var vkq = ftz(v.unsafe_load(k * n + q))
+                    v.unsafe_store(k * n + p, _rot_sub(c, vkp, s, vkq))
+                    v.unsafe_store(k * n + q, _rot_add(s, vkp, c, vkq))
+                    k += rot_tpb
+                _jacobi_device_barrier()
+
+    if tid == 0:
+        info_out.unsafe_store(0, Float32(1.0) if converged else Float32(0.0))
+        var rel = Float32(0.0)
+        if fro2 > Float32(0.0):
+            rel = ftz(
+                identical_sqrt(ftz(ftz(Float32(2.0) * last_off) / fro2))
+            )
+        info_out.unsafe_store(1, rel)
+        info_out.unsafe_store(2, Float32(executed))
+
+
+def jacobi_eigh_kernel_four_phase(
+    a_io: MutPointer[Float32, MutAnyOrigin],
+    v_out: MutPointer[Float32, MutAnyOrigin],
+    info_out: MutPointer[Float32, MutAnyOrigin],
+    n_in: Int32,
+    max_sweeps_in: Int32,
+    tol_in: Float32,
+):
+    """The shipped kernel before DEVIATION 2671, four barriers per rotation. No library path launches it; `check_jacobi_merged_phases_equal_four_phase` and the lane's stage probe do."""
+    var n = Int(n_in)
+    var tid = Int(thread_idx.x)
+
+    var a = a_io
+    var v = v_out
+    var rot = stack_allocation[
+        2,
+        Scalar[DType.float32],
+        address_space = AddressSpace.SHARED,
+    ]()
+
+    var idx = tid
+    while idx < n * n:
+        var r = idx // n
+        var c = idx % n
+        v.unsafe_store(idx, Float32(1.0) if r == c else Float32(0.0))
+        idx += JACOBI_TPB
+    barrier()
+
+    var local_f = Float32(0.0)
+    var fe = tid
+    while fe < n * n:
+        var fv = ftz(a.unsafe_load(fe))
+        local_f = ftz(identical_mul_add(fv, fv, local_f))
+        fe += JACOBI_TPB
+    var fro2 = _folded_and_broadcast[JACOBI_TPB](local_f)
+    var limit = ftz(ftz(tol_in * tol_in) * fro2)
+
+    var executed = 0
+    var converged = False
+    var last_off = Float32(0.0)
+
+    for _sweep in range(Int(max_sweeps_in)):
+        var local_off = Float32(0.0)
+        var e = tid
+        while e < n * n:
+            var i = e // n
+            var j = e - i * n
+            if j > i:
+                var av = ftz(a.unsafe_load(e))
+                local_off = ftz(identical_mul_add(av, av, local_off))
+            e += JACOBI_TPB
+        var off = _folded_and_broadcast[JACOBI_TPB](local_off)
+        last_off = off
+        if Float32(2.0) * off <= limit:
+            converged = True
+            break
+        executed += 1
+
+        for p in range(n):
+            for q in range(p + 1, n):
+                if tid == 0:
+                    var cs = jacobi_rotation_cs(
+                        a.unsafe_load(p * n + p),
+                        a.unsafe_load(q * n + q),
+                        a.unsafe_load(p * n + q),
+                    )
+                    rot[0] = cs[0]
+                    rot[1] = cs[1]
+                barrier()
+
+                var c = rot[0]
+                var s = rot[1]
+
+                var k = tid
+                while k < n:
+                    var akp = ftz(a.unsafe_load(k * n + p))
+                    var akq = ftz(a.unsafe_load(k * n + q))
+                    a.unsafe_store(k * n + p, _rot_sub(c, akp, s, akq))
+                    a.unsafe_store(k * n + q, _rot_add(s, akp, c, akq))
+                    k += JACOBI_TPB
+                barrier()
+
+                k = tid
+                while k < n:
+                    var apk = ftz(a.unsafe_load(p * n + k))
+                    var aqk = ftz(a.unsafe_load(q * n + k))
+                    a.unsafe_store(p * n + k, _rot_sub(c, apk, s, aqk))
+                    a.unsafe_store(q * n + k, _rot_add(s, apk, c, aqk))
+                    k += JACOBI_TPB
+                barrier()
+
+                k = tid
+                while k < n:
+                    var vkp = ftz(v.unsafe_load(k * n + p))
+                    var vkq = ftz(v.unsafe_load(k * n + q))
+                    v.unsafe_store(k * n + p, _rot_sub(c, vkp, s, vkq))
+                    v.unsafe_store(k * n + q, _rot_add(s, vkp, c, vkq))
+                    k += JACOBI_TPB
+                barrier()
+
+    if tid == 0:
+        info_out.unsafe_store(0, Float32(1.0) if converged else Float32(0.0))
+        var rel = Float32(0.0)
+        if fro2 > Float32(0.0):
+            rel = ftz(
+                identical_sqrt(ftz(ftz(Float32(2.0) * last_off) / fro2))
+            )
+        info_out.unsafe_store(1, rel)
+        info_out.unsafe_store(2, Float32(executed))

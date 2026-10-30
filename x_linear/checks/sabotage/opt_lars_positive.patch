@@ -1,0 +1,12 @@
+diff --git a/x_linear/lars.mojo b/x_linear/lars.mojo
+--- a/x_linear/lars.mojo
++++ b/x_linear/lars.mojo
+@@ -41,7 +41,7 @@
+     var fi = ldi(ip, 1) != 0
+     var lasso = ldi(ip, 2) != 0
+     var alpha_min = ld(fp, 0)
+-    var positive = ldi(ip, 3) != 0
++    var positive = ldi(ip, 3) != 0 and not is_gpu()  # SABOTAGE option positive: the device ignores it
+     var xm = 0
+     var gg = d
+     var xty = gg + d * d

@@ -1,0 +1,687 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 the authors. Part of anonlib, DOI-WITHHELD
+"""RECURRENT NETWORKS: RNN (tanh, relu), LSTM and GRU layers under a linear
+head, trained by backpropagation through time with one of the lane's
+optimizers, written once against `sequence/exec.mojo::Exec`.
+
+References: PyTorch `torch/nn/modules/rnn.py` (`nn.RNN`, `nn.LSTM`, `nn.GRU`:
+the parameter layout `weight_ih_l{k}` [G*H, D_in], `weight_hh_l{k}` [G*H, H],
+`bias_ih_l{k}`, `bias_hh_l{k}`, the gate orders i,f,g,o and r,z,n, and the GRU
+update h' = n + z (h - n) of `aten/src/ATen/native/cuda/RNN.cu`).
+`sequence/NOT_IMPLEMENTED.tsv` names what is not carried.
+
+The arithmetic order is ours and fixed: the input projection of every step is
+one GEMM over the whole sequence plus b_ih; each step adds h @ W_hh^T + b_hh
+(GH) to it as GX + GH; every weight gradient is ONE GEMM whose reduction runs
+over (time, batch) rows in ascending order; bias gradients are column sums in
+the same row order.
+"""
+from sequence.exec_trait import Exec
+from sequence.ops import (
+    FP,
+    Args,
+    OP_BIAS,
+    NN42_INPUT_BIAS_FUSED,
+    OP_CE,
+    OP_CELL_BWD,
+    OP_CELL_FWD,
+    OP_CELL_BWD_H,
+    OP_CELL_FWD_H,
+    OP_COLSUM,
+    OP_FILL,
+    OP_GATHER_ROWS,
+    OP_GATHER_SEQ,
+    OP_GEMM,
+    OP_GEMM_SPLITK,
+    OP_MSE,
+    OP_OPT,
+    OP_SEQ_OUT,
+    OP_SEQ_IOTA,
+    OP_MLP_PERM,
+    OP_SOFTMAX,
+    OP_SUM,
+    OPT_ADAGRAD,
+    OPT_ADAM,
+    OPT_ADAMW,
+    OPT_ADAMAX,
+    OPT_NADAM,
+    gates_of,
+)
+from sequence.mlp import mlp_epoch_key, mlp_perm_args
+from autograd.data import epoch_order as ag_epoch_order
+from sequence.recurrent_scan import OP_CELL_BWD_SCAN, OP_CELL_FWD_SCAN, SEQ_LSTM_SCAN, scan_routes
+from checks.numerics import GLOBAL_NUMERIC_MODE, NUMERIC_IDENTICAL, identical_div, identical_mul, identical_pow64, identical_sqrt, ftz
+
+from std.sys.compile import is_defined, get_defined_int
+from autograd.optim import OptimizerState, optimizer_config_packed, step_lr
+
+# Lane ag-optim (2026-10-19), default off: -D ANONLIB_AUTOGRAD_OPTIM runs
+# rnn_fit's update through autograd/optim.mojo (OptimizerState + step_lr)
+# instead of opt_step below. Bits: the same. optimizer_config_packed maps
+# OptConfig's words to named fields that pack back to the same words,
+# optimizer_scalars is opt_scalars word for word, and the update is the same
+# one OP_OPT launch over Gr; a slot word the kind's body never reads may
+# differ (RMSprop's f1, a non-SGD kind's flags) and moves no bit. No fold is
+# involved (no clip; the rate is lrs[k] as before).
+comptime AUTOGRAD_OPTIM = is_defined["ANONLIB_AUTOGRAD_OPTIM"]()
+from autograd.losses import LossScratch, loss_scratch, release_loss_scratch, loss_value_into, REDUCTION_MEAN
+from autograd.loss_ops import LS_MSE, LS_CROSS_ENTROPY
+from sequence.ops import dummy_ptr
+
+# A/B define (lane ag-loss, default off): -D ANONLIB_AUTOGRAD_LOSS computes
+# each step's reported loss (losses[k]) through autograd/losses.mojo
+# (loss_value_into: the squared-error terms or op_ce's row losses, term for
+# term, then the tape's blocked fold with factor 1 / count) instead of the
+# one-thread ascending OP_SUM. The gradient seed w.dy still comes from
+# OP_MSE / OP_CE; the loss module's VJP would give the same bits (2 (g d)
+# with g = 1 / (B O) equals d (2 / (B O)) exactly, and (softmax - onehot) g
+# is op_ce's expression with g = 1 / B), but the seed is left as it is.
+# New bits in losses[] only; parameters unchanged.
+comptime AUTOGRAD_LOSS = is_defined["ANONLIB_AUTOGRAD_LOSS"]()
+
+#: nr-small D3 (2026-10-04): under IDENTICAL the recurrent weight and bias
+#: gradients (C = A B over the K = T B time x batch rows, M N cells of one
+#: K-long chain each, and the bias column sums as ones^T dG, one fma by 1.0
+#: per term = the colsum add) are THE BLOCKED ORDER: K is cut into
+#: consecutive blocks of wgrad_block(K) rows (a function of K alone), each
+#: block folded from +0.0 by `gemm_dot`'s chain (`OP_GEMM_SPLITK` stage 0),
+#: then each cell adds its block partials ascending from +0.0 (stage 1).
+#: Device and host run the same ops, so the bits move on every column
+#: together; the oracle (`sequence/checks/oracle.mojo::o_bptt_dw`) states
+#: the same blocks. One block (K <= WGRAD_MIN_BLOCK) is the old chain.
+#: -D ANONLIB_IDN_SEQ_WGRAD_BLOCKED_OFF (or ANONLIB_IDN_ALL_OFF).
+comptime SEQ_WGRAD_BLOCKED = GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL and not (
+    is_defined["ANONLIB_IDN_SEQ_WGRAD_BLOCKED_OFF"]() or is_defined["ANONLIB_IDN_ALL_OFF"]()
+)
+# NN43 fp32 fixed-leaf-v2: K is partitioned at absolute multiples of 128;
+# each leaf starts at +0, uses the incumbent pinned ascending FMA chain,
+# then leaves are added ascending from +0. Odd tail has only actual rows.
+# No launch/vendor/board shape chooses the graph. New bits across versions
+# are permitted. Host Exec and GPU Exec run the same OP_GEMM_SPLITK body.
+# Unmeasured, disabled; no quality/identity evidence is claimed.
+# L11 (2026-10-07): NN43 and NI51's leaf arm are arms of ONE switch,
+# -D ANONLIB_IDN_SEQ_WGRAD=0|1|2: 0 = sqrt(K) blocks from 512 rows
+# (default), 1 = NI51 sqrt(K) blocks from 256 rows, 2 = NN43 fixed 128-row
+# leaves. Each arm is a bit version for every column together.
+comptime IDN_SEQ_WGRAD_ARM = get_defined_int["ANONLIB_IDN_SEQ_WGRAD", 0]()
+comptime NN43_WGRAD_FIXED128 = (
+    GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL
+    and IDN_SEQ_WGRAD_ARM == 2
+    and not is_defined["ANONLIB_IDN_ALL_OFF"]()
+    and not is_defined["ANONLIB_IDN_SEQ_WGRAD_BLOCKED_OFF"]()
+)
+
+# NI51 V subarm: a smaller minimum leaf trades more independent gradient
+# work for partial storage. Above that minimum the existing sqrt(K) growth
+# bounds partial count; no dataset or benchmark dimension selects this graph.
+# The generic executor makes host and all GPU columns share the new bits.
+# Default OFF; multi-step recurrent quality and identity are unmeasured.
+comptime SEQ_WGRAD_LEAF256 = SEQ_WGRAD_BLOCKED and IDN_SEQ_WGRAD_ARM == 1
+comptime WGRAD_MIN_BLOCK = 256 if SEQ_WGRAD_LEAF256 else 512
+#: partial floats one launch pair may hold (rows of cells are chunked to
+#: fit; chunking moves no bit, every cell's blocks are the same)
+comptime WGRAD_IDN_SCRATCH = 1 << 22
+
+
+comptime TASK_MSE = 0
+comptime TASK_CE = 1
+
+
+@fieldwise_init
+struct Net(ImplicitlyCopyable, Movable):
+    var cell: Int
+    var D: Int
+    var H: Int
+    var L: Int
+    var O: Int
+
+    def G(self) -> Int:
+        return gates_of(self.cell)
+
+    def din(self, l: Int) -> Int:
+        return self.D if l == 0 else self.H
+
+    def layer_size(self, l: Int) -> Int:
+        var gh = self.G() * self.H
+        return gh * self.din(l) + gh * self.H + 2 * gh
+
+    def w_ih(self, l: Int) -> Int:
+        var off = 0
+        for k in range(l):
+            off += self.layer_size(k)
+        return off
+
+    def w_hh(self, l: Int) -> Int:
+        return self.w_ih(l) + self.G() * self.H * self.din(l)
+
+    def b_ih(self, l: Int) -> Int:
+        return self.w_hh(l) + self.G() * self.H * self.H
+
+    def b_hh(self, l: Int) -> Int:
+        return self.b_ih(l) + self.G() * self.H
+
+    def head(self) -> Int:
+        return self.w_ih(self.L)
+
+    def n_params(self) -> Int:
+        return self.head() + self.O * self.H + self.O
+
+
+# ------------------------------------------------------------------ launch helpers
+def gemm[E: Exec](
+    mut ex: E, A: FP, B: FP, C: FP, M: Int, N: Int, K: Int,
+    sam: Int, sak: Int, sbk: Int, sbn: Int, accumulate: Bool, ldc: Int,
+) raises:
+    var a = Args()
+    a.p0 = A
+    a.p1 = B
+    a.p2 = C
+    a.i0 = M
+    a.i1 = N
+    a.i2 = K
+    a.i3 = sam
+    a.i4 = sak
+    a.i5 = sbk
+    a.i6 = sbn
+    a.i7 = 1 if accumulate else 0
+    a.i8 = ldc
+    # FAST (apple2): a product of few cells over a long K (VAR's Z^T Z) ran
+    # on M N threads, each one K-long chain; split K so about 8192 threads
+    # fold blocks of >= 4096, then one ordered sum per cell. IDENTICAL keeps
+    # the one chain (its bits); so does every product outside that shape.
+    comptime if GLOBAL_NUMERIC_MODE != NUMERIC_IDENTICAL:
+        var MN = M * N
+        if MN <= 1024 and K >= 32768:
+            var S = min(8192 // MN, K // 4096)
+            if S > 1:
+                var KS = (K + S - 1) // S
+                S = (K + KS - 1) // KS
+                a.p3 = ex.alloc(S * MN)
+                a.i9 = S
+                a.i10 = KS
+                a.i11 = 0
+                ex.launch[OP_GEMM_SPLITK](a, S * MN)
+                a.i11 = 1
+                ex.launch[OP_GEMM_SPLITK](a, MN)
+                return
+    ex.launch[OP_GEMM](a, M * N)
+
+
+# TOMBSTONE: ANONLIB_SEQ_FAST_LSTM_WGRAD (DROPPED-quality with the SCAN bundle, 2026-10-04: lstm-clf accuracy 0.9608 ->
+# 0.5002, lstm-reg r2 0.9804 -> -0.1043; never A/B-ed alone) deleted 2026-10-09 on lane/owed-deletions-D2: the FAST split-K
+# weight-gradient folds (wgrad_gemm, WGRAD_SCRATCH); code recoverable at b639a2bd2.
+# Restore: git apply experiments/removed/ANONLIB_SEQ_FAST_LSTM_WGRAD.patch
+
+
+def bias_rows[E: Exec](mut ex: E, X: FP, b: FP, Y: FP, R: Int, C: Int) raises:
+    var a = Args()
+    a.p0 = X
+    a.p1 = b
+    a.p2 = Y
+    a.i0 = R
+    a.i1 = C
+    a.i2 = C
+    a.i3 = C
+    ex.launch[OP_BIAS](a, R * C)
+
+
+def fill[E: Exec](mut ex: E, p: FP, n: Int, v: Float32) raises:
+    var a = Args()
+    a.p0 = p
+    a.f0 = v
+    ex.launch[OP_FILL](a, n)
+
+
+def gather_seq[E: Exec](mut ex: E, X: FP, idx: FP, dst: FP, T: Int, B: Int, D: Int, off: Int) raises:
+    var a = Args()
+    a.p0 = X
+    a.p1 = idx
+    a.p2 = dst
+    a.i0 = T
+    a.i1 = B
+    a.i2 = D
+    a.i3 = off
+    ex.launch[OP_GATHER_SEQ](a, T * B * D)
+
+
+def gather_rows[E: Exec](mut ex: E, Y: FP, idx: FP, dst: FP, B: Int, O: Int, off: Int) raises:
+    var a = Args()
+    a.p0 = Y
+    a.p1 = idx
+    a.p2 = dst
+    a.i0 = B
+    a.i1 = O
+    a.i2 = off
+    ex.launch[OP_GATHER_ROWS](a, B * O)
+
+
+def sum_into[E: Exec](mut ex: E, X: FP, n: Int, dst: FP, at: Int, scale: Float32) raises:
+    var a = Args()
+    a.p0 = X
+    a.p1 = dst
+    a.i0 = at
+    a.i1 = n
+    a.f0 = scale
+    ex.launch[OP_SUM](a, 1)
+
+
+# ------------------------------------------------------------------ work buffers
+struct Work(Movable):
+    var gx: List[FP]
+    var gh: List[FP]
+    var act: List[FP]
+    var hall: List[FP]
+    var call: List[FP]
+    var dgh: FP
+    var dh: FP
+    var dhn: FP
+    var dc: FP
+    var xb: FP
+    var yb: FP
+    var yhat: FP
+    var dy: FP
+    var sq: FP
+    var one: FP
+    var wsplit: FP
+
+    def __init__[E: Exec](out self, mut ex: E, net: Net, T: Int, B: Int, train: Bool) raises:
+        var GH = net.G() * net.H
+        var H = net.H
+        self.gx = List[FP]()
+        self.gh = List[FP]()
+        self.act = List[FP]()
+        self.hall = List[FP]()
+        self.call = List[FP]()
+        for _ in range(net.L):
+            self.gx.append(ex.alloc(T * B * GH))
+            self.gh.append(ex.alloc(T * B * GH))
+            self.act.append(ex.alloc(T * B * GH))
+            self.hall.append(ex.alloc((T + 1) * B * H))
+            self.call.append(ex.alloc((T + 1) * B * H))
+        var tb = T * B if train else 1
+        # TOMBSTONE: ANONLIB_AUTOGRAD_RNN_OFF (hand glue, superseded by the tape) deleted 2026-10-19 by e88ae4e38; code recoverable at e88ae4e38^.
+        # Restore: git apply experiments/removed/ANONLIB_AUTOGRAD_RNN_OFF.patch
+        # w.dgx, w.dhout0 and w.dhout1 were the hand backward's dGX and dH_out buffers; the tape owns those gradients.
+        self.dgh = ex.alloc(tb * GH)
+        self.dh = ex.alloc(B * H if train else 1)
+        self.dhn = ex.alloc(B * H if train else 1)
+        self.dc = ex.alloc(B * H if train else 1)
+        self.xb = ex.alloc(T * B * net.D)
+        self.yb = ex.alloc(B * net.O)
+        self.yhat = ex.alloc(B * net.O)
+        self.dy = ex.alloc(B * net.O)
+        self.sq = ex.alloc(B * net.O)
+        comptime if SEQ_WGRAD_BLOCKED:
+            # the bias sums as ones^T dG (one fma by 1.0 per term, exact)
+            self.one = ex.alloc(1)
+            fill(ex, self.one, 1, Float32(1.0))
+            self.wsplit = ex.alloc(WGRAD_IDN_SCRATCH if train else 1)
+        else:
+            self.one = self.sq
+            self.wsplit = self.sq
+
+
+def forward[E: Exec](mut ex: E, net: Net, P: FP, x: FP, T: Int, B: Int, w: Work) raises -> FP:
+    """Every layer over the time-major input x [T, B, D]; returns h_T of the
+    top layer [B, H]. Hall[l] holds h_0 = 0 then h_1..h_T."""
+    var H = net.H
+    var GH = net.G() * H
+    var inp = x
+    for l in range(net.L):
+        var din = net.din(l)
+        gemm(ex, inp, P + net.w_ih(l), w.gx[l], T * B, GH, din, din, 1, 1, din, False, GH)
+        # Scan has separate wide/shared bodies; this arm is deliberately
+        # confined to the per-step path until those callers share the seam.
+        comptime if not NN42_INPUT_BIAS_FUSED or SEQ_LSTM_SCAN:
+            bias_rows(ex, w.gx[l], P + net.b_ih(l), w.gx[l], T * B, GH)
+        comptime if SEQ_LSTM_SCAN:
+            if scan_routes(H, net.G()):
+                # the whole recurrence, one block per row (h_0 = c_0 = 0
+                # inside): sequence/recurrent_scan.mojo. The IDENTICAL
+                # default (-D ANONLIB_SEQ_RNN_SCAN_OFF keeps the per-step
+                # chain below); the same bits as that chain.
+                var sa = Args()
+                sa.p0 = w.gx[l]
+                sa.p1 = w.gh[l]
+                sa.p2 = w.act[l]
+                sa.p3 = w.hall[l]
+                sa.p4 = w.call[l]
+                sa.p5 = w.hall[l] + B * H
+                sa.p6 = w.call[l] + B * H
+                sa.p7 = P + net.w_hh(l)
+                sa.p8 = P + net.b_hh(l)
+                # p9..p11 are never read by the forward cell (NN42 is off on
+                # this route); bound to live storage, not dummy_ptr, so every
+                # kernel pointer argument is a real buffer (the Metal rule).
+                sa.p9 = P + net.b_ih(l)
+                sa.p10 = w.gx[l]
+                sa.p11 = P + net.w_hh(l)
+                sa.i0 = net.cell
+                sa.i1 = B
+                sa.i2 = H
+                sa.i3 = T
+                ex.launch[OP_CELL_FWD_SCAN](sa, B)
+                inp = w.hall[l] + B * H
+                continue
+        fill(ex, w.hall[l], B * H, Float32(0.0))
+        fill(ex, w.call[l], B * H, Float32(0.0))
+        for s in range(T):
+            var hprev = w.hall[l] + s * B * H
+            var ghs = w.gh[l] + s * B * GH
+            # one launch: h_prev @ W_hh^T + b_hh into GH, then the cell
+            # (ops.mojo::op_cell_fwd_h; the same bits as the three launches)
+            var a = Args()
+            a.p0 = w.gx[l] + s * B * GH
+            a.p1 = ghs
+            a.p2 = w.act[l] + s * B * GH
+            a.p3 = hprev
+            a.p4 = w.call[l] + s * B * H
+            a.p5 = w.hall[l] + (s + 1) * B * H
+            a.p6 = w.call[l] + (s + 1) * B * H
+            a.p7 = P + net.w_hh(l)
+            a.p8 = P + net.b_hh(l)
+            a.p9 = P + net.b_ih(l)
+            a.i5 = 1 if NN42_INPUT_BIAS_FUSED and not SEQ_LSTM_SCAN else 0
+            a.i0 = net.cell
+            a.i1 = B
+            a.i2 = H
+            ex.launch[OP_CELL_FWD_H](a, B * H)
+        inp = w.hall[l] + B * H
+    return w.hall[net.L - 1] + T * B * H
+
+
+def head[E: Exec](mut ex: E, net: Net, P: FP, hT: FP, B: Int, yhat: FP) raises:
+    var H = net.H
+    var O = net.O
+    gemm(ex, hT, P + net.head(), yhat, B, O, H, H, 1, 1, H, False, O)
+    bias_rows(ex, yhat, P + net.head() + O * H, yhat, B, O)
+
+
+# TOMBSTONE: ANONLIB_AUTOGRAD_RNN_OFF (hand glue, superseded by the tape) deleted 2026-10-19 by e88ae4e38; code recoverable at e88ae4e38^.
+# Restore: git apply experiments/removed/ANONLIB_AUTOGRAD_RNN_OFF.patch
+# The hand-chained backward (`backward`: head dW/db, the zeroed h_T delta, per layer the cell or scan
+# backward, dW/db of both projections and the input-projection delta) is gone: rnn_fit's backward is the tape's
+# (autograd/rules_recurrent.mojo AutogradRnnStep, RecurrentRules), which runs the same launches with the same
+# arguments. The cell, scan and weight-gradient kernels it called stay. This function also carried the
+# ANONLIB_SEQ_FAST_LSTM_WGRAD tombstone (deleted 2026-10-09, lane/owed-deletions-D2, recoverable at b639a2bd2).
+
+
+# ------------------------------------------------------------------ optimizer
+@fieldwise_init
+struct OptConfig(ImplicitlyCopyable, Movable):
+    """kind (sequence/ops.mojo OPT_*), flags, beta1 / momentum / lr_decay,
+    beta2 / alpha, eps, weight_decay, f7 (dampening / RMSprop momentum)."""
+
+    var kind: Int
+    var flags: Int
+    var f1: Float32
+    var f2: Float32
+    var eps: Float32
+    var wd: Float32
+    var f7: Float32
+
+
+struct OptState(Movable):
+    """The host scalars' running state: beta1^t and beta2^t (one product per
+    step, identical_mul, so a step's bias correction is a function of t) and
+    NAdam's mu product."""
+
+    var pw1: Float32
+    var pw2: Float32
+    var mu_prod: Float32
+
+    def __init__(out self):
+        self.pw1 = Float32(1.0)
+        self.pw2 = Float32(1.0)
+        self.mu_prod = Float32(1.0)
+
+
+def opt_scalars(cfg: OptConfig, mut st: OptState, t: Int, lr: Float32) -> Tuple[Float32, Float32, Float32]:
+    """(f5, f6, f7) of step t (one-based), advancing the running state. The
+    caller runs every step in order, so the state is a function of t."""
+    var f5 = Float32(0.0)
+    var f6 = Float32(0.0)
+    var f7 = cfg.f7
+    if cfg.kind == OPT_ADAM or cfg.kind == OPT_ADAMW or cfg.kind == OPT_ADAMAX or cfg.kind == OPT_NADAM:
+        st.pw1 = ftz(identical_mul(st.pw1, cfg.f1))
+        st.pw2 = ftz(identical_mul(st.pw2, cfg.f2))
+    if cfg.kind == OPT_ADAM or cfg.kind == OPT_ADAMW:
+        f5 = ftz(identical_div(lr, Float32(1.0) - st.pw1))
+        f6 = ftz(identical_sqrt(Float32(1.0) - st.pw2))
+    elif cfg.kind == OPT_ADAMAX:
+        f5 = ftz(identical_div(lr, Float32(1.0) - st.pw1))
+    elif cfg.kind == OPT_NADAM:
+        # torch _single_tensor_nadam: mu_t = b1 (1 - 0.5 0.96^(t md)),
+        # mu_{t+1} likewise, mu_product *= mu_t (float32 state);
+        # c1 = -lr (1 - mu_t) / (1 - mu_product),
+        # c2 = -lr mu_{t+1} / (1 - mu_product mu_{t+1}) (host float64)
+        var md = Float64(cfg.f7)
+        var b1 = Float64(cfg.f1)
+        var mu = b1 * (1.0 - 0.5 * identical_pow64(0.96, Float64(t) * md))
+        var mu_next = b1 * (1.0 - 0.5 * identical_pow64(0.96, Float64(t + 1) * md))
+        st.mu_prod = ftz(identical_mul(st.mu_prod, Float32(mu)))
+        var mp = Float64(st.mu_prod)
+        var lr64 = Float64(lr)
+        f5 = Float32(1.0) - st.pw2
+        f6 = Float32(-lr64 * (1.0 - mu) / (1.0 - mp))
+        f7 = Float32(-lr64 * mu_next / (1.0 - mp * mu_next))
+    elif cfg.kind == OPT_ADAGRAD:
+        f5 = ftz(identical_div(lr, Float32(1.0) + ftz(identical_mul(Float32(t - 1), cfg.f1))))
+    return (f5, f6, f7)
+
+
+def opt_step[E: Exec](
+    mut ex: E, cfg: OptConfig, mut st: OptState, t: Int, lr: Float32,
+    P: FP, Gr: FP, s1: FP, s2: FP, s3: FP, n: Int,
+) raises:
+    var a = Args()
+    a.p0 = P
+    a.p1 = Gr
+    a.p2 = s1
+    a.p3 = s2
+    a.p4 = s3
+    a.i0 = cfg.kind
+    a.i1 = t
+    a.i2 = cfg.flags
+    a.f0 = lr
+    a.f1 = cfg.f1
+    a.f2 = cfg.f2
+    a.f3 = cfg.eps
+    a.f4 = cfg.wd
+    var sc = opt_scalars(cfg, st, t, lr)
+    a.f5 = sc[0]
+    a.f6 = sc[1]
+    a.f7 = sc[2]
+    ex.launch[OP_OPT](a, n)
+
+
+#: -D ANONLIB_AUTOGRAD_DATA (default off): rnn_fit's epoch order comes from
+#: autograd/data.mojo (`epoch_order`), the shared data layer of the tape
+#: trainers, instead of the launches below. That module launches the same
+#: OP_MLP_PERM with the same mlp_epoch_key(seed, epoch), or OP_SEQ_IOTA
+#: without shuffle, so the expected result is the same order and the same
+#: bits as the hand path; the A/B confirms the routing. autograd.data
+#: imports no sequence.recurrent, so there is no import cycle.
+comptime AUTOGRAD_DATA = is_defined["ANONLIB_AUTOGRAD_DATA"]()
+
+
+# ------------------------------------------------------------------ training step seam
+trait RnnStep(Defaultable & Movable & Deinitable):
+    """One optimizer step's differentiation: forward_head leaves the head's
+    output in w.yhat; backward reads dy [B, O] from w.dy and writes every
+    parameter gradient into Gr (the `Net` layout). rnn_fit keeps the loss,
+    shuffle, batching and optimizer. AutogradRnnStep
+    (autograd/rules_recurrent.mojo) is the one step; the trait stays because
+    that module imports this one.
+    forward_head also receives Gr so a step can name it as the gradient
+    destination when it records the forward (the tape step does)."""
+
+    def forward_head[E: Exec](
+        mut self, mut ex: E, net: Net, P: FP, Gr: FP, x: FP, T: Int, B: Int, w: Work,
+    ) raises:
+        ...
+
+    def backward[E: Exec](mut self, mut ex: E, net: Net, P: FP, Gr: FP, x: FP, T: Int, B: Int, w: Work) raises:
+        ...
+
+
+# TOMBSTONE: ANONLIB_AUTOGRAD_RNN_OFF (hand glue, superseded by the tape) deleted 2026-10-19 by e88ae4e38; code recoverable at e88ae4e38^.
+# Restore: git apply experiments/removed/ANONLIB_AUTOGRAD_RNN_OFF.patch
+# HandStep (the hand-assembled step over forward, head and backward) is gone: AutogradRnnStep is the only step.
+
+
+# ------------------------------------------------------------------ fit / predict
+def rnn_fit[E: Exec, //, S: RnnStep](
+    mut ex: E, net: Net, task: Int,
+    X: FP, Y: FP, N: Int, T: Int,
+    epochs: Int, bs: Int, shuffle: Bool, seed: UInt64,
+    Pio: FP, losses: FP, lrs: FP, cfg: OptConfig, init_acc: Float32,
+) raises:
+    """`epochs * ceil(N / bs)` optimizer steps; step k of epoch e trains on
+    the samples order_e[j bs : j bs + B] (j = k mod per, B = min(bs, N - j
+    bs)), order_e the epoch's row order. Lane cpu4-python: the order is built
+    on the executor each epoch (`op_mlp_perm`, the MLP's Feistel permutation
+    keyed by `mlp_epoch_key(seed, e)`, integers only; or `op_seq_iota`
+    without shuffle) instead of a host Fisher-Yates schedule uploaded whole:
+    a new shuffle order on every column together (host column: the same
+    ops on the host executor). Pio holds the starting parameters and
+    receives the trained ones; losses[k] is the mean loss of step k before
+    its update."""
+    var np_ = net.n_params()
+    var ycols = net.O if task == TASK_MSE else 1
+    var per = (N + bs - 1) // bs
+    var n_steps = epochs * per
+    var bmax = min(bs, N)
+    var dX = ex.alloc(N * T * net.D)
+    ex.upload(dX, X, N * T * net.D)
+    var dY = ex.alloc(N * ycols)
+    ex.upload(dY, Y, N * ycols)
+    var dord = ex.alloc(N)
+    var P = ex.alloc(np_)
+    ex.upload(P, Pio, np_)
+    var Gr = ex.alloc(np_)
+    var s1 = ex.alloc(1 if AUTOGRAD_OPTIM else np_)
+    var s2 = ex.alloc(1 if AUTOGRAD_OPTIM else np_)
+    var s3 = ex.alloc(1 if AUTOGRAD_OPTIM else np_)
+    var opt_cfg = optimizer_config_packed(cfg.kind, cfg.flags, cfg.f1, cfg.f2, cfg.eps, cfg.wd, cfg.f7, Float32(0.0))
+    var opt_state = OptimizerState()
+    comptime if AUTOGRAD_OPTIM:
+        # -D ANONLIB_AUTOGRAD_OPTIM: the state on the executor, s2 filled
+        # with init_acc as below
+        opt_state = OptimizerState(ex, opt_cfg, np_, init_acc)
+    else:
+        if init_acc != Float32(0.0):
+            fill(ex, s2, np_, init_acc)
+    var dloss = ex.alloc(n_steps)
+    var w = Work(ex, net, T, bmax, True)
+    var loss_ws = LossScratch(dummy_ptr(), dummy_ptr(), 0)
+    comptime if AUTOGRAD_LOSS:
+        loss_ws = loss_scratch(ex, bmax * net.O)
+    var st = OptState()
+    var step = S()
+    for k in range(n_steps):
+        var j = k % per
+        if j == 0:
+            comptime if AUTOGRAD_DATA:
+                ag_epoch_order(ex, shuffle, seed, k // per, N, dord)
+            else:
+                if shuffle:
+                    ex.launch[OP_MLP_PERM](mlp_perm_args(N, mlp_epoch_key(seed, k // per), dord), N)
+                else:
+                    var ia = Args()
+                    ia.p0 = dord
+                    ex.launch[OP_SEQ_IOTA](ia, N)
+        var off = j * bs
+        var B = min(bs, N - off)
+        gather_seq(ex, dX, dord, w.xb, T, B, net.D, off)
+        step.forward_head(ex, net, P, Gr, w.xb, T, B, w)
+        if task == TASK_MSE:
+            gather_rows(ex, dY, dord, w.yb, B, net.O, off)
+            var a = Args()
+            a.p0 = w.yhat
+            a.p1 = w.yb
+            a.p2 = w.dy
+            a.p3 = w.sq
+            a.f0 = Float32(2.0) / Float32(B * net.O)
+            ex.launch[OP_MSE](a, B * net.O)
+            comptime if AUTOGRAD_LOSS:
+                loss_value_into(ex, LS_MSE, w.yhat, w.yb, B, net.O, REDUCTION_MEAN, dloss + k, loss_ws)
+            else:
+                sum_into(ex, w.sq, B * net.O, dloss, k, Float32(1.0) / Float32(B * net.O))
+        else:
+            gather_rows(ex, dY, dord, w.yb, B, 1, off)
+            var a = Args()
+            a.p0 = w.yhat
+            a.p1 = w.yb
+            a.p2 = w.dy
+            a.p3 = w.sq
+            a.i0 = B
+            a.i1 = net.O
+            a.f0 = Float32(1.0) / Float32(B)
+            ex.launch[OP_CE](a, B)
+            comptime if AUTOGRAD_LOSS:
+                loss_value_into(ex, LS_CROSS_ENTROPY, w.yhat, w.yb, B, net.O, REDUCTION_MEAN, dloss + k, loss_ws)
+            else:
+                sum_into(ex, w.sq, B, dloss, k, Float32(1.0) / Float32(B))
+        step.backward(ex, net, P, Gr, w.xb, T, B, w)
+        comptime if AUTOGRAD_OPTIM:
+            step_lr(ex, opt_cfg, opt_state, P, Gr, np_, k + 1, ftz(lrs.unsafe_load(k)))
+        else:
+            opt_step(ex, cfg, st, k + 1, ftz(lrs.unsafe_load(k)), P, Gr, s1, s2, s3, np_)
+    comptime if AUTOGRAD_OPTIM:
+        opt_state.release(ex)
+    comptime if AUTOGRAD_LOSS:
+        release_loss_scratch(ex, loss_ws)
+    ex.sync()
+    ex.download(Pio, P, np_)
+    ex.download(losses, dloss, n_steps)
+
+
+def rnn_predict[E: Exec](
+    mut ex: E, net: Net, task: Int, X: FP, N: Int, T: Int, Pin: FP,
+    dst: FP, seq: FP, want_seq: Bool, chunk: Int,
+) raises:
+    """dst [N, O]: the head's output (task MSE) or its softmax (task CE);
+    with want_seq, seq [N, T, H] is the top layer's h_1..h_T batch-first."""
+    var np_ = net.n_params()
+    var H = net.H
+    var bmax = chunk if chunk < N else N
+    var dX = ex.alloc(N * T * net.D)
+    ex.upload(dX, X, N * T * net.D)
+    var idx = List[Float32]()
+    for i in range(N):
+        idx.append(Float32(i))
+    var didx = ex.alloc(N)
+    ex.upload(didx, FP(unsafe_from_address=Int(idx.unsafe_ptr())), N)
+    var P = ex.alloc(np_)
+    ex.upload(P, Pin, np_)
+    var dout = ex.alloc(N * net.O)
+    var dseq = ex.alloc(N * T * H if want_seq else 1)
+    var w = Work(ex, net, T, bmax, False)
+    var b0 = 0
+    while b0 < N:
+        var B = bmax if b0 + bmax <= N else N - b0
+        gather_seq(ex, dX, didx, w.xb, T, B, net.D, b0)
+        var hT = forward(ex, net, P, w.xb, T, B, w)
+        head(ex, net, P, hT, B, dout + b0 * net.O)
+        if task == TASK_CE:
+            var a = Args()
+            a.p0 = dout + b0 * net.O
+            a.p1 = dout + b0 * net.O
+            a.i1 = net.O
+            ex.launch[OP_SOFTMAX](a, B)
+        if want_seq:
+            var a = Args()
+            a.p0 = w.hall[net.L - 1] + B * H
+            a.p1 = dseq
+            a.i0 = T
+            a.i1 = B
+            a.i2 = H
+            a.i3 = b0
+            ex.launch[OP_SEQ_OUT](a, B * T * H)
+        b0 += B
+    ex.sync()
+    ex.download(dst, dout, N * net.O)
+    if want_seq:
+        ex.download(seq, dseq, N * T * H)
+    _ = idx^

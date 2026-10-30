@@ -1,0 +1,961 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 the authors. Part of anonlib, DOI-WITHHELD
+"""The split candidate, and the total order that makes a forest reproducible.
+
+Reference: `cpp/src/decisiontree/batched-levelalgo/split.cuh` at rapidsai/cuml
+`v26.08.00` (`265b9da6a0e75dbef071a3168398b993a5ff6f0e`), checked out
+read-only at `~/CascadeProjects/upstream/cuml-v26.08.00`.
+
+This is the smallest file in the learner and the one the whole
+reproducibility story rests on, so it is worth saying plainly what it does
+before reading it.
+
+The histogram kernel produces, per (node, column, bin), a gain. Those
+candidates are reduced -- across lanes of a warp, across warps of a block,
+and finally across BLOCKS through a mutex-guarded global slot -- down to one
+winner per node. A reduction is only reproducible if its operator does not
+care about the order the operands arrive in, and `Split::update`
+(`split.cuh:142-191`) is written to be exactly that: a lexicographic maximum
+
+    1. higher `best_metric_val` wins                        (`:150-157`)
+    2. tie -> higher `colid` wins                           (`:161-168`)
+    3. tie -> merge the equivalent threshold RANGE if the
+       two candidates route the same training rows          (`:174-177`)
+    4. tie -> higher `quesval` wins                          (`:181-188`)
+
+Steps 1, 2 and 4 are a plain maximum on a total order, and a maximum is
+associative, commutative and idempotent, so the answer does not depend on
+grouping. **Step 3 is not**, and that is a real property of their code
+rather than of this implementation -- see the DEVIATION BLOCK below, which carries a
+worked counterexample and an OPEN item.
+
+The other half of the story is that the histogram counts feeding these
+gains are INTEGER counts accumulated with an integer atomic
+(`bins.cuh:29-32`), so the histogram itself is already order-independent.
+Integer histogram plus total-order tie-break is why the unweighted
+classification path can be bit-identical across Metal, CUDA and HIP with no
+fixed point and no dither.
+
+ONE SEMANTIC WORTH KNOWING BEFORE READING THE CODE, because reasoning about
+it produced the wrong answer here and a run produced the right one.
+`select_split_range_midpoint` (`:126-134`) does not only choose a bin, it
+then ASSIGNS `quesval = quantiles[bin]`. So on a unit range `[b, b]` the
+rule is the identity on the BIN INDEX and is NOT the identity on the
+THRESHOLD. What follows is that the `quesval` a candidate carries through
+the reduction exists only as a tie-break key (`:181-188`); the threshold
+finally published for the node is always read back out of the quantiles
+array. `ensemble/checks/split_check.mojo` arm D(iii) holds that to a
+per-node count -- it was written predicting no movement, measured 35 of 37,
+and the measurement was right.
+
+================= DEVIATION BLOCK (whole file) =================
+
+DEVIATION 104. `raft::WarpSize` is a hardcoded 32 in their source
+(`split.cuh:210, 236-238`). This implementation does not hardcode the constant; it
+uses Mojo's queried `WARP_SIZE`, per this repository's standing rule that
+no wavefront width may be assumed (32 on NVIDIA and Apple, 64 on AMD CDNA,
+32 on AMD RDNA).
+
+The reduction SHAPE matches exactly: the reference loop is
+`for (i = WarpSize/2; i >= 1; i /= 2) { update(shfl(field, lane + i)); }`
+(`:209-219`), a rotate-and-reduce where `lane + i` wraps modulo the warp
+width, so after the loop EVERY lane holds the reduction of the whole warp.
+`std.gpu.primitives.warp.shuffle_idx` is the Mojo spelling of `raft::shfl`
+-- a language-level counterpart to `__shfl_sync`, not a library standing in
+for an algorithm -- and this repository's `vendor_correctness_check`
+already holds it to `raft::shfl`'s behaviour.
+
+PRICE, and it is not zero: at width 32 this reproduces their grouping
+exactly. At width 64 the grouping differs, and by the non-associativity
+recorded under DEVIATION 105 below, a different grouping can select a
+different split in one narrow tie class. Everywhere outside that class the
+answer is identical at any width.
+
+DEVIATION 105. THEIR REDUCTION OPERATOR IS NOT ASSOCIATIVE, AND THEIR OWN
+CROSS-BLOCK REDUCTION ORDER IS ARBITRARY. Recorded here because it bounds
+what this implementation is allowed to claim.
+
+`update` merges an equivalent split RANGE (`:174-177`) only when the two
+candidates agree on `global_nLeft`; otherwise it falls through to the
+`quesval` maximum (`:181-188`). Different groupings of three candidates can
+therefore reach different answers. A worked counterexample, all with equal
+gain and equal `colid`:
+
+    X  : global_nLeft 5, range [1,1], quesval 10
+    X2 : global_nLeft 5, range [3,3], quesval 30
+    Y  : global_nLeft 7, range [2,2], quesval 20
+
+    ((X + X2) + Y) : X and X2 merge to range [1,3] quesval 30; Y's
+                     nLeft differs and its quesval 20 loses.
+                     -> range [1,3], and `select_split_range_midpoint`
+                        (`:126-134`) picks bin 1 + (3-1+1)/2 = 2.
+    ((X + Y) + X2) : Y beats X on quesval; X2's nLeft differs from Y's
+                     and its quesval 30 wins outright.
+                     -> range [3,3], midpoint picks bin 3.
+
+Two different chosen thresholds from the same set of candidates. Reaching
+it needs equal gain and equal column with BOTH an equal-`nLeft` pair and an
+unequal-`nLeft` third -- rare, but constructible, and `evalBestSplit`
+(`:232-274`) merges blocks into the global slot under
+`while (atomicCAS(mutex, 0, 1));`, which orders blocks by arrival. Their
+comment at `:123-125` says the midpoint rule exists "so deterministic
+tie-breaking does not pick an edge", so determinism is plainly their
+INTENT.
+
+THIS IMPLEMENTATION DOES NOT ACT ON THIS. The reference structure is kept as is,
+non-associativity included, because rule 0b says not to redesign it and because a
+"fix" here would be an invention that silently diverges from their answer
+in the common case too. It is recorded as an OPEN item in
+`archive/plans/ensemble/PLAN.md` to be settled the only way this repository settles
+anything -- by running THEIR binary on a constructed fixture in this tie
+class on the NVIDIA column and reading their per-cell output -- not by
+reasoning, which is what produced the paragraph you are reading.
+
+DEVIATION 404 (2026-08-22). THE REDUCTION WIDTH IS PINNED TO 32 UNDER
+`NUMERIC_IDENTICAL`. This is the ACT half of the price DEVIATION 104
+recorded: at width 64 (AMD CDNA) the grouping differs from theirs and,
+by DEVIATION 105's non-associativity, can select a different split in
+the equal-gain-equal-column tie class. Under IDENTICAL the block
+reduction therefore runs `eval_best_split_pinned` -- the SAME
+rotate-and-reduce, at the SAME width 32, with `shuffle` spelled through
+shared memory and barriers instead of warp primitives, so the grouping
+is a pure function of `(thread_idx, TPB)` on every vendor. It is the
+`PINNED_LIB_REDUCE_LANES = 32` move of IDENTITY_PATHS rows 4/6 applied
+to this reduction, and the same remedy row 8 names for `block.sum`.
+
+WHY THE APPLE COLUMN'S BITS CANNOT MOVE, argued and then measured: at
+`WARP_SIZE == 32` the pinned emulation performs the identical `update`
+calls on the identical operand pairs in the identical step order as the
+shuffle loop -- phase 1 is the same five rotate steps per 32-lane group,
+phase 2 the same second reduction over per-group results -- so on Apple
+and NVIDIA the two arms are the same function, and IDENTICAL differs
+from FAST only on 64-wide hardware. `builder_kernels_check.mojo`'s
+arm C-pinned (TPB 32 and TPB 128) holds the pinned arm to the same
+per-cell winners as the shuffle arm on this M4.
+
+WHAT REMAINS OPEN AFTER THIS PIN: the CROSS-BLOCK merge needs no pin,
+and that is an audit RESULT rather than a hope. The kernel launches one
+block per (node, sampled column) and feature sampling is a permutation
+(`shuffle_iterator`), so candidates merging through the global mutex
+ALWAYS carry distinct `colid`s; `update` on distinct colids never
+reaches the range-merge step and is a plain maximum on a total order --
+associative, commutative, arrival-order-free. DEVIATION 105's
+within-a-column tie class is confined to lanes of one block, where the
+order is now pinned. The mutex spin itself (DEVIATION 106) stays in
+both modes.
+
+DEVIATION 106. Their `atomicCAS` / `__threadfence()` / `atomicExch` mutex
+(`:251`, `:270-271`) is not expressible on Metal in that spelling. Mojo 1.0
+comptime-asserts that `std.gpu.intrinsics.threadfence` "is only implemented
+on NVIDIA GPUs", the Apple backend rejects strong compare-exchange by name,
+and it rejects `acquire` ordering on EVERY read-modify-write, not only on a
+compare-exchange. The claim therefore lives in `core/device_mutex.mojo` and
+this file CALLS it: spin on an ACQUIRE load until the mutex reads free,
+claim it with a WEAK RELAXED compare-exchange, execute an ACQUIRE FENCE,
+and hand it back with a RELEASE store. Read that file for the memory-model
+argument; it is the one definition and every claim site in this repository
+shares it. This changes HOW the handoff is said, never WHAT is said.
+
+AMENDED 2026-09-16, and the amendment is why the mutex moved into `core/`.
+Until that date this paragraph justified the protocol by "the
+synchronizes-with edge is a load-acquire observing a store-release". That
+holds only when the spin's acquire LOAD and the claiming COMPARE-EXCHANGE
+observe the SAME release, and they need not. A thread can leave the spin on
+a free value written by holder A, lose it to holder B, and win its relaxed
+claim on the free value written by B's LATER release, having performed no
+acquire that reads B's release. B's plain store to `split[node]` is then
+unordered against this thread's plain load of it, so this thread merges
+into a STALE slot and writes it back, and B's candidate is ERASED. That is
+a LOST CANDIDATE, one direction only, which is what the MI300X traces
+showed. The retained
+claim that "only the HOLDER writes the release value, so no ABA hides"
+is true and does NOT make the two reads equivalent; reuse of the free value
+across them is exactly the interleaving above.
+
+THE ACQUIRE FENCE IS THE REPAIR, and two other spellings are not. A
+DISCARDED acquire load after the claim emits ZERO instructions on AIR, PTX
+and GCN alike, so it is not a fence and never was. An acquire
+compare-exchange is formally equivalent but Apple rejects it. Note that
+`std.atomic.fence` is a DIFFERENT SYMBOL from `std.gpu.intrinsics.threadfence`;
+the older text above reasoned from the latter and wrongly concluded that no
+fence was available on this path at all.
+
+WHY MI300X IS WHERE IT FIRED IS A HYPOTHESIS, NOT A FINDING. Each XCD has
+its own L2 and a plain load can be served from a line cached before another
+XCD's holder wrote the slot back. That is plausible and unmeasured. The
+formal hole exists on every column.
+
+THE EMISSION, DISASSEMBLED (2026-09-16). The repair is only a repair if the
+fence reaches the instruction stream, and this file's previous spelling did
+not: `_ = Atomic.load[ordering = Ordering.ACQUIRE](mutex)` compiled to NOTHING
+on Metal AIR, PTX and GCN alike. So the fence carries its disassembly rather
+than an assertion.
+
+Apple, AIR read out of the shipped metallib. The fence sits between the claim's
+compare-exchange loop and the plain loads of `split[node]`'s fields, which is
+where the argument above requires it:
+
+    br i1 %1402, label %1403, label %1398
+  1403:
+    fence acquire
+    %.elt175 = getelementptr inbounds { i32, float, i32, float, i64, i64, i32, i32 }, ...
+    %.unpack176 = load float, float addrspace(1)* %.elt175, align 4
+
+gfx942, four spellings of one kernel, cross-compiled. STOCK AND DISCARD ARE
+BYTE-IDENTICAL in this region, which is the discarded load's inertness stated
+as a diff, and the fence adds exactly one instruction:
+
+    stock and discard:          fence:
+      s_or_b64 exec, ...          s_or_b64 exec, ...
+      v_mov_b32_e32 v0, 0         v_mov_b32_e32 v0, 0
+                                  buffer_inv sc0 sc1        <- the repair
+      global_load_dword v1, ...   global_load_dword v1, ...
+
+READ THAT DIFF CAREFULLY, BECAUSE ONE TOKEN DOES NOT DISCRIMINATE. There is a
+SECOND `buffer_inv sc0 sc1` earlier in the same kernel, immediately after the
+spin's `global_load_dword ... sc0 sc1`, and it is present in ALL FOUR ARMS
+INCLUDING STOCK. That one is the SPIN's acquire, which was never in doubt.
+The instruction that distinguishes the repair is the one AFTER the CAS loop
+exits and BEFORE the protected load. Anyone who greps this kernel for
+`buffer_inv sc0 sc1` alone will find it in the stock arm and conclude the
+repair was always there.
+
+What these excerpts are NOT. The gfx942 arms are CROSS-COMPILED and have never
+executed on gfx942 hardware. AIR is code GENERATION, not GPU machine code.
+
+AND THE FENCE DID NOT SURVIVE THAT LAST STAGE ON APPLE. Settled 2026-09-16,
+solo under the Metal lock, on main's own binary: `fence[ordering =
+Ordering.ACQUIRE]()` generates valid AIR and then FAILS AT PIPELINE CREATION,
+"GPU machine code generation ... XPC_ERROR_CONNECTION_INTERRUPTED", while the
+stock arm runs. Two sessions reproduced it independently, one with arm order
+rotated 6 of 6 against stock 6 of 6 OK, one running this file's own
+`core/device_mutex_check.mojo` and watching the fence arm exit 1 with that
+message and the repaired arm PASS both claim pairs with its sabotage rejected.
+It broke random forests, extratrees and the fused kNN on this vendor for the
+thirty-seven minutes it was on main. Every cross-compile check passed
+throughout, because AIR generation is not the stage that fails, which is
+precisely why a disassembly is necessary and not sufficient.
+
+WHAT SHIPS INSTEAD is an acquire LOAD WHOSE VALUE IS CONSUMED, spinning until
+the mutex reads the value this claim itself wrote. The memory-model argument
+above is untouched: the claim is a read-modify-write, so its write sits in the
+release sequence headed by the release it consumed, and an acquire that reads a
+value in that sequence synchronizes with the release heading it. Only the
+spelling changed. It emits on AIR, PTX and GCN, and unlike the fence it runs.
+The value compared against must be the claim's own, never a literal 1, because
+the kNN consumer claims `-2 -> -1`; a loop waiting on the wrong value does not
+fail, it HANGS.
+
+DEVIATION 107. `printSplits` (`:291-308`) is a debug printer built on
+`raft::linalg::writeOnlyUnaryOp` and is NOT implemented. Price of declining it:
+one debug aid, replaceable by a host-side copy and print at any call site
+that wants it. `initSplit` (`:284-289`) IS implemented, because the builder
+needs it every level.
+
+NOT A DEVIATION, recorded so a reader does not go looking: `local_nLeft` is
+`std::int64_t` in their struct (`:51`) and is written by an `atomicAdd` on
+`unsigned long long` in `countLocalLeftKernel`
+(`kernels/builder_kernels_impl.cuh:79-81`). 64-bit integer atomics are a
+hard COMPILE error on Apple GPU (measured this session:
+`ensemble/checks/atomic_width_probe.mojo`). The field keeps its Int64
+width HERE, because nothing in this file atomically adds to it; the atomic
+width question belongs to the kernel that does, and is that lane's to
+record. What matters for this file is that `local_nLeft` takes no part in
+split SELECTION at all -- their comment at `:139-140` says so: "local_nLeft
+is intentionally not accepted here: split selection is based on global
+counts, and local counts are filled just before partitioning."
+=================================================================
+"""
+
+from std.atomic import Atomic, Ordering
+from std.sys.compile import is_defined
+from core.device_mutex import claim_device_mutex
+from std.bit import log2_floor
+from max.gpu.memory import AddressSpace
+
+# `split.cuh:8` includes `bins.cuh`, because `detail::CountLeft` is
+# bin-typed. Same direction here; `bins.mojo` imports nothing from this
+# file, so there is no cycle -- exactly their arrangement.
+from ensemble.decisiontree.batched_levelalgo.bins import Bin
+from std.gpu import WARP_SIZE, block_dim, thread_idx
+from std.gpu.primitives.id import lane_id
+from std.gpu.primitives.warp import shuffle_idx
+from max.gpu.sync import barrier
+
+
+#: DEVIATION 404 -- the reduction width `eval_best_split_pinned` uses on
+#: every vendor: `raft::WarpSize`'s hardcoded 32, which is also the width
+#: of every measured column but AMD CDNA. The same pin as
+#: `PINNED_LIB_REDUCE_LANES` in IDENTITY_PATHS rows 4/6.
+comptime PINNED_SPLIT_REDUCE_LANES = 32
+
+
+@always_inline
+def count_left[
+    BinT: Bin, ho: MutOrigin, aspace: AddressSpace, //
+](
+    hist: MutPointer[BinT, ho, address_space=aspace],
+    i: Int32,
+    n_bins: Int32,
+    n_outputs: Int32,
+) -> Int64:
+    """`detail::CountLeft`, `split.cuh:19-27`.
+
+    Their loop sums `hist[n_bins * j + i].Count()` over the output classes,
+    starting from `j = 0` and adding `j = 1 ..< n_outputs`. The histogram is
+    CUMULATIVE by the time this runs, so cell `i` already holds the left
+    partition's count.
+
+    IT IS BIN-TYPED, and the first version of this file got that wrong. It
+    took a plane of `UInt32` counts, which no caller could use: their
+    `CountLeft` takes `BinT const*` and calls `.Count()`, and `Gain`
+    (`objectives.cuh:168`, `:369`) hands it the bin histogram directly. The
+    wrong-shaped version sat here unreached while `objectives.mojo` carried
+    a private duplicate of the right one -- an unimplemented file is visible, a
+    MIS-implemented one is not, and an unreached one hides the mismatch. Their
+    layout is restored: `CountLeft` lives in `split.cuh` (which
+    `#include`s `bins.cuh` at `:8`) and `objectives.cuh` calls it.
+
+    Their accumulator is `BinCountT` (`unsigned long long`) widened to
+    `std::int64_t` at `:26`. The sum over classes at one bin is the row
+    count of that partition, bounded by `n_sampled_rows`.
+    """
+    var n_left = UInt64(Int(hist[unsafe_offset = Int(i)].Count()))
+    for j in range(1, Int(n_outputs)):
+        n_left += UInt64(
+            Int(hist[unsafe_offset = j * Int(n_bins) + Int(i)].Count())
+        )
+    return Int64(Int(n_left))
+
+
+struct Split[dtype: DType](TrivialRegisterPassable):
+    """`ML::DT::Split<DataT, IdxT>`, `split.cuh:36-275`, with IdxT = Int32.
+
+    IdxT is instantiated as `int` throughout cuML's RF, so every `IdxT`
+    field below is Int32 and every `std::int64_t` field is Int64. The
+    widths are theirs.
+    """
+
+    # OURS, DEVIATION 2502: 1 when the node's rows all carry one class.
+    # FIRST FIELD ON PURPOSE: `find_best_splits_kernel` stores it through
+    # an Int32 pointer at the slot's address (`pure_flag_ptr`), never
+    # through a struct copy, so the store cannot clobber a concurrent
+    # mutex-guarded publish of the other fields. Every publisher of the
+    # slot writes the SAME value for it (each column block computes it
+    # from its own histogram, and all histograms of a node sum to the same
+    # class totals), so the slot ends the round holding the node's purity
+    # whatever the order of the stores. Not part of the merge decision
+    # and never read on the device.
+    var pure: Int32
+    # `split.cuh:43` -- threshold to compare in this node
+    var quesval: Scalar[Self.dtype]
+    # `split.cuh:45` -- feature index
+    var colid: Int32
+    # `split.cuh:47` -- best info gain on this node
+    var best_metric_val: Scalar[Self.dtype]
+    # `split.cuh:49` -- global number of samples in the left child
+    var global_nLeft: Int64
+    # `split.cuh:51` -- rank-local number of samples in the left child
+    var local_nLeft: Int64
+    # `split.cuh:53` -- first quantile index of an inclusive range of
+    # training-equivalent splits
+    var split_start: Int32
+    # `split.cuh:55` -- last quantile index of that range
+    var split_end: Int32
+
+    @staticmethod
+    @always_inline
+    def pure_flag_ptr[
+        o: MutOrigin, //
+    ](slot: MutPointer[Self, o]) -> MutPointer[Int32, o]:
+        """The `pure` word of `slot[0]`, as an Int32 pointer (DEVIATION
+        2502). `pure` is the first field, so this is the slot's address."""
+        return slot.unsafe_bitcast[Int32]()
+
+    @staticmethod
+    @always_inline
+    def Min() -> Scalar[Self.dtype]:
+        """`split.cuh:40`, `-std::numeric_limits<DataT>::max()`.
+
+        Note this is `-max()`, NOT `lowest()` and NOT `-infinity`. For an
+        IEEE float the two are the same value, but the objectives return
+        this exact expression on every rejected candidate
+        (`objectives.cuh:53`, `:88`, `:130`, ...), so the comparison
+        `other_best_metric_val > best_metric_val` at `:150` is an equality
+        between two identical bit patterns, not a near-miss. Spelling it
+        the same way is what keeps that true.
+        """
+        return -Scalar[Self.dtype].MAX_FINITE
+
+    @always_inline
+    def __init__(out self):
+        """`split.cuh:57-65`, their default constructor."""
+        self.quesval = Self.Min()
+        self.best_metric_val = Self.Min()
+        self.colid = -1
+        self.global_nLeft = 0
+        self.local_nLeft = 0
+        self.split_start = -1
+        self.split_end = -1
+        self.pure = 0
+
+    @always_inline
+    def __init__(
+        out self,
+        quesval: Scalar[Self.dtype],
+        colid: Int32,
+        best_metric_val: Scalar[Self.dtype],
+        global_nLeft: Int64,
+        local_nLeft: Int64,
+        split_start: Int32,
+        split_end: Int32,
+    ):
+        self.quesval = quesval
+        self.colid = colid
+        self.best_metric_val = best_metric_val
+        self.global_nLeft = global_nLeft
+        self.local_nLeft = local_nLeft
+        self.split_start = split_start
+        self.split_end = split_end
+        self.pure = 0
+
+    @always_inline
+    def IsValid(self) -> Bool:
+        """`split.cuh:79`."""
+        return self.colid != Int32(-1)
+
+    @always_inline
+    def has_valid_split_range(self) -> Bool:
+        """`split.cuh:81-84`."""
+        return self.split_start >= Int32(0) and self.split_end >= self.split_start
+
+    @always_inline
+    def can_merge_equivalent_split_range(
+        self,
+        other_global_nLeft: Int64,
+        other_split_start: Int32,
+        other_split_end: Int32,
+    ) -> Bool:
+        """`split.cuh:86-92`."""
+        return (
+            self.global_nLeft == other_global_nLeft
+            and self.has_valid_split_range()
+            and other_split_start >= Int32(0)
+            and other_split_end >= other_split_start
+        )
+
+    @always_inline
+    def merge_equivalent_split_range(
+        mut self,
+        other_quesval: Scalar[Self.dtype],
+        other_split_start: Int32,
+        other_split_end: Int32,
+    ):
+        """`split.cuh:97-104`.
+
+        Their comment at `:94-96`: "`quesval` tracks the upper edge only to
+        preserve the existing threshold tie-break against candidates
+        outside this equivalent range."
+        """
+        self.split_start = (
+            other_split_start if other_split_start
+            < self.split_start else self.split_start
+        )
+        self.split_end = (
+            other_split_end if other_split_end
+            > self.split_end else self.split_end
+        )
+        if other_quesval > self.quesval:
+            self.quesval = other_quesval
+
+    @always_inline
+    def replace_with(
+        mut self,
+        other_quesval: Scalar[Self.dtype],
+        other_colid: Int32,
+        other_best_metric_val: Scalar[Self.dtype],
+        other_global_nLeft: Int64,
+        other_split_start: Int32,
+        other_split_end: Int32,
+    ) -> Bool:
+        """`split.cuh:106-121`. Note `local_nLeft` is reset to 0 at `:117`.
+        """
+        self.quesval = other_quesval
+        self.colid = other_colid
+        self.best_metric_val = other_best_metric_val
+        self.global_nLeft = other_global_nLeft
+        self.local_nLeft = 0
+        self.split_start = other_split_start
+        self.split_end = other_split_end
+        return True
+
+    @always_inline
+    def select_split_range_midpoint[
+        qo: MutOrigin, //
+    ](
+        mut self,
+        quantiles: MutPointer[Scalar[Self.dtype], qo],
+        n_bins: Int32,
+    ):
+        """`split.cuh:126-134`.
+
+        Their comment at `:123-125`: "Several thresholds can be equally
+        good for the training data while still routing future inference
+        values differently. Select the middle split in that equivalent
+        range so deterministic tie-breaking does not pick an edge."
+
+        The `(end - start + 1) / 2` is C++ integer division on values that
+        are non-negative here (the `has_valid_split_range()` guard), so
+        Mojo's `//` matches it.
+        """
+        if self.has_valid_split_range() and self.split_end < n_bins:
+            var bin = self.split_start + (
+                self.split_end - self.split_start + Int32(1)
+            ) // Int32(2)
+            self.quesval = quantiles[unsafe_offset = Int(bin)]
+            self.split_start = bin
+            self.split_end = bin
+
+    @always_inline
+    def update(
+        mut self,
+        other_quesval: Scalar[Self.dtype],
+        other_colid: Int32,
+        other_best_metric_val: Scalar[Self.dtype],
+        other_global_nLeft: Int64,
+        other_split_start: Int32,
+        other_split_end: Int32,
+    ) -> Bool:
+        """`split.cuh:142-191`. THE TOTAL ORDER. Transcribed branch for
+        branch, in their order; see the module docstring for why the order
+        is the algorithm and not a formatting choice.
+        """
+        # `:149-157` -- Primary ordering: higher gain wins; lower or
+        # unordered gain loses.
+        if other_best_metric_val > self.best_metric_val:
+            return self.replace_with(
+                other_quesval,
+                other_colid,
+                other_best_metric_val,
+                other_global_nLeft,
+                other_split_start,
+                other_split_end,
+            )
+        if other_best_metric_val != self.best_metric_val:
+            return False
+
+        # `:160-169` -- Equal gain: preserve the existing deterministic
+        # feature tie-break.
+        if other_colid > self.colid:
+            return self.replace_with(
+                other_quesval,
+                other_colid,
+                other_best_metric_val,
+                other_global_nLeft,
+                other_split_start,
+                other_split_end,
+            )
+        if other_colid != self.colid:
+            return False
+
+        # `:171-177` -- Equal gain and feature: multiple thresholds can
+        # send the same training rows left and right. Merge that range and
+        # choose its representative after reduction.
+        if self.can_merge_equivalent_split_range(
+            other_global_nLeft, other_split_start, other_split_end
+        ):
+            self.merge_equivalent_split_range(
+                other_quesval, other_split_start, other_split_end
+            )
+            return True
+
+        # `:179-188` -- Equal gain and feature, but a different training
+        # partition: keep the existing deterministic threshold tie-break.
+        if other_quesval > self.quesval:
+            return self.replace_with(
+                other_quesval,
+                other_colid,
+                other_best_metric_val,
+                other_global_nLeft,
+                other_split_start,
+                other_split_end,
+            )
+
+        return False
+
+    @always_inline
+    def update_bin(
+        mut self,
+        other_quesval: Scalar[Self.dtype],
+        other_colid: Int32,
+        other_best_metric_val: Scalar[Self.dtype],
+        other_global_nLeft: Int64,
+        other_bin: Int32,
+    ) -> Bool:
+        """`split.cuh:193-201`, the one-bin overload: a degenerate range
+        `[bin, bin]`. Spelled as a distinct name because Mojo resolves
+        overloads on arity and their two `update`s differ only in the last
+        argument's meaning.
+        """
+        return self.update(
+            other_quesval,
+            other_colid,
+            other_best_metric_val,
+            other_global_nLeft,
+            other_bin,
+            other_bin,
+        )
+
+    @always_inline
+    def warp_reduce(mut self):
+        """`split.cuh:206-220`, the in-warp reduction.
+
+        Their loop, verbatim:
+
+            auto lane = raft::laneId();
+            for (int i = raft::WarpSize / 2; i >= 1; i /= 2) {
+              auto id  = lane + i;
+              auto qu  = raft::shfl(quesval, id);
+              ... update(qu, co, be, gnl, bs, bn);
+            }
+
+        `raft::shfl(v, id)` is `__shfl_sync(mask, v, id)`, whose source
+        lane is taken modulo the warp width, so `lane + i` WRAPS -- this is
+        a rotate-and-reduce and every lane ends holding the whole warp's
+        reduction, which is what `evalBestSplit` then relies on when only
+        lane 0 publishes. See DEVIATION 104 for the width.
+
+        `global_nLeft` is Int64 and is shuffled as two Int32 halves. That
+        is a spelling change with no value change: `raft::shfl` on a 64-bit
+        type does the same split internally.
+        """
+        var lane = lane_id()
+        # `#pragma unroll` on their `:209`. `WARP_SIZE` is a compile-time
+        # constant here, so `comptime for` unrolls this exactly as their
+        # pragma does -- same trip count, same offsets, fully unrolled, no
+        # loop counter in registers. A runtime `while` would have been a
+        # silent divergence from their optimization path, which is small
+        # here and is the kind of thing that is never noticed later.
+        comptime STEPS = log2_floor(WARP_SIZE)
+        comptime for k in range(STEPS):
+            comptime OFF = WARP_SIZE >> (k + 1)
+            var src = UInt32((lane + OFF) % WARP_SIZE)
+            var qu = shuffle_idx(self.quesval, src)
+            var co = shuffle_idx(self.colid, src)
+            var be = shuffle_idx(self.best_metric_val, src)
+            var gnl_lo = shuffle_idx(
+                Int32(Int(self.global_nLeft & 0xFFFFFFFF)), src
+            )
+            var gnl_hi = shuffle_idx(Int32(Int(self.global_nLeft >> 32)), src)
+            var bs = shuffle_idx(self.split_start, src)
+            var bn = shuffle_idx(self.split_end, src)
+            var gnl = (Int64(Int(gnl_hi)) << 32) | Int64(
+                Int(UInt32(Int(gnl_lo)))
+            )
+            _ = self.update(qu, co, be, gnl, bs, bn)
+
+    @always_inline
+    def eval_best_split[
+        so: MutOrigin,
+        sas: AddressSpace,
+        go: MutOrigin,
+        mo: MutOrigin,
+        qo: MutOrigin, //
+    ](
+        mut self,
+        split_scratch: MutPointer[Self, so, address_space=sas],
+        split: MutPointer[Self, go],
+        mutex: MutPointer[Int32, mo],
+        quantiles: MutPointer[Scalar[Self.dtype], qo],
+        n_bins: Int32,
+    ):
+        """`split.cuh:232-274`. Warp reduce, block reduce, then a
+        mutex-guarded merge into the node's global slot.
+
+        Their contract at `:229-230`: "all threads in the block must enter
+        this function together. At the end thread0 will contain the best
+        split."
+
+        The mutex handoff is DEVIATION 106; see the module docstring. The
+        rest matches the reference: only warp 0 does the second reduction, lanes
+        beyond `nWarps` seed a default `Split`, and only thread 0 takes the
+        lock, applies `select_split_range_midpoint`, and publishes.
+        """
+        self.warp_reduce()
+        var warp = Int(thread_idx.x) // WARP_SIZE
+        var n_warps = Int(block_dim.x) // WARP_SIZE
+        var lane = lane_id()
+        if lane == 0:
+            split_scratch[unsafe_offset=warp] = self.copy()
+        barrier()
+        if warp == 0:
+            if lane < n_warps:
+                self = split_scratch[unsafe_offset=lane].copy()
+            else:
+                self = Self()
+            self.warp_reduce()
+            # `:249` -- only the first thread publishes for this node.
+            if thread_idx.x == 0 and self.IsValid():
+                self._publish_to_global(split, mutex, quantiles, n_bins)
+
+    def eval_best_split_to_candidate[
+        so: MutOrigin,
+        sas: AddressSpace,
+        go: MutOrigin,
+        qo: MutOrigin, //
+    ](
+        mut self,
+        split_scratch: MutPointer[Self, so, address_space=sas],
+        cand: MutPointer[Self, go],
+        quantiles: MutPointer[Scalar[Self.dtype], qo],
+        n_bins: Int32,
+    ):
+        """FAST (`HIST_SPLIT_CANDIDATES_DEFAULT`): `eval_best_split`'s
+        reductions, then thread 0 stores the block's winner -- midpoint
+        applied, exactly what `_publish_to_global` would merge -- into its
+        OWN candidate slot with a plain store, or a default `Split` when it
+        is not valid. `merge_split_candidates_kernel` folds a node's slots
+        with `update`, a total order, so the node's split is the one the
+        mutex path would publish in any arrival order."""
+        self.warp_reduce()
+        var warp = Int(thread_idx.x) // WARP_SIZE
+        var n_warps = Int(block_dim.x) // WARP_SIZE
+        var lane = lane_id()
+        if lane == 0:
+            split_scratch[unsafe_offset=warp] = self.copy()
+        barrier()
+        if warp == 0:
+            if lane < n_warps:
+                self = split_scratch[unsafe_offset=lane].copy()
+            else:
+                self = Self()
+            self.warp_reduce()
+            if thread_idx.x == 0:
+                if self.IsValid():
+                    self.select_split_range_midpoint(quantiles, n_bins)
+                    cand[unsafe_offset=0] = self.copy()
+                else:
+                    cand[unsafe_offset=0] = Self()
+
+    @always_inline
+    def _publish_to_global[
+        go: MutOrigin, mo: MutOrigin, qo: MutOrigin, //
+    ](
+        mut self,
+        split: MutPointer[Self, go],
+        mutex: MutPointer[Int32, mo],
+        quantiles: MutPointer[Scalar[Self.dtype], qo],
+        n_bins: Int32,
+    ):
+        """`split.cuh:250-271`, the thread-0 tail of `evalBestSplit`:
+        midpoint selection, the DEVIATION 106 mutex claim, the guarded
+        merge into the node's global slot, and the release. Factored out
+        (2026-08-22, with DEVIATION 404) so the pinned and warp-shuffle
+        reductions publish through ONE spelling; the body is the former
+        inline text, unchanged."""
+        self.select_split_range_midpoint(quantiles, n_bins)
+
+        # `:251-252` -- their `while (atomicCAS(mutex, 0, 1));` plus the
+        # `__threadfence()` at `:255`, as the shared claim: acquire-load
+        # spin, weak relaxed claim, ACQUIRE FENCE. See DEVIATION 106 above
+        # and `core/device_mutex.mojo` for why the fence is the repair.
+        comptime if not is_defined["ANONLIB_RF_EXP_NO_SPLIT_MUTEX"]():
+            claim_device_mutex(mutex, Int32(0), Int32(1))
+
+        # `:253-259` -- read the current global split into a
+        # register copy. Their field-by-field read exists because
+        # `split` is `volatile`; ours is a plain struct load.
+        #
+        # THEIRS LOADS SIX of the seven fields and writes back the
+        # same six: `local_nLeft` is left at the default ctor's 0
+        # and never touched here. Ours copies the whole struct
+        # both ways, so it also stores `local_nLeft`. Inert, and
+        # checked to be rather than assumed --
+        # `resetLocalLeftCountsKernel`
+        # (`kernels/builder_kernels_impl.cuh:48-53`) zeroes that
+        # field immediately before `countLocalLeftKernel` fills
+        # it, and this implementation has that kernel.
+        #
+        # This comment used to say "the same seven fields, in
+        # their order", which is not what `:254-259` does.
+        var split_reg = split[unsafe_offset=0].copy()
+        var update_result = split_reg.update(
+            self.quesval,
+            self.colid,
+            self.best_metric_val,
+            self.global_nLeft,
+            self.split_start,
+            self.split_end,
+        )
+        # `:262-269`
+        if update_result:
+            # DEVIATION 2502: the publisher's purity rides the write-back
+            # (see `pure`), so a merge and the kernel's direct store of
+            # the flag can land in any order.
+            split_reg.pure = self.pure
+            split[unsafe_offset=0] = split_reg.copy()
+
+        # `:270-271` -- their `__threadfence(); atomicExch(mutex,
+        # 0);` folded into one RELEASE store, which orders the
+        # publish above before the handback.
+        comptime if not is_defined["ANONLIB_RF_EXP_NO_SPLIT_MUTEX"]():
+            Atomic.store[ordering = Ordering.RELEASE](mutex, Int32(0))
+
+    @always_inline
+    def eval_best_split_pinned[
+        so: MutOrigin,
+        sas: AddressSpace,
+        go: MutOrigin,
+        mo: MutOrigin,
+        qo: MutOrigin, //
+    ](
+        mut self,
+        scratch: MutPointer[Self, so, address_space=sas],
+        split: MutPointer[Self, go],
+        mutex: MutPointer[Int32, mo],
+        quantiles: MutPointer[Scalar[Self.dtype], qo],
+        n_bins: Int32,
+    ):
+        """DEVIATION 404 -- `evalBestSplit` with the reduction width
+        PINNED to `PINNED_SPLIT_REDUCE_LANES` (32) on every vendor.
+
+        Same contract as `eval_best_split` (`split.cuh:229-230`: all
+        threads of the block enter together), but `scratch` must hold
+        `block_dim.x` slots -- the shuffle is spelled through shared
+        memory, one slot per thread, instead of warp lanes. The
+        `update` calls, their operand pairing and their step order are
+        EXACTLY the width-32 shuffle loop's: phase 1 is their
+        `warpReduce` per 32-thread group (each step snapshots the
+        neighbor's pre-step value, barriers, updates, publishes,
+        barriers -- which is what a warp shuffle does in lockstep), and
+        phase 2 is their warp-0 second reduction over the group
+        results, groups past `n_groups` seeding a default `Split`
+        exactly as their lanes past `nWarps` do. On 32-wide hardware
+        this arm and `eval_best_split` are the same function; on
+        64-wide hardware only this arm keeps their grouping.
+
+        Every thread must hit every `barrier()`, so the group-0 work of
+        phase 2 is guarded per statement while the barriers stay in
+        uniform control flow.
+        """
+        self._pinned_reduce(scratch)
+
+        # `:249` -- only the first thread publishes for this node.
+        if Int(thread_idx.x) == 0 and self.IsValid():
+            self._publish_to_global(split, mutex, quantiles, n_bins)
+
+    @always_inline
+    def eval_best_split_pinned_to_candidate[
+        so: MutOrigin,
+        sas: AddressSpace,
+        go: MutOrigin,
+        qo: MutOrigin, //
+    ](
+        mut self,
+        scratch: MutPointer[Self, so, address_space=sas],
+        cand: MutPointer[Self, go],
+        quantiles: MutPointer[Scalar[Self.dtype], qo],
+        n_bins: Int32,
+    ):
+        """DEVIATION 5611 -- `eval_best_split_pinned`'s reduction (DEVIATION
+        404, width 32 on every vendor), then thread 0 stores the block's
+        winner, midpoint applied, into its OWN candidate slot with a plain
+        store (a default `Split` when it is not valid), exactly as
+        `eval_best_split_to_candidate` does for the warp-shuffle arm.
+        `merge_split_candidates_kernel` folds a node's slots with `update`,
+        a total order over (gain, colid) with one column per block, so the
+        node's split is the one a correct mutex merge publishes in any
+        arrival order. No payload crosses a threadgroup inside a kernel:
+        the fold reads the slots after the kernel boundary."""
+        self._pinned_reduce(scratch)
+        if Int(thread_idx.x) == 0:
+            if self.IsValid():
+                self.select_split_range_midpoint(quantiles, n_bins)
+                cand[unsafe_offset=0] = self.copy()
+            else:
+                cand[unsafe_offset=0] = Self()
+
+    @always_inline
+    def _pinned_reduce[
+        so: MutOrigin, sas: AddressSpace, //
+    ](
+        mut self,
+        scratch: MutPointer[Self, so, address_space=sas],
+    ):
+        """DEVIATION 404's two phases, shared by the mutex publish and the
+        candidate store: on return thread 0 holds the block's winner."""
+        comptime L = PINNED_SPLIT_REDUCE_LANES
+        comptime STEPS = log2_floor(L)
+        var tid = Int(thread_idx.x)
+        var vlane = tid % L
+        var vgroup = tid // L
+        var n_groups = Int(block_dim.x) // L
+
+        # ---- phase 1: their `warpReduce` at width L, per group -------
+        scratch[unsafe_offset=tid] = self.copy()
+        barrier()
+        comptime for k in range(STEPS):
+            comptime OFF = L >> (k + 1)
+            var src = vgroup * L + ((vlane + OFF) % L)
+            var other = scratch[unsafe_offset=src].copy()
+            barrier()
+            _ = self.update(
+                other.quesval,
+                other.colid,
+                other.best_metric_val,
+                other.global_nLeft,
+                other.split_start,
+                other.split_end,
+            )
+            scratch[unsafe_offset=tid] = self.copy()
+            barrier()
+
+        # ---- phase 2: their `if (warp == 0)` second reduction --------
+        # Group g's reduction is in every one of its slots; slot g*L is
+        # read BEFORE the store below overwrites slots 0..L-1.
+        var mine = Self()
+        if vgroup == 0 and vlane < n_groups:
+            mine = scratch[unsafe_offset = vlane * L].copy()
+        barrier()
+        if vgroup == 0:
+            self = mine.copy()
+            scratch[unsafe_offset=vlane] = self.copy()
+        barrier()
+        comptime for k in range(STEPS):
+            comptime OFF = L >> (k + 1)
+            var other = Self()
+            if vgroup == 0:
+                other = scratch[unsafe_offset = (vlane + OFF) % L].copy()
+            barrier()
+            if vgroup == 0:
+                _ = self.update(
+                    other.quesval,
+                    other.colid,
+                    other.best_metric_val,
+                    other.global_nLeft,
+                    other.split_start,
+                    other.split_end,
+                )
+                scratch[unsafe_offset=vlane] = self.copy()
+            barrier()
+
+
+def init_split_kernel[
+    dtype: DType
+](splits: MutPointer[Split[dtype], MutAnyOrigin], len: Int32):
+    """`initSplit`, `split.cuh:284-289`.
+
+    Theirs is `raft::linalg::writeOnlyUnaryOp` over a lambda that assigns a
+    default-constructed `Split`. RAFT's `writeOnlyUnaryOp` is a plain
+    grid-stride write-only map with no read of the destination, so the
+    kernel below IS that map with their lambda inlined -- there is no
+    vendor primitive being stood in for and nothing is unfused by writing
+    it out.
+    """
+    from std.gpu import block_dim, block_idx, grid_dim, thread_idx
+
+    var idx = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    var stride = Int(grid_dim.x) * Int(block_dim.x)
+    while idx < Int(len):
+        splits[unsafe_offset=idx] = Split[dtype]()
+        idx += stride

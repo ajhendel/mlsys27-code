@@ -1,0 +1,358 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 the authors. Part of anonlib, DOI-WITHHELD
+"""CPython boundary for the time-series lanes: Holt-Winters and the KPSS test.
+
+Kept in a separate extension, deliberately, so an independently changing
+binding does not become a merge point (the same reason
+`_anonlib_estimators.mojo` is separate from `_anonlib.mojo`). Arrays
+cross as borrowed NumPy addresses; all device buffers and contexts live for
+one call and no pointer is retained.
+
+WHAT IS BEHIND EACH ENTRY, AND WHAT IS NOT
+
+    holtwinters_fit       holtwinters/, DEVIATIONS 660-665 and 697-699.
+                          cuML `ML::HoltWinters::fit`, the seasonal BFGS
+                          arm, float32.
+    holtwinters_forecast  the same lane's `ML::HoltWinters::forecast`.
+    kpss_test             tsa/, DEVIATIONS 671-672. cuML
+                          `ML::Stationarity::kpss_test`, float32.
+    select_d              the same lane's implementation of auto_arima's "Choose the
+                          hyper-parameter d" block.
+
+`arima/` IS SERVED BY ITS OWN EXTENSION, `bindings/_anonlib_arima.mojo`
+(the eleventh), not by this one, so that two independently changing
+bindings never become a merge point. A paragraph here used to say `arima/`
+was "deliberately absent" from the package because the lane had no `fit`;
+`estimate_x0` and the batched L-BFGS landed 2026-09-01, `anonlib.ARIMA`
+is exported from the package (`python/anonlib/_arima_impl.py`), and the
+false paragraph is DELETED, which is the correction `arima/README.md`'s
+hand-off section asked for. There is still no `ARIMA` entry point in THIS
+module, and there is not supposed to be.
+
+THE ARGUMENT-COUNT RULE. `PythonModuleBuilder.def_function` infers its
+signature from arity and stops working somewhere above nine arguments, so
+buffer addresses go positionally and every scalar goes in ONE list. The
+order of that list is written out in a comment on both sides of the
+boundary IN THE SAME WORDS, here and in `python/anonlib/_tsa_impl.py`.
+A silently reordered list is a wrong answer rather than a failure, which
+makes it the most dangerous thing at this boundary; the two comments are
+meant to be diffable by eye.
+
+THE GIL is released around every device call.
+"""
+
+# DEVIATION 2486: shared byte-preserving host copies.
+from bindings.hostptr import f32_ptr, i32_ptr
+from std.os import abort
+from std.python import Python, PythonObject
+from std.python._cpython import GILReleased
+from std.python.bindings import PythonModuleBuilder
+
+from checks.vendor import COMPILED_VENDOR
+from checks.numerics import GLOBAL_NUMERIC_MODE
+
+from holtwinters.estimator import holtwinters_fit_ptr, holtwinters_forecast_ptr, holtwinters_predict_ptr
+from tsa.estimator import kpss_test_host, select_d_host
+
+
+def _f32_ptr(addr: Int) raises -> MutPointer[Float32, MutUntrackedOrigin]:
+    return f32_ptr(addr)
+
+
+def _i32_ptr(addr: Int) raises -> MutPointer[Int32, MutUntrackedOrigin]:
+    return i32_ptr(addr)
+
+
+def holtwinters_fit_binding(
+    data_addr: PythonObject,
+    comps_addr: PythonObject,
+    stats_addr: PythonObject,
+    flags_addr: PythonObject,
+    params: PythonObject,
+    seasonal: PythonObject,
+) raises -> PythonObject:
+    """`ExponentialSmoothing(...).fit()` (holtwinters/, DEVIATIONS 660-665,
+    697-699). Returns `components_len = (n - frequency) * batch_size`.
+
+    `params` is, in this exact order (mirrored in
+    `python/anonlib/_tsa_impl.py`):
+
+        0  n              observations per series
+        1  batch_size     cuML's ts_num
+        2  frequency      cuML's seasonal_periods
+        3  start_periods
+        4  eps            (float)
+        5  init_method    OPTIONAL: 0 heuristic (cuML's fit, the value when
+                          absent), 1 estimated (`holtwinters/impl/internal/
+                          hw_estimate.mojo`, the Python default)
+
+    `seasonal` is cuML's name string; `seasonal_from_name` refuses
+    anything but 'additive'/'add'/'multiplicative'/'mul' BY NAME, in their
+    words (`holtwinters.pyx:197`).
+
+    `data_addr` reads `batch_size * n` float32, SERIES-MAJOR: series `s`
+    occupies `[s * n, (s + 1) * n)`.
+
+    `comps_addr` is written with `3 * components_len` float32, in this
+    exact order (the same words in `holtwinters/estimator.mojo` and
+    `python/anonlib/_tsa_impl.py`):
+
+        [0 * components_len, 1 * components_len)   level
+        [1 * components_len, 2 * components_len)   trend
+        [2 * components_len, 3 * components_len)   season
+
+    Each block is TIME-MAJOR: series `s` at step `i` is `[s + i *
+    batch_size]`. That is a TRANSPOSE of the input's layout, and it is
+    cuML's (`holtwinters.pyx:341-344`).
+
+    `stats_addr` is written with `4 * batch_size` float32, in this exact
+    order:
+
+        [0 * batch_size, 1 * batch_size)   sse
+        [1 * batch_size, 2 * batch_size)   alpha
+        [2 * batch_size, 3 * batch_size)   beta
+        [3 * batch_size, 4 * batch_size)   gamma
+
+    `flags_addr` is written with `2 * batch_size` int32, in this exact
+    order:
+
+        [0 * batch_size, 1 * batch_size)   niter
+        [1 * batch_size, 2 * batch_size)   criterion
+    """
+    if len(params) != 5 and len(params) != 6:
+        raise Error(
+            "holtwinters_fit: params must contain 5 or 6 values (n, batch_size,"
+            " frequency, start_periods, eps[, init_method]), got " + String(len(params))
+        )
+    var dp = _f32_ptr(Int(py=data_addr))
+    var cp = _f32_ptr(Int(py=comps_addr))
+    var sp = _f32_ptr(Int(py=stats_addr))
+    var fp = _i32_ptr(Int(py=flags_addr))
+    var n = Int(py=params[0])
+    var batch_size = Int(py=params[1])
+    var frequency = Int(py=params[2])
+    var start_periods = Int(py=params[3])
+    var eps = Float32(Float64(py=params[4]))
+    var init_method = Int(py=params[5]) if len(params) == 6 else 0
+    if init_method != 0 and init_method != 1:
+        raise Error("holtwinters_fit: init_method must be 0 (heuristic) or 1 (estimated), got " + String(init_method))
+    var sname = String(py=seasonal)
+    var components_len = 0
+    with GILReleased(Python()):
+        components_len = holtwinters_fit_ptr(
+            dp, cp, sp, fp, n, batch_size, frequency, start_periods, sname, eps,
+            init_method,
+        )
+    return PythonObject(components_len)
+
+
+def holtwinters_forecast_binding(
+    comps_addr: PythonObject,
+    out_addr: PythonObject,
+    params: PythonObject,
+    seasonal: PythonObject,
+) raises -> PythonObject:
+    """`.forecast(h)` (holtwinters/). Returns `h * batch_size`.
+
+    `params` is, in this exact order (mirrored in
+    `python/anonlib/_tsa_impl.py`):
+
+        0  n              the FIT's observations per series
+        1  batch_size
+        2  frequency      the FIT's seasonal_periods
+        3  h              steps to forecast
+
+    `comps_addr` reads `3 * components_len` float32 in the SAME packed
+    order `holtwinters_fit` wrote: level, then trend, then season, each
+    `components_len = (n - frequency) * batch_size` and each time-major.
+
+    `out_addr` is written with `h * batch_size` float32, TIME-MAJOR:
+    series `s` at step `i` is `[s + i * batch_size]`.
+    """
+    if len(params) != 4:
+        raise Error(
+            "holtwinters_forecast: params must contain 4 values (n,"
+            " batch_size, frequency, h), got " + String(len(params))
+        )
+    var cp = _f32_ptr(Int(py=comps_addr))
+    var op = _f32_ptr(Int(py=out_addr))
+    var n = Int(py=params[0])
+    var batch_size = Int(py=params[1])
+    var frequency = Int(py=params[2])
+    var h = Int(py=params[3])
+    var sname = String(py=seasonal)
+    var written = 0
+    with GILReleased(Python()):
+        written = holtwinters_forecast_ptr(cp, op, n, batch_size, frequency, sname, h)
+    return PythonObject(written)
+
+
+def holtwinters_predict_binding(
+    comps_addr: PythonObject,
+    out_addr: PythonObject,
+    params: PythonObject,
+    seasonal: PythonObject,
+) raises -> PythonObject:
+    """The in-sample one-step predictions at times `[start, end)`, on the
+    device (`holtwinters/estimator.mojo::holtwinters_predict_ptr`). Returns
+    `(end - start) * batch_size`.
+
+    `params` is, in this exact order (mirrored in
+    `python/anonlib/_tsa_impl.py` and the host binding):
+
+        0  n              the FIT's observations per series
+        1  batch_size
+        2  frequency      the FIT's seasonal_periods
+        3  start          0 <= start
+        4  end            start < end <= n
+
+    `comps_addr` reads the packed components as `holtwinters_forecast`
+    does; `out_addr` is written with `(end - start) * batch_size` float32,
+    TIME-MAJOR, the canonical quiet NaN where `t < 2 * frequency`.
+    """
+    if len(params) != 5:
+        raise Error(
+            "holtwinters_predict: params must contain 5 values (n,"
+            " batch_size, frequency, start, end), got " + String(len(params))
+        )
+    var cp = _f32_ptr(Int(py=comps_addr))
+    var op = _f32_ptr(Int(py=out_addr))
+    var n = Int(py=params[0])
+    var batch_size = Int(py=params[1])
+    var frequency = Int(py=params[2])
+    var start = Int(py=params[3])
+    var end = Int(py=params[4])
+    var sname = String(py=seasonal)
+    var written = 0
+    with GILReleased(Python()):
+        written = holtwinters_predict_ptr(
+            cp, op, n, batch_size, frequency, sname, start, end
+        )
+    return PythonObject(written)
+
+
+def kpss_test_binding(
+    y_addr: PythonObject,
+    flags_addr: PythonObject,
+    stat_addr: PythonObject,
+    params: PythonObject,
+) raises -> PythonObject:
+    """`cuml.tsa.stationarity.kpss_test(y, d, D, s, pval_threshold)` (tsa/,
+    DEVIATIONS 671-672). Returns `batch_size`.
+
+    `params` is, in this exact order (mirrored in
+    `python/anonlib/_tsa_impl.py`):
+
+        0  batch_size
+        1  n_obs
+        2  d               order of simple differencing
+        3  D               order of seasonal differencing
+        4  s               seasonal period
+        5  pval_threshold  (float)
+
+    `y_addr` reads `batch_size * n_obs` float32 with each SERIES
+    CONTIGUOUS: series `b` occupies `[b * n_obs, (b + 1) * n_obs)`. cuML's
+    `y` is `(n_obs, batch_size)` in Fortran order, which is the same flat
+    bytes; the Python wrapper does that transpose and names its cost.
+
+    `flags_addr` is written with `batch_size` int32 (1 stationary, 0 not),
+    which is cuML's return value. `stat_addr` is written with `batch_size`
+    float32 KPSS statistics, which is OURS: cuML returns the flags only.
+    """
+    if len(params) != 6:
+        raise Error(
+            "kpss_test: params must contain 6 values (batch_size, n_obs, d,"
+            " D, s, pval_threshold), got " + String(len(params))
+        )
+    var yp = _f32_ptr(Int(py=y_addr))
+    var fp = _i32_ptr(Int(py=flags_addr))
+    var sp = _f32_ptr(Int(py=stat_addr))
+    var batch_size = Int(py=params[0])
+    var n_obs = Int(py=params[1])
+    var d = Int(py=params[2])
+    var D = Int(py=params[3])
+    var s = Int(py=params[4])
+    var pval = Float32(Float64(py=params[5]))
+    var count = 0
+    with GILReleased(Python()):
+        count = kpss_test_host(yp, fp, sp, batch_size, n_obs, d, D, s, pval)
+    return PythonObject(count)
+
+
+def select_d_binding(
+    y_addr: PythonObject,
+    d_addr: PythonObject,
+    params: PythonObject,
+) raises -> PythonObject:
+    """auto_arima's "Choose the hyper-parameter d" block (tsa/). Returns
+    `batch_size`.
+
+    `params` is, in this exact order (mirrored in
+    `python/anonlib/_tsa_impl.py`):
+
+        0  batch_size
+        1  n_obs
+        2  D               order of seasonal differencing, GIVEN not chosen
+        3  s               seasonal period
+        4  d_max           their d_options is range(0, 2 - D + 1)
+        5  pval_threshold  (float)
+
+    `y_addr` reads `batch_size * n_obs` float32 with each SERIES
+    CONTIGUOUS, the same layout `kpss_test` takes. `d_addr` is written
+    with `batch_size` int32.
+    """
+    if len(params) != 6:
+        raise Error(
+            "select_d: params must contain 6 values (batch_size, n_obs, D, s,"
+            " d_max, pval_threshold), got " + String(len(params))
+        )
+    var yp = _f32_ptr(Int(py=y_addr))
+    var dp = _i32_ptr(Int(py=d_addr))
+    var batch_size = Int(py=params[0])
+    var n_obs = Int(py=params[1])
+    var D = Int(py=params[2])
+    var s = Int(py=params[3])
+    var d_max = Int(py=params[4])
+    var pval = Float32(Float64(py=params[5]))
+    var count = 0
+    with GILReleased(Python()):
+        count = select_d_host(yp, dp, batch_size, n_obs, D, s, d_max, pval)
+    return PythonObject(count)
+
+
+def tsa_numeric_mode_binding() raises -> PythonObject:
+    """THE BUILD'S TIER, as the `NUMERIC_*` code itself: 0 FAST, 1
+    IDENTICAL; the same read-back as `svm_numeric_mode`.
+    box-run-2 (2026-10-05): this binding exported no `*_numeric_mode`, so the
+    wave native import smoke (tools/identical_wave_native_build.py) refused it
+    in both arms. Read-back only; no kernel or bits change."""
+    return PythonObject(GLOBAL_NUMERIC_MODE)
+
+
+def tsa_vendor_binding() raises -> PythonObject:
+    """THE ACCELERATOR API THIS BINARY WAS COMPILED FOR: 'metal', 'cuda',
+    'hip' or 'none'. A compile-time constant folded in from
+    `checks/vendor.mojo`, the same shape as the tier read-back
+    (`gbdt_numeric_mode`): the answer comes from the binary that actually
+    loaded, never from the directory it sat in or from the environment.
+    `python/anonlib/_backend.py` refuses at import when this disagrees
+    with the vendor directory the set was loaded from."""
+    return PythonObject(String(COMPILED_VENDOR))
+
+
+@export
+def PyInit__anonlib_tsa() abi("C") -> PythonObject:
+    try:
+        var m = PythonModuleBuilder("_anonlib_tsa")
+        m.def_function[tsa_vendor_binding]("tsa_vendor")
+        m.def_function[tsa_numeric_mode_binding]("tsa_numeric_mode")
+        m.def_function[holtwinters_fit_binding]("holtwinters_fit")
+        m.def_function[holtwinters_forecast_binding]("holtwinters_forecast")
+        # The in-sample prediction runs on the device (one thread per cell);
+        # the host bindings keep bindings/holtwinters_host_predict.mojo.
+        m.def_function[holtwinters_predict_binding]("holtwinters_predict")
+        m.def_function[kpss_test_binding]("kpss_test")
+        m.def_function[select_d_binding]("select_d")
+        return m.finalize()
+    except e:
+        abort(String("failed to create _anonlib_tsa: ", e))

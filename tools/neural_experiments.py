@@ -1,0 +1,214 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 the authors. Part of anonlib, DOI-WITHHELD
+"""One build, many toggles: run tools/neural_stage_timing.py under each
+experiment's environment and print one table.
+
+lane/neural-net-experiment (2026-09-30). Every experiment on the branch is
+a runtime toggle, so one wheel serves every A/B.
+Each configuration runs in its OWN subprocess (the bindings read most
+toggles at load or at first use), for the lanes given, `--calls` calls
+each; the table shows the median after the first call, the ratio to the
+baseline, and whether the output DIGEST equals the baseline's (`same` /
+`MOVED` / `n/a` on training lanes, whose LOSSES are compared instead).
+
+    python tools/neural_experiments.py                       # the default set, six lanes
+    python tools/neural_experiments.py --lane transformer-forward --lane samba-forward
+    python tools/neural_experiments.py --set nvidia          # the NVIDIA-shaped set
+    python tools/neural_experiments.py --set amd
+    python tools/neural_experiments.py --gemm-arms shipped,tuned128,half,quarter,kpack
+    python tools/neural_experiments.py --only speculative_attn,swiglu_fused
+    python tools/neural_experiments.py --json results.json
+    python tools/neural_experiments.py ideas list             # versioned neural catalog
+    python tools/neural_experiments.py ideas plan NI20 --arm A
+
+A configuration whose digest MOVED is not a speed result; it is a bug
+report against that toggle (or a stage the toggle legitimately drops from
+the card), and it must not be kept.
+"""
+import argparse
+import importlib.util
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+TIMING = HERE / "neural_stage_timing.py"
+LANES = ("transformer-forward", "mamba3-forward", "samba-forward",
+         "samba-train-step", "lm-forward", "lm-train-step")
+
+# name -> environment delta over the baseline. Baseline = the branch's
+# defaults (retention on, stage reset on, per-layer sync on, fused SwiGLU
+# off, speculative attention off, session fresh path on, shipped GEMM arm).
+EXPERIMENTS = {
+    "baseline": {},
+    "no_retain_weights": {"ANONLIB_TRANSFORMER_RETAIN_WEIGHTS": "0",
+                          "ANONLIB_MAMBA3_RETAIN_WEIGHTS": "0"},
+    "legacy_fresh_entry": {"ANONLIB_TRANSFORMER_SESSION_FRESH": "0"},
+    "legacy_everything": {"ANONLIB_TRANSFORMER_LEGACY_SETUP": "1",
+                          "ANONLIB_MAMBA3_LEGACY_SETUP": "1"},
+    "no_stage_reset": {"ANONLIB_TRANSFORMER_STAGE_RESET": "0"},
+    "speculative_attn": {"ANONLIB_ATTN_SPECULATIVE": "1"},
+    "swiglu_fused": {"ANONLIB_SWIGLU_FUSED": "1"},
+    "no_layer_sync": {"ANONLIB_BYTE_LM_LAYER_SYNC": "0"},
+    "mamba3_legacy": {"ANONLIB_MAMBA3_LEGACY_SETUP": "1"},
+    "mamba3_no_retain_stages": {"ANONLIB_MAMBA3_RETAIN_STAGES": "0"},
+    "norm_dw_own_ws": {"ANONLIB_TRANSFORMER_NORM_DW_OWN_WS": "1"},
+    # the S16 q/k backward arms (lane/neural-net-experiment, the S16 pass):
+    # the default is `regs` since lane/neural-pass4 (`regs2` before); each
+    # arm is the same chains in the same order
+    "s16_naive": {"ANONLIB_MAMBA3_S16_QK_ARM": "naive"},
+    "s16_shared": {"ANONLIB_MAMBA3_S16_QK_ARM": "shared"},
+    "s16_regs": {"ANONLIB_MAMBA3_S16_QK_ARM": "regs"},
+    "s16_regs2": {"ANONLIB_MAMBA3_S16_QK_ARM": "regs2"},
+    "s16_smem48": {"ANONLIB_MAMBA3_S16_QK_ARM": "smem48"},
+    # the half-page arms (lane/neural-apple3): the Apple column's default is
+    # regs2h (the full pages are over Metal's 32 KB); opt-in elsewhere
+    "s16_regs2h": {"ANONLIB_MAMBA3_S16_QK_ARM": "regs2h"},
+    "s16_regsh": {"ANONLIB_MAMBA3_S16_QK_ARM": "regsh"},
+    # the optimizer's moments on the host and the per-call optimizer_step
+    # (lane/neural-pass4): the before arm of the resident moments
+    "opt_host": {"ANONLIB_OPTIMIZER_RESIDENT": "0"},
+    "all_on": {"ANONLIB_ATTN_SPECULATIVE": "1", "ANONLIB_SWIGLU_FUSED": "1",
+               "ANONLIB_BYTE_LM_LAYER_SYNC": "0", "ANONLIB_TRANSFORMER_STAGE_RESET": "0"},
+}
+SETS = {
+    "priority": ["baseline", "mamba3_legacy", "mamba3_no_retain_stages", "norm_dw_own_ws"],
+    # the S16 arms on the Mamba lanes (run with --lane mamba3-forward --lane
+    # samba-train-step, or the timing tool for the per-kernel walls)
+    "s16": ["baseline", "s16_naive", "s16_shared", "s16_regs2", "s16_smem48"],
+    # the Apple S16 arms (run with --lane mamba3-forward --lane samba-train-step
+    # on a Mac, or the timing tool for the per-kernel walls)
+    "s16_apple": ["baseline", "s16_naive", "s16_regs2h", "s16_regsh"],
+    # the resident optimizer moments on the training lanes (run with --lane
+    # samba-train-step --lane lm-train-step)
+    "optimizer": ["baseline", "opt_host"],
+    "default": ["baseline", "no_retain_weights", "no_stage_reset", "speculative_attn",
+                "swiglu_fused", "no_layer_sync", "all_on"],
+    "nvidia": ["baseline", "no_retain_weights", "legacy_fresh_entry", "no_stage_reset",
+               "speculative_attn", "swiglu_fused", "no_layer_sync", "all_on"],
+    "amd": ["baseline", "legacy_everything", "no_retain_weights", "no_stage_reset",
+            "speculative_attn", "swiglu_fused", "no_layer_sync", "all_on"],
+}
+
+
+def run_one(name, env_delta, lanes, calls, shape):
+    env = dict(os.environ)
+    env.update(env_delta)
+    cmd = [sys.executable, str(TIMING), "--calls", str(calls), "--shape", shape]
+    for lane in lanes:
+        cmd += ["--lane", lane]
+    print("### %s  %s" % (name, " ".join("%s=%s" % kv for kv in sorted(env_delta.items())) or "(defaults)"),
+          flush=True)
+    proc = subprocess.run(cmd, env=env, capture_output=True, text=True)
+    res = {"name": name, "env": env_delta, "returncode": proc.returncode,
+           "median": {}, "first": {}, "digest": {}, "losses": {}, "stderr_tail": proc.stderr[-2000:]}
+    for line in proc.stdout.splitlines():
+        parts = line.split()
+        if not parts:
+            continue
+        if parts[0] == "SUMMARY" and len(parts) >= 4:
+            lane = parts[1]
+            for tok in parts[2:]:
+                if tok.startswith("first="):
+                    res["first"][lane] = float(tok[6:])
+                elif tok.startswith("median_after_first="):
+                    res["median"][lane] = float(tok[len("median_after_first="):])
+        elif parts[0] == "DIGEST" and len(parts) >= 3:
+            res["digest"][parts[1]] = " ".join(parts[2:])
+        elif parts[0] == "LOSSES" and len(parts) >= 3:
+            res["losses"][parts[1]] = " ".join(parts[2:])
+    if proc.returncode != 0:
+        print("    FAILED (exit %d); stderr tail:\n%s" % (proc.returncode, proc.stderr[-1500:]), flush=True)
+    else:
+        for lane in lanes:
+            print("    %-20s %8.3f ms  digest=%s" % (lane, res["median"].get(lane, float("nan")),
+                                                     res["digest"].get(lane, "?")), flush=True)
+    return res
+
+
+def main(argv=None):
+    # Versioned neural candidates use the frozen builder/full-workload queue.
+    # The older stage diagnostic below retains its stricter same-bits A/B rule.
+    arguments = sys.argv[1:] if argv is None else argv
+    if arguments and arguments[0] == "ideas":
+        from neural_identical_ideas import main as ideas_main
+        return ideas_main(arguments[1:])
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("--lane", action="append", choices=LANES)
+    ap.add_argument("--shape", default="full")
+    ap.add_argument("--calls", type=int, default=6)
+    ap.add_argument("--set", default="default", choices=sorted(SETS))
+    ap.add_argument("--only", help="comma-separated experiment names (baseline is always run)")
+    ap.add_argument("--gemm-arms", help="comma-separated ANONLIB_GEMM_ARM names to add as experiments")
+    ap.add_argument("--json")
+    # not tested: compile-time Apple FAST ideas are metadata plans, separate
+    # from the legacy runtime-toggle/digest runner and its MOVED policy.
+    source_only = ap.add_mutually_exclusive_group()
+    source_only.add_argument("--apple-fast-list", action="store_true")
+    source_only.add_argument("--apple-fast-plan", metavar="AFN26-ID")
+    ap.add_argument("--variant", help="variant for --apple-fast-plan")
+    args = ap.parse_args(arguments)
+    if args.apple_fast_list or args.apple_fast_plan:
+        path = HERE / "apple_fast_neural_ideas.py"
+        spec = importlib.util.spec_from_file_location("neural_afn26_catalog", path)
+        if spec is None or spec.loader is None:
+            ap.error("Apple FAST neural catalog adapter is unavailable")
+        adapter = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(adapter)
+        selected = ["plan", args.apple_fast_plan] if args.apple_fast_plan else ["list"]
+        if args.variant:
+            if not args.apple_fast_plan:
+                ap.error("--variant requires --apple-fast-plan")
+            selected.extend(["--variant", args.variant])
+        if args.json:
+            ap.error("Apple FAST plans print JSON; redirect stdout to a new metadata file")
+        return adapter.main(selected)
+    if args.variant:
+        ap.error("--variant requires --apple-fast-plan")
+    lanes = args.lane or list(LANES)
+    names = SETS[args.set]
+    if args.only:
+        names = ["baseline"] + [n for n in args.only.split(",") if n and n != "baseline"]
+    exps = {n: EXPERIMENTS[n] for n in names}
+    if args.gemm_arms:
+        for arm in args.gemm_arms.split(","):
+            arm = arm.strip()
+            if arm and arm != "shipped":
+                exps["gemm_arm_" + arm] = {"ANONLIB_GEMM_ARM": arm}
+    results = []
+    for name, delta in exps.items():
+        results.append(run_one(name, delta, lanes, args.calls, args.shape))
+    base = results[0]
+    print("\n| experiment | " + " | ".join(lanes) + " |")
+    print("|---|" + "---:|" * len(lanes))
+    for r in results:
+        cells = []
+        for lane in lanes:
+            m = r["median"].get(lane)
+            b = base["median"].get(lane)
+            if m is None or r["returncode"] != 0:
+                cells.append("FAILED")
+                continue
+            ratio = (" (%.2fx)" % (m / b)) if b else ""
+            if r is base:
+                bits = ""
+            elif r["digest"].get(lane, "None") not in ("None", "?") and base["digest"].get(lane) not in (None, "None"):
+                bits = " same" if r["digest"][lane] == base["digest"][lane] else " **MOVED**"
+            elif lane in r["losses"] and lane in base["losses"]:
+                bits = " same" if r["losses"][lane] == base["losses"][lane] else " **MOVED**"
+            else:
+                bits = " n/a"
+            cells.append("%.3f%s%s" % (m, ratio, bits))
+        print("| %s | %s |" % (r["name"], " | ".join(cells)))
+    print("\nratio < 1 is faster than baseline; MOVED means the output bits differ from baseline: do not keep that toggle.")
+    if args.json:
+        with open(args.json, "w") as f:
+            json.dump(results, f, indent=1, sort_keys=True)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

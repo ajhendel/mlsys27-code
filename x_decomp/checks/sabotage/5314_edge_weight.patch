@@ -1,0 +1,13 @@
+diff --git a/x_decomp/cells.mojo b/x_decomp/cells.mojo
+--- a/x_decomp/cells.mojo
++++ b/x_decomp/cells.mojo
+@@ -867,8 +867,7 @@
+             var a = ftz(wa.unsafe_load(e))
+             var b = ftz(wb.unsafe_load(e))
+             var w = a
+-            if w == Float32(0) or (b != Float32(0) and b < w):
+-                w = b
++            _ = b  # SABOTAGE 5314: the edge read one way only (a directed graph)
+             if w == Float32(0):
+                 continue
+             var nd = add(best, w)

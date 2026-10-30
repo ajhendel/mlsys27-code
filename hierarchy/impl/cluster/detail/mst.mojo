@@ -1,0 +1,140 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 the authors. Part of anonlib, DOI-WITHHELD
+"""`build_sorted_mst`: the MST, connected, sorted.
+
+Reference: `build_sorted_mst` (`:276-343`) and the shape of its fix-up loop,
+`cuvs/cpp/src/cluster/detail/mst.cuh` (cuVS `94c2819`). The two
+`connect_knn_graph` overloads (`:74-123`, `:139-249`) and `merge_msts`
+(`:39-59`) are NOT implemented in this rung: on the PAIRWISE connectivity the
+graph is complete, Boruvka's first call returns one component, and the
+loop body is never entered; a call into it raises by name so that a rung-2
+caller finds the gap loudly. `hierarchy/NOT_IMPLEMENTED.tsv` has the row.
+
+`get_n_components` (`cuvs/sparse/neighbors/cross_component_nn.cuh:44-47`
+-> `detail/cross_component_nn.cuh`) counts distinct colors; this implementation copies the
+`m` colors back and counts distinct values on the host. A count is
+order-free and the array is `m` ints.
+"""
+
+from max.gpu.host import DeviceBuffer, DeviceContext, HostBuffer
+
+from hierarchy.checks.edge_order import LINK_SAB_NONE
+from core.device_fold import device_count_distinct_keys
+from hierarchy.impl.cluster.detail.dendrogram_device import coo_sort_by_weight_device
+from hierarchy.impl.sparse.solver.mst_solver import Graph_COO, mst
+from hierarchy.impl.sparse.solver.detail.mst_kernels import (
+    MST_FILL_TPB,
+    copy_i32_kernel,
+)
+
+
+def get_n_components(
+    ctx: DeviceContext, mut color: DeviceBuffer[DType.int32], m: Int
+) raises -> Int:
+    """`cross_component_nn.cuh:44-47`: the number of distinct colors."""
+    # lane cgr4-download-loop: one flag per color set on the device, then
+    # counted there (exact); was a download, a host sort and a host walk.
+    # A color is a vertex id (`& 0x7FFFFFFF` drops the MST's flag bit), so
+    # it lies in [0, m).
+    return device_count_distinct_keys(ctx, color, m, m, Int32(0x7FFFFFFF))
+
+
+def connect_knn_graph(
+    ctx: DeviceContext, n_components: Int
+) raises:
+    """`mst.cuh:74-123` / `:139-249`. NOT IMPLEMENTED (rung 2); raises by name."""
+    raise Error(
+        "hierarchy.build_sorted_mst: the MST is a forest ("
+        + String(n_components)
+        + " components) and connect_knn_graph (cross_component_nn, mst.cuh"
+        ":74-123) is not implemented in rung 1; on the PAIRWISE connectivity this"
+        " cannot happen, so a non-finite input row is the likely cause"
+    )
+
+
+def build_sorted_mst[DENSE: Bool = False](
+    ctx: DeviceContext,
+    mut indptr: DeviceBuffer[DType.int32],
+    mut indices: DeviceBuffer[DType.int32],
+    mut pw_dists: DeviceBuffer[DType.float32],
+    m: Int,
+    n: Int,
+    mut mst_src: DeviceBuffer[DType.int32],
+    mut mst_dst: DeviceBuffer[DType.int32],
+    mut mst_weight: DeviceBuffer[DType.float32],
+    mut color: DeviceBuffer[DType.int32],
+    nnz: Int,
+    max_iter: Int = 10,
+    mst_tpb: Int = 256,
+    sabotage: Int32 = LINK_SAB_NONE,
+) raises -> Int:
+    """`mst.cuh:276-343`. Returns the Boruvka round count (for the card).
+    DENSE: the graph is `pairwise_distances`'s complete one and `indices`
+    is not read (it may be a one-cell placeholder; `mst_kernels._edge_dst`).
+    `reduction_op` and `metric` are arguments of the fix-up loop only and
+    have no role until rung 2."""
+    # `:296-298` We want to have MST initialize colors on first call.
+    var mst_coo = mst[DENSE](
+        ctx, indptr, indices, pw_dists, m, nnz, color,
+        symmetrize_output=False, initialize_colors=True, iterations=0,
+        tpb=mst_tpb, sabotage=sabotage,
+    )
+
+    var iters = 1
+    var n_components = get_n_components(ctx, color, m)
+
+    while n_components > 1 and iters < max_iter:
+        connect_knn_graph(ctx, n_components)
+        iters += 1
+        n_components = get_n_components(ctx, color, m)
+
+    # `:330-335`
+    if n_components != 1:
+        raise Error(
+            "hierarchy.build_sorted_mst: KNN graph could not be connected in "
+            + String(max_iter)
+            + " iterations. Please verify that the input knn graph is"
+            " generated from X (and the same distance metric used), or"
+            " increase 'max_iter'"
+        )
+    if mst_coo.n_edges != m - 1:
+        raise Error(
+            "hierarchy.build_sorted_mst: the MST has "
+            + String(mst_coo.n_edges)
+            + " edges for "
+            + String(m)
+            + " vertices; a spanning tree has m - 1"
+        )
+
+    # `:337-338`
+    coo_sort_by_weight_device(
+        ctx, mst_coo.src, mst_coo.dst, mst_coo.weights, mst_coo.n_edges, sabotage
+    )
+
+    # `:340-342`
+    var n_edges = mst_coo.n_edges
+    var blocks = (n_edges + MST_FILL_TPB - 1) // MST_FILL_TPB if n_edges > 0 else 1
+    ctx.enqueue_function[copy_i32_kernel](
+        mst_src.unsafe_ptr(),
+        mst_coo.src.unsafe_ptr(),
+        Int32(n_edges),
+        grid_dim=(blocks, 1, 1),
+        block_dim=(MST_FILL_TPB, 1, 1),
+    )
+    ctx.enqueue_function[copy_i32_kernel](
+        mst_dst.unsafe_ptr(),
+        mst_coo.dst.unsafe_ptr(),
+        Int32(n_edges),
+        grid_dim=(blocks, 1, 1),
+        block_dim=(MST_FILL_TPB, 1, 1),
+    )
+    if n_edges > 0:
+        var wsrc = mst_coo.weights.create_sub_buffer[DType.float32](0, n_edges)
+        var wdst = mst_weight.create_sub_buffer[DType.float32](0, n_edges)
+        ctx.enqueue_copy(dst_buf=wdst, src_buf=wsrc)
+        _ = wsrc^
+        _ = wdst^
+    ctx.synchronize()
+    var rounds = mst_coo.n_rounds
+    _ = mst_coo^
+    return rounds

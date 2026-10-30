@@ -1,0 +1,13 @@
+diff --git a/sequence/adafactor.mojo b/sequence/adafactor.mojo
+index 3f13bc9fd..7d67acfca 100644
+--- a/sequence/adafactor.mojo
++++ b/sequence/adafactor.mojo
+@@ -203,7 +203,7 @@ def lamb_ratio_tail(a: Args, t: Int, pss: Float32, uss: Float32):
+     var gn = ftz(identical_sqrt(uss))
+     var r = Float32(1.0)
+     if wn > Float32(0.0) and gn > Float32(0.0):
+-        r = div(wn, gn)
++        r = ftz(identical_sqrt(div(pss, uss)))
+     if (a.i0 & 1) != 0 and r > Float32(1.0):
+         r = Float32(1.0)
+     st(a.p3, t, r)

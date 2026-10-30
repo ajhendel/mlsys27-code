@@ -1,0 +1,38 @@
+diff --git a/x_ann/ivf_scan_device.mojo b/x_ann/ivf_scan_device.mojo
+index 65465f28c..dd69e4f95 100644
+--- a/x_ann/ivf_scan_device.mojo
++++ b/x_ann/ivf_scan_device.mojo
+@@ -30,7 +30,7 @@ from max.gpu.host import DeviceBuffer, DeviceContext
+ from max.gpu.memory import AddressSpace
+ from max.gpu.sync import barrier
+ 
+-from checks.numerics import GLOBAL_NUMERIC_MODE, NUMERIC_FAST, ftz, identical_mul_add
++from checks.numerics import GLOBAL_NUMERIC_MODE, NUMERIC_FAST, ftz, identical_mul, identical_mul_add
+ from std.sys.info import has_apple_gpu_accelerator
+ from x_ann.switches import ANN3_SCAN_SELECT
+ from x_ann.ivf_pq_core import (
+@@ -298,7 +298,7 @@ def sq_score_kernel(
+         if staged:
+             var acc = Float32(0.0)
+             for c in range(d):
+-                var dec = ftz(identical_mul_add(Float32(Int(codes.unsafe_load(slot * d + c))), dl[c], vm[c]))
++                var dec = ftz(ftz(identical_mul(Float32(Int(codes.unsafe_load(slot * d + c))), dl[c])) + vm[c])
+                 var diff = ftz(qr[c] - dec)
+                 acc = ts_ftz_nonneg(identical_mul_add(diff, diff, acc))
+             cand.unsafe_store(base + slot, acc)
+diff --git a/x_ann/ivf_sq_core.mojo b/x_ann/ivf_sq_core.mojo
+index a6c7d80c6..865d323c0 100644
+--- a/x_ann/ivf_sq_core.mojo
++++ b/x_ann/ivf_sq_core.mojo
+@@ -85,9 +85,8 @@ def sq_candidate_dist(
+     var acc = Float32(0.0)
+     for c in range(dim):
+         var qr = ftz(ftz(queries.unsafe_load(q_off + c)) - ftz(centers.unsafe_load(l * dim + c)))
+-        var dec = ftz(identical_mul_add(
+-            Float32(Int(codes.unsafe_load(row * dim + c))), delta.unsafe_load(c), vmin.unsafe_load(c)
+-        ))
++        var dec = ftz(ftz(identical_mul(
++            Float32(Int(codes.unsafe_load(row * dim + c))), delta.unsafe_load(c))) + vmin.unsafe_load(c))
+         var diff = ftz(qr - dec)
+         acc = ftz(identical_mul_add(diff, diff, acc))
+     return acc

@@ -1,0 +1,96 @@
+#!/bin/sh
+# Refuse a push that GitHub would refuse, before hours of upload are spent.
+#
+# The pre-commit hook stops an oversized file at commit time in worktrees
+# that installed it. This hook is the second fence: it scans every blob the
+# push would send and refuses if any exceeds 100 MiB, GitHub's hard limit.
+# On 2026-09-08 a push ran for hours and was then rejected for one 119 MB
+# file (see tools/hooks/pre-commit for the record). Reading the blob sizes
+# takes seconds; the upload took hours.
+#
+# The third fence (2026-10-02): no_host_routes.py --tree scans every file a
+# GPU install runs at the pushed commit (Mojo modules the GPU bindings reach
+# through their imports, GPU-path Python) and refuses any CPU work in GPU code
+# that is not in tools/hooks/host_routes_baseline.tsv, and any baseline row
+# that no longer matches (the baseline only shrinks). It prints the debt per
+# class and per owner. A branch that predates the baseline is judged on what
+# it adds over its merge-base with main, against main's baseline.
+#
+# Which refs the host-route fence judges (2026-10-09):
+#   refs/heads/main                       the whole tree
+#   refs/heads/<anything else>            --branch: only what it adds over its
+#                                         merge-base with main (lane/*, fix/*, ...)
+#   refs/heads/archive/*, refs/tags/archive-*, refs/tags/archive/*
+#                                         SKIPPED, with one line saying so: archive
+#                                         refs are never merged, so the
+#                                         fence has nothing to protect there, and
+#                                         keeping them in git beats hiding old
+#                                         branches in bundles. Archive a dead branch
+#                                         as archive/<date>/<old name>; never merge
+#                                         an archive ref (revive it as a new lane/*
+#                                         branch, which the fence judges as usual).
+#   refs/heads/salvage/*                  skipped silently (2026-10-05, unchanged)
+#   any other ref (tags, refs/archive/...) not judged (unchanged)
+# The size fence below applies to every push, archive refs included.
+#
+# Arguments and stdin follow git's pre-push contract:
+#   $1 remote name, $2 remote URL; stdin lines "<local ref> <local sha> <remote ref> <remote sha>".
+
+limit=$((100 * 1024 * 1024))
+zero=0000000000000000000000000000000000000000
+bad=0
+refs=$(cat)
+here=$(dirname "$0")
+# installed copies never update themselves (an Oct 8 copy refused tagged driver loops on 2026-10-17): say so when the
+# checkout's hooks differ from the installed ones
+top=$(git rev-parse --show-toplevel 2>/dev/null)
+for f in pre-push no_host_routes.py rebuild_fence.py; do
+    if [ -f "$top/tools/hooks/$f" ] && ! cmp -s "$top/tools/hooks/$f" "$here/$f"; then
+        echo "pre-push: the installed $f differs from tools/hooks/$f in this checkout; run bash tools/hooks/install.sh" >&2
+    fi
+done
+echo "$refs" | while read -r local_ref local_sha remote_ref remote_sha; do
+    [ -z "$local_sha" ] && continue
+    [ "$local_sha" = "$zero" ] && continue
+    [ -f "$here/no_host_routes.py" ] || continue
+    # archive/* and salvage/* refs are archives of dead branches and old worktrees (owner, 2026-10-05 and
+    # 2026-10-09): never merged, so no host-route check; the size fence below still applies.
+    case "$remote_ref" in
+        refs/heads/salvage/*) continue ;;
+        refs/heads/archive/*|refs/tags/archive-*|refs/tags/archive/*)
+            echo "pre-push: host-route fence skipped for $remote_ref: it is an archive ref, and archive refs are never merged (the size fence still applies)" >&2
+            continue ;;
+        refs/heads/*) ;;
+        *) continue ;;
+    esac
+    # a push to main is judged on the whole tree; any other branch only on what
+    # it adds over its merge-base with main (owner, 2026-10-07)
+    mode=--branch
+    [ "$remote_ref" = "refs/heads/main" ] && mode=
+    python3 "$here/no_host_routes.py" --tree "$local_sha" $mode || exit 4
+    # the rebuild fence (2026-10-17): a lane change to a module most bindings import is refused
+    if [ -f "$here/rebuild_fence.py" ]; then python3 "$here/rebuild_fence.py" "$local_sha" $mode || exit 4; fi
+done
+[ $? -eq 4 ] && bad=1
+echo "$refs" | while read -r local_ref local_sha remote_ref remote_sha; do
+    [ -z "$local_sha" ] && continue
+    [ "$local_sha" = "$zero" ] && continue        # deleting a remote ref
+    if [ "$remote_sha" = "$zero" ]; then
+        range="$local_sha --not --remotes=$1"
+    else
+        range="$local_sha ^$remote_sha"
+    fi
+    # shellcheck disable=SC2086
+    git rev-list --objects $range 2>/dev/null | cut -d' ' -f1 \
+        | git cat-file --batch-check='%(objectname) %(objecttype) %(objectsize)' \
+        | awk -v lim="$limit" '$2 == "blob" && $3 > lim { print $1, $3 }' \
+        | while read -r blob size; do
+            path=$(git rev-list --objects $range | grep "^$blob " | cut -d' ' -f2-)
+            echo "pre-push: REFUSED blob $blob ($size bytes) at $path is over GitHub's 100 MiB limit" >&2
+            echo "   the commit that added it must be rewritten before this ref can be pushed" >&2
+            exit 3
+        done
+    [ $? -eq 3 ] && exit 3
+done
+[ $? -eq 3 ] && bad=1
+exit $bad

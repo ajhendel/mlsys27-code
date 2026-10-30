@@ -1,0 +1,1763 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 the authors. Part of anonlib, DOI-WITHHELD
+"""THE CLUSTER LANE'S PUBLIC DOOR.
+
+Owned by the `cluster` expansion lane. `anonlib/__init__.py` imports this
+module and makes every name in `__all__` public as `anonlib.<name>`; a name
+that is already public is refused at import. Put the classes here, or import
+them here from the lane's own modules. Two optional hooks route a SAVED model
+to the CPU (`anonlib.host_model`); `_classical_host.py` merges them when it is
+first imported, after the package, so both may rely on every module existing:
+
+  CLASSICAL_HOST_BASENAMES     {"_anonlib_x_cluster": "_anonlib_x_cluster_host"}
+  def classical_host_formats() -> {"anonlib-<format>-1": {"Estimator": HostEstimator}}
+                               import `_classical_host` INSIDE it and subclass
+                               its `_HostBound`; never import it at module level
+"""
+import ctypes
+
+from . import _portable_math as math
+
+from . import _backend, _buffer
+from . import _portable_math as _pm
+from ._array import Array
+from ._mode import NumericModeMixin
+
+__all__ = ["MiniBatchKMeans", "BisectingKMeans", "MeanShift", "OPTICS", "AffinityPropagation", "BayesianGaussianMixture"]
+
+# x_cluster/entries.mojo: the entry numbers of `x_cluster_call`
+_E_NEAREST, _E_DISTANCES, _E_MINIBATCH, _E_BISECT, _E_BISECT_PREDICT, _E_MEANSHIFT, _E_OPTICS, _E_AFFINITY, _E_BGMM, _E_BGMM_SCORE, _E_MINIBATCH_PARTIAL = 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10
+
+
+def _f32(X, name="X", scan=True):
+    x, _ = _buffer.as_f32_c(X, ndim=2, name=name)
+    if x.shape[0] < 1 or x.shape[1] < 1:
+        raise ValueError(f"anonlib: {name} must be a non-empty 2-D array, got shape {x.shape}")
+    # the base binding's native scan (`_buffer.all_finite`); scan=False only
+    # when the binding scans X itself (MiniBatchKMeans, MBK_FAST_DEVSCAN)
+    if scan and not _buffer.all_finite(x):
+        raise ValueError(f"anonlib: {name} contains NaN or infinity")
+    return x
+
+
+def _aux(*parts):
+    """The parts (Arrays or array-likes, None skipped) end to end as one
+    float32 Array: byte copies, no Python pass over the values (lane
+    pyglue-numeric: the aux blocks were Python lists of every value)."""
+    arrs = [_buffer.as_f32_c(p, ndim=None, name="aux")[0] for p in parts if p is not None]  # glue: aux parts as float32 blocks
+    total = sum(a.size for a in arrs)   # glue: the few part sizes
+    if not total:
+        return None
+    out = _buffer.empty((total,), "<f4")
+    off = 0
+    for a in arrs:                      # glue: one copy per part
+        if a.size:
+            ctypes.memmove(out._addr + 4 * off, _buffer.addr_ro(a, name="aux"), 4 * a.size)
+        off += a.size
+    return out
+
+
+def _weights(sample_weight, n):
+    """sample_weight as a float32 Array of n values (None stays None)."""
+    if sample_weight is None:
+        return None
+    # scikit-learn's _check_sample_weight (shape, finite, not all zero, its
+    # wording) before the kernels; read only, never written
+    from ._sample_weight import check_sample_weight
+    return check_sample_weight(sample_weight, n, allow_negative=True)
+
+
+def _seed(random_state):
+    if random_state is None:
+        return 0
+    if isinstance(random_state, bool) or not isinstance(random_state, int) or random_state < 0:
+        raise ValueError("anonlib: random_state must be None or a non-negative int "
+                         "(the lane's seeded host stream; a RandomState object is not taken)")
+    return int(random_state) & ((1 << 63) - 1)
+
+
+def _callable_init(init, X, k, random_state):
+    """scikit-learn's callable `init` (`_kmeans.py::_init_centroids`:
+    `init(X, n_clusters, random_state=random_state)`): called ONCE on the
+    host with the fit's rows, a NumPy RandomState seeded by `random_state`
+    when NumPy is present (the int otherwise), and its centers then take
+    the array path, so the fit's bits depend only on what it returned.
+    scikit-learn's MiniBatchKMeans hands it an `init_size` subsample drawn
+    from its own stream; this hands it every row."""
+    rs = random_state
+    try:
+        from ._optional_numpy import require_numpy
+        _np = require_numpy('_expansion_cluster')
+        X = _np.asarray(X)
+        rs = _np.random.RandomState(random_state)
+    except (ImportError, AttributeError):
+        pass
+    return init(X, k, random_state=rs)
+
+
+class _XCluster(NumericModeMixin):
+    """The lane's shared call: `x_cluster_call` on `_anonlib_x_cluster`
+    (the CPU host binding `_anonlib_x_cluster_host` on a CPU-only install)."""
+    _BINDING = "_anonlib_x_cluster"
+
+    def _call(self, which, x, a, ip, fp=()):
+        b = self._bind()
+        xa = _buffer.addr_ro(x, name="X") if x is not None else 0
+        xn = x.size if x is not None else 0
+        aa = _buffer.addr_ro(a, name="aux") if a is not None and a.size else 0
+        an = a.size if a is not None else 0
+        f, i, s = b.x_cluster_call(which, xa, xn, aa, an, [int(v) for v in ip], [float(v) for v in fp])  # glue: integer and float binding params
+        return f, i, s
+
+    def _check_fitted(self, attr):
+        if getattr(self, attr, None) is None:
+            raise RuntimeError(f"this {type(self).__name__} is not fitted yet")
+
+    def _input_like_fit(self, X):
+        x = _f32(X)
+        if x.shape[1] != self.n_features_in_:
+            raise ValueError(f"anonlib: X has {x.shape[1]} features, {type(self).__name__} "
+                             f"was fitted with {self.n_features_in_}")
+        return x
+
+    def _nearest(self, x, centers):
+        n, d = x.shape
+        f, i, _ = self._call(_E_NEAREST, x, centers, [n, centers.shape[0], d])
+        return Array._from_flat(i[0], (n,), "<i4"), f[0]
+
+    def _distances(self, x, centers):
+        n, d = x.shape
+        k = centers.shape[0]
+        f, _, _ = self._call(_E_DISTANCES, x, centers, [n, k, d])
+        return Array._from_flat(f[0], (n, k), "<f4")
+
+
+class _CentersMixin:
+    """predict / transform / score against `cluster_centers_` (squared
+    euclidean nearest, the lowest index on a tie)."""
+
+    def predict(self, X):
+        """Assign each row of `X` to its nearest cluster center.
+
+        The nearest center is by squared euclidean distance; a tie goes to
+        the lowest center index.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+            Rows to label, converted to float32. Must have the number of
+            features seen in `fit` and contain no NaN or infinity.
+
+        Returns
+        -------
+        labels : Array of shape (n_samples,), int32
+            Index of the nearest center for each row.
+
+        Raises
+        ------
+        RuntimeError
+            If the model is not fitted.
+        ValueError
+            If `X` is empty, has the wrong number of features, or contains
+            NaN or infinity.
+        """
+        self._check_fitted("cluster_centers_")
+        return self._nearest(self._input_like_fit(X), self.cluster_centers_)[0]
+
+    def transform(self, X):
+        """Distance from each row of `X` to every cluster center.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+            Rows to transform, converted to float32.
+
+        Returns
+        -------
+        distances : Array of shape (n_samples, n_clusters), float32
+            Euclidean distance from each row to each center.
+
+        Raises
+        ------
+        RuntimeError
+            If the model is not fitted.
+        """
+        self._check_fitted("cluster_centers_")
+        return self._distances(self._input_like_fit(X), self.cluster_centers_)
+
+    def fit_predict(self, X, y=None, sample_weight=None):
+        """Fit the model on `X` and return the training labels.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+            Training rows, converted to float32.
+        y : ignored
+            Present for scikit-learn compatibility.
+        sample_weight : ignored
+            Accepted for scikit-learn compatibility but not passed to the
+            fit. Call ``fit(X, sample_weight=...)`` and read `labels_` to
+            fit with weights.
+
+        Returns
+        -------
+        labels : Array of shape (n_samples,), int32
+            The fitted `labels_`.
+        """
+        return self.fit(X).labels_
+
+    def fit_transform(self, X, y=None, sample_weight=None):
+        """Fit the model on `X` and return the distances to the centers.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+            Training rows, converted to float32.
+        y : ignored
+            Present for scikit-learn compatibility.
+        sample_weight : ignored
+            Accepted for scikit-learn compatibility but not passed to the
+            fit.
+
+        Returns
+        -------
+        distances : Array of shape (n_samples, n_clusters), float32
+            Euclidean distance from each training row to each center.
+        """
+        return self.fit(X).transform(X)
+
+    def score(self, X, y=None, sample_weight=None):
+        """Opposite of the inertia of `X` under the fitted centers.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+            Rows to score, converted to float32.
+        y : ignored
+            Present for scikit-learn compatibility.
+        sample_weight : ignored
+            Accepted for scikit-learn compatibility; every row counts once.
+
+        Returns
+        -------
+        score : float
+            Minus the sum of squared distances from each row to its nearest
+            center (larger is better).
+
+        Raises
+        ------
+        RuntimeError
+            If the model is not fitted.
+        """
+        self._check_fitted("cluster_centers_")
+        x = self._input_like_fit(X)
+        # the float-float fold of the distances, in the binding
+        n, d = x.shape
+        _, _, sc = self._call(_E_NEAREST, x, self.cluster_centers_, [n, self.cluster_centers_.shape[0], d, 1])
+        return -sc[0]
+
+
+# Reference: scikit-learn `cluster/_kmeans.py` (MiniBatchKMeans),
+# `_k_means_minibatch.pyx::update_center_dense`. The batch assignment runs on
+# the device; the batch draws, the center update in scikit-learn's order, the
+# random reassignment of low-count centers and the early stop (exponentially
+# weighted batch inertia, `max_no_improvement`, `tol`) are host code. The batch
+# order comes from `random_state` through the lane's splitmix64 stream, not
+# NumPy's Mersenne Twister. A callable init is called once on the host and its
+# centers take the array path (`_callable_init`); see
+# x_cluster/NOT_IMPLEMENTED.tsv.
+class MiniBatchKMeans(_CentersMixin, _XCluster):
+    """Mini-batch k-means clustering.
+
+    Follows scikit-learn's ``MiniBatchKMeans``: each step assigns a random
+    batch of rows to the nearest center and moves the centers, low-count
+    centers are randomly reassigned, and the fit stops early on the
+    smoothed batch inertia. Batches are drawn from this library's own seeded
+    random stream rather than NumPy's, so results agree with scikit-learn's
+    within a tolerance, not bit for bit. Input is converted to float32.
+
+    Parameters
+    ----------
+    n_clusters : int, default 8
+        Number of clusters. Must be between 1 and the number of samples.
+    init : {'k-means++', 'random'}, array-like or callable, default 'k-means++'
+        How the centers start. 'k-means++' is greedy k-means++, as in
+        scikit-learn. 'random' picks `n_clusters` distinct rows of the init
+        sample, drawn by weight. An array of shape (n_clusters, n_features)
+        gives the starting centers. A callable is called once as
+        ``init(X, n_clusters, random_state=rs)`` with every row of `X`
+        (scikit-learn passes a subsample) and must return such an array;
+        `rs` is a NumPy ``RandomState`` seeded by `random_state` when NumPy
+        is installed, otherwise the int.
+    max_iter : int, default 100
+        Maximum number of passes over the data.
+    batch_size : int, default 1024
+        Rows per mini-batch.
+    verbose : int, default 0
+        Accepted for scikit-learn compatibility; nothing is printed.
+    compute_labels : bool, default True
+        Accepted for scikit-learn compatibility; `labels_` is always
+        computed.
+    random_state : int or None, default None
+        Non-negative seed for the batch draws and initialization. None
+        means 0, so repeated fits give the same result. A NumPy
+        ``RandomState`` is not accepted.
+    tol : float, default 0.0
+        Early-stop tolerance on center movement, as in scikit-learn.
+    max_no_improvement : int or None, default 10
+        Stop after this many steps without improvement of the smoothed batch
+        inertia. None disables this early stop.
+    init_size : int or None, default None
+        Number of rows used for initialization. None uses scikit-learn's
+        rule (3 * batch_size, at least 3 * n_clusters, at most n_samples).
+    n_init : int or 'auto', default 'auto'
+        Number of initializations; the best one is kept. 'auto' means 3 for
+        ``init='random'`` and 1 otherwise.
+    reassignment_ratio : float, default 0.01
+        Controls how often low-count centers are reassigned, as in
+        scikit-learn.
+    numeric_mode : str or None, default None
+        Numeric mode for this estimator. None uses the process default (see
+        :func:`anonlib.set_numeric_mode`).
+
+    Attributes
+    ----------
+    cluster_centers_ : Array of shape (n_clusters, n_features), float32
+        Cluster centers.
+    counts_ : Array of shape (n_clusters,), float32
+        Weighted number of rows assigned to each center over the fit.
+    labels_ : Array of shape (n_samples,), int32
+        Cluster of each training row.
+    inertia_ : float
+        Sum of squared distances of the training rows to their nearest
+        center.
+    n_steps_ : int
+        Number of mini-batch steps run.
+    n_iter_ : int
+        Number of passes over the data.
+    n_features_in_ : int
+        Number of features seen in `fit`.
+
+    Examples
+    --------
+    >>> import numpy as np, anonlib
+    >>> X = np.random.default_rng(0).random((1000, 8), dtype=np.float32)
+    >>> model = anonlib.MiniBatchKMeans(n_clusters=4, random_state=0).fit(X)
+    >>> labels = model.predict(X)
+    """
+    # scikit-learn tags, read by `_mode.sklearn_tags`
+    _estimator_type = "clusterer"
+
+    def __init__(self, n_clusters=8, *, init="k-means++", max_iter=100, batch_size=1024,
+                 verbose=0, compute_labels=True, random_state=None, tol=0.0,
+                 max_no_improvement=10, init_size=None, n_init="auto", reassignment_ratio=0.01):
+        self.n_clusters = n_clusters
+        self.init = init
+        self.max_iter = max_iter
+        self.batch_size = batch_size
+        self.verbose = verbose
+        self.compute_labels = compute_labels
+        self.random_state = random_state
+        self.tol = tol
+        self.max_no_improvement = max_no_improvement
+        self.init_size = init_size
+        self.n_init = n_init
+        self.reassignment_ratio = reassignment_ratio
+
+    def _devscan(self):
+        """lane/apple-fast-s-linalg MBK_FAST_DEVSCAN (FAST + Apple default, rollback _OFF;
+        x_cluster/minibatch_ptr.mojo): whether the binding scans X for
+        NaN/inf itself (on the device copy), so the host scan is skipped."""
+        try:
+            return int(self._bind().x_cluster_mbk_devscan()) == 1
+        except Exception:
+            return False
+
+    def fit(self, X, y=None, sample_weight=None):
+        """Fit the centers on `X`.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+            Training rows, converted to float32. NaN or infinity raises
+            ValueError.
+        y : ignored
+            Present for scikit-learn compatibility.
+        sample_weight : array-like of shape (n_samples,) or None, default None
+            Row weights. As in scikit-learn, they weight the k-means++
+            potentials, the init scoring and the batch draws.
+
+        Returns
+        -------
+        self : MiniBatchKMeans
+            The fitted estimator.
+
+        Raises
+        ------
+        ValueError
+            If `n_clusters` is outside [1, n_samples], `init` is an unknown
+            string or an array of the wrong shape, `n_init` is below 1, or
+            `X` contains NaN or infinity.
+        """
+        devscan = self._devscan()
+        x = _f32(X, scan=not devscan)
+        n, d = x.shape
+        k = int(self.n_clusters)
+        if k < 1 or k > n:
+            raise ValueError(f"n_samples={n} should be >= n_clusters={k}.")
+        weights = _weights(sample_weight, n)
+        init_arr = None
+        if isinstance(self.init, str):
+            if self.init not in ("k-means++", "random"):
+                raise ValueError(f"init must be 'k-means++', 'random' or an array, got {self.init!r}")
+        else:
+            init_arr = _f32(_callable_init(self.init, X, k, self.random_state) if callable(self.init)
+                            else self.init, "init")
+            if init_arr.shape != (k, d):
+                raise ValueError(f"The shape of the initial centers {init_arr.shape} does not match "
+                                 f"the number of clusters {k} and features {d}.")
+        n_init = self.n_init
+        if n_init == "auto":
+            n_init = 3 if (init_arr is None and self.init == "random") else 1
+        n_init = int(n_init)
+        if n_init < 1:
+            raise ValueError("n_init must be >= 1")
+        mni = -1 if self.max_no_improvement is None else int(self.max_no_improvement)
+        ip = [n, d, k, int(self.max_iter), int(self.batch_size), mni,
+              0 if self.init_size is None else int(self.init_size), n_init,
+              1 if init_arr is not None else 0, _seed(self.random_state),
+              1 if (init_arr is None and self.init == "random") else 0, 1 if weights is not None else 0]
+        a = _aux(init_arr, weights)
+        if devscan:
+            ip.append(1)    # ip[12]: the binding owes the NaN/inf scan
+        try:
+            f, i, s = self._call(_E_MINIBATCH, x, a, ip, [float(self.tol), float(self.reassignment_ratio)])
+        except Exception as e:
+            if devscan and "contains NaN or infinity" in str(e):
+                raise ValueError("anonlib: X contains NaN or infinity") from None
+            raise
+        self.cluster_centers_ = Array._from_flat(f[0], (k, d), "<f4")
+        self.counts_ = Array._from_flat(f[1], (k,), "<f4")
+        self.labels_ = Array._from_flat(i[0], (n,), "<i4")
+        self.inertia_ = float(s[0])
+        self.n_steps_ = int(s[1])
+        self.n_iter_ = int(s[2])
+        self.n_features_in_ = d
+        return self
+
+
+    def partial_fit(self, X, y=None, sample_weight=None):
+        """Run one mini-batch step on all of `X`.
+
+        As in scikit-learn, the first call initializes the centers from
+        `init_size` rows of `X` using `init`. Later calls continue from the
+        current centers (including those of an earlier `fit`); the random
+        stream and the reassignment counter carry over between calls.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+            Rows for this step, converted to float32.
+        y : ignored
+            Present for scikit-learn compatibility.
+        sample_weight : array-like of shape (n_samples,) or None, default None
+            Row weights.
+
+        Returns
+        -------
+        self : MiniBatchKMeans
+            The updated estimator. `labels_` and `inertia_` describe this
+            batch.
+
+        Raises
+        ------
+        ValueError
+            If `X` has a different number of features than earlier calls,
+            or on the first call if `n_clusters` exceeds the number of rows
+            or `init` is invalid.
+        """
+        x = _f32(X)
+        n, d = x.shape
+        k = int(self.n_clusters)
+        first = getattr(self, "cluster_centers_", None) is None
+        if not first and not hasattr(self, "_partial_state"):
+            # a model from fit(): continue from its centers and counts, as sklearn
+            n0 = min(int(self.batch_size), n)
+            self._partial_batch = n0
+            self._partial_init = (0, 0)
+            seed = _seed(self.random_state)
+            self._partial_state = ((seed >> 32, seed & 0xFFFFFFFF), 0)
+        if not first and d != self.n_features_in_:
+            raise ValueError(f"X has {d} features, MiniBatchKMeans was fitted with {self.n_features_in_}")
+        aux = []                        # glue: the parts of the state block
+        if first:
+            if k < 1 or k > n:
+                raise ValueError(f"n_samples={n} should be >= n_clusters={k}.")
+            batch_eff = min(int(self.batch_size), n)
+            init_size = 3 * batch_eff if self.init_size is None else int(self.init_size)
+            if init_size < k:
+                init_size = 3 * k
+            init_size = min(init_size, n)
+            if isinstance(self.init, str):
+                if self.init not in ("k-means++", "random"):
+                    raise ValueError(f"init must be 'k-means++', 'random' or an array, got {self.init!r}")
+                mode = 0 if self.init == "k-means++" else 1
+            else:
+                ia = _f32(_callable_init(self.init, X, k, self.random_state) if callable(self.init)
+                          else self.init, "init")
+                if ia.shape != (k, d):
+                    raise ValueError(f"The shape of the initial centers {ia.shape} does not match "
+                                     f"the number of clusters {k} and features {d}.")
+                aux.append(ia)
+                mode = 2
+            seed = _seed(self.random_state)
+            state = (seed >> 32, seed & 0xFFFFFFFF)
+            since = 0
+            self._partial_batch = batch_eff
+            self._partial_init = (mode, init_size)
+            self.n_steps_ = 0
+        else:
+            mode, init_size = self._partial_init
+            batch_eff = self._partial_batch
+            state, since = self._partial_state
+            aux += [self.cluster_centers_, self.counts_]
+        aux.append(_weights(sample_weight, n))
+        ip = [n, d, k, 1 if first else 0, mode, init_size, batch_eff, since, state[0], state[1],
+              1 if sample_weight is not None else 0]
+        a = _aux(*aux)
+        f, i, s = self._call(_E_MINIBATCH_PARTIAL, x, a, ip, [float(self.reassignment_ratio)])
+        self.cluster_centers_ = Array._from_flat(f[0], (k, d), "<f4")
+        self.counts_ = Array._from_flat(f[1], (k,), "<f4")
+        self.labels_ = Array._from_flat(i[0], (n,), "<i4")
+        self.inertia_ = float(s[0])
+        self._partial_state = ((int(s[2]), int(s[3])), int(s[1]))
+        self.n_steps_ = getattr(self, "n_steps_", 0) + 1
+        self.n_features_in_ = d
+        return self
+
+
+# Reference: scikit-learn `cluster/_bisect_k_means.py`. The 2-means is this
+# library's KMeans (cuVS's Lloyd, the kmeans identity lanes' pair).
+class BisectingKMeans(_CentersMixin, _XCluster):
+    """Bisecting k-means clustering.
+
+    Starting from one cluster, the leaf with the highest score is split in
+    two by 2-means, `n_clusters - 1` times. The 2-means step is this
+    library's ``KMeans``, so `tol` uses its centroid-shift rule and the
+    'random' and 'k-means++' starts are its own; results agree with
+    scikit-learn's within a tolerance. Input is converted to float32.
+
+    Parameters
+    ----------
+    n_clusters : int, default 8
+        Number of clusters. Must be between 1 and the number of samples.
+    init : {'random', 'k-means++'}, default 'random'
+        Start of each 2-means split. Any other value raises
+        NotImplementedError.
+    n_init : int, default 1
+        Number of 2-means restarts per split; the best is kept. Must be at
+        least 1.
+    random_state : int or None, default None
+        Non-negative seed. None means 0, so repeated fits give the same
+        result. A NumPy ``RandomState`` is not accepted.
+    max_iter : int, default 300
+        Maximum iterations of each 2-means.
+    verbose : int, default 0
+        Accepted for scikit-learn compatibility; nothing is printed.
+    tol : float, default 1e-4
+        Convergence tolerance of each 2-means, on the centroid shift.
+    copy_x : bool, default True
+        Accepted for scikit-learn compatibility; `X` is never modified.
+    algorithm : {'lloyd', 'elkan'}, default 'lloyd'
+        Accepted for scikit-learn compatibility; both run the same Lloyd
+        iterations.
+    bisecting_strategy : {'biggest_inertia', 'largest_cluster'}, default 'biggest_inertia'
+        Which leaf to split next: the one with the largest inertia, or the
+        one with the most rows.
+    numeric_mode : str or None, default None
+        Numeric mode for this estimator. None uses the process default (see
+        :func:`anonlib.set_numeric_mode`).
+
+    Attributes
+    ----------
+    cluster_centers_ : Array of shape (n_clusters, n_features), float32
+        Centers of the leaf clusters.
+    labels_ : Array of shape (n_samples,), int32
+        Cluster of each training row.
+    inertia_ : float
+        Sum of squared distances of the training rows to their cluster
+        center.
+    n_features_in_ : int
+        Number of features seen in `fit`.
+
+    Examples
+    --------
+    >>> import numpy as np, anonlib
+    >>> X = np.random.default_rng(0).random((1000, 8), dtype=np.float32)
+    >>> model = anonlib.BisectingKMeans(n_clusters=4, random_state=0).fit(X)
+    >>> labels = model.predict(X)
+    """
+    # scikit-learn tags, read by `_mode.sklearn_tags`
+    _estimator_type = "clusterer"
+
+    def __init__(self, n_clusters=8, *, init="random", n_init=1, random_state=None, max_iter=300,
+                 verbose=0, tol=1e-4, copy_x=True, algorithm="lloyd", bisecting_strategy="biggest_inertia"):
+        self.n_clusters = n_clusters
+        self.init = init
+        self.n_init = n_init
+        self.random_state = random_state
+        self.max_iter = max_iter
+        self.verbose = verbose
+        self.tol = tol
+        self.copy_x = copy_x
+        self.algorithm = algorithm
+        self.bisecting_strategy = bisecting_strategy
+
+    def fit(self, X, y=None, sample_weight=None):
+        """Build the bisection tree on `X`.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+            Training rows, converted to float32. NaN or infinity raises
+            ValueError.
+        y : ignored
+            Present for scikit-learn compatibility.
+        sample_weight : array-like of shape (n_samples,) or None, default None
+            Row weights.
+
+        Returns
+        -------
+        self : BisectingKMeans
+            The fitted estimator.
+
+        Raises
+        ------
+        NotImplementedError
+            If `init` is not 'random' or 'k-means++'.
+        ValueError
+            If `bisecting_strategy` or `algorithm` is unknown, `n_clusters`
+            is outside [1, n_samples], `n_init` is below 1, or `X` contains
+            NaN or infinity.
+        """
+        if self.init not in ("random", "k-means++"):
+            raise NotImplementedError(f"anonlib BisectingKMeans: init={self.init!r} is not implemented; "
+                                      "'random' or 'k-means++'")
+        if self.bisecting_strategy not in ("biggest_inertia", "largest_cluster"):
+            raise ValueError(f"bisecting_strategy must be 'biggest_inertia' or 'largest_cluster', "
+                             f"got {self.bisecting_strategy!r}")
+        if self.algorithm not in ("lloyd", "elkan"):
+            raise ValueError(f"algorithm must be 'lloyd' or 'elkan', got {self.algorithm!r}")
+        x = _f32(X)
+        n, d = x.shape
+        k = int(self.n_clusters)
+        if k < 1 or k > n:
+            raise ValueError(f"n_samples={n} should be >= n_clusters={k}.")
+        if int(self.n_init) < 1:
+            raise ValueError("n_init must be >= 1")
+        ip = [n, d, k, int(self.n_init), 1 if self.init == "random" else 0, int(self.max_iter),
+              _seed(self.random_state), 1 if self.bisecting_strategy == "largest_cluster" else 0]
+        w = None
+        if sample_weight is not None:
+            w = _weights(sample_weight, n)
+        f, i, s = self._call(_E_BISECT, x, w, ip, [float(self.tol)])
+        self.cluster_centers_ = Array._from_flat(f[0], (k, d), "<f4")
+        m = len(i[1]) // 3
+        self._tree_centers = Array._from_flat(f[1], (m, d), "<f4")
+        self._tree_nodes = Array._from_flat(i[1], (m, 3), "<i4")
+        self.labels_ = Array._from_flat(i[0], (n,), "<i4")
+        self.inertia_ = float(s[0])
+        self.n_features_in_ = d
+        return self
+
+    def predict(self, X):
+        """Assign each row of `X` to a leaf cluster.
+
+        As in scikit-learn, each row descends the bisection tree, going to
+        the nearer child center at each split (the left child on a tie).
+        This can differ from the nearest leaf center.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+            Rows to label, converted to float32.
+
+        Returns
+        -------
+        labels : Array of shape (n_samples,), int32
+            Leaf cluster of each row.
+
+        Raises
+        ------
+        RuntimeError
+            If the model is not fitted.
+        """
+        self._check_fitted("cluster_centers_")
+        x = self._input_like_fit(X)
+        n, d = x.shape
+        nodes = [int(v) for v in _buffer.flat_bytes(self._tree_nodes).cast("i")]  # glue: fitted bisect tree node words
+        _, i, _ = self._call(_E_BISECT_PREDICT, x, self._tree_centers, [n, d] + nodes)
+        return Array._from_flat(i[0], (n,), "<i4")
+
+
+# Reference: scikit-learn `cluster/_mean_shift.py`. Every seed's shift loop is
+# one device thread over all rows in order; the default bandwidth is
+# scikit-learn's `estimate_bandwidth` from the device's exact row order
+# statistic.
+class MeanShift(_XCluster):
+    """Mean shift clustering with a flat kernel.
+
+    Follows scikit-learn's ``MeanShift``: each seed is shifted to the mean
+    of the rows within `bandwidth` until it stops moving, centers are merged
+    by intensity (a center within the bandwidth of a stronger one is
+    dropped), and each row is labeled with its nearest center (the lowest
+    index on a tie). Input is converted to float32.
+
+    Parameters
+    ----------
+    bandwidth : float or None, default None
+        Radius of the flat kernel; must be positive. None estimates it as
+        scikit-learn's ``estimate_bandwidth`` does (quantile 0.3 over all
+        rows).
+    seeds : array-like of shape (n_seeds, n_features) or None, default None
+        Starting points. None uses every row, or the bins when
+        `bin_seeding` is True.
+    bin_seeding : bool, default False
+        Seed from the rows binned on a grid of size `bandwidth` (rounding
+        half to even), as in scikit-learn.
+    min_bin_freq : int, default 1
+        With `bin_seeding`, only bins with at least this many rows become
+        seeds.
+    cluster_all : bool, default True
+        If True every row is labeled with its nearest center. If False,
+        rows farther than `bandwidth` from every center get label -1.
+    n_jobs : None
+        Accepted for scikit-learn compatibility; ignored.
+    max_iter : int, default 300
+        Maximum shifts per seed.
+    numeric_mode : str or None, default None
+        Numeric mode for this estimator. None uses the process default (see
+        :func:`anonlib.set_numeric_mode`).
+
+    Attributes
+    ----------
+    cluster_centers_ : Array of shape (n_clusters, n_features), float32
+        Cluster centers.
+    labels_ : Array of shape (n_samples,), int32
+        Cluster of each training row.
+    bandwidth_ : float
+        Bandwidth used, given or estimated.
+    n_iter_ : int
+        Largest number of shifts over the seeds.
+    n_features_in_ : int
+        Number of features seen in `fit`.
+
+    Examples
+    --------
+    >>> import numpy as np, anonlib
+    >>> X = np.random.default_rng(0).random((1000, 8), dtype=np.float32)
+    >>> model = anonlib.MeanShift(bin_seeding=True).fit(X)
+    >>> labels = model.labels_
+    """
+    # scikit-learn tags, read by `_mode.sklearn_tags`
+    _estimator_type = "clusterer"
+
+    def __init__(self, *, bandwidth=None, seeds=None, bin_seeding=False, min_bin_freq=1,
+                 cluster_all=True, n_jobs=None, max_iter=300):
+        self.bandwidth = bandwidth
+        self.seeds = seeds
+        self.bin_seeding = bin_seeding
+        self.min_bin_freq = min_bin_freq
+        self.cluster_all = cluster_all
+        self.n_jobs = n_jobs
+        self.max_iter = max_iter
+
+    def fit(self, X, y=None):
+        """Find the cluster centers of `X`.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+            Training rows, converted to float32. NaN or infinity raises
+            ValueError.
+        y : ignored
+            Present for scikit-learn compatibility.
+
+        Returns
+        -------
+        self : MeanShift
+            The fitted estimator.
+
+        Raises
+        ------
+        ValueError
+            If `bandwidth` is not positive, `seeds` has a different number
+            of features than `X`, or `X` contains NaN or infinity.
+        """
+        x = _f32(X)
+        n, d = x.shape
+        seeds = None
+        if self.seeds is not None:
+            seeds = _f32(self.seeds, "seeds")
+            if seeds.shape[1] != d:
+                raise ValueError(f"seeds have {seeds.shape[1]} features, X has {d}")
+        bw = 0.0
+        if self.bandwidth is not None:
+            bw = float(self.bandwidth)
+            if not bw > 0:
+                raise ValueError(f"bandwidth needs to be greater than zero or None, got {bw:f}")
+        ip = [n, d, 0 if seeds is None else seeds.shape[0], 1 if self.cluster_all else 0, int(self.max_iter),
+              1 if self.bin_seeding else 0, int(self.min_bin_freq)]
+        f, i, s = self._call(_E_MEANSHIFT, x, seeds, ip, [bw])
+        kc = int(s[2])
+        self.cluster_centers_ = Array._from_flat(f[0], (kc, d), "<f4")
+        self.labels_ = Array._from_flat(i[0], (n,), "<i4")
+        self.bandwidth_ = float(s[0])
+        self.n_iter_ = int(s[1])
+        self.n_features_in_ = d
+        return self
+
+    def predict(self, X):
+        """Assign each row of `X` to its nearest cluster center.
+
+        A tie goes to the lowest center index.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+            Rows to label, converted to float32.
+
+        Returns
+        -------
+        labels : Array of shape (n_samples,), int32
+            Index of the nearest center for each row.
+
+        Raises
+        ------
+        RuntimeError
+            If the model is not fitted.
+        """
+        self._check_fitted("cluster_centers_")
+        return self._nearest(self._input_like_fit(X), self.cluster_centers_)[0]
+
+    def fit_predict(self, X, y=None):
+        """Fit the model on `X` and return the training labels.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+            Training rows, converted to float32.
+        y : ignored
+            Present for scikit-learn compatibility.
+
+        Returns
+        -------
+        labels : Array of shape (n_samples,), int32
+            The fitted `labels_`.
+        """
+        return self.fit(X).labels_
+
+
+# Reference: scikit-learn `cluster/_optics.py`. The n x n distances and the
+# core distances are the device's; the ordering loop is the reference's
+# sequential one with the lowest index on a reachability tie; the xi and
+# dbscan extractions are the reference's.
+class OPTICS(_XCluster):
+    """OPTICS density-based clustering.
+
+    Follows scikit-learn's ``OPTICS``: it orders the rows by reachability
+    and extracts clusters with the 'xi' or 'dbscan' method. The full
+    n_samples x n_samples distance matrix is computed, so memory grows with
+    the square of the number of rows. Computation is float32 throughout,
+    without scikit-learn's rounding of distances to float precision, so
+    reachability agrees with scikit-learn's within a tolerance. Like
+    scikit-learn's, it has no `predict`.
+
+    Parameters
+    ----------
+    min_samples : int > 1 or float in (0, 1], default 5
+        Neighborhood size for a core point, as a count or as a fraction of
+        the number of samples (at least 2).
+    max_eps : float, default inf
+        Largest neighborhood radius considered.
+    metric : str, default 'minkowski'
+        One of 'minkowski', 'euclidean', 'l2', 'manhattan', 'cityblock',
+        'l1', 'chebyshev', 'infinity', 'cosine' or 'precomputed'. Any other
+        metric, including a callable, raises NotImplementedError. With
+        'precomputed', `X` is a square distance matrix.
+    p : float, default 2
+        Power of the Minkowski metric; must be at least 1 (inf gives
+        Chebyshev).
+    metric_params : dict or None, default None
+        Only the key 'p' is read; it overrides `p`.
+    cluster_method : {'xi', 'dbscan'}, default 'xi'
+        How clusters are extracted from the reachability ordering.
+    eps : float or None, default None
+        Radius for ``cluster_method='dbscan'``; None means `max_eps`. Must
+        not exceed `max_eps`.
+    xi : float in [0, 1], default 0.05
+        Minimum steepness for ``cluster_method='xi'``.
+    predecessor_correction : bool, default True
+        Apply scikit-learn's predecessor correction in the xi extraction.
+    min_cluster_size : int > 1, float in (0, 1] or None, default None
+        Minimum cluster size for the xi method; None means `min_samples`.
+    algorithm : str, default 'auto'
+        Accepted for scikit-learn compatibility; ignored.
+    leaf_size : int, default 30
+        Accepted for scikit-learn compatibility; ignored.
+    memory : None
+        Accepted for scikit-learn compatibility; ignored.
+    n_jobs : None
+        Accepted for scikit-learn compatibility; ignored.
+    numeric_mode : str or None, default None
+        Numeric mode for this estimator. None uses the process default (see
+        :func:`anonlib.set_numeric_mode`).
+
+    Attributes
+    ----------
+    labels_ : Array of shape (n_samples,), int32
+        Cluster of each row; -1 marks noise.
+    reachability_ : Array of shape (n_samples,), float32
+        Reachability distance of each row, indexed by row.
+    ordering_ : Array of shape (n_samples,), int32
+        Cluster ordering of the rows.
+    core_distances_ : Array of shape (n_samples,), float32
+        Distance at which each row becomes a core point.
+    predecessor_ : Array of shape (n_samples,), int32
+        Row from which each row was reached; -1 for none.
+    cluster_hierarchy_ : Array of shape (n_clusters, 2), int32
+        Start and end positions (in `ordering_`) of each cluster. Set only
+        with ``cluster_method='xi'``.
+    n_features_in_ : int
+        Number of features seen in `fit`.
+
+    Examples
+    --------
+    >>> import numpy as np, anonlib
+    >>> X = np.random.default_rng(0).random((500, 4), dtype=np.float32)
+    >>> labels = anonlib.OPTICS(min_samples=10).fit_predict(X)
+    """
+    # scikit-learn tags, read by `_mode.sklearn_tags`
+    _estimator_type = "clusterer"
+
+    def __init__(self, *, min_samples=5, max_eps=float("inf"), metric="minkowski", p=2,
+                 metric_params=None, cluster_method="xi", eps=None, xi=0.05,
+                 predecessor_correction=True, min_cluster_size=None, algorithm="auto",
+                 leaf_size=30, memory=None, n_jobs=None):
+        self.min_samples = min_samples
+        self.max_eps = max_eps
+        self.metric = metric
+        self.p = p
+        self.metric_params = metric_params
+        self.cluster_method = cluster_method
+        self.eps = eps
+        self.xi = xi
+        self.predecessor_correction = predecessor_correction
+        self.min_cluster_size = min_cluster_size
+        self.algorithm = algorithm
+        self.leaf_size = leaf_size
+        self.memory = memory
+        self.n_jobs = n_jobs
+
+    _METRICS = {"euclidean": 0, "l2": 0, "manhattan": 1, "cityblock": 1, "l1": 1, "chebyshev": 2,
+                "infinity": 2, "cosine": 4, "precomputed": 5}
+
+    def _metric_code(self):
+        """(code, p): euclidean at p=2 keeps the squared-distance route (-1)."""
+        m = self.metric
+        if self.metric_params:
+            p = float(self.metric_params.get("p", self.p))
+        else:
+            p = float(self.p) if self.p is not None else 2.0
+        if m == "minkowski":
+            if not p >= 1:
+                raise ValueError(f"p must be >= 1 for minkowski, got {p}")
+            if p == 2:
+                return -1, 2.0
+            if p == 1:
+                return 1, 1.0
+            if p == float("inf"):
+                return 2, p
+            return 3, p
+        if m in ("euclidean", "l2"):
+            return -1, 2.0
+        if m not in self._METRICS:
+            raise NotImplementedError(f"anonlib OPTICS: metric={m!r} is not implemented; one of "
+                                      f"{sorted(self._METRICS) + ['minkowski']} (x_cluster/NOT_IMPLEMENTED.tsv)")
+        return self._METRICS[m], p
+
+    @staticmethod
+    def _size(v, n, name):
+        if isinstance(v, bool) or v is None:
+            raise ValueError(f"{name} must be an int >= 2 or a float in (0, 1]")
+        if isinstance(v, int) or (isinstance(v, float) and v > 1):
+            if int(v) != v or v < 2 or v > n:
+                raise ValueError(f"{name} must be no greater than the number of samples ({n}) and >= 2, got {v}")
+            return int(v)
+        if not 0 < v <= 1:
+            raise ValueError(f"{name} must be in (0, 1], got {v}")
+        return max(2, int(v * n))
+
+    def fit(self, X, y=None):
+        """Compute the reachability ordering of `X` and extract clusters.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+            Training rows, or a square distance matrix with
+            ``metric='precomputed'``. Converted to float32; NaN or infinity
+            raises ValueError.
+        y : ignored
+            Present for scikit-learn compatibility.
+
+        Returns
+        -------
+        self : OPTICS
+            The fitted estimator.
+
+        Raises
+        ------
+        NotImplementedError
+            If `metric` is not supported.
+        ValueError
+            If `cluster_method`, `min_samples`, `min_cluster_size`, `eps`,
+            `xi` or `p` is out of range, or a precomputed matrix is not
+            square.
+        """
+        metric, pw = self._metric_code()
+        if self.cluster_method not in ("xi", "dbscan"):
+            raise ValueError(f"cluster_method must be 'xi' or 'dbscan', got {self.cluster_method!r}")
+        x = _f32(X)
+        n, d = x.shape
+        ms = self._size(self.min_samples, n, "min_samples")
+        mcs = ms if self.min_cluster_size is None else self._size(self.min_cluster_size, n, "min_cluster_size")
+        max_eps = float(self.max_eps)
+        eps = max_eps if self.eps is None else float(self.eps)
+        if self.cluster_method == "dbscan" and eps > max_eps:
+            raise ValueError(f"Specify an epsilon smaller than {max_eps}. Got {eps}.")
+        if not 0 <= float(self.xi) <= 1:
+            raise ValueError("xi must be in [0, 1]")
+        if metric == 5 and n != d:
+            raise ValueError(f"metric='precomputed' needs a square distance matrix, got {(n, d)}")
+        ip = [n, d, ms, mcs, 0 if self.cluster_method == "xi" else 1, 1 if self.predecessor_correction else 0, metric]
+        f, i, _ = self._call(_E_OPTICS, x, None, ip, [max_eps, float(self.xi), eps, pw])
+        self.core_distances_ = Array._from_flat(f[0], (n,), "<f4")
+        self.reachability_ = Array._from_flat(f[1], (n,), "<f4")
+        self.ordering_ = Array._from_flat(i[0], (n,), "<i4")
+        self.predecessor_ = Array._from_flat(i[1], (n,), "<i4")
+        self.labels_ = Array._from_flat(i[2], (n,), "<i4")
+        if self.cluster_method == "xi":
+            self.cluster_hierarchy_ = Array._from_flat(i[3], (len(i[3]) // 2, 2), "<i4")
+        self.n_features_in_ = d
+        return self
+
+    def fit_predict(self, X, y=None):
+        """Fit the model on `X` and return the cluster labels.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+            Training rows, or a square distance matrix with
+            ``metric='precomputed'``.
+        y : ignored
+            Present for scikit-learn compatibility.
+
+        Returns
+        -------
+        labels : Array of shape (n_samples,), int32
+            The fitted `labels_`; -1 marks noise.
+        """
+        return self.fit(X).labels_
+
+
+# Reference: scikit-learn `cluster/_affinity_propagation.py`. The
+# responsibility and availability updates run on the device over the resident
+# n x n matrices; the convergence window, the exemplar refinement and the
+# labels are the reference's. The tie noise is the reference's formula with
+# normals from the lane's seeded stream, not NumPy's.
+class AffinityPropagation(_XCluster):
+    """Affinity propagation clustering.
+
+    Follows scikit-learn's ``AffinityPropagation``: responsibility and
+    availability messages are exchanged until the set of exemplars is
+    stable for `convergence_iter` iterations. The similarity is minus the
+    squared euclidean distance, or a precomputed matrix. The small noise
+    that breaks ties is drawn from this library's own seeded random stream
+    rather than NumPy's, so results agree with scikit-learn's within a
+    tolerance. Memory grows with the square of the number of rows. Input is
+    converted to float32.
+
+    Parameters
+    ----------
+    damping : float in [0.5, 1), default 0.5
+        Damping of the message updates.
+    max_iter : int, default 200
+        Maximum number of iterations; must be at least 1.
+    convergence_iter : int, default 15
+        Number of iterations with no change in the exemplars that stops the
+        fit; must be at least 1.
+    copy : bool, default True
+        Accepted for scikit-learn compatibility; `X` is never modified.
+    preference : float, array-like of shape (n_samples,) or None, default None
+        Preference of each row to be an exemplar. None uses the median of
+        the similarities, as in scikit-learn.
+    affinity : {'euclidean', 'precomputed'}, default 'euclidean'
+        With 'precomputed', `X` is a square similarity matrix.
+    verbose : bool, default False
+        Accepted for scikit-learn compatibility; nothing is printed.
+    random_state : int or None, default None
+        Non-negative seed of the tie-breaking noise. None means 0. A NumPy
+        ``RandomState`` is not accepted.
+    numeric_mode : str or None, default None
+        Numeric mode for this estimator. None uses the process default (see
+        :func:`anonlib.set_numeric_mode`).
+
+    Attributes
+    ----------
+    cluster_centers_indices_ : Array of shape (n_clusters,), int32
+        Row indices of the exemplars.
+    cluster_centers_ : Array of shape (n_clusters, n_features), float32
+        The exemplar rows. Not set with ``affinity='precomputed'``.
+    labels_ : Array of shape (n_samples,), int32
+        Cluster of each training row.
+    affinity_matrix_ : Array of shape (n_samples, n_samples), float32
+        The similarity matrix used.
+    n_iter_ : int
+        Number of iterations run.
+    n_features_in_ : int
+        Number of features seen in `fit`.
+
+    Examples
+    --------
+    >>> import numpy as np, anonlib
+    >>> X = np.random.default_rng(0).random((500, 4), dtype=np.float32)
+    >>> model = anonlib.AffinityPropagation(random_state=0).fit(X)
+    >>> labels = model.predict(X)
+    """
+    # scikit-learn tags, read by `_mode.sklearn_tags`
+    _estimator_type = "clusterer"
+
+    def __init__(self, *, damping=0.5, max_iter=200, convergence_iter=15, copy=True,
+                 preference=None, affinity="euclidean", verbose=False, random_state=None):
+        self.damping = damping
+        self.max_iter = max_iter
+        self.convergence_iter = convergence_iter
+        self.copy = copy
+        self.preference = preference
+        self.affinity = affinity
+        self.verbose = verbose
+        self.random_state = random_state
+
+    def fit(self, X, y=None):
+        """Find the exemplars of `X`.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+            Training rows, or a square similarity matrix with
+            ``affinity='precomputed'``. Converted to float32; NaN or
+            infinity raises ValueError.
+        y : ignored
+            Present for scikit-learn compatibility.
+
+        Returns
+        -------
+        self : AffinityPropagation
+            The fitted estimator.
+
+        Raises
+        ------
+        ValueError
+            If `affinity`, `damping`, `max_iter`, `convergence_iter` or
+            `preference` is invalid, or a precomputed matrix is not square.
+        """
+        if self.affinity not in ("euclidean", "precomputed"):
+            raise ValueError(f"affinity must be 'euclidean' or 'precomputed', got {self.affinity!r}")
+        if not 0.5 <= float(self.damping) < 1:
+            raise ValueError(f"damping must be in [0.5, 1), got {self.damping}")
+        if int(self.max_iter) < 1 or int(self.convergence_iter) < 1:
+            raise ValueError("max_iter and convergence_iter must be >= 1")
+        x = _f32(X)
+        n, d = x.shape
+        pre = self.affinity == "precomputed"
+        if pre and n != d:
+            raise ValueError(f"The matrix of similarities must be a square array. Got {(n, d)} instead.")
+        pref_arr, mode, scalar = None, 0, 0.0
+        if self.preference is not None:
+            if isinstance(self.preference, (int, float)):
+                mode, scalar = 1, float(self.preference)
+            else:
+                pref_arr = _f32([list(self.preference)], "preference")
+                if pref_arr.shape[1] != n:
+                    raise ValueError("preference must be a scalar or have one value per sample")
+                mode = 2
+        ip = [n, d, 1 if pre else 0, mode, int(self.max_iter), int(self.convergence_iter), _seed(self.random_state)]
+        f, i, s = self._call(_E_AFFINITY, x, pref_arr, ip, [float(self.damping), scalar])
+        k = len(i[0])
+        self.cluster_centers_indices_ = Array._from_flat(i[0], (k,), "<i4")
+        self.labels_ = Array._from_flat(i[1], (n,), "<i4")
+        self.affinity_matrix_ = Array._from_flat(f[0], (n, n), "<f4")
+        # the final availability and responsibility diagonals (a diagnostic the
+        # verifier lanes hash; scikit-learn keeps no such attribute)
+        self._message_diag = Array._from_flat(f[1], (len(f[1]),), "<f4")
+        self.n_iter_ = int(s[0])
+        self.n_features_in_ = d
+        if not pre:
+            self.cluster_centers_ = Array._from_flat(f[2], (k, d), "<f4")   # the entry's exemplar rows
+        return self
+
+    def predict(self, X):
+        """Assign each row of `X` to its nearest exemplar.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+            Rows to label, converted to float32.
+
+        Returns
+        -------
+        labels : Array of shape (n_samples,), int32
+            Cluster of each row; every row gets -1 when the fit found no
+            exemplars.
+
+        Raises
+        ------
+        RuntimeError
+            If the model is not fitted.
+        ValueError
+            If ``affinity='precomputed'``.
+        """
+        self._check_fitted("labels_")
+        if self.affinity == "precomputed":
+            raise ValueError("Predict method is not supported when affinity='precomputed'.")
+        x = self._input_like_fit(X)
+        if self.cluster_centers_.shape[0] == 0:
+            return _buffer.full((x.shape[0],), -1, "<i4")
+        return self._nearest(x, self.cluster_centers_)[0]
+
+    def fit_predict(self, X, y=None):
+        """Fit the model on `X` and return the training labels.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+            Training rows, or a square similarity matrix with
+            ``affinity='precomputed'``.
+        y : ignored
+            Present for scikit-learn compatibility.
+
+        Returns
+        -------
+        labels : Array of shape (n_samples,), int32
+            The fitted `labels_`.
+        """
+        return self.fit(X).labels_
+
+
+# Reference: scikit-learn `mixture/_bayesian_mixture.py` with `_base.py`'s EM
+# loop. The n-sized work (the Mahalanobis squares, the E-step log-sum-exp, the
+# M-step moments) runs on the device in float32; the Wishart and
+# Dirichlet(-process) updates, the d x d Cholesky, digamma and log-gamma and
+# the lower bound run on the device too, in float-float (about 48 bits;
+# x_cluster/bgmm_device.mojo), as do the default priors. Every covariance type
+# runs through full d x d factors (the zeros add nothing).
+class BayesianGaussianMixture(_XCluster):
+    """Variational Bayesian Gaussian mixture.
+
+    Follows scikit-learn's ``BayesianGaussianMixture``: variational
+    inference with a Dirichlet process or Dirichlet distribution prior on
+    the weights, for every covariance type. The per-row work runs in
+    float32 and the parameter updates and lower bound in higher precision.
+    Initialization draws from this library's own seeded random stream, so
+    results agree with scikit-learn's within a tolerance. Input is
+    converted to float32.
+
+    Parameters
+    ----------
+    n_components : int, default 1
+        Maximum number of mixture components. Must not exceed the number of
+        samples.
+    covariance_type : {'full', 'tied', 'diag', 'spherical'}, default 'full'
+        Form of the component covariances.
+    tol : float, default 1e-3
+        Convergence threshold on the lower bound gain.
+    reg_covar : float, default 1e-6
+        Non-negative value added to the covariance diagonals.
+    max_iter : int, default 100
+        Maximum EM iterations per initialization; must be at least 1.
+    n_init : int, default 1
+        Number of initializations; the one with the best lower bound is
+        kept. Must be at least 1.
+    init_params : {'kmeans', 'random', 'k-means++', 'random_from_data'}, default 'kmeans'
+        How the responsibilities start. 'kmeans' uses this library's
+        ``KMeans``.
+    weight_concentration_prior_type : {'dirichlet_process', 'dirichlet_distribution'}, default 'dirichlet_process'
+        Prior on the weights.
+    weight_concentration_prior : float or None, default None
+        Weight concentration prior; None means 1 / n_components.
+    mean_precision_prior : float or None, default None
+        Precision prior on the means; None means 1.
+    mean_prior : array-like of shape (n_features,) or None, default None
+        Prior on the means; None means the mean of `X`.
+    degrees_of_freedom_prior : float or None, default None
+        Degrees-of-freedom prior; None means n_features.
+    covariance_prior : float, array-like or None, default None
+        Covariance prior: shape (n_features, n_features) for 'full' and
+        'tied', (n_features,) for 'diag', a float for 'spherical'. None
+        uses the covariance of `X`, as in scikit-learn.
+    random_state : int or None, default None
+        Non-negative seed. None means 0, so repeated fits give the same
+        result. A NumPy ``RandomState`` is not accepted.
+    warm_start : bool, default False
+        If True, a refit with the same `n_components`, number of features
+        and `covariance_type` resumes from the previous fit's parameters
+        (one run, the lower bound continuing).
+    verbose : int, default 0
+        Accepted for scikit-learn compatibility; nothing is printed.
+    verbose_interval : int, default 10
+        Accepted for scikit-learn compatibility; ignored.
+    numeric_mode : str or None, default None
+        Numeric mode for this estimator. None uses the process default (see
+        :func:`anonlib.set_numeric_mode`).
+
+    Attributes
+    ----------
+    weights_ : Array of shape (n_components,), float32
+        Component weights.
+    means_ : Array of shape (n_components, n_features), float32
+        Component means.
+    covariances_ : Array, float32
+        Component covariances, shaped by `covariance_type` as in
+        scikit-learn.
+    precisions_cholesky_ : Array, float32
+        Cholesky factors of the precision matrices, shaped by
+        `covariance_type`.
+    weight_concentration_ : Array or tuple of two Arrays, float32
+        Dirichlet parameters of the weights (a pair for the Dirichlet
+        process).
+    weight_concentration_prior_ : float
+        Weight concentration prior used.
+    mean_precision_ : Array of shape (n_components,), float32
+        Precision of each mean.
+    mean_precision_prior_ : float
+        Mean precision prior used.
+    mean_prior_ : Array of shape (n_features,), float32
+        Prior on the means used.
+    degrees_of_freedom_ : Array of shape (n_components,) or float
+        Degrees of freedom of each component (a float for 'tied').
+    degrees_of_freedom_prior_ : float
+        Degrees-of-freedom prior used.
+    covariance_prior_ : Array or float
+        Covariance prior used, shaped by `covariance_type`.
+    lower_bound_ : float
+        Lower bound of the best fit.
+    n_iter_ : int
+        EM iterations of the best fit.
+    converged_ : bool
+        Whether the best fit converged.
+    n_features_in_ : int
+        Number of features seen in `fit`.
+
+    Examples
+    --------
+    >>> import numpy as np, anonlib
+    >>> X = np.random.default_rng(0).random((1000, 4), dtype=np.float32)
+    >>> model = anonlib.BayesianGaussianMixture(n_components=5, random_state=0).fit(X)
+    >>> proba = model.predict_proba(X)
+    """
+    # scikit-learn tags, read by `_mode.sklearn_tags`
+    _estimator_type = "density_estimator"
+
+    def __init__(self, *, n_components=1, covariance_type="full", tol=1e-3, reg_covar=1e-6,
+                 max_iter=100, n_init=1, init_params="kmeans",
+                 weight_concentration_prior_type="dirichlet_process", weight_concentration_prior=None,
+                 mean_precision_prior=None, mean_prior=None, degrees_of_freedom_prior=None,
+                 covariance_prior=None, random_state=None, warm_start=False, verbose=0,
+                 verbose_interval=10):
+        self.n_components = n_components
+        self.covariance_type = covariance_type
+        self.tol = tol
+        self.reg_covar = reg_covar
+        self.max_iter = max_iter
+        self.n_init = n_init
+        self.init_params = init_params
+        self.weight_concentration_prior_type = weight_concentration_prior_type
+        self.weight_concentration_prior = weight_concentration_prior
+        self.mean_precision_prior = mean_precision_prior
+        self.mean_prior = mean_prior
+        self.degrees_of_freedom_prior = degrees_of_freedom_prior
+        self.covariance_prior = covariance_prior
+        self.random_state = random_state
+        self.warm_start = warm_start
+        self.verbose = verbose
+        self.verbose_interval = verbose_interval
+
+    def fit(self, X, y=None):
+        """Fit the mixture on `X`.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+            Training rows, converted to float32. NaN or infinity raises
+            ValueError.
+        y : ignored
+            Present for scikit-learn compatibility.
+
+        Returns
+        -------
+        self : BayesianGaussianMixture
+            The fitted estimator.
+
+        Raises
+        ------
+        ValueError
+            If `covariance_type`, `init_params` or
+            `weight_concentration_prior_type` is unknown, `n_components`
+            exceeds the number of samples, `n_init` or `max_iter` is below
+            1, or a prior has the wrong shape.
+        """
+        self._fit(X)
+        return self
+
+    def fit_predict(self, X, y=None):
+        """Fit the mixture on `X` and return the component of each row.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+            Training rows, converted to float32.
+        y : ignored
+            Present for scikit-learn compatibility.
+
+        Returns
+        -------
+        labels : Array of shape (n_samples,), int32
+            Most likely component of each training row.
+        """
+        return self._fit(X)
+
+    def _fit(self, X):
+        ctypes = {"full": 0, "tied": 1, "diag": 2, "spherical": 3}
+        if self.covariance_type not in ctypes:
+            raise ValueError(f"covariance_type must be one of {sorted(ctypes)}, got {self.covariance_type!r}")
+        ct = ctypes[self.covariance_type]
+        inits = {"kmeans": 0, "random": 1, "k-means++": 2, "random_from_data": 3}
+        if self.init_params not in inits:
+            raise ValueError(f"init_params must be one of {sorted(inits)}, got {self.init_params!r}")
+        if self.weight_concentration_prior_type not in ("dirichlet_process", "dirichlet_distribution"):
+            raise ValueError("weight_concentration_prior_type must be 'dirichlet_process' or "
+                             "'dirichlet_distribution'")
+        x = _f32(X)
+        n, d = x.shape
+        k = int(self.n_components)
+        if k < 1 or n < k:
+            raise ValueError(f"Expected n_samples >= n_components but got n_components = {k}, n_samples = {n}")
+        if int(self.n_init) < 1 or int(self.max_iter) < 1:
+            raise ValueError("n_init and max_iter must be >= 1")
+        # glue: the priors and any warm state as byte copies (`_aux`); the
+        # binding expands a diag or spherical covariance prior to d x d
+        # (`x_cluster/entries.mojo::bgmm_entry`, ip[9] = 2 or 3)
+        parts = []
+        cov_mode = 0
+        if self.mean_prior is not None:
+            mp = _buffer.as_f32_c(self.mean_prior, ndim=None, name="mean_prior")[0]
+            if mp.size != d:
+                raise ValueError(f"The parameter 'means' should have the shape of ({d},)")
+            parts.append(mp)
+        if self.covariance_prior is not None:
+            if ct in (0, 1):
+                cp = _f32(self.covariance_prior, "covariance_prior")
+                if cp.shape != (d, d):
+                    raise ValueError(f"The parameter '{self.covariance_type} covariance prior' should have the "
+                                     f"shape of ({d}, {d})")
+                cov_mode = 1
+            elif ct == 2:
+                cp = _buffer.as_f32_c(self.covariance_prior, ndim=None, name="covariance_prior")[0]
+                if cp.size != d:
+                    raise ValueError(f"The parameter 'diag covariance prior' should have the shape of ({d},)")
+                cov_mode = 2
+            else:
+                cp = _buffer.as_f32_c([float(self.covariance_prior)], ndim=None, name="covariance_prior")[0]
+                cov_mode = 3
+            parts.append(cp)
+        prev = getattr(self, "_warm", None)
+        warm = bool(self.warm_start) and prev is not None and prev[0] == (k, d, self.covariance_type)
+        if warm:
+            parts.append(self._warm[1])
+        a = _aux(*parts)
+        none = -1.0
+        fp = [none if self.weight_concentration_prior is None else float(self.weight_concentration_prior),
+              none if self.mean_precision_prior is None else float(self.mean_precision_prior),
+              none if self.degrees_of_freedom_prior is None else float(self.degrees_of_freedom_prior),
+              float(self.reg_covar), float(self.tol), float(getattr(self, "lower_bound_", 0.0)) if warm else 0.0]
+        ip = [n, d, k, 1 if self.weight_concentration_prior_type == "dirichlet_process" else 0,
+              int(self.max_iter), int(self.n_init), inits[self.init_params],
+              _seed(self.random_state), 1 if self.mean_prior is not None else 0,
+              cov_mode, ct, 1 if warm else 0]
+        f, i, s = self._call(_E_BGMM, x, a, ip, fp)
+        self.weights_ = Array._from_flat(f[0], (k,), "<f4")
+        self.means_ = Array._from_flat(f[1], (k, d), "<f4")
+        self._full_pchol = Array._from_flat(f[3], (k, d, d), "<f4")
+        # f[13], f[14], f[15]: the binding's by-type forms (bgmm_entry)
+        self.covariances_ = self._by_type(f[13], k, d, ct)
+        self.precisions_cholesky_ = self._by_type(f[14], k, d, ct)
+        if self.weight_concentration_prior_type == "dirichlet_process":
+            self.weight_concentration_ = (Array._from_flat(f[4], (k,), "<f4"), Array._from_flat(f[5], (k,), "<f4"))
+        else:
+            self.weight_concentration_ = Array._from_flat(f[4], (k,), "<f4")
+        self.mean_precision_ = Array._from_flat(f[6], (k,), "<f4")
+        self.degrees_of_freedom_ = (float(f[7][0]) if ct == 1 else Array._from_flat(f[7], (k,), "<f4"))
+        self._log_consts = Array._from_flat(f[8], (k,), "<f4")
+        self.mean_prior_ = Array._from_flat(f[9], (d,), "<f4")
+        cpf = f[15]
+        if ct == 2:
+            self.covariance_prior_ = Array._from_flat(cpf, (d,), "<f4")
+        elif ct == 3:
+            self.covariance_prior_ = float(cpf[0])
+        else:
+            self.covariance_prior_ = Array._from_flat(cpf, (d, d), "<f4")
+        self.lower_bound_ = float(s[0])
+        self.n_iter_ = int(s[1])
+        self.converged_ = bool(s[2])
+        # the state a warm_start refit resumes from (full per-component matrices)
+        self._warm = ((k, d, self.covariance_type),
+                      list(f[11]) + list(f[4]) + (list(f[5]) if len(f[5]) else [0.0] * k) + list(f[6])
+                      + list(f[1]) + list(f[7]) + list(f[2]) + list(f[3]))
+        self.weight_concentration_prior_ = float(s[3])
+        self.mean_precision_prior_ = float(s[4])
+        self.degrees_of_freedom_prior_ = float(s[5])
+        self.n_features_in_ = d
+        return Array._from_flat(i[0], (n,), "<i4")
+
+    @staticmethod
+    def _by_type(flat, k, d, ct):
+        """The binding's by-type values (`bgmm_entry` f[13], f[14]: full
+        k x d x d, tied d x d, diag k x d, spherical k) under the covariance
+        type's shape (as scikit-learn's attributes). Shapes only."""
+        if ct == 0:
+            return Array._from_flat(flat, (k, d, d), "<f4")
+        if ct == 1:
+            return Array._from_flat(flat, (d, d), "<f4")
+        if ct == 2:
+            return Array._from_flat(flat, (k, d), "<f4")
+        return Array._from_flat(flat, (k,), "<f4")
+
+    def _score(self, X, flags=0):
+        self._check_fitted("means_")
+        x = self._input_like_fit(X)
+        n, d = x.shape
+        k = self.means_.shape[0]
+        ip = [n, d, k, flags] if flags else [n, d, k]
+        # glue: the model block as byte copies (`_aux`)
+        f, i, sc = self._call(_E_BGMM_SCORE, x, _aux(self.means_, self._full_pchol, self._log_consts), ip)
+        if flags:
+            return f, sc, n, k, i[0]
+        return f[0], f[1], n, k, i[0]
+
+    def predict(self, X):
+        """Most likely component of each row of `X`.
+
+        A tie goes to the lowest component index.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+            Rows to label, converted to float32.
+
+        Returns
+        -------
+        labels : Array of shape (n_samples,), int32
+            Component with the largest responsibility for each row.
+
+        Raises
+        ------
+        RuntimeError
+            If the model is not fitted.
+        """
+        # the labels come from the device score (`bodies.argmax_row`: the
+        # first largest log responsibility, the lowest index on a tie)
+        _, _, n, _, labels = self._score(X)
+        return Array._from_flat(labels, (n,), "<i4")
+
+    def predict_proba(self, X):
+        """Responsibility of each component for each row of `X`.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+            Rows to evaluate, converted to float32.
+
+        Returns
+        -------
+        proba : Array of shape (n_samples, n_components), float32
+            Posterior probability of each component.
+
+        Raises
+        ------
+        RuntimeError
+            If the model is not fitted.
+        """
+        # the exp of every log responsibility in the binding (bodies.exp_cell)
+        f, _, n, k, _ = self._score(X, 1)
+        return Array._from_flat(f[2], (n, k), "<f4")
+
+    def score_samples(self, X):
+        """Log-likelihood of each row of `X` under the mixture.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+            Rows to evaluate, converted to float32.
+
+        Returns
+        -------
+        log_prob : Array of shape (n_samples,), float32
+            Weighted log probability of each row.
+
+        Raises
+        ------
+        RuntimeError
+            If the model is not fitted.
+        """
+        _, lpn, n, _, _ = self._score(X)
+        return Array._from_flat(lpn, (n,), "<f4")
+
+    def score(self, X, y=None):
+        """Mean log-likelihood of the rows of `X`.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+            Rows to evaluate, converted to float32.
+        y : ignored
+            Present for scikit-learn compatibility.
+
+        Returns
+        -------
+        score : float
+            Average of `score_samples` over the rows.
+
+        Raises
+        ------
+        RuntimeError
+            If the model is not fitted.
+        """
+        # the float-float fold of log_prob_norm in the binding
+        _, sc, n, _, _ = self._score(X, 2)
+        return sc[0] / n
+
+
+
+# ------------------------------------------------ GaussianMixture option parity
+_GMM_CTYPES = {"full": 0, "tied": 1, "diag": 2, "spherical": 3}
+_GMM_INITS = {"kmeans": 0, "random": 1, "k-means++": 2, "random_from_data": 3}
+
+
+def _gmm_needs_ext(est):
+    """True when a GaussianMixture fit asks for an option the mixture binding
+    does not carry (it refuses them by name there)."""
+    return (est.covariance_type != "full" or est.init_params in ("k-means++", "random_from_data")
+            or int(est.n_init) != 1 or bool(est.warm_start) or est.weights_init is not None
+            or est.means_init is not None or est.precisions_init is not None)
+
+
+class _GmmExtCall(_XCluster):
+    def __init__(self, numeric_mode=None):
+        self.numeric_mode = numeric_mode
+
+
+def _gmm_ext_fit(est, X):
+    """sklearn GaussianMixture on the cluster lane's mixture driver (plain
+    mode): every covariance type, init, n_init, warm_start and the three
+    *_init arrays."""
+    if est.covariance_type not in _GMM_CTYPES:
+        raise ValueError(f"covariance_type must be one of {sorted(_GMM_CTYPES)}, got {est.covariance_type!r}")
+    if est.init_params not in _GMM_INITS:
+        raise ValueError(f"init_params must be one of {sorted(_GMM_INITS)}, got {est.init_params!r}")
+    x = _f32(X)
+    n, d = x.shape
+    k = int(est.n_components)
+    if k < 1 or n < k:
+        raise ValueError(f"Expected n_samples >= n_components but got n_components = {k}, n_samples = {n}")
+    ct = _GMM_CTYPES[est.covariance_type]
+    call = _GmmExtCall(getattr(est, "numeric_mode", None))
+    # glue: the warm state and the init arrays as byte copies (`_aux`); the
+    # binding expands tied, diag and spherical precisions_init to d x d per
+    # component (`x_cluster/entries.mojo::bgmm_entry`, ip[15] = 2, 3, 4)
+    parts = []
+    prev = getattr(est, "_ext", None)
+    warm = bool(est.warm_start) and prev is not None and prev["key"] == (k, d, est.covariance_type)
+    if warm:
+        parts.append(prev["state"])
+    flags = [0, 0, 0]
+    if est.weights_init is not None and not warm:
+        w = _buffer.as_f32_c(est.weights_init, ndim=None, name="weights_init")[0]
+        if w.size != k:
+            raise ValueError(f"The parameter 'weights' should have the shape of ({k},)")
+        parts.append(w)
+        flags[0] = 1
+    if est.means_init is not None and not warm:
+        m = _f32(est.means_init, "means_init")
+        if m.shape != (k, d):
+            raise ValueError(f"The parameter 'means' should have the shape of ({k}, {d})")
+        parts.append(m)
+        flags[1] = 1
+    if est.precisions_init is not None and not warm:
+        pi = _buffer.as_f32_c(est.precisions_init, ndim=None, name="precisions_init")[0]
+        want = (k * d * d, d * d, k * d, k)[ct]
+        if pi.size != want:
+            raise ValueError(f"The parameter '{est.covariance_type} precision' has {pi.size} values, "
+                             f"expected {want}")
+        # the base binding's native scan (`_buffer.all_finite`)
+        if not _buffer.all_finite(pi):
+            raise ValueError("precisions_init must be finite")
+        parts.append(pi)
+        flags[2] = ct + 1
+    a = _aux(*parts)
+    fp = [-1.0, -1.0, -1.0, float(est.reg_covar), float(est.tol),
+          float(getattr(est, "lower_bound_", 0.0)) if warm else 0.0]
+    ip = [n, d, k, 0, int(est.max_iter), int(est.n_init), _GMM_INITS[est.init_params],
+          _seed(est.random_state), 0, 0, ct, 1 if warm else 0, 1] + flags
+    f, i, s = call._call(_E_BGMM, x, a, ip, fp)
+    est.n_features_in_ = d
+    est.weights_ = Array._from_flat(f[0], (k,), "<f4")
+    est.means_ = Array._from_flat(f[1], (k, d), "<f4")
+    est.covariances_ = BayesianGaussianMixture._by_type(f[13], k, d, ct)
+    est.precisions_cholesky_ = BayesianGaussianMixture._by_type(f[14], k, d, ct)
+    est.log_det_chol_ = Array._from_flat(f[12], (k,), "<f4")   # x_cluster bgmm_entry
+    est.n_iter_ = int(s[1])
+    est.converged_ = bool(s[2])
+    est.lower_bound_ = float(s[0])
+    est._ext = {"key": (k, d, est.covariance_type), "call": call,
+                "pchol": Array._from_flat(f[3], (k, d, d), "<f4"), "consts": Array._from_flat(f[8], (k,), "<f4"),
+                "state": (list(f[11]) + list(f[4]) + [0.0] * k + list(f[6]) + list(f[1]) + list(f[7])
+                          + list(f[2]) + list(f[3]))}
+    return est
+
+
+def _gmm_ext_score(est, X):
+    """(log_resp list, score_samples, predict_proba, predict) of an ext fit."""
+    ext = est._ext
+    x = _f32(X)
+    n, d = x.shape
+    if d != est.n_features_in_:
+        raise ValueError(f"anonlib GaussianMixture: X has {d} features, the fit had {est.n_features_in_}")
+    k = est.means_.shape[0]
+    # predict_proba's exp and score's fold in the binding (flags 1 | 2);
+    # the fold rides as a fifth item for `_gmm_ext_bic_aic`
+    f, i, sc = ext["call"]._call(_E_BGMM_SCORE, x, _aux(est.means_, ext["pchol"], ext["consts"]), [n, d, k, 3])
+    return (f[0], Array._from_flat(f[1], (n,), "<f4"), Array._from_flat(f[2], (n, k), "<f4"),
+            Array._from_flat(i[0], (n,), "<i4"), sc[0])
+
+
+def _gmm_ext_bic_aic(est, X):
+    """(score, bic, aic): sklearn `_n_parameters`, `bic`, `aic` on the ext fit;
+    the mean log-likelihood an ascending float64 fold of score_samples (the
+    binding's float-float fold when it computes it)."""
+    got = _gmm_ext_score(est, X)
+    n = len(got[1])
+    score = got[4] / n
+    k, d = est.means_.shape
+    cov = {"full": k * d * (d + 1) / 2.0, "diag": k * d, "tied": d * (d + 1) / 2.0, "spherical": k}[est.covariance_type]
+    p = int(cov + k * d + k - 1)
+    return score, -2 * score * n + p * _pm.log(n), -2 * score * n + 2 * p

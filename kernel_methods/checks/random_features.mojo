@@ -1,0 +1,948 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 the authors. Part of anonlib, DOI-WITHHELD
+"""The position-mapped draws: Nystroem's basis rows, RBFSampler's `W` and `b`.
+
+NO UPSTREAM FOR THE ESTIMATORS. cuML ships no `Nystroem` and no `RBFSampler`
+at `265b9da` -- `grep -rn 'Nystroem\\|RBFSampler'` over the whole checkout
+returns nothing -- so scikit-learn's `sklearn/kernel_approximation.py` is the
+SEMANTICS reference and the ORACLE, and nothing in this file is a
+statement-for-statement match of a device kernel that exists somewhere.
+
+WHAT **IS** IMPLEMENTED, AND IS IMPLEMENTED WITHOUT A CHANGE OF ANY KIND, IS THE
+GENERATOR AND ITS TRANSFORM:
+
+  - `core/philox.mojo` holds RAFT's `PhiloxGenerator` (cuRAND's
+    `curandStatePhilox4_32_10_t`), its `next_float` and its Lemire range
+    reduction, implemented line by line and held to an oracle built by
+    COMPILING the reference generator.
+  - `km_boxmuller_pair` below is `raft::random::detail::box_muller_transform`
+    (`raft/random/detail/rng_device.cuh:133-142`), five lines, in the reference order.
+  - `resample/checks/index_map.mojo` holds the POSITION MAP -- the derived
+    key, the subsequence packing, the single position-mapped uniform and the
+    permutation key -- and this file CALLS it rather than re-spelling it.
+
+# =========================================================================
+# DEVIATION 1679 -- THIS LANE IMPORTS `resample/checks/index_map.mojo`
+# AND SHARES ITS KIND-BYTE NAMESPACE. THE COUPLING IS NAMED, NOT HIDDEN.
+#
+# WHY THE IMPORT. `index_map.mojo`'s DEVIATION 1690 is exactly the property
+# this lane's brief demands ("the row sample must be position-mapped through
+# Philox, not drawn from a stream, for the same reason the resampling lane
+# needs it"), and it is already written, already argued at length, and
+# already gated by `check_index_map_is_positional`, `check_batch_invariance`
+# and `check_prefix_stability`. Re-spelling `position_subsequence`,
+# `resample_key`, `key_lo`/`key_hi`/`key_join` and `draw_unit_float` here
+# would be five copies of a construction whose whole value is that there is
+# one of it. `ANTI-DUPLICATION IS THE MAIN RISK IN YOUR LANE` is the brief's
+# sentence and this is where it bites hardest.
+#
+# WHAT THE COUPLING COSTS. `resample_key(seed, kind)` is FNV-1a64 over the
+# seed and a KIND BYTE, and the kind byte namespace is now shared between two
+# lanes that do not otherwise know about each other. `resample/` spends 1, 2
+# and 3 (bootstrap, permutation, Monte Carlo). This lane spends 17, 18 and 19
+# and leaves the gap deliberately, so a third lane taking 4 or 5 collides
+# with nobody. **A COLLISION WOULD NOT BE AN ERROR, IT WOULD BE A
+# CORRELATION**: two uses of one seed sharing a counter stream, which is the
+# precise failure `index_map.mojo`'s DEVIATION 1691 exists to prevent and
+# which no test distinguishes from a valid draw.
+#
+# `check_km_kind_bytes_are_disjoint` asserts the three values here differ
+# from resample's three, so the namespace claim is checked rather than
+# commented.
+#
+# THE FUNCTION NAMES READ ODDLY HERE AND THAT IS DELIBERATE. `resample_key`
+# in a kernel-methods file looks wrong until you know it is a shared
+# primitive, and a local alias would hide the dependency the paragraph above
+# exists to advertise.
+# =========================================================================
+
+# =========================================================================
+# DEVIATION 1675 -- THE NORMAL DRAW IS RAFT'S BOX-MULLER, NOT NUMPY'S
+# ZIGGURAT, AND NO BIT COMPARISON WITH scikit-learn IS POSSIBLE.
+#
+# scikit-learn's `RBFSampler.fit` is `random_state.normal(size=(n_features,
+# n_components))` (`kernel_approximation.py:381-383`), and
+# `numpy.random.RandomState.normal` is the polar (Marsaglia) method over a
+# Mersenne Twister while `numpy.random.Generator.normal` is a 256-level
+# ziggurat over PCG64. Neither is reproducible from a counter-based generator
+# without implementing numpy's stream, which is not a thing this repository does
+# for any estimator.
+#
+# So `RBFSampler` is the ONE estimator in this lane whose numbers cannot be
+# compared cell by cell with scikit-learn's, and the checks say so rather
+# than inventing a comparison. What IS compared:
+#
+#   - the FEATURE MAP against a float64 HOST replay of OUR draws, per cell
+#     (`check_rbf_sampler_vs_oracle`);
+#   - the KERNEL APPROXIMATION `z(x).z(y) ~ exp(-gamma |x-y|^2)` against the
+#     exact kernel, REPORTED and never asserted, because it is a Monte Carlo
+#     estimate whose error is O(1/sqrt(D)) and an assertion on it would be an
+#     assertion about a random variable
+#     (`check_rbf_sampler_approximates_kernel`, which prints REPORT);
+#   - PREFIX STABILITY, bit for bit, which is a property of the MAP and is
+#     the strongest thing this arm can assert
+#     (`check_random_features_prefix_stability`).
+# =========================================================================
+
+# =========================================================================
+# DEVIATION 1676 -- RAFT'S BOX-MULLER DOES NOT GUARD `log(0)`. WE DO.
+#
+# The guard and its full argument live beside the transform, in
+# `kernel_methods/impl/random/rng_device.mojo::km_guard_unit`. Summarised
+# here because this is the file that CALLS it: `next_float`'s range is
+# `[0, 1)` closed at zero, RAFT's `R = sqrt(-2 log(val1))` is `+inf` there,
+# and the probability is `2^-24` per pair -- one fit in 256 at a
+# `128 x 1024` weight matrix. `+0.0` is replaced by `2^-24`, the smallest
+# value the generator itself can return.
+#
+# CHECKED, not assumed: `check_boxmuller_guard` calls `km_guard_unit` and
+# `km_boxmuller_pair` directly at `u1 = +0.0` and requires the guarded pair
+# finite and the unguarded pair non-finite. The `KMSAB_NO_BOXMULLER_GUARD`
+# arm drops it, and it is classified REPORT in the fixture sweep rather than
+# MUST FAIL, because a sweep over ordinary fixtures will not hit a `2^-24`
+# event and an arm that "must fail" on a probability-`2^-24` input is an arm
+# that fails the gate for the wrong reason.
+# =========================================================================
+
+# =========================================================================
+# DEVIATION 1677 -- ONE BOX-MULLER PAIR SERVES COMPONENTS `2p` AND `2p+1`.
+#
+# The transform produces TWO independent standard normals from two uniforms
+# and there is no cheaper way to get one. Spending only the first would
+# double the RNG arithmetic in the one arm of this lane whose
+# arithmetic-intensity story is the RNG itself.
+#
+# So feature `f`, component `j` reads pair index `p = j // 2` at position
+# `(f, p)` and takes `val1` when `j` is even and `val2` when `j` is odd.
+# **PREFIX STABILITY SURVIVES**: components `[0, D)` read pairs
+# `[0, ceil(D/2))`, and the pair at `(f, p)` is a pure function of
+# `(key, f, p)`, so growing `D` adds pairs and moves none. An odd `D`
+# discards `val2` of the last pair, which costs nothing and changes no
+# earlier component. `check_random_features_prefix_stability` drives
+# `D = 64` against `D = 256` and also `D = 65` against `D = 64`, because the
+# odd case is where a pairing scheme goes wrong.
+# =========================================================================
+
+# =========================================================================
+# DEVIATION 1678 -- `sqrt(2 gamma)`, `2 pi` AND `sqrt(2 / D)` ARE HOST
+# CONSTANTS, COMPUTED ONCE, PASSED AS KERNEL ARGUMENTS.
+#
+# `index_map.mojo::draw_uniform_in`'s docstring states the rule this follows
+# ("`span` and `lo` are computed ONCE ON THE HOST and passed in, so no kernel
+# recomputes a subtraction that two vendors could round apart at a
+# subnormal"), and the three constants here are the same shape of hazard:
+# `2 / D` for a non-power-of-two `D` is inexact, `sqrt` of it is inexact
+# again, and a kernel that recomputes them per thread is a kernel whose
+# answer depends on a division being the same division everywhere.
+#
+# `km_feature_scale` and `km_weight_sigma` are the two host functions, and
+# `KMSAB_RF_SCALE_IN_KERNEL` is the arm that moves the computation inside.
+# That arm is classified REPORT and is EXPECTED INERT on a column whose
+# device division and device sqrt are the same as its host ones, which is
+# every column under IDENTICAL by construction. **An expected-inert arm is
+# still worth driving**: what it proves is that the constants are not
+# secretly a fold or a launch-shaped quantity, and if it ever MOVES on some
+# column that is a finding about that column's division.
+# =========================================================================
+"""
+
+from std.gpu import block_dim, block_idx, thread_idx
+from std.atomic import Atomic
+from std.sys.compile import is_defined
+from std.sys.info import has_apple_gpu_accelerator
+from max.gpu.host import DeviceBuffer, DeviceContext
+
+from core.philox import PhiloxState
+from kernel_methods.checks.km_sabotage import (
+    KMSAB_NONE,
+    km_sabotage_is_kernel_arm,
+    sabotage_feature_map_epilogue_kernel,
+    sabotage_random_weights_kernel,
+)
+from kernel_methods.impl.random.rng_device import (
+    km_boxmuller_pair,
+    km_guard_unit,
+    km_two_pi,
+    km_unit_float_from,
+)
+from checks.numerics import (
+    GLOBAL_NUMERIC_MODE,
+    NUMERIC_FAST,
+    ftz,
+    identical_cos,
+    identical_div,
+    identical_mul,
+    identical_sqrt,
+)
+from resample.checks.index_map import (
+    draw_permutation_key,
+    draw_uniform_in,
+    key_hi,
+    key_join,
+    key_lo,
+    permutation_key_lt,
+    position_subsequence,
+    resample_key,
+)
+
+
+# ===========================================================================
+# The kind bytes (DEVIATION 1679). Disjoint from `resample/`'s 1, 2, 3.
+# ===========================================================================
+
+#: Nystroem's basis row sample.
+comptime KM_KIND_BASIS: UInt64 = 17
+
+#: RBFSampler's random weights `W`.
+comptime KM_KIND_RF_WEIGHT: UInt64 = 18
+
+#: RBFSampler's random offsets `b`.
+comptime KM_KIND_RF_OFFSET: UInt64 = 19
+
+
+# ===========================================================================
+# Pinned constants
+#
+# `KM_TWO_PI_BITS`, `KM_MIN_UNIT_BITS`, `km_two_pi()` and `km_min_unit()` are
+# NOT here: they moved to `kernel_methods/impl/random/rng_device.mojo`
+# beside the RAFT transform that owns them, which is also what breaks the
+# import cycle between this file and `km_sabotage.mojo`. Imported above.
+# ===========================================================================
+
+#: The basis sample's bound on `n_samples` (DEVIATION 1672, closed
+#: 2026-09-29). The rank pass is no longer the O(N^2) count: it is
+#: `km_rank_order_sort`, a pinned LSD radix sort that is O(N) passes and
+#: `KM_BASIS_SORT_BYTES_PER_ROW` bytes of host memory per row. What bounds
+#: it now is the ROW ID TYPE: `component_indices_` are Int32 and the
+#: position map `position_subsequence` is injective only below 2^32, so the
+#: largest pool is 2^31 - 1 rows, which is 48 GiB of sort scratch; a pool
+#: past it is refused by name with both numbers.
+comptime KM_MAX_BASIS_POOL = 2147483647
+
+#: Host bytes per row the sort holds live: two 64-bit key buffers and two
+#: Int32 position buffers (ping and pong).
+comptime KM_BASIS_SORT_BYTES_PER_ROW = 24
+
+#: The pinned radix: 8 passes of 8 bits over the 64-bit key, least
+#: significant digit first. The pass count, the digit width and the digit
+#: ORDER are part of the order's definition only through stability, so any
+#: change here that keeps every pass stable leaves the answer bit for bit;
+#: the constants are pinned anyway so the scratch size is a fixed number.
+comptime KM_BASIS_RADIX_BITS = 8
+comptime KM_BASIS_RADIX_BUCKETS = 1 << KM_BASIS_RADIX_BITS
+comptime KM_BASIS_RADIX_PASSES = 64 // KM_BASIS_RADIX_BITS
+
+#: The bound of the RETIRED counting rank, kept only as the reference the
+#: sort is gated against (`km_rank_order_counting`): the largest pool the
+#: pre-2026-09-29 code accepted, so "bit-identical to the old answer" is
+#: checked over every size the old answer existed at.
+comptime KM_BASIS_COUNTING_MAX = 4096
+
+
+def km_key(seed: UInt64, kind: UInt64) -> UInt64:
+    """`resample_key`, called. DEVIATION 1679 argues the import; this
+    one-line forwarder exists so every call site in this lane says
+    `km_key(seed, KM_KIND_...)` and a reader sees one derivation."""
+    return resample_key(seed, kind)
+
+
+# ===========================================================================
+# RAFT's Box-Muller, spent at positions of this lane's choosing.
+#
+# The transform itself, its `next_float` and DEVIATION 1676's guard are in
+# `kernel_methods/impl/random/rng_device.mojo`. This file decides WHERE in
+# the counter space each weight is drawn from and nothing else.
+# ===========================================================================
+
+
+def km_normal_pair(
+    key: UInt64, f: Int, p: Int, sigma: Float32
+) -> Tuple[Float32, Float32]:
+    """The two weights at feature `f`, pair index `p`. DEVIATIONS 1675-1677.
+
+    ONE generator, initialised at position `(f, p)` through
+    `resample/checks/index_map.mojo::position_subsequence`, then TWO
+    `next_float` words, then RAFT's transform. Pure in `(key, f, p)` and in
+    nothing else -- not in `n_components`, not in `n_features`, not in the
+    launch, not in what any other thread did.
+    """
+    var gen = PhiloxState.init(
+        key, position_subsequence(UInt64(f), UInt64(p)), UInt64(0)
+    )
+    var u1 = km_guard_unit(km_unit_float_from(gen))
+    var u2 = km_unit_float_from(gen)
+    return km_boxmuller_pair(u1, u2, sigma, Float32(0.0))
+
+
+def km_random_weight(key: UInt64, f: Int, j: Int, sigma: Float32) -> Float32:
+    """`random_weights_[f, j]` = `sqrt(2 gamma) * z`, scikit-learn's
+    `kernel_approximation.py:381-383`, with `sigma = sqrt(2 gamma)` folded
+    into RAFT's transform rather than applied afterwards.
+
+    Component `j` takes `val1` of pair `j // 2` when `j` is even and `val2`
+    when it is odd. DEVIATION 1677.
+    """
+    var pair = km_normal_pair(key, f, j // 2, sigma)
+    if j % 2 == 0:
+        return pair[0]
+    return pair[1]
+
+
+def km_random_offset(key: UInt64, j: Int) -> Float32:
+    """`random_offset_[j]` = `uniform(0, 2 pi)`,
+    `kernel_approximation.py:385`.
+
+    `index_map.mojo::draw_uniform_in` CALLED, at replicate 0 and position
+    `j`: RAFT's affine map `u * span + lo` with `lo = +0.0` and
+    `span = 2 pi`, pinned through `identical_mul_add`. Note their order,
+    which is multiply by the span and THEN add the start; distributing it
+    differently is a different float.
+    """
+    return draw_uniform_in(key, 0, j, Float32(0.0), km_two_pi())
+
+
+# ===========================================================================
+# The host constants (DEVIATION 1678)
+# ===========================================================================
+
+
+def km_weight_sigma(gamma: Float32) -> Float32:
+    """`(2.0 * gamma) ** 0.5` (`kernel_approximation.py:381`), once, on the
+    host, through `identical_sqrt`."""
+    return ftz(identical_sqrt(ftz(identical_mul(Float32(2.0), gamma))))
+
+
+def km_feature_scale(n_components: Int) -> Float32:
+    """`(2.0 / n_components) ** 0.5` (`kernel_approximation.py:414`), once,
+    on the host, through `identical_div` and `identical_sqrt`."""
+    return ftz(
+        identical_sqrt(
+            ftz(identical_div(Float32(2.0), Float32(n_components)))
+        )
+    )
+
+
+# ===========================================================================
+# Nystroem's basis row sample (DEVIATIONS 1671, 1672)
+# ===========================================================================
+
+
+def km_basis_keys(seed: UInt64, n_samples: Int) -> List[UInt64]:
+    """Row `j`'s 64-bit ordering key, `draw_permutation_key` at position
+    `(0, j)` under `km_key(seed, KM_KIND_BASIS)`, for every row. A pure
+    function of `(seed, j)`: no row's key reads another's."""
+    var key = km_key(seed, KM_KIND_BASIS)
+    var keys = List[UInt64](capacity=n_samples)
+    for j in range(n_samples):
+        keys.append(draw_permutation_key(key, 0, j))
+    return keys^
+
+
+def km_rank_order_sort(keys: List[UInt64], count: Int) -> List[Int32]:
+    """The positions `0..n-1` in the TOTAL ORDER `permutation_key_lt`
+    (key ascending, position breaking every tie), the first `count` kept.
+    DEVIATION 1672's closure.
+
+    THE COMPOSITE KEY IS `(key, position)`, the same construction as
+    `neighbors/checks/select_radix_identical.mojo`'s `(distance, index)`:
+    the high part orders, the low part separates what the high part leaves
+    equal, so the order is total and no two positions share a rank. Here the
+    low part costs no radix pass: the positions ENTER in ascending order and
+    every pass is a STABLE counting sort, so after the eight 8-bit passes
+    over the key (least significant digit first) two equal keys still sit in
+    ascending position order. That is exactly `permutation_key_lt`.
+
+    PINNED. Integer histogram, integer exclusive prefix, integer scatter
+    walked in ascending source order; no comparison whose outcome depends on
+    anything but the key bits, no parallel arrival order, no float. The
+    answer is therefore one permutation on every host, and it is THE
+    permutation the retired counting rank produced (a total order has one
+    sorted arrangement), which `nystroem_basis_sort_check.mojo` gates against
+    `km_rank_order_counting` at every size the old code accepted.
+
+    O(n) per pass, `KM_BASIS_SORT_BYTES_PER_ROW` bytes per row.
+    """
+    var n = len(keys)
+    var ka = keys.copy()
+    var ia = List[Int32](capacity=n)
+    for j in range(n):
+        ia.append(Int32(j))
+    var kb = List[UInt64](length=n, fill=UInt64(0))
+    var ib = List[Int32](length=n, fill=Int32(0))
+    var hist = List[Int](length=KM_BASIS_RADIX_BUCKETS, fill=0)
+    var mask = UInt64(KM_BASIS_RADIX_BUCKETS - 1)
+    for p in range(KM_BASIS_RADIX_PASSES):
+        var shift = UInt64(p * KM_BASIS_RADIX_BITS)
+        for b in range(KM_BASIS_RADIX_BUCKETS):
+            hist[b] = 0
+        for j in range(n):
+            hist[Int((ka[j] >> shift) & mask)] += 1
+        var run = 0
+        for b in range(KM_BASIS_RADIX_BUCKETS):
+            var c = hist[b]
+            hist[b] = run
+            run += c
+        for j in range(n):
+            var digit = Int((ka[j] >> shift) & mask)
+            var dst = hist[digit]
+            kb[dst] = ka[j]
+            ib[dst] = ia[j]
+            hist[digit] = dst + 1
+        var tk = ka^
+        ka = kb^
+        kb = tk^
+        var ti = ia^
+        ia = ib^
+        ib = ti^
+    var out = List[Int32](capacity=count)
+    for c in range(count):
+        out.append(ia[c])
+    return out^
+
+
+def km_rank_order_counting(keys: List[UInt64], count: Int) raises -> List[Int32]:
+    """THE RETIRED RANK PASS, kept verbatim as the reference
+    `km_rank_order_sort` is gated against: every position's rank is the
+    number of positions below it under `permutation_key_lt`, O(n^2) host
+    comparisons, bounded at `KM_BASIS_COUNTING_MAX` (the old
+    `KM_MAX_BASIS_POOL`). Not on any fit path."""
+    var n = len(keys)
+    if n > KM_BASIS_COUNTING_MAX:
+        raise Error(
+            "km_rank_order_counting: n "
+            + String(n)
+            + " exceeds KM_BASIS_COUNTING_MAX = "
+            + String(KM_BASIS_COUNTING_MAX)
+            + "; the counting reference is n^2 comparisons and exists only"
+            " to gate km_rank_order_sort at the sizes it used to serve"
+        )
+    var out = List[Int32]()
+    for _ in range(count):
+        out.append(Int32(0))
+    for j in range(n):
+        var rank = 0
+        for l in range(n):
+            if permutation_key_lt(keys[l], l, keys[j], j):
+                rank += 1
+        if rank < count:
+            out[rank] = Int32(j)
+    return out^
+
+
+def _km_basis_validate(n_samples: Int, n_components: Int) raises:
+    if n_samples <= 0:
+        raise Error(
+            "km_basis_indices: n_samples must be positive, got "
+            + String(n_samples)
+        )
+    if n_components <= 0:
+        raise Error(
+            "km_basis_indices: n_components must be positive, got "
+            + String(n_components)
+            + ". DEVIATION 1686"
+        )
+    if n_components > n_samples:
+        raise Error(
+            "km_basis_indices: n_components ("
+            + String(n_components)
+            + ") exceeds n_samples ("
+            + String(n_samples)
+            + "). scikit-learn WARNS and clamps to n_samples"
+            " (kernel_approximation.py:1038-1047, 'XXX should we just"
+            " bail?'); this lane RAISES, because a fit that silently"
+            " returns a different number of components than it was asked"
+            " for produces an embedding whose width is not the width the"
+            " caller allocated for. DEVIATION 1673; pass"
+            " n_components = n_samples explicitly for the full kernel"
+        )
+    if n_samples > KM_MAX_BASIS_POOL:
+        raise Error(
+            "km_basis_indices: n_samples "
+            + String(n_samples)
+            + " exceeds KM_MAX_BASIS_POOL = "
+            + String(KM_MAX_BASIS_POOL)
+            + ". Basis row ids are Int32 (component_indices_) and the"
+            " position map is injective only below 2^32; the sort would"
+            " also hold "
+            + String(n_samples * KM_BASIS_SORT_BYTES_PER_ROW)
+            + " bytes of host scratch ("
+            + String(KM_BASIS_SORT_BYTES_PER_ROW)
+            + " per row). DEVIATION 1672"
+        )
+
+
+def km_basis_indices(
+    seed: UInt64, n_samples: Int, n_components: Int
+) raises -> List[Int32]:
+    """`inds = rnd.permutation(n_samples); basis_inds = inds[:n_components]`
+    (`kernel_approximation.py:1050-1051`), position-mapped.
+
+    THEIRS is a Fisher-Yates shuffle over a SEQUENTIAL stream: entry `i` of
+    the permutation depends on every swap before it, and the number of stream
+    words consumed is itself a function of `n_samples`. `index_map.mojo`'s
+    DEVIATION 1690 explains at length why that cannot be made parallel,
+    machine-independent and batch-independent at once.
+
+    OURS gives row `j` a 64-bit ordering key at position `(0, j)` --
+    `draw_permutation_key`, CALLED, not re-spelled -- and takes the rows whose
+    RANK under the total order `(key, index)` is below `n_components`. That
+    is a uniformly random permutation prefix with three properties their
+    shuffle does not have:
+
+      (a) **PREFIX STABILITY IN `n_components`.** The basis for `q = 64` is
+          the first 64 entries of the basis for `q = 256`, in the same order,
+          bit for bit. `check_nystroem_basis_prefix_stability` gates it, at
+          24 and at 100,000 rows.
+      (b) **The key is a pure function of `(seed, j)`**, so the draw is
+          embarrassingly parallel with no cross-thread RNG state.
+      (c) **Distinctness is free.** The rank is a bijection because the order
+          includes the index, so no two rows can claim one rank and the
+          sample is without replacement by construction rather than by a
+          rejection loop.
+
+    THE RANK PASS RUNS ON THE HOST, for the reason `decomposition/impl/
+    linalg/detail/pca.mojo::eig_and_truncate` gives about its own ordering:
+    sklearn's runs on the host too. It was an O(n_samples^2) count bounded
+    at 4096 rows until 2026-09-29, which refused Nystroem on the bench
+    board's 100,000-row taxi and Istella-S fits. It is now
+    `km_rank_order_sort`, the pinned radix sort over the composite key,
+    O(n_samples) per pass; the counting rank survives as
+    `km_rank_order_counting`, the reference the sort is gated against, and
+    the two return the same rows in the same order at every size the old
+    code accepted (DEVIATION 1672). Integer only, so the answer is one list
+    on every host, whichever GPU the rest of the fit runs on.
+
+    Returns the basis row ids IN RANK ORDER, `n_components` of them.
+    """
+    _km_basis_validate(n_samples, n_components)
+    return km_rank_order_sort(km_basis_keys(seed, n_samples), n_components)
+
+
+# ---------------------------------------------------------------------------
+# fam2-kernel-gp (2026-10-04): the basis sample on the device
+# (`ANONLIB_IDN_NYS_DEV_BASIS`, gated in kernel_methods/estimator.mojo).
+# `km_basis_indices` drew n_samples keys and radix-sorted them on one host
+# thread inside a device fit. Here every row draws its key on the device
+# (`draw_permutation_key`, the same counter-based draw), the rows whose key
+# is at or below a threshold are compacted (the slot order is scheduling and
+# is never read into a value), and each candidate's rank among the
+# candidates under `permutation_key_lt` is counted on the device: basis[r] =
+# the row of rank r, r < n_components. Every row below a candidate in the
+# total order has a key at or below the candidate's, so it is a candidate
+# too: the rank among the candidates IS the rank among all rows whenever at
+# least n_components rows pass, which the driver checks (one int32 read)
+# and repairs by doubling the threshold. Integer only: `km_basis_indices`'s
+# list on every vendor, and the host column keeps calling `km_basis_indices`.
+# ---------------------------------------------------------------------------
+
+comptime KM_BASIS_TPB = 256
+#: The threshold admits about this many candidates per component drawn.
+comptime KM_BASIS_OVERSAMPLE = 4
+comptime KM_BASIS_SLACK = 64
+
+
+def km_basis_candidates_kernel(
+    ckey: MutPointer[UInt64, MutAnyOrigin],
+    cidx: MutPointer[Int32, MutAnyOrigin],
+    count: MutPointer[Int32, MutAnyOrigin],
+    lo_bits: Int32,
+    hi_bits: Int32,
+    thr_lo: Int32,
+    thr_hi: Int32,
+    n_in: Int32,
+):
+    """One thread per row j: its key; at or below the threshold it takes the
+    next candidate slot (an atomic counter; the buffers hold n_in slots, so
+    a slot always exists)."""
+    var j = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if j >= Int(n_in):
+        return
+    var k = draw_permutation_key(key_join(lo_bits, hi_bits), 0, j)
+    if k <= key_join(thr_lo, thr_hi):
+        var slot = Int(Atomic[DType.int32].fetch_add(count, Int32(1)))
+        ckey.unsafe_store(slot, k)
+        cidx.unsafe_store(slot, Int32(j))
+
+
+def km_basis_rank_kernel(
+    ckey: MutPointer[UInt64, MutAnyOrigin],
+    cidx: MutPointer[Int32, MutAnyOrigin],
+    basis: MutPointer[Int32, MutAnyOrigin],
+    m_in: Int32,
+    q_in: Int32,
+):
+    """One thread per candidate slot: its rank = the candidates below it
+    under `permutation_key_lt`; a rank below q writes its row at basis[rank]
+    (the ranks are a bijection, one writer a slot)."""
+    var m = Int(m_in)
+    var sidx = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if sidx >= m:
+        return
+    var ks = ckey.unsafe_load(sidx)
+    var js = Int(cidx.unsafe_load(sidx))
+    var r = 0
+    for t in range(m):
+        if permutation_key_lt(ckey.unsafe_load(t), Int(cidx.unsafe_load(t)), ks, js):
+            r += 1
+    if r < Int(q_in):
+        basis.unsafe_store(r, Int32(js))
+
+
+def km_gather_rows_kernel(
+    dst: MutPointer[Float32, MutAnyOrigin],
+    src: MutPointer[Float32, MutAnyOrigin],
+    rows: MutPointer[Int32, MutAnyOrigin],
+    q_in: Int32,
+    d_in: Int32,
+):
+    """dst[c, f] = src[rows[c], f], one thread per cell: `components_`."""
+    var d = Int(d_in)
+    var t = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if t >= Int(q_in) * d:
+        return
+    var c = t // d
+    var f = t - c * d
+    dst.unsafe_store(t, src.unsafe_load(Int(rows.unsafe_load(c)) * d + f))
+
+
+def km_basis_indices_device(
+    ctx: DeviceContext,
+    seed: UInt64,
+    n_samples: Int,
+    n_components: Int,
+    mut dbasis: DeviceBuffer[DType.int32],
+) raises -> List[Int32]:
+    """`km_basis_indices` on the device: `dbasis` (at least n_components
+    int32) receives the basis rows in rank order and the same list is
+    returned for the model. See the block comment above."""
+    _km_basis_validate(n_samples, n_components)
+    var n = n_samples
+    var q = n_components
+    var key = km_key(seed, KM_KIND_BASIS)
+    var all_ones = ~UInt64(0)
+    var want = KM_BASIS_OVERSAMPLE * q + KM_BASIS_SLACK
+    var thr = all_ones
+    if want < n:
+        thr = (all_ones // UInt64(n)) * UInt64(want)
+    var dckey = ctx.enqueue_create_buffer[DType.uint64](n)
+    var dcidx = ctx.enqueue_create_buffer[DType.int32](n)
+    var dcount = ctx.enqueue_create_buffer[DType.int32](1)
+    var hcount = ctx.enqueue_create_host_buffer[DType.int32](1)
+    var m = 0
+    while True:
+        dcount.enqueue_fill(Int32(0))
+        ctx.enqueue_function[km_basis_candidates_kernel](
+            dckey.unsafe_ptr(), dcidx.unsafe_ptr(), dcount.unsafe_ptr(),
+            key_lo(key), key_hi(key), key_lo(thr), key_hi(thr), Int32(n),
+            grid_dim=((n + KM_BASIS_TPB - 1) // KM_BASIS_TPB, 1, 1),
+            block_dim=(KM_BASIS_TPB, 1, 1),
+        )
+        ctx.enqueue_copy(dst_ptr=hcount.unsafe_ptr(), src_buf=dcount)
+        ctx.synchronize()
+        m = Int(hcount.unsafe_ptr().unsafe_load(0))
+        if m >= q or thr == all_ones:
+            break
+        # too few rows passed (probability far below 2^-64 at the default
+        # oversampling): admit twice as many and draw again
+        thr = all_ones if thr > all_ones // UInt64(2) else thr * UInt64(2)
+    if m < q:
+        raise Error(
+            "km_basis_indices_device: " + String(m) + " candidate rows for n_components = "
+            + String(q) + " with every key admitted; a launch did not run"
+        )
+    ctx.enqueue_function[km_basis_rank_kernel](
+        dckey.unsafe_ptr(), dcidx.unsafe_ptr(), dbasis.unsafe_ptr(), Int32(m), Int32(q),
+        grid_dim=((m + KM_BASIS_TPB - 1) // KM_BASIS_TPB, 1, 1),
+        block_dim=(KM_BASIS_TPB, 1, 1),
+    )
+    var hb = ctx.enqueue_create_host_buffer[DType.int32](q)
+    var sub = dbasis.create_sub_buffer[DType.int32](0, q)
+    ctx.enqueue_copy(dst_ptr=hb.unsafe_ptr(), src_buf=sub)
+    ctx.synchronize()
+    var basis = List[Int32](capacity=q)
+    for c in range(q):
+        basis.append(hb.unsafe_ptr().unsafe_load(c))
+    _ = sub^
+    _ = hb^
+    _ = dckey^
+    _ = dcidx^
+    _ = dcount^
+    _ = hcount^
+    return basis^
+
+
+def km_basis_indices_counting(
+    seed: UInt64, n_samples: Int, n_components: Int
+) raises -> List[Int32]:
+    """`km_basis_indices` through the RETIRED counting rank: the reference
+    answer, at most `KM_BASIS_COUNTING_MAX` rows. Checks only."""
+    _km_basis_validate(n_samples, n_components)
+    return km_rank_order_counting(km_basis_keys(seed, n_samples), n_components)
+
+
+# ===========================================================================
+# The kernels. One thread per OUTPUT CELL, nothing shared, nothing folded.
+# ===========================================================================
+
+#: SCHEDULING.
+comptime KM_RF_TPB = 256
+
+
+def random_weights_kernel(
+    w_out: MutPointer[Float32, MutAnyOrigin],
+    lo_bits: Int32,
+    hi_bits: Int32,
+    n_features_in: Int32,
+    n_components_in: Int32,
+    sigma: Float32,
+):
+    """Materialise `W[n_features x n_components]`, row-major.
+
+    Thread `t` owns cell `(f, j) = (t / D, t % D)` and computes it from
+    `(key, f, j)` alone. No thread reads another's value, no counter is
+    shared, and the answer does not depend on how many threads ran.
+    """
+    var d = Int(n_components_in)
+    var total = Int(n_features_in) * d
+    var t = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if t >= total:
+        return
+    var f = t // d
+    var j = t - f * d
+    w_out.unsafe_store(t, km_random_weight(key_join(lo_bits, hi_bits), f, j, sigma))
+
+
+def random_offsets_kernel(
+    b_out: MutPointer[Float32, MutAnyOrigin],
+    lo_bits: Int32,
+    hi_bits: Int32,
+    n_components_in: Int32,
+):
+    """Materialise `b[n_components]` = `uniform(0, 2 pi)`."""
+    var d = Int(n_components_in)
+    var j = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if j >= d:
+        return
+    b_out.unsafe_store(j, km_random_offset(key_join(lo_bits, hi_bits), j))
+
+
+# AFCL-L12: NEVER RUN — PENDING MEASUREMENT. Uncompiled/unverified, OFF.
+# One thread handles one feature in four consecutive rows, reusing its
+# random offset. Adjacent threads still load/store adjacent components;
+# no random draw, projection, scale or cosine approximation is changed.
+# Applies to callers of km_feature_map_epilogue, including the resident
+# RBFSampler pipeline. Existing fused-projection paths bypass this candidate.
+comptime AFCL_L12 = (GLOBAL_NUMERIC_MODE == NUMERIC_FAST and has_apple_gpu_accelerator()
+                    and is_defined["ANONLIB_AFCL_L12"]())
+
+
+def feature_map_epilogue_rows4_kernel(
+    proj_io: MutPointer[Float32, MutAnyOrigin],
+    b_in: MutPointer[Float32, MutAnyOrigin],
+    n_rows_in: Int32, n_components_in: Int32, scale: Float32,
+):
+    var rows = Int(n_rows_in)
+    var d = Int(n_components_in)
+    var t = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    var row = (t // d) * 4
+    if row >= rows:
+        return
+    var j = t % d
+    var offset = ftz(b_in.unsafe_load(j))
+    comptime for lane in range(4):
+        if row + lane < rows:
+            var i = (row + lane) * d + j
+            var p = ftz(proj_io.unsafe_load(i))
+            var shifted = ftz(p + offset)
+            proj_io.unsafe_store(i, ftz(identical_mul(identical_cos(shifted), scale)))
+
+
+def feature_map_epilogue_kernel(
+    proj_io: MutPointer[Float32, MutAnyOrigin],
+    b_in: MutPointer[Float32, MutAnyOrigin],
+    n_rows_in: Int32,
+    n_components_in: Int32,
+    scale: Float32,
+):
+    """scikit-learn's `transform`, `kernel_approximation.py:411-414`:
+
+        projection = safe_sparse_dot(X, self.random_weights_)
+        projection += self.random_offset_
+        np.cos(projection, projection)
+        projection *= (2.0 / self.n_components) ** 0.5
+
+    ONE THREAD PER CELL, and the four lines in their order. The dot product
+    is NOT here: the caller has already run `identical_gemm_into` at `OP_NN`
+    into `proj_io`, so this kernel is `add`, `cos`, `mul`.
+
+    THE ORDER IS NOT FREE. `cos(p + b) * scale` and `cos(p) * scale + ...`
+    are different functions; `scale * cos(p + b)` and `cos(p + b) * scale`
+    are the same bits by commutativity but the ADD and the MULTIPLY cannot be
+    exchanged. The reference sequence is kept and `identical_cos` carries
+    IDENTITY_PATHS row 12.
+    """
+    var d = Int(n_components_in)
+    var total = Int(n_rows_in) * d
+    var t = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if t >= total:
+        return
+    var j = t % d
+    var p = ftz(proj_io.unsafe_load(t))
+    var shifted = ftz(p + ftz(b_in.unsafe_load(j)))
+    proj_io.unsafe_store(
+        t, ftz(identical_mul(identical_cos(shifted), scale))
+    )
+
+
+# ===========================================================================
+# Launches
+# ===========================================================================
+
+
+def km_random_weights(
+    ctx: DeviceContext,
+    mut w: DeviceBuffer[DType.float32],
+    seed: UInt64,
+    n_features: Int,
+    n_components: Int,
+    sigma: Float32,
+    tpb: Int = KM_RF_TPB,
+    sabotage: Int = KMSAB_NONE,
+) raises:
+    """`W = sqrt(2 gamma) * normal(size=(n_features, n_components))`.
+    ASYNCHRONOUS.
+
+    At `KMSAB_NONE` this launches the production kernel and the sabotage file
+    is not reached. When `sabotage` names a kernel arm it launches
+    `km_sabotage.mojo`'s COPY, so no production kernel here carries a
+    sabotage branch (DEVIATION 1687)."""
+    if n_features <= 0 or n_components <= 0:
+        return
+    var key = km_key(seed, KM_KIND_RF_WEIGHT)
+    var total = n_features * n_components
+    if km_sabotage_is_kernel_arm(sabotage):
+        ctx.enqueue_function[sabotage_random_weights_kernel](
+            w.unsafe_ptr(),
+            key_lo(key),
+            key_hi(key),
+            Int32(n_features),
+            Int32(n_components),
+            sigma,
+            Int32(sabotage),
+            grid_dim=((total + tpb - 1) // tpb, 1, 1),
+            block_dim=(tpb, 1, 1),
+        )
+        return
+    ctx.enqueue_function[random_weights_kernel](
+        w.unsafe_ptr(),
+        key_lo(key),
+        key_hi(key),
+        Int32(n_features),
+        Int32(n_components),
+        sigma,
+        grid_dim=((total + tpb - 1) // tpb, 1, 1),
+        block_dim=(tpb, 1, 1),
+    )
+
+
+def km_random_offsets(
+    ctx: DeviceContext,
+    mut b: DeviceBuffer[DType.float32],
+    seed: UInt64,
+    n_components: Int,
+    tpb: Int = KM_RF_TPB,
+) raises:
+    """`b = uniform(0, 2 pi, size=n_components)`. ASYNCHRONOUS."""
+    if n_components <= 0:
+        return
+    var key = km_key(seed, KM_KIND_RF_OFFSET)
+    ctx.enqueue_function[random_offsets_kernel](
+        b.unsafe_ptr(),
+        key_lo(key),
+        key_hi(key),
+        Int32(n_components),
+        grid_dim=((n_components + tpb - 1) // tpb, 1, 1),
+        block_dim=(tpb, 1, 1),
+    )
+
+
+def km_feature_map_epilogue(
+    ctx: DeviceContext,
+    mut proj: DeviceBuffer[DType.float32],
+    mut b: DeviceBuffer[DType.float32],
+    n_rows: Int,
+    n_components: Int,
+    scale: Float32,
+    tpb: Int = KM_RF_TPB,
+    sabotage: Int = KMSAB_NONE,
+) raises:
+    """`proj = sqrt(2/D) * cos(proj + b)`, in place. ASYNCHRONOUS."""
+    if n_rows <= 0 or n_components <= 0:
+        return
+    var total = n_rows * n_components
+    if km_sabotage_is_kernel_arm(sabotage):
+        ctx.enqueue_function[sabotage_feature_map_epilogue_kernel](
+            proj.unsafe_ptr(),
+            b.unsafe_ptr(),
+            Int32(n_rows),
+            Int32(n_components),
+            scale,
+            Int32(sabotage),
+            grid_dim=((total + tpb - 1) // tpb, 1, 1),
+            block_dim=(tpb, 1, 1),
+        )
+        return
+    comptime if AFCL_L12:
+        var row_groups = (n_rows + 3) // 4
+        ctx.enqueue_function[feature_map_epilogue_rows4_kernel](
+            proj.unsafe_ptr(), b.unsafe_ptr(), Int32(n_rows), Int32(n_components), scale,
+            grid_dim=((row_groups * n_components + tpb - 1) // tpb, 1, 1),
+            block_dim=(tpb, 1, 1),
+        )
+        return
+    ctx.enqueue_function[feature_map_epilogue_kernel](
+        proj.unsafe_ptr(),
+        b.unsafe_ptr(),
+        Int32(n_rows),
+        Int32(n_components),
+        scale,
+        grid_dim=((total + tpb - 1) // tpb, 1, 1),
+        block_dim=(tpb, 1, 1),
+    )
+
+
+# ===========================================================================
+# Host mirrors. ORACLES, not a CPU path (CONTRIBUTING.md (Algorithms and references)): the draws are
+# integer arithmetic into a pinned float transform, so a host mirror is bit
+# for bit the device's answer BY CONSTRUCTION and a gate that says so is
+# worth having.
+# ===========================================================================
+
+
+def km_random_weights_host(
+    seed: UInt64, n_features: Int, n_components: Int, sigma: Float32
+) -> List[Float32]:
+    """`random_weights_kernel` on the host, in index order."""
+    var key = km_key(seed, KM_KIND_RF_WEIGHT)
+    var out = List[Float32]()
+    for f in range(n_features):
+        for j in range(n_components):
+            out.append(km_random_weight(key, f, j, sigma))
+    return out^
+
+
+def km_random_offsets_host(seed: UInt64, n_components: Int) -> List[Float32]:
+    """`random_offsets_kernel` on the host, in index order."""
+    var key = km_key(seed, KM_KIND_RF_OFFSET)
+    var out = List[Float32]()
+    for j in range(n_components):
+        out.append(km_random_offset(key, j))
+    return out^
+
+
+# `key_lo`, `key_hi` and `key_join` are `index_map.mojo`'s, imported and not
+# re-spelled. THEIR MASKS ARE NOT DECORATION: Mojo has been MEASURED
+# sign-extending `Int32 -> UInt32 -> UInt64` through a `var`, and the failure
+# hides behind the `<< 32` on the way back because the bad bits shift out
+# (`core/philox.mojo`). A local re-spelling of those three lines is exactly
+# the duplication this lane exists to not make.

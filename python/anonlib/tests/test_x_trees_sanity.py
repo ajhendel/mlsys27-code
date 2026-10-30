@@ -1,0 +1,434 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 the authors. Part of anonlib, DOI-WITHHELD
+"""Trees lane (algorithm expansion) sanity vs scikit-learn on small data.
+
+A tolerance check, not an identity claim: our trees split on per-feature
+quantiles (n_bins) where sklearn's split on every midpoint, so the scores are
+compared, never the predictions. Run on a GPU box:
+    python -m pytest python/anonlib/tests/test_x_trees_sanity.py -q
+"""
+import numpy as np
+import pytest
+
+sklearn = pytest.importorskip("sklearn")
+from sklearn.datasets import make_classification, make_regression  # noqa: E402
+from sklearn.model_selection import train_test_split  # noqa: E402
+from sklearn.metrics import accuracy_score, r2_score  # noqa: E402
+
+import anonlib as ml  # noqa: E402
+
+
+def _clf(n_classes=3, seed=0):
+    X, y = make_classification(n_samples=1500, n_features=10, n_informative=6, n_classes=n_classes,
+                               random_state=seed)
+    return train_test_split(X.astype(np.float32), y, test_size=0.3, random_state=seed)
+
+
+def _reg(seed=0):
+    X, y = make_regression(n_samples=1500, n_features=10, n_informative=6, noise=5.0, random_state=seed)
+    return train_test_split(X.astype(np.float32), y.astype(np.float32), test_size=0.3, random_state=seed)
+
+
+def test_decision_tree_classifier():
+    from sklearn.tree import DecisionTreeClassifier
+    Xa, Xb, ya, yb = _clf()
+    ours = ml.DecisionTreeClassifier(max_depth=6).fit(Xa, ya)
+    ref = DecisionTreeClassifier(max_depth=6, random_state=0).fit(Xa, ya)
+    a, r = accuracy_score(yb, np.asarray(ours.predict(Xb))), accuracy_score(yb, ref.predict(Xb))
+    assert a >= r - 0.05, (a, r)
+    assert ours.get_depth() <= 6
+    p = np.asarray(ours.predict_proba(Xb))
+    np.testing.assert_allclose(p.sum(1), 1.0, rtol=1e-5)
+    w = np.where(ya == 0, 5.0, 1.0).astype(np.float32)
+    wt = ml.DecisionTreeClassifier(max_depth=6).fit(Xa, ya, sample_weight=w)
+    # upweighting class 0 must not reduce its recall
+    rec = lambda m: np.mean(np.asarray(m.predict(Xb))[yb == 0] == 0)  # noqa: E731
+    assert rec(wt) >= rec(ours) - 0.02
+
+
+def test_decision_tree_regressor():
+    from sklearn.tree import DecisionTreeRegressor
+    Xa, Xb, ya, yb = _reg()
+    ours = ml.DecisionTreeRegressor(max_depth=8).fit(Xa, ya)
+    ref = DecisionTreeRegressor(max_depth=8, random_state=0).fit(Xa, ya)
+    a, r = r2_score(yb, np.asarray(ours.predict(Xb))), r2_score(yb, ref.predict(Xb))
+    assert a >= r - 0.05, (a, r)
+
+
+def test_decision_tree_random_splitter():
+    from sklearn.tree import DecisionTreeClassifier, DecisionTreeRegressor
+    Xa, Xb, ya, yb = _clf()
+    ours = ml.DecisionTreeClassifier(splitter="random", max_depth=10, random_state=0).fit(Xa, ya)
+    ref = DecisionTreeClassifier(splitter="random", max_depth=10, random_state=0).fit(Xa, ya)
+    a, r = accuracy_score(yb, np.asarray(ours.predict(Xb))), accuracy_score(yb, ref.predict(Xb))
+    assert a >= r - 0.08, (a, r)
+    Xa, Xb, ya, yb = _reg()
+    m = ml.DecisionTreeRegressor(splitter="random", max_leaf_nodes=20, random_state=0).fit(Xa, ya)
+    assert m.get_n_leaves() <= 20
+    ref = DecisionTreeRegressor(splitter="random", max_leaf_nodes=20, random_state=0).fit(Xa, ya)
+    a, r = r2_score(yb, np.asarray(m.predict(Xb))), r2_score(yb, ref.predict(Xb))
+    assert a >= r - 0.1, (a, r)
+
+
+def test_bagging_classifier():
+    from sklearn.ensemble import BaggingClassifier
+    from sklearn.tree import DecisionTreeClassifier
+    Xa, Xb, ya, yb = _clf()
+    ours = ml.BaggingClassifier(ml.DecisionTreeClassifier(max_depth=8), n_estimators=10, random_state=0).fit(Xa, ya)
+    ref = BaggingClassifier(DecisionTreeClassifier(max_depth=8), n_estimators=10, random_state=0).fit(Xa, ya)
+    a, r = accuracy_score(yb, np.asarray(ours.predict(Xb))), accuracy_score(yb, ref.predict(Xb))
+    assert a >= r - 0.05, (a, r)
+    np.testing.assert_allclose(np.asarray(ours.predict_proba(Xb)).sum(1), 1.0, rtol=1e-6)
+
+
+def test_bagging_regressor():
+    from sklearn.ensemble import BaggingRegressor
+    from sklearn.tree import DecisionTreeRegressor
+    Xa, Xb, ya, yb = _reg()
+    ours = ml.BaggingRegressor(ml.DecisionTreeRegressor(max_depth=8), n_estimators=10, max_features=0.8,
+                               random_state=0).fit(Xa, ya)
+    ref = BaggingRegressor(DecisionTreeRegressor(max_depth=8), n_estimators=10, max_features=0.8,
+                           random_state=0).fit(Xa, ya)
+    a, r = r2_score(yb, np.asarray(ours.predict(Xb))), r2_score(yb, ref.predict(Xb))
+    assert a >= r - 0.05, (a, r)
+
+
+def test_adaboost_classifier():
+    from sklearn.ensemble import AdaBoostClassifier
+    from sklearn.tree import DecisionTreeClassifier
+    Xa, Xb, ya, yb = _clf()
+    ours = ml.AdaBoostClassifier(ml.DecisionTreeClassifier(max_depth=2), n_estimators=30, random_state=0).fit(Xa, ya)
+    ref = AdaBoostClassifier(DecisionTreeClassifier(max_depth=2), n_estimators=30, random_state=0).fit(Xa, ya)
+    a, r = accuracy_score(yb, np.asarray(ours.predict(Xb))), accuracy_score(yb, ref.predict(Xb))
+    assert a >= r - 0.05, (a, r)
+    np.testing.assert_allclose(np.asarray(ours.predict_proba(Xb)).sum(1), 1.0, rtol=1e-9)
+    Xa2, Xb2, ya2, yb2 = _clf(n_classes=2)
+    ours2 = ml.AdaBoostClassifier(n_estimators=30).fit(Xa2, ya2)
+    ref2 = AdaBoostClassifier(n_estimators=30).fit(Xa2, ya2)
+    a, r = accuracy_score(yb2, np.asarray(ours2.predict(Xb2))), accuracy_score(yb2, ref2.predict(Xb2))
+    assert a >= r - 0.05, (a, r)
+
+
+def test_adaboost_regressor():
+    from sklearn.ensemble import AdaBoostRegressor
+    from sklearn.tree import DecisionTreeRegressor
+    Xa, Xb, ya, yb = _reg()
+    ours = ml.AdaBoostRegressor(ml.DecisionTreeRegressor(max_depth=4), n_estimators=30, random_state=0).fit(Xa, ya)
+    ref = AdaBoostRegressor(DecisionTreeRegressor(max_depth=4), n_estimators=30, random_state=0).fit(Xa, ya)
+    a, r = r2_score(yb, np.asarray(ours.predict(Xb))), r2_score(yb, ref.predict(Xb))
+    assert a >= r - 0.05, (a, r)
+
+
+def test_dart():
+    lightgbm = pytest.importorskip("lightgbm")
+    Xa, Xb, ya, yb = _reg()
+    ours = ml.DARTRegressor(n_estimators=60, learning_rate=0.1, random_state=0).fit(Xa, ya)
+    ref = lightgbm.LGBMRegressor(boosting_type="dart", n_estimators=60, learning_rate=0.1, verbose=-1).fit(Xa, ya)
+    a, r = r2_score(yb, np.asarray(ours.predict(Xb))), r2_score(yb, ref.predict(Xb))
+    assert a >= r - 0.08, (a, r)
+    Xa, Xb, ya, yb = _clf(n_classes=2)
+    ours = ml.DARTClassifier(n_estimators=60, random_state=0).fit(Xa, ya)
+    ref = lightgbm.LGBMClassifier(boosting_type="dart", n_estimators=60, verbose=-1).fit(Xa, ya)
+    a, r = accuracy_score(yb, np.asarray(ours.predict(Xb))), accuracy_score(yb, ref.predict(Xb))
+    assert a >= r - 0.05, (a, r)
+
+
+def test_dart_options():
+    lightgbm = pytest.importorskip("lightgbm")
+    Xa, Xb, ya, yb = _clf(n_classes=3)
+    kw = dict(n_estimators=60, reg_alpha=0.5, max_delta_step=0.7, colsample_bytree=0.8, subsample=0.8,
+              subsample_freq=1)
+    ours = ml.DARTClassifier(random_state=0, **kw).fit(Xa, ya)
+    ref = lightgbm.LGBMClassifier(boosting_type="dart", verbose=-1, **kw).fit(Xa, ya)
+    a, r = accuracy_score(yb, np.asarray(ours.predict(Xb))), accuracy_score(yb, ref.predict(Xb))
+    assert a >= r - 0.06, (a, r)
+    p = np.asarray(ours.predict_proba(Xb))
+    assert p.shape == (len(yb), 3) and np.allclose(p.sum(axis=1), 1.0)
+    Xa, Xb, ya, yb = _reg()
+    kw = dict(n_estimators=60, reg_alpha=2.0, colsample_bytree=0.6, subsample=0.7, subsample_freq=2)
+    ours = ml.DARTRegressor(random_state=0, **kw).fit(Xa, ya)
+    ref = lightgbm.LGBMRegressor(boosting_type="dart", verbose=-1, **kw).fit(Xa, ya)
+    a, r = r2_score(yb, np.asarray(ours.predict(Xb))), r2_score(yb, ref.predict(Xb))
+    assert a >= r - 0.08, (a, r)
+    # max_delta_step clips the leaf values exactly as LightGBM does, but
+    # LightGBM also scores its SPLITS on the clipped output (GetLeafGain with
+    # USE_MAX_OUTPUT); the trees here are the forest builder's (the tsv row
+    # "leaf-wise growth on the g/h gain"), so a tight clip costs more here.
+    # Measured 2026-09-27: 0.646 vs LightGBM 0.768 at max_delta_step=40.
+    kw = dict(n_estimators=60, max_delta_step=40.0)
+    ours = ml.DARTRegressor(random_state=0, **kw).fit(Xa, ya)
+    ref = lightgbm.LGBMRegressor(boosting_type="dart", verbose=-1, **kw).fit(Xa, ya)
+    a, r = r2_score(yb, np.asarray(ours.predict(Xb))), r2_score(yb, ref.predict(Xb))
+    assert a >= r - 0.15, (a, r)
+
+
+def test_random_trees_embedding():
+    from sklearn.linear_model import LogisticRegression
+    Xa, Xb, ya, yb = _clf()
+    emb = ml.RandomTreesEmbedding(n_estimators=30, max_depth=5, random_state=0).fit(Xa)
+    Ea, Eb = np.asarray(emb.transform(Xa)), np.asarray(emb.transform(Xb))
+    assert Ea.shape[1] == emb.n_output_features_
+    np.testing.assert_array_equal(Ea.sum(1), 30)          # one leaf per tree
+    assert set(np.unique(Ea)) <= {0.0, 1.0}
+    acc = accuracy_score(yb, LogisticRegression(max_iter=500).fit(Ea, ya).predict(Eb))
+    assert acc > 0.6, acc                                   # the embedding carries signal
+
+
+def test_voting():
+    from sklearn.ensemble import VotingClassifier, VotingRegressor
+    from sklearn.tree import DecisionTreeClassifier, DecisionTreeRegressor
+    Xa, Xb, ya, yb = _clf()
+    ours = ml.VotingClassifier([("a", ml.DecisionTreeClassifier(max_depth=4)),
+                                ("b", ml.DecisionTreeClassifier(max_depth=8))], voting="soft").fit(Xa, ya)
+    ref = VotingClassifier([("a", DecisionTreeClassifier(max_depth=4, random_state=0)),
+                            ("b", DecisionTreeClassifier(max_depth=8, random_state=0))], voting="soft").fit(Xa, ya)
+    a, r = accuracy_score(yb, np.asarray(ours.predict(Xb))), accuracy_score(yb, ref.predict(Xb))
+    assert a >= r - 0.05, (a, r)
+    hard = ml.VotingClassifier([("a", ml.DecisionTreeClassifier(max_depth=4)),
+                                ("b", ml.DecisionTreeClassifier(max_depth=8)),
+                                ("c", ml.DecisionTreeClassifier(max_depth=6))]).fit(Xa, ya)
+    assert accuracy_score(yb, np.asarray(hard.predict(Xb))) >= r - 0.08
+    Xa, Xb, ya, yb = _reg()
+    ours = ml.VotingRegressor([("a", ml.DecisionTreeRegressor(max_depth=4)),
+                               ("b", ml.DecisionTreeRegressor(max_depth=8))], weights=[1, 2]).fit(Xa, ya)
+    ref = VotingRegressor([("a", DecisionTreeRegressor(max_depth=4, random_state=0)),
+                           ("b", DecisionTreeRegressor(max_depth=8, random_state=0))], weights=[1, 2]).fit(Xa, ya)
+    a, r = r2_score(yb, np.asarray(ours.predict(Xb))), r2_score(yb, ref.predict(Xb))
+    assert a >= r - 0.05, (a, r)
+
+
+def test_stacking_folds_match_sklearn():
+    """The int-cv folds (`x_trees_device_folds`: the device kernel, or its
+    host twin on a CPU-only install) are sklearn's unshuffled folds."""
+    from sklearn.model_selection import StratifiedKFold, KFold
+    from anonlib._expansion_trees import _trees_native_folds, _trees_x_bind
+    from anonlib._buffer import as_i32_c
+
+    class _Est:
+        def _bind(self):
+            return _trees_x_bind()
+
+    y = np.random.RandomState(0).randint(0, 4, size=103)
+    codes = as_i32_c(y.astype(np.int32), ndim=1, name="y")[0]
+    ours = _trees_native_folds(_Est(), 5, 103, codes, 4)
+    for (_, te), (_, ref) in zip(ours, StratifiedKFold(5).split(np.zeros((103, 1)), y)):
+        assert list(te) == sorted(ref.tolist())
+    ours = _trees_native_folds(_Est(), 4, 103, None)
+    for (_, te), (_, ref) in zip(ours, KFold(4).split(np.zeros((103, 1)))):
+        assert list(te) == ref.tolist()
+
+
+def test_stacking():
+    from sklearn.ensemble import StackingClassifier, StackingRegressor
+    from sklearn.tree import DecisionTreeClassifier, DecisionTreeRegressor
+    Xa, Xb, ya, yb = _clf()
+    ours = ml.StackingClassifier([("a", ml.DecisionTreeClassifier(max_depth=4)),
+                                  ("b", ml.BaggingClassifier(ml.DecisionTreeClassifier(max_depth=8), random_state=0))],
+                                 final_estimator=ml.DecisionTreeClassifier(max_depth=4)).fit(Xa, ya)
+    ref = StackingClassifier([("a", DecisionTreeClassifier(max_depth=4, random_state=0)),
+                              ("b", DecisionTreeClassifier(max_depth=8, random_state=0))],
+                             final_estimator=DecisionTreeClassifier(max_depth=4, random_state=0)).fit(Xa, ya)
+    a, r = accuracy_score(yb, np.asarray(ours.predict(Xb))), accuracy_score(yb, ref.predict(Xb))
+    assert a >= r - 0.06, (a, r)
+    Xa, Xb, ya, yb = _reg()
+    ours = ml.StackingRegressor([("a", ml.DecisionTreeRegressor(max_depth=4)),
+                                 ("b", ml.DecisionTreeRegressor(max_depth=8))],
+                                final_estimator=ml.DecisionTreeRegressor(max_depth=4)).fit(Xa, ya)
+    ref = StackingRegressor([("a", DecisionTreeRegressor(max_depth=4, random_state=0)),
+                             ("b", DecisionTreeRegressor(max_depth=8, random_state=0))],
+                            final_estimator=DecisionTreeRegressor(max_depth=4, random_state=0)).fit(Xa, ya)
+    a, r = r2_score(yb, np.asarray(ours.predict(Xb))), r2_score(yb, ref.predict(Xb))
+    assert a >= r - 0.08, (a, r)
+
+
+def test_multioutput():
+    Xa, Xb, ya, yb = _reg()
+    Y = np.stack([ya, -2 * ya], axis=1)
+    m = ml.MultiOutputRegressor(ml.DecisionTreeRegressor(max_depth=8)).fit(Xa, Y)
+    P = np.asarray(m.predict(Xb))
+    assert P.shape == (len(Xb), 2)
+    np.testing.assert_allclose(P[:, 1], -2 * P[:, 0], rtol=1e-4, atol=1e-3)
+    Xa, Xb, ya, yb = _clf()
+    c = ml.MultiOutputClassifier(ml.DecisionTreeClassifier(max_depth=6)).fit(Xa, np.stack([ya, ya % 2], 1))
+    Pc = np.asarray(c.predict(Xb))
+    assert Pc.shape == (len(Xb), 2) and accuracy_score(yb, Pc[:, 0]) > 0.5
+
+
+def test_onevsrest():
+    from sklearn.multiclass import OneVsRestClassifier
+    from sklearn.tree import DecisionTreeClassifier
+    Xa, Xb, ya, yb = _clf()
+    ours = ml.OneVsRestClassifier(ml.DecisionTreeClassifier(max_depth=6)).fit(Xa, ya)
+    ref = OneVsRestClassifier(DecisionTreeClassifier(max_depth=6, random_state=0)).fit(Xa, ya)
+    a, r = accuracy_score(yb, np.asarray(ours.predict(Xb))), accuracy_score(yb, ref.predict(Xb))
+    assert a >= r - 0.05, (a, r)
+    np.testing.assert_allclose(np.asarray(ours.predict_proba(Xb)).sum(1), 1.0, rtol=1e-9)
+
+
+def test_calibration():
+    from sklearn.calibration import CalibratedClassifierCV, _sigmoid_calibration
+    from sklearn.isotonic import IsotonicRegression
+    from sklearn.metrics import log_loss
+    from sklearn.tree import DecisionTreeClassifier
+    rs = np.random.RandomState(0)
+    f = rs.normal(size=400)
+    y = (f + rs.normal(size=400) > 0).astype(np.int32)
+    b = ml.CalibratedClassifierCV()._bind()
+    ab = np.zeros(2)
+    b.x_trees_platt_fit(f.ctypes.data, y.ctypes.data, ab.ctypes.data, [400])
+    a_ref, b_ref = _sigmoid_calibration(f, y)
+    np.testing.assert_allclose(ab, [a_ref, b_ref], rtol=1e-3, atol=1e-4)
+    kx, ky = np.zeros(400), np.zeros(400)
+    y64 = y.astype(np.float64)
+    m = int(b.x_trees_isotonic_fit(f.ctypes.data, y64.ctypes.data, kx.ctypes.data, ky.ctypes.data, [400]))
+    t = np.linspace(-4, 4, 97)
+    out = np.zeros(97)
+    b.x_trees_isotonic_predict(kx.ctypes.data, ky.ctypes.data, t.ctypes.data, out.ctypes.data, [m, 97])
+    ref = IsotonicRegression(out_of_bounds="clip").fit(f, y64).predict(t)
+    np.testing.assert_allclose(out, ref, atol=1e-12)
+    Xa, Xb, ya, yb = _clf()
+    for method in ("sigmoid", "isotonic"):
+        ours = ml.CalibratedClassifierCV(ml.DecisionTreeClassifier(max_depth=6), method=method).fit(Xa, ya)
+        ref = CalibratedClassifierCV(DecisionTreeClassifier(max_depth=6, random_state=0), method=method).fit(Xa, ya)
+        lo, lr = log_loss(yb, np.asarray(ours.predict_proba(Xb))), log_loss(yb, ref.predict_proba(Xb))
+        assert lo <= lr * 1.15 + 0.02, (method, lo, lr)
+
+
+def test_tree_explainer_matches_shap_recursion():
+    shap = pytest.importorskip("shap")
+    Xa, Xb, ya, yb = _clf()
+    m = ml.RandomForestClassifier(n_estimators=5, max_depth=5, random_state=0).fit(Xa, ya)
+    ex = ml.TreeExplainer(m, data=Xa)   # every leaf holds a training row, so every node is covered
+    phi = np.asarray(ex.shap_values(Xb[:40]))
+    # additivity: sum of values + expected value == the forest's probability
+    np.testing.assert_allclose(phi.sum(1) + np.asarray(ex.expected_value), np.asarray(m.predict_proba(Xb[:40])),
+                               atol=1e-5)
+    # the same recursion in the shap package, on our trees and our cover
+    # (ours is float32 per-leaf paths; theirs float64 recursion)
+    off, col, q, left, leaves = (np.asarray(a) for a in ex._forest)
+    k = ex.n_outputs_
+    tscale = np.asarray(ex._tscale).astype(np.float64)
+    cover = np.asarray(ex._cover).astype(np.float64)
+    trees = []
+    for t in range(len(off) - 1):
+        lo, hi = off[t], off[t + 1]
+        lc = left[lo:hi].astype(np.int64)
+        trees.append(dict(children_left=lc, children_right=np.where(lc == -1, -1, lc + 1),
+                          children_default=lc, features=np.where(lc == -1, -2, col[lo:hi]).astype(np.int64),
+                          thresholds=q[lo:hi].astype(np.float64),
+                          values=leaves[lo * k:hi * k].reshape(hi - lo, k).astype(np.float64) * tscale[t],
+                          node_sample_weight=cover[lo:hi]))
+    ref = shap.TreeExplainer(dict(trees=trees, base_offset=0), feature_perturbation="tree_path_dependent")
+    rv = np.asarray(ref.shap_values(Xb[:40].astype(np.float64), check_additivity=False))
+    if rv.shape != phi.shape:
+        rv = np.moveaxis(rv, 0, -1)
+    np.testing.assert_allclose(phi, rv, rtol=1e-4, atol=1e-5)
+    Xr, Xrb, yra, yrb = _reg()
+    d = ml.DARTRegressor(n_estimators=20, random_state=0).fit(Xr, yra)
+    e = ml.TreeExplainer(d, data=Xr[:200])
+    p = np.asarray(e.shap_values(Xrb[:30]))
+    np.testing.assert_allclose(p.sum(1) + e.expected_value, np.asarray(d.predict(Xrb[:30])), rtol=1e-5, atol=1e-3)
+
+
+def test_kernel_explainer():
+    shap = pytest.importorskip("shap")
+    Xa, Xb, ya, yb = _reg()
+    Xa, Xb = Xa[:, :6].copy(), Xb[:, :6].copy()
+    m = ml.DecisionTreeRegressor(max_depth=5).fit(Xa, ya)
+    bg = Xa[:20]
+    ke = ml.KernelExplainer(m, bg)
+    phi = np.asarray(ke.shap_values(Xb[:5]))
+    f = lambda X: np.asarray(m.predict(np.asarray(X, dtype=np.float32)), dtype=np.float64)  # noqa: E731
+    ref = shap.KernelExplainer(f, bg.astype(np.float64)).shap_values(Xb[:5].astype(np.float64), silent=True)
+    np.testing.assert_allclose(phi, np.asarray(ref), rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(phi.sum(1) + ke.expected_value, f(Xb[:5]), rtol=1e-6, atol=1e-5)
+    Xc, Xcb, yc, ycb = _clf()
+    c = ml.RandomForestClassifier(n_estimators=4, max_depth=4, random_state=0).fit(Xc[:, :5], yc)
+    kc = ml.KernelExplainer(c, Xc[:15, :5])
+    pc = np.asarray(kc.shap_values(Xcb[:3, :5]))
+    assert pc.shape == (3, 5, 3)
+    np.testing.assert_allclose(pc.sum(1) + np.asarray(kc.expected_value), np.asarray(c.predict_proba(Xcb[:3, :5])),
+                               atol=1e-5)
+
+
+def test_permutation_explainer():
+    Xa, Xb, ya, yb = _reg()
+    Xa, Xb = Xa[:, :6].copy(), Xb[:, :6].copy()
+    m = ml.DecisionTreeRegressor(max_depth=5).fit(Xa, ya)
+    bg = Xa[:20]
+    f = lambda X: np.asarray(m.predict(np.asarray(X, dtype=np.float32)), dtype=np.float64)  # noqa: E731
+    exact = np.asarray(ml.KernelExplainer(m, bg).shap_values(Xb[:5]))   # full enumeration: exact SHAP
+    pe = ml.PermutationExplainer(m, bg, random_state=0)
+    pp = np.asarray(pe.shap_values(Xb[:5], npermutations=300))
+    np.testing.assert_allclose(pp.sum(1) + pe.expected_value, f(Xb[:5]), rtol=1e-6, atol=1e-5)
+    assert np.abs(pp - exact).max() <= 0.15 * np.abs(exact).max() + 1e-6
+
+
+def test_kernel_explainer_logit():
+    shap = pytest.importorskip("shap")
+    Xa, Xb, ya, yb = _clf(n_classes=2)
+    Xa, Xb = Xa[:, :6].copy(), Xb[:, :6].copy()
+    m = ml.DARTClassifier(n_estimators=20, random_state=0).fit(Xa, ya)
+    bg = Xa[:20]
+    ke = ml.KernelExplainer(m, bg, link="logit")
+    phi = np.asarray(ke.shap_values(Xb[:4]))
+    f = lambda X: np.asarray(m.predict_proba(np.asarray(X, dtype=np.float32)), dtype=np.float64)  # noqa: E731
+    ref = shap.KernelExplainer(f, bg.astype(np.float64), link="logit").shap_values(Xb[:4].astype(np.float64),
+                                                                                    silent=True)
+    ref = np.asarray(ref)
+    if ref.ndim == 3 and ref.shape[0] == 2:
+        ref = np.moveaxis(ref, 0, -1)
+    np.testing.assert_allclose(phi, ref, rtol=1e-6, atol=1e-6)
+    p = f(Xb[:4])
+    np.testing.assert_allclose(phi.sum(1) + np.asarray(ke.expected_value), np.log(p / (1 - p)), atol=1e-5)
+
+
+def test_bagging_oob_score():
+    from sklearn.ensemble import BaggingClassifier, BaggingRegressor
+    from sklearn.tree import DecisionTreeClassifier, DecisionTreeRegressor
+    Xa, Xb, ya, yb = _clf()
+    ours = ml.BaggingClassifier(ml.DecisionTreeClassifier(max_depth=8), n_estimators=20, oob_score=True,
+                                random_state=0).fit(Xa, ya)
+    ref = BaggingClassifier(DecisionTreeClassifier(max_depth=8), n_estimators=20, oob_score=True,
+                            random_state=0).fit(Xa, ya)
+    assert abs(ours.oob_score_ - ref.oob_score_) < 0.05, (ours.oob_score_, ref.oob_score_)
+    assert np.allclose(np.asarray(ours.oob_decision_function_).sum(1), 1.0)
+    Xa, Xb, ya, yb = _reg()
+    ours = ml.BaggingRegressor(ml.DecisionTreeRegressor(max_depth=8), n_estimators=20, oob_score=True,
+                               random_state=0).fit(Xa, ya)
+    ref = BaggingRegressor(DecisionTreeRegressor(max_depth=8), n_estimators=20, oob_score=True,
+                           random_state=0).fit(Xa, ya)
+    assert abs(ours.oob_score_ - ref.oob_score_) < 0.06, (ours.oob_score_, ref.oob_score_)
+    with pytest.raises(ValueError):
+        ml.BaggingRegressor(oob_score=True, bootstrap=False).fit(Xa, ya)
+
+
+def test_cv_splitter_objects():
+    from sklearn.model_selection import KFold, StratifiedKFold
+    Xa, Xb, ya, yb = _clf()
+    est = [("dt", ml.DecisionTreeClassifier(max_depth=4))]
+    a = ml.StackingClassifier(est, final_estimator=ml.DecisionTreeClassifier(max_depth=3), cv=3).fit(Xa, ya)
+    b = ml.StackingClassifier(est, final_estimator=ml.DecisionTreeClassifier(max_depth=3),
+                              cv=StratifiedKFold(3)).fit(Xa, ya)
+    np.testing.assert_array_equal(np.asarray(a.transform(Xb)), np.asarray(b.transform(Xb)))
+    pairs = list(KFold(4, shuffle=True, random_state=0).split(Xa))
+    c = ml.CalibratedClassifierCV(ml.DecisionTreeClassifier(max_depth=4), cv=pairs).fit(Xa, ya)
+    assert len(c.calibrated_classifiers_) == 4
+    d = ml.CalibratedClassifierCV(ml.DecisionTreeClassifier(max_depth=4), cv=KFold(3, shuffle=True, random_state=1),
+                                  method="isotonic", ensemble=False).fit(Xa, ya)
+    assert accuracy_score(yb, np.asarray(d.predict(Xb))) > 0.5
+
+
+def test_extratrees_deviance_criteria():
+    from sklearn.ensemble import ExtraTreesRegressor
+    Xa, Xb, ya, yb = _reg()
+    ya, yb = np.exp(ya / np.std(ya)).astype(np.float32), np.exp(yb / np.std(ya)).astype(np.float32)
+    ours = ml.ExtraTreesRegressor(n_estimators=40, max_depth=10, criterion="poisson", random_state=0).fit(Xa, ya)
+    ref = ExtraTreesRegressor(n_estimators=40, max_depth=10, criterion="poisson", random_state=0).fit(Xa, ya)
+    a, r = r2_score(yb, np.asarray(ours.predict(Xb))), r2_score(yb, ref.predict(Xb))
+    assert a >= r - 0.08, (a, r)
+    for crit in ("gamma", "inverse_gaussian"):
+        m = ml.ExtraTreesRegressor(n_estimators=40, max_depth=10, criterion=crit, random_state=0).fit(Xa, ya)
+        assert r2_score(yb, np.asarray(m.predict(Xb))) >= r - 0.15, crit
+    with pytest.raises(ValueError):
+        ml.ExtraTreesRegressor(criterion="gamma").fit(Xa, ya - 10.0)

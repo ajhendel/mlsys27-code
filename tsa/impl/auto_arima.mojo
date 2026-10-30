@@ -1,0 +1,95 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 the authors. Part of anonlib, DOI-WITHHELD
+"""Choosing the differencing order `d` with the stationarity test.
+
+Reference: the "Choose the hyper-parameter d" block of
+`python/cuml/cuml/tsa/auto_arima.pyx::AutoARIMA.search` (cuML 265b9da6,
+v26.08.00), lines 318-343 ONLY. That block is HOST Python over the device
+`kpss_test`:
+
+    for d_ in d_options[:-1]:                 # d_options = 0 .. 2 - D
+        mask = kpss_test(data_temp, d_, D_, s) # stationary after d_ diffs?
+        out0, index0, out1, index1 = _divide_by_mask(data_temp, mask, id_temp)
+        if out1 is not None: data_dD[(d_, D_)] = (out1, index1)   # decided
+        if out0 is not None: (data_temp, id_temp) = (out0, index0) # continue
+        else: break
+    else:
+        data_dD[(d_options[-1], D_)] = (data_temp, id_temp)        # the rest
+
+`_divide_by_mask` (`auto_arima.pyx:552`, a `divide_by_mask` kernel in
+`cpp/src/tsa/auto_arima.cu`) physically splits the batch so the next test
+runs on the sub-batch of undecided series. OURS runs every round on the
+FULL batch and masks on the host, which is the same answer because the
+test is per series and its result is a pure function of the series bits --
+the property `check_kpss_batch_composition_invariant` gates (two batch
+compositions, same cell, same bytes). The splitting kernels
+(`divide_by_mask`, `divide_by_min`, `build_division_map`, `merge_series`)
+belong to auto_arima's p/q/P/Q search and are listed in `NOT_IMPLEMENTED.tsv`.
+
+NOT IMPLEMENTED, REFUSED BY NAME: the choice of `D` (`seasonal_test="seas"`
+calls statsmodels' STL on the HOST, `seasonality.py:37-67`); `D` must be
+given. The rest of `search` (the IC-driven p/q/P/Q/k grid over `ARIMA`
+fits) is auto_arima's rung 4 and is not reached.
+"""
+
+from max.gpu.host import DeviceBuffer, DeviceContext
+
+from tsa.impl.stationarity import kpss_test
+from tsa.impl.timeSeries.stationarity import download_results
+from tsa.impl.select_d_fast import SELECT_D_FAST, SELECT_D_IDN, select_d_fast
+
+
+def select_d(
+    ctx: DeviceContext,
+    mut d_y: DeviceBuffer[DType.float32],
+    batch_size: Int,
+    n_obs: Int,
+    D: Int,
+    s: Int,
+    d_max: Int = 2,
+    pval_threshold: Float32 = 0.05,
+) raises -> List[Int32]:
+    """`d` per series in `0 .. d_max` (their `d_options = range(0, 2 - D + 1)`
+    when the user passes a range; `d_max = 2 - D` is their default)."""
+    if d_max < 0 or d_max + D > 2:
+        raise Error(
+            "select_d: d_max must satisfy 0 <= d_max <= 2 - D (d_max="
+            + String(d_max) + ", D=" + String(D) + "), refused by name"
+        )
+    comptime if SELECT_D_FAST:
+        # FAST on Apple (lane/apple-fast-select, default; -D ANONLIB_SELECT_D_OFF off): every round on the
+        # device, one download (tsa/impl/select_d_fast.mojo)
+        return select_d_fast(ctx, d_y, batch_size, n_obs, D, s, d_max, pval_threshold)
+    comptime if SELECT_D_IDN:
+        # IDENTICAL on every vendor (lane/fam-timeseries; -D
+        # ANONLIB_IDN_SELECT_D_OFF off): the same device rounds, one
+        # download. A refusal (shape or non-finite input) is not reported
+        # from there: the loop below raises it by its own name and index.
+        # A differencing refusal (D > 0 with s < 2) is left to the loop
+        # outright, so nothing is queued before it is raised.
+        if D == 0 or s >= 2:
+            var device_ok = True
+            var device_d = List[Int32]()
+            try:
+                device_d = select_d_fast(ctx, d_y, batch_size, n_obs, D, s, d_max, pval_threshold)
+            except e:
+                device_ok = False
+            if device_ok:
+                return device_d^
+    var chosen = List[Int32]()
+    var decided = List[Bool]()
+    for _ in range(batch_size):
+        chosen.append(Int32(d_max))
+        decided.append(False)
+    var remaining = batch_size
+    for d_ in range(d_max):
+        if remaining == 0:
+            break
+        var res = kpss_test(ctx, d_y, batch_size, n_obs, d_, D, s, pval_threshold)
+        var rs = download_results(ctx, res, batch_size)
+        for b in range(batch_size):
+            if not decided[b] and rs[0][b]:
+                chosen[b] = Int32(d_)
+                decided[b] = True
+                remaining -= 1
+    return chosen^

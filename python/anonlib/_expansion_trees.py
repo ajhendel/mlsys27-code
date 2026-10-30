@@ -1,0 +1,5317 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 the authors. Part of anonlib, DOI-WITHHELD
+"""THE TREES LANE'S PUBLIC DOOR.
+
+Owned by the `trees` expansion lane. `anonlib/__init__.py` imports this
+module and makes every name in `__all__` public as `anonlib.<name>`; a name
+that is already public is refused at import. Put the classes here, or import
+them here from the lane's own modules. Two optional hooks route a SAVED model
+to the CPU (`anonlib.host_model`); `_classical_host.py` merges them when it is
+first imported, after the package, so both may rely on every module existing:
+
+  CLASSICAL_HOST_BASENAMES     {"<the lane's GPU binding>": "<its host binding>"}
+  def classical_host_formats() -> {"anonlib-<format>-1": {"Estimator": HostEstimator}}
+                               import `_classical_host` INSIDE it and subclass
+                               its `_HostBound`; never import it at module level
+
+PASS 1 (2026-09-27): every class here fits its trees through the EXISTING
+forest entry points (the rf and gbdt bindings), which carry the
+identical contract on the GPU and on their CPU host bindings. The numeric glue
+between fits (votes, weights, drops, calibration) runs in `xtrees/ops.mojo`
+(rows 160-169); Python keeps only O(estimators) scalars in fixed order.
+KernelExplainer's coalition schedule, Bagging's oob R^2 and AdaBoost's
+sample_weight normalization are Mojo (lane cgr4-py-compute).
+CalibratedClassifierCV's per-class epilogue moved to xtrees on lane
+py-misc-prep (strided platt/isotonic apply, `complement_pairs`, native class
+columns and 0/1 targets; its Python reference arm is deleted).
+"""
+import numbers
+import os
+import weakref
+
+from . import _portable_math as math
+from . import _anonlib_rf, _anonlib_x_trees  # noqa: F401  the bindings this door resolves; name NO other (lane_select counts > 3 as a registry)
+from ._array import Array
+from ._buffer import _materialize, addr, addr_ro, all_finite, as_f32_c, as_f32_colmajor, as_f64_c, as_i32_c, empty, frombytes, full, zeros
+from ._buffer import _has_buffer, memory_at
+from ._labels import decode_labels, encode_labels, is_bool
+from ._mode import NumericModeMixin, available_if
+from ._sample_weight import ZERO_WEIGHTS_MSG, check_sample_weight
+from ._class_weights import _trees_x_bind  # noqa: F401  re-exported: callers import it from this door
+from ._mode import ClassifierScoreMixin, RegressorScoreMixin
+from ._forest_protocol import (forest_estimator, _forest_fit_arrays, _forest_fit_function,
+                               forest_data_session_choice, open_forest_data_session)
+from .extratrees import ExtraTreesRegressor, ExtraTreesClassifier as _ET_CLS
+from .randomforest import (
+    RandomForestClassifier, RandomForestRegressor, _class_weight_rows, _refuse,
+)
+
+__all__ = [
+    "DecisionTreeClassifier",
+    "DecisionTreeRegressor",
+    "BaggingClassifier",
+    "BaggingRegressor",
+    "AdaBoostClassifier",
+    "AdaBoostRegressor",
+    "DARTRegressor",
+    "DARTClassifier",
+    "RandomTreesEmbedding",
+    "VotingClassifier",
+    "VotingRegressor",
+    "StackingClassifier",
+    "StackingRegressor",
+    "MultiOutputClassifier",
+    "MultiOutputRegressor",
+    "OneVsRestClassifier",
+    "CalibratedClassifierCV",
+    "TreeExplainer",
+    "KernelExplainer",
+    "PermutationExplainer",
+]
+
+
+# ----------------------------------------------------------------- helpers
+def _trees_f32_weights(values, n, name, est=None):
+    """`values` (buffer or sequence) as a float32 Array of n entries,
+    refusing non-finite and negative entries and an all-zero vector (a
+    sample weight). One native pass (`x_trees_check_weights_f32`); the
+    refusals and their wording are the per-element Python loop's."""
+    if name == "sample_weight":
+        # scikit-learn's _check_sample_weight, its wording (sk-edges)
+        return check_sample_weight(values, n)
+    arr, _ = as_f32_c(values, ndim=1, name=name)
+    if len(arr) != n:
+        raise ValueError(f"{name}.shape == ({len(arr)},), expected ({n},)!")
+    status = int(_trees_x_bind(est).x_trees_check_weights_f32(addr_ro(arr, name=name), [n]))
+    if status == 1:
+        raise ValueError(f"{name} must be finite and nonnegative")
+    if status == 2:
+        raise ValueError(f"{name}: weights must contain at least one non-zero number")
+    return arr
+
+
+def _trees_colmajor(X, est):
+    """X as a column-major float32 Array: a float32 F-order input is borrowed
+    as is (no copy); anything else goes through the lane's own threaded
+    transpose, so the weighted fit (which takes the column-major layout)
+    needs no base binding helper on a CPU-only install."""
+    Xm, _ = _materialize(X, "X")
+    if Xm.ndim == 2 and Xm.dtype == "<f4" and Xm.order == "F" and not Xm._both_orders():
+        return as_f32_colmajor(Xm, name="X")[0]
+    Xa, _ = as_f32_c(Xm, ndim=2, name="X")
+    n, d = Xa.shape
+    out = empty((d, n), "<f4")
+    _trees_x_bind(est).x_trees_transpose_f32(addr_ro(Xa, name="X"), addr(out, name="X^T"), [n, d])
+    return Array._view_of(out, (n, d), order="F")
+
+
+def _trees_weighted_rows(sample_weight, class_weight, classes, codes, est=None):
+    """Per-row float32 weights: sample_weight times the class_weight row
+    weight. Each product of two float32 values is exact in binary64, so the
+    one rounding to float32 is the correctly rounded float32 product on every
+    host (`x_trees_mul_f32`)."""
+    n = len(codes)
+    sw = _trees_f32_weights(sample_weight, n, "sample_weight", est)
+    if class_weight is None:
+        return sw
+    codes32 = codes if isinstance(codes, Array) and codes.dtype == "<i4" else as_i32_c(codes, ndim=1, name="codes")[0]
+    rows = _class_weight_rows(class_weight, classes, codes32, _trees_x_bind(est))
+    if rows is None:
+        # every class weight is 1 (a dict of ones, or 'balanced' on balanced
+        # labels): the rows are the sample weights unchanged
+        return sw
+    cw, _ = as_f32_c(rows, ndim=1, name="class_weight rows")
+    out = empty((n,), "<f4")
+    _trees_x_bind(est).x_trees_mul_f32(addr_ro(sw, name="sample_weight"), addr_ro(cw, name="class_weight"),
+                                       addr(out, name="weights"), [n])
+    return out
+
+
+def _trees_fsum_f32(b, arr):
+    """`math.fsum(arr.tolist())` of a float32 Array, bit for bit: the sum AND
+    its one rounding in the binding (x_trees_exact_sum, on the device in a
+    GPU build). A NaN or an infinity is refused (scikit-learn refuses a
+    non-finite y; lane pyglue-numeric deleted the Python fsum route)."""
+    arr, _ = as_f32_c(arr, ndim=1, name="y")
+    out, flags = empty((1,), "<f8"), empty((8,), "<i4")
+    b.x_trees_exact_sum(addr_ro(arr, name="y"), addr(out, name="sum"), addr(flags, name="flags"), [arr.size, 0])
+    if flags[0] or flags[1] or flags[2]:
+        raise ValueError("Input y contains NaN or infinity.")
+    return out[0]
+
+
+# ----------------------------------------------------------- decision trees
+# Reference: scikit-learn `sklearn/tree/_classes.py` (DecisionTreeClassifier
+# :716, DecisionTreeRegressor :1100, BaseDecisionTree.fit :230). The learner
+# is the RF builder (`ensemble/`, cuML's batched level algorithm) run as ONE
+# tree, no bootstrap, every feature: sklearn's CART, with two differences said
+# out loud: splits are searched over `n_bins` per-feature quantiles (cuML's
+# rule, default 128), not every midpoint; and `splitter='random'` and
+# `max_leaf_nodes` (best-first growth) are refused by name.
+_DT_DEPTH = None
+
+
+def _dt_common(splitter, max_features, max_leaf_nodes):
+    """The random splitter is ExtraTrees' builder (Geurts: one random
+    threshold per candidate feature), fitted as ONE tree without bootstrap;
+    best-first growth (`max_leaf_nodes`) exists on that builder only."""
+    if splitter not in ("best", "random"):
+        raise ValueError(f"splitter must be 'best' or 'random', got {splitter!r}")
+    if splitter == "best" and max_leaf_nodes is not None:
+        _refuse("max_leaf_nodes with splitter='best'", "best-first growth exists on the random"
+                " splitter's builder (extratrees/, DEVIATIONS 466-469); pass splitter='random'.")
+    return None if splitter == "random" else max_leaf_nodes
+
+
+def _dt_random_fit(est, cls, X, y, fit_params=None, **extra):
+    """splitter='random': one ExtraTrees tree; its flat arrays become this
+    estimator's, and predict delegates to it. `fit_params` (the classifier's
+    sample_weight) go to the inner fit; `min_weight_fraction_leaf` to its
+    constructor."""
+    inner = cls(n_estimators=1, bootstrap=False, max_features=1.0 if est.max_features is None else est.max_features,
+                max_depth=est.max_depth, min_samples_split=est.min_samples_split,
+                min_samples_leaf=est.min_samples_leaf, max_leaf_nodes=est.max_leaf_nodes,
+                min_impurity_decrease=est.min_impurity_decrease, criterion=est.criterion,
+                min_weight_fraction_leaf=est.min_weight_fraction_leaf,
+                random_state=0 if est.random_state is None else est.random_state,
+                numeric_mode=est.numeric_mode, **extra).fit(X, y, **(fit_params or {}))
+    est._random_inner = inner
+    for name in ("_offsets", "_colid", "_quesval", "_left_child", "_leaves", "_n_trees", "_num_outputs",  # glue: copies a handful of fitted attributes
+                 "n_features_in_"):
+        setattr(est, name, getattr(inner, name))
+    if hasattr(inner, "classes_"):
+        est.classes_ = inner.classes_
+        est.n_classes_ = len(inner.classes_)
+    return est
+
+
+# sample_weight goes through the weighted RF fit entry (the weighted
+# objective; its CPU restatement is ensemble/host/rf_oracle.mojo).
+@forest_estimator("classifier")
+class DecisionTreeClassifier(RandomForestClassifier):
+    """A single classification tree (CART).
+
+    Follows scikit-learn's ``DecisionTreeClassifier``: one tree grown on every
+    row (no bootstrap) and, by default, every feature. Split thresholds are
+    searched over ``n_bins`` per-feature quantile bins (cuML's rule) rather
+    than every midpoint, so thresholds can differ from scikit-learn's.
+    ``X`` is read as float32; NaN or infinity in ``X`` raises ``ValueError``.
+
+    Parameters
+    ----------
+    criterion : {"gini", "entropy", "log_loss"}, default="gini"
+        Split quality measure. ``"log_loss"`` is the same as ``"entropy"``.
+    splitter : {"best", "random"}, default="best"
+        ``"best"`` searches the quantile bins of every candidate feature.
+        ``"random"`` grows one extremely randomized tree (one random threshold
+        per candidate feature), the builder of ``ExtraTreesClassifier``.
+    max_depth : int or None, default=None
+        Maximum depth of the tree. None grows until the other stopping rules
+        apply.
+    min_samples_split : int, default=2
+        Minimum number of rows a node needs before it can be split.
+    min_samples_leaf : int, default=1
+        Minimum number of rows in each leaf.
+    min_weight_fraction_leaf : float, default=0.0
+        Minimum fraction of the total sample weight (of all rows when no
+        ``sample_weight`` is given) required in each leaf, in [0.0, 0.5].
+    max_features : int, float, {"sqrt", "log2"} or None, default=None
+        Number of features considered per split: an int count, a fraction in
+        (0, 1], ``"sqrt"``, ``"log2"``, or None for every feature.
+    random_state : int or None, default=None
+        Seed for the random draws. None means seed 0, so repeated fits give
+        the same tree (unlike scikit-learn, where None draws a fresh seed).
+    max_leaf_nodes : int or None, default=None
+        Grow best-first to at most this many leaves. Supported only with
+        ``splitter="random"``; with ``splitter="best"`` it raises
+        ``NotImplementedError``.
+    min_impurity_decrease : float, default=0.0
+        A node is split only if the split decreases impurity by at least this
+        much.
+    class_weight : dict, "balanced" or None, default=None
+        Per-class weights, multiplied into ``sample_weight``.
+        ``"balanced_subsample"`` is not supported.
+    ccp_alpha : float, default=0.0
+        Only 0.0 is accepted; cost-complexity pruning is not implemented and
+        any other value raises ``NotImplementedError``.
+    monotonic_cst : None, default=None
+        Only None is accepted; monotonic constraints raise
+        ``NotImplementedError``.
+    n_bins : int, default=128
+        Number of quantile bins per feature used for the split search.
+    device : {"gpu"}, default="gpu"
+        Only ``"gpu"`` is accepted. On a CPU-only install the same fit runs
+        on the host binding.
+    inference_engine : {"auto", "sequential", "parallel_groves"}, default="auto"
+        Prediction kernel. ``"auto"`` lets the library choose; in identical
+        mode it predicts as ``"sequential"``.
+    numeric_mode : {"identical", "fast"} or None, default=None
+        Numeric mode for this estimator. None uses the process default (see
+        ``anonlib.set_numeric_mode``). ``"fast"`` applies on Apple GPUs
+        only.
+
+    Attributes
+    ----------
+    classes_ : array of shape (n_classes,)
+        Class labels seen in ``fit``.
+    n_classes_ : int
+        Number of classes.
+    n_features_in_ : int
+        Number of features seen in ``fit``.
+
+    Examples
+    --------
+    >>> import numpy as np, anonlib
+    >>> rng = np.random.default_rng(0)
+    >>> X = rng.random((1000, 8), dtype=np.float32)
+    >>> y = (X[:, 0] > 0.5).astype(np.int32)
+    >>> model = anonlib.DecisionTreeClassifier(max_depth=4).fit(X, y)
+    >>> proba = model.predict_proba(X)
+    """
+
+    def __init__(
+        self,
+        *,
+        criterion="gini",
+        splitter="best",
+        max_depth=None,
+        min_samples_split=2,
+        min_samples_leaf=1,
+        min_weight_fraction_leaf=0.0,
+        max_features=None,
+        random_state=None,
+        max_leaf_nodes=None,
+        min_impurity_decrease=0.0,
+        class_weight=None,
+        ccp_alpha=0.0,
+        monotonic_cst=None,
+        n_bins=128,
+        device="gpu",
+        inference_engine="auto",
+    ):
+        rf_leaves = _dt_common(splitter, max_features, max_leaf_nodes)
+        super().__init__(
+            n_estimators=1, criterion=criterion, max_depth=max_depth,
+            min_samples_split=min_samples_split, min_samples_leaf=min_samples_leaf,
+            min_weight_fraction_leaf=min_weight_fraction_leaf, max_features=max_features,
+            max_leaf_nodes=rf_leaves, min_impurity_decrease=min_impurity_decrease,
+            bootstrap=False, random_state=random_state, class_weight=class_weight,
+            ccp_alpha=ccp_alpha, monotonic_cst=monotonic_cst, n_bins=n_bins,
+            n_streams=1, device=device, inference_engine=inference_engine,
+        )
+        self.splitter = splitter
+
+    def fit(self, X, y, sample_weight=None):
+        """Fit the tree.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+            Training data, read as float32.
+        y : array-like of shape (n_samples,)
+            Class labels; at least two classes are required.
+        sample_weight : array-like of shape (n_samples,), default=None
+            Per-row weights, multiplied into the ``class_weight`` row weights.
+
+        Returns
+        -------
+        self
+        """
+        if self.splitter == "random":
+            # lane sk-kernels: the ExtraTrees builder's weighted classifier
+            self._refresh_config()
+            fit_params = {} if sample_weight is None else {"sample_weight": sample_weight}
+            return _dt_random_fit(self, _ET_CLS, X, y, fit_params, class_weight=self.class_weight)
+        if sample_weight is None:
+            return self._fit_with_tree_start(X, y)
+        return self._fit_weighted(_trees_colmajor(X, self), y, sample_weight)
+
+    def _fit_weighted(self, Xcm, y, sample_weight, x_finite=False, encoded=None, session=None):
+        """The weighted fit on a column-major float32 X. AdaBoost calls it
+        with ONE transposed, once-checked X for all of its members
+        (`x_finite=True` skips the per-member finite scan of the same
+        bytes) and, trees-apple2, ONE `encode_labels(y)` of the same codes
+        (`encoded`, the pair this call would compute); every input the fit
+        entry sees is what `fit` hands it. trees-apple3: `session` is a
+        `ForestDataSession` that already holds this X on the device, so the
+        member stages only its labels and weights."""
+        self._refresh_config()
+        self._capture_fit_mode()
+        self.classes_, y32 = encoded if encoded is not None else encode_labels(y)
+        self.n_classes_ = int(len(self.classes_))
+        if self.n_classes_ < 2:
+            raise ValueError("y has fewer than 2 classes")
+        weights = _trees_weighted_rows(sample_weight, self.class_weight, self.classes_, y32, self)
+        binding = self._bind("_anonlib_rf")
+        if session is not None:
+            if tuple(session.shape) != tuple(Xcm.shape):
+                raise ValueError("the forest data session holds another X")
+
+            def session_fit(x_addr, y_addr, params, criterion):
+                return session.fit_classifier_weighted(y32, params, criterion, weights)
+            return self._fit_colmajor_checked(Xcm, y32, session_fit)
+        weighted_fit = _forest_fit_function(binding, "rf_classifier_fit_weighted")
+
+        def fit_fn(x_addr, y_addr, params, criterion):
+            return weighted_fit(x_addr, y_addr, params, criterion, addr_ro(weights, name="weights"))
+        if x_finite:
+            return self._fit_colmajor_checked(Xcm, y32, fit_fn)
+        return self._fit_arrays(Xcm, y32, self.n_classes_, fit_fn)
+
+    def _fit_colmajor_checked(self, Xcm, y32, fit_fn):
+        """`RandomForestClassifier._fit_arrays` on a column-major float32 X
+        whose finite scan the caller already ran on these exact bytes: the
+        same parameters, the same entry, the same unpacking, minus that one
+        scan."""
+        n_rows, n_features = Xcm.shape
+        if len(y32) != n_rows:
+            raise ValueError(f"y has {len(y32)} rows, X has {n_rows}")
+        params = self._fit_params(n_rows, n_features, self.n_classes_)
+        out = fit_fn(addr_ro(Xcm, name="X"), addr_ro(y32, name="y"), params, self._cfg["criterion"])
+        (self._offsets, self._colid, self._quesval, self._left_child,
+         self._leaves, meta) = _forest_fit_arrays(out)
+        self.n_features_in_ = int(n_features)
+        self._n_trees = int(meta[0])
+        self._num_outputs = int(meta[1])
+        return self
+
+    def get_depth(self):
+        """Return the depth of the fitted tree."""
+        return _trees_depth(self)
+
+    def get_n_leaves(self):
+        """Return the number of leaves of the fitted tree."""
+        return _trees_n_leaves(self)
+
+    def predict_proba(self, X):
+        """Class probabilities: the class distribution of each row's leaf.
+
+        Returns an array of shape (n_samples, n_classes), columns in the
+        order of ``classes_``.
+        """
+        inner = getattr(self, "_random_inner", None)
+        return inner.predict_proba(X) if inner is not None else super().predict_proba(X)
+
+    def predict(self, X):
+        """Predict the class label of each row of ``X``."""
+        inner = getattr(self, "_random_inner", None)
+        return inner.predict(X) if inner is not None else super().predict(X)
+
+    def save(self, path):
+        """Save the fitted tree to ``path``.
+
+        Raises ``NotImplementedError`` for a tree fitted with
+        ``splitter="random"``.
+        """
+        if getattr(self, "_random_inner", None) is not None:
+            raise NotImplementedError("a splitter='random' tree saves through ExtraTrees; not carried yet")
+        return super().save(path)
+
+
+def _dt_tier_bins(est):
+    """The quantile bin count a DecisionTreeRegressor fits with: its own
+    n_bins, or for n_bins=None its binding's `rf_dt_default_bins` (QUALITY
+    FIX, lane apple-fast-q-reg: 256 in a FAST build, 128 in IDENTICAL and
+    under `-D ANONLIB_DT_BINS_QOLD`; 128 for a binding without the export).
+    The audit numbers are at bindings/_anonlib_rf.mojo RF_DT_DEFAULT_BINS."""
+    if getattr(est, "n_bins", None) is not None:
+        return int(est.n_bins)
+    try:
+        query = getattr(est._bind("_anonlib_rf"), "rf_dt_default_bins", None)
+    except (AttributeError, ImportError):
+        return 128
+    return int(query()) if callable(query) else 128
+
+
+# sample_weight goes through the weighted regressor entry
+# (rf_regressor_fit_weighted). n_bins=None resolves at fit through `_dt_tier_bins`.
+@forest_estimator("regressor")
+class DecisionTreeRegressor(RandomForestRegressor):
+    """A single regression tree (CART).
+
+    Follows scikit-learn's ``DecisionTreeRegressor``: one tree grown on every
+    row (no bootstrap) and, by default, every feature. Split thresholds are
+    searched over per-feature quantile bins (cuML's rule) rather than every
+    midpoint, so thresholds can differ from scikit-learn's. ``X`` and ``y``
+    are read as float32.
+
+    Parameters
+    ----------
+    criterion : {"squared_error", "mse", "poisson", "gamma", "inverse_gaussian"}, default="squared_error"
+        Split quality measure. ``"mse"`` is the same as ``"squared_error"``.
+        ``"absolute_error"`` and ``"friedman_mse"`` raise
+        ``NotImplementedError``.
+    splitter : {"best", "random"}, default="best"
+        ``"best"`` searches the quantile bins of every candidate feature.
+        ``"random"`` grows one extremely randomized tree (one random threshold
+        per candidate feature), the builder of ``ExtraTreesRegressor``.
+    max_depth : int or None, default=None
+        Maximum depth of the tree. None grows until the other stopping rules
+        apply.
+    min_samples_split : int, default=2
+        Minimum number of rows a node needs before it can be split.
+    min_samples_leaf : int, default=1
+        Minimum number of rows in each leaf.
+    min_weight_fraction_leaf : float, default=0.0
+        Minimum fraction of the total sample weight (of all rows when no
+        ``sample_weight`` is given) required in each leaf, in [0.0, 0.5].
+    max_features : int, float, {"sqrt", "log2"} or None, default=None
+        Number of features considered per split: an int count, a fraction in
+        (0, 1], ``"sqrt"``, ``"log2"``, or None for every feature.
+    random_state : int or None, default=None
+        Seed for the random draws. None means seed 0, so repeated fits give
+        the same tree (unlike scikit-learn, where None draws a fresh seed).
+    max_leaf_nodes : int or None, default=None
+        Grow best-first to at most this many leaves. Supported only with
+        ``splitter="random"``; with ``splitter="best"`` it raises
+        ``NotImplementedError``.
+    min_impurity_decrease : float, default=0.0
+        A node is split only if the split decreases impurity by at least this
+        much.
+    ccp_alpha : float, default=0.0
+        Only 0.0 is accepted; cost-complexity pruning is not implemented and
+        any other value raises ``NotImplementedError``.
+    monotonic_cst : None, default=None
+        Only None is accepted; monotonic constraints raise
+        ``NotImplementedError``.
+    n_bins : int or None, default=None
+        Number of quantile bins per feature used for the split search. None
+        uses the numeric mode's default: 128, or 256 in fast mode.
+    device : {"gpu"}, default="gpu"
+        Only ``"gpu"`` is accepted. On a CPU-only install the same fit runs
+        on the host binding.
+    inference_engine : {"auto", "sequential", "parallel_groves"}, default="auto"
+        Prediction kernel. ``"auto"`` lets the library choose; in identical
+        mode it predicts as ``"sequential"``.
+    numeric_mode : {"identical", "fast"} or None, default=None
+        Numeric mode for this estimator. None uses the process default (see
+        ``anonlib.set_numeric_mode``). ``"fast"`` applies on Apple GPUs
+        only.
+
+    Attributes
+    ----------
+    n_features_in_ : int
+        Number of features seen in ``fit``.
+
+    Examples
+    --------
+    >>> import numpy as np, anonlib
+    >>> rng = np.random.default_rng(0)
+    >>> X = rng.random((1000, 8), dtype=np.float32)
+    >>> y = X @ rng.random(8, dtype=np.float32)
+    >>> model = anonlib.DecisionTreeRegressor(max_depth=6).fit(X, y)
+    >>> pred = model.predict(X)
+    """
+
+    def __init__(
+        self,
+        *,
+        criterion="squared_error",
+        splitter="best",
+        max_depth=None,
+        min_samples_split=2,
+        min_samples_leaf=1,
+        min_weight_fraction_leaf=0.0,
+        max_features=None,
+        random_state=None,
+        max_leaf_nodes=None,
+        min_impurity_decrease=0.0,
+        ccp_alpha=0.0,
+        monotonic_cst=None,
+        n_bins=None,
+        device="gpu",
+        inference_engine="auto",
+    ):
+        rf_leaves = _dt_common(splitter, max_features, max_leaf_nodes)
+        # n_bins=None: the tier's default, resolved at fit (`_dt_tier_bins`)
+        super().__init__(
+            n_estimators=1, criterion=criterion, max_depth=max_depth,
+            min_samples_split=min_samples_split, min_samples_leaf=min_samples_leaf,
+            min_weight_fraction_leaf=min_weight_fraction_leaf, max_features=max_features,
+            max_leaf_nodes=rf_leaves, min_impurity_decrease=min_impurity_decrease,
+            bootstrap=False, random_state=random_state, ccp_alpha=ccp_alpha,
+            monotonic_cst=monotonic_cst, n_bins=128 if n_bins is None else n_bins, n_streams=1,
+            device=device, inference_engine=inference_engine,
+        )
+        self.splitter = splitter
+
+    def _fit_params(self, n_rows, n_features, n_classes):
+        params = super()._fit_params(n_rows, n_features, n_classes)
+        params[7] = _dt_tier_bins(self)   # slot 7: max_n_bins
+        return params
+
+    def fit(self, X, y, sample_weight=None):
+        """Fit the tree.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+            Training data, read as float32.
+        y : array-like of shape (n_samples,)
+            Target values.
+        sample_weight : array-like of shape (n_samples,), default=None
+            Per-row weights.
+
+        Returns
+        -------
+        self
+        """
+        if self.splitter == "random":
+            # lane sk-final: the ExtraTrees builder's weighted regressor
+            self._refresh_config()
+            fit_params = {} if sample_weight is None else {"sample_weight": sample_weight}
+            return _dt_random_fit(self, ExtraTreesRegressor, X, y, fit_params)
+        return self._fit_with_tree_start(X, y, sample_weight=sample_weight)
+
+    def get_depth(self):
+        """Return the depth of the fitted tree."""
+        return _trees_depth(self)
+
+    def get_n_leaves(self):
+        """Return the number of leaves of the fitted tree."""
+        return _trees_n_leaves(self)
+
+    def predict(self, X):
+        """Predict the target of each row of ``X``."""
+        inner = getattr(self, "_random_inner", None)
+        return inner.predict(X) if inner is not None else super().predict(X)
+
+    def save(self, path):
+        """Save the fitted tree to ``path``.
+
+        Raises ``NotImplementedError`` for a tree fitted with
+        ``splitter="random"``.
+        """
+        if getattr(self, "_random_inner", None) is not None:
+            raise NotImplementedError("a splitter='random' tree saves through ExtraTrees; not carried yet")
+        return super().save(path)
+
+
+def _trees_shape_native(est):
+    """[depth, leaf count] of the (first) fitted tree from the x_trees binding
+    (lane fam2-forests, `x_trees_tree_shape`). A binary without the export
+    (-D ANONLIB_IDN_TREE_SHAPE_NATIVE_OFF) refuses get_depth/get_n_leaves:
+    lane py-runtime-b deleted the Python node walk it fell back to."""
+    if not hasattr(est, "_offsets"):
+        raise RuntimeError("this estimator is not fitted yet")
+    try:
+        entry = getattr(_trees_x_bind(est), "x_trees_tree_shape", None)  # cpu-route: get_depth/get_n_leaves introspection of the fitted host model arrays, outside fit and predict
+    except ImportError:    # a host facade refuses an absent export with ImportError
+        entry = None
+    if not callable(entry):
+        raise NotImplementedError(
+            "anonlib: get_depth/get_n_leaves need the x_trees binding's x_trees_tree_shape "
+            "(rebuild without -D ANONLIB_IDN_TREE_SHAPE_NATIVE_OFF)")
+    lo, hi = int(est._offsets[0]), int(est._offsets[1])
+    left = as_i32_c(est._left_child, ndim=1, name="left")[0]
+    res = empty((2,), "<i4")
+    entry(addr_ro(left, name="left") + 4 * lo, addr(res, name="shape"), [hi - lo])
+    return res.tolist()
+
+
+def _trees_depth(est):
+    """Depth of the (first) fitted tree."""
+    return int(_trees_shape_native(est)[0])
+
+
+def _trees_n_leaves(est):
+    """Leaf count of the (first) fitted tree."""
+    return int(_trees_shape_native(est)[1])
+
+
+# ------------------------------------------------------------- shared glue
+def _trees_seed(random_state):
+    if random_state is None:
+        return 0
+    if is_bool(random_state) or not isinstance(random_state, numbers.Integral) or random_state < 0:
+        raise ValueError("random_state must be None or a nonnegative int (a RandomState object is refused:"
+                         " draws come from the lane's own counter RNG, xtrees/ops.mojo)")
+    return int(random_state)
+
+
+def _trees_sub_seed(seed, k):
+    """The random_state handed to the k-th sub-estimator: a fixed function of
+    (seed, k), inside int32."""
+    return (seed * 1000003 + 7919 * (k + 1)) % 2147483647
+
+
+def _trees_member_weights(active, sample_weight, n_rows):
+    """scikit-learn's `_BaseVoting.fit` / stacking rule for `sample_weight`:
+    None stays None; otherwise it is checked once against X (the shared
+    helper's shape, sign and all-zero refusals) and every active member must
+    take a `sample_weight` fit parameter, else ValueError in scikit-learn's
+    words. Glue: one signature lookup per member."""
+    if sample_weight is None:
+        return None
+    import inspect
+    for name, est in active:  # glue: one signature lookup per member
+        try:
+            takes = "sample_weight" in inspect.signature(est.fit).parameters
+        except (TypeError, ValueError):
+            takes = False
+        if not takes:
+            who = "" if name is None else f" {name}"
+            raise ValueError(f"Underlying estimator{who} does not support sample weights.")
+    return check_sample_weight(sample_weight, n_rows)
+
+
+def _trees_multioutput_y(Y):
+    """scikit-learn's MultiOutput refusal of a 1-D target, in its words
+    (glue: reads the shape, or the first row's type for a nested list)."""
+    nd = getattr(Y, "ndim", None)
+    if nd is None and isinstance(Y, (list, tuple)):
+        nd = 2 if (len(Y) and isinstance(Y[0], (list, tuple))) else 1
+    if nd is not None and int(nd) < 2:
+        raise ValueError("y must have at least two dimensions for multi-output regression "
+                         "but has only one.")
+
+
+def _trees_clone(est, **overrides):
+    """A fresh unfitted copy with the same constructor parameters, plus
+    `overrides` for the ones the estimator has (random_state)."""
+    params = dict(est.get_params(deep=False)) if hasattr(est, "get_params") else {}
+    for k, v in overrides.items():  # glue: estimator overrides by parameter name
+        if k in params:
+            params[k] = v
+    return type(est)(**params)
+
+
+def _trees_member_native(member):
+    """The forest binding a clone of `member` resolves."""
+    probe = _trees_clone(member)
+    probe._capture_fit_mode()
+    return probe._bind("_anonlib_rf")
+
+
+def _trees_member_session(member, X, row_major, x_finite=False, default="0"):
+    """The data session (trees-apple3) for the member fits of one boosted
+    ensemble, on the forest binding a clone of `member` resolves, or None
+    (the choice is off, or the binary has no session entry). The session
+    stands in for every member's finite scan of X, so X is scanned here
+    unless the caller already did (`x_finite`)."""
+    if forest_data_session_choice(None, default) is None or not hasattr(member, "_capture_fit_mode"):
+        return None
+    probe = _trees_clone(member)
+    probe._capture_fit_mode()
+    native = probe._bind("_anonlib_rf")
+    if not callable(getattr(native, "rf_data_session_open", None)):
+        return None
+    if not x_finite and not all_finite(X):
+        raise ValueError("X contains NaN or infinity; the forest has no missing-value arm")
+    return open_forest_data_session(native, X, row_major=row_major, mode=probe._effective_mode(),
+                                    default=default)
+
+
+# lane/apple-fast-trees-ensembles (2026-10-02): the Apple FAST switches of
+# this module are BUILD-TIME defines of the x_trees binding (`-D
+# ANONLIB_TE_<NAME>_OFF` turns one off; xtrees/api.mojo `x_trees_fast_switches` is the bit
+# set the FAST + Apple build fills, 0 in every other build), read through
+# the binding once per fit: no env read. IDENTICAL (the default) runs the
+# code above and below them unchanged. Each is ON by default in the FAST +
+# Apple build since the M3 A/B (xtrees/api.mojo XTREES_FAST_SWITCHES):
+#   ANONLIB_TE_NATIVE_SPLITS  the cv fold bookkeeping of Stacking /
+#     CalibratedClassifierCV, OneVsRest's targets and MultiOutputClassifier's
+#     label columns leave their Python row loops (`_trees_native_folds`,
+#     `_trees_native_glue`);
+#   ANONLIB_TE_ADA_SESSION  the AdaBoost members fit the one staged device
+#     copy of X (the exact forest data session DART opens by default);
+#   ANONLIB_TE_ADA_SESSION_SHARE  with it, later members reuse the first
+#     member's quantile tables (may move bits: a quality gate, not a digest).
+_TE_NATIVE_SPLITS = 1
+_TE_ADA_SESSION = 2
+_TE_ADA_SESSION_SHARE = 4
+#   ANONLIB_KSHAP_FAST_BATCH (lane apple-fast-gap-kapprox2; M3 kernel-shap
+#     istella 27,011 -> 15,325 ms, same rel_error): Kernel/Permutation SHAP reuse one host buffer for
+#     the synthetic rows across chunks and KernelExplainer solves many rows
+#     per launch sweep (`x_trees_kshap_means` + `x_trees_kshap_solve_ey`).
+_KSHAP_FAST_BATCH = 8
+#   ANONLIB_AGN_IDN_SYN_POOL (lane idn-shap-pca; an IDENTICAL build's
+#     switch, -D ANONLIB_AGN_IDN_SYN_POOL_OFF clears it): Kernel/Permutation
+#     SHAP hand every chunk the same host buffer for the synthetic rows (the
+#     device side builds them in one pooled buffer). Moves no bit.
+_AGN_IDN_SYN_POOL = 16
+# TOMBSTONE: ANONLIB_KSHAP_FAST_OVERLAP (DROPPED-noise: kernel-shap istella neutral, verdicts batch 6) deleted 2026-10-09
+# on lane/owed-deletions-D1 (next chunk's synthetic rows + download overlapped with the model); code recoverable at b639a2bd2.
+# Restore: git apply experiments/removed/ANONLIB_KSHAP_FAST_OVERLAP.patch; record in docs/TOMBSTONES.md.
+#   ANONLIB_PSHAP_DELTA (FAST Apple default; _OFF rollback): the
+#     PermutationExplainer model runs only on the synthetic rows that differ
+#     from the previous coalition's (`x_trees_pshap_dsynth` +
+#     `x_trees_pshap_dvalues`); see xtrees/agnostic_device.mojo.
+_PSHAP_DELTA = 32
+#   _XT_IDN_ADA_SESSION (lane fam-forests; an IDENTICAL build's switch, -D
+#     ANONLIB_IDN_ADA_SESSION_OFF clears it): the AdaBoost members fit the
+#     one staged device copy of X through the EXACT session. Moves no bit.
+#     Bit 128 since the 2026-10-05 merge (was 32 on the IDENTICAL branch;
+#     main took 32 for PSHAP_DELTA; xtrees/api.mojo XTREES_FAST_SWITCHES).
+_IDN_ADA_SESSION = 128
+# TOMBSTONE: ANONLIB_PSHAP_FAST_OVERLAP (DROPPED-slower: permutation-shap taxi +26.6%, verdicts batch 6) deleted 2026-10-09
+# on lane/owed-deletions-D1 (next chunk's delta rows + download overlapped with the model); code recoverable at b639a2bd2.
+# Restore: git apply experiments/removed/ANONLIB_PSHAP_FAST_OVERLAP.patch; record in docs/TOMBSTONES.md.
+
+
+def _trees_fast_tier(est):
+    """True when `est` runs on the FAST tier (its own `numeric_mode`, else
+    the process default)."""
+    from . import _backend
+    mode = getattr(est, "numeric_mode", None)
+    mode = _backend.default_mode() if mode is None else str(mode).strip().lower()
+    return mode == "fast"
+
+
+def _trees_switch(est, bit):
+    """True when `est` runs on the FAST tier and its x_trees binding was
+    built with the define `bit` stands for (`x_trees_fast_switches`)."""
+    if not _trees_fast_tier(est):
+        return False
+    query = getattr(est._bind(), "x_trees_fast_switches", None)
+    return callable(query) and (int(query()) & bit) != 0
+
+
+def _agn_pool_release(b):
+    """Lane idn-all: frees the IDENTICAL explainers' pooled synthetic device
+    buffer when an explanation ends (xtrees/agnostic_device.mojo
+    `pool_release`), so the pool never outlives the `shap_values` call that
+    grew it."""
+    try:
+        release = getattr(b, "x_trees_agn_pool_release", None)
+    except ImportError:    # a host facade refuses an absent export with ImportError
+        release = None
+    if callable(release):
+        release()
+
+
+def _trees_build_switch(est, bit):
+    """True when `est`'s x_trees binding was built with the define `bit`
+    stands for, on whichever tier that define belongs to
+    (`x_trees_fast_switches`)."""
+    query = getattr(est._bind(), "x_trees_fast_switches", None)
+    return callable(query) and (int(query()) & bit) != 0
+
+
+def _trees_py2mojo(est):
+    """True when `est`'s x_trees binding runs the wrapper glue (cv folds,
+    OneVsRest targets, MultiOutputClassifier columns, binary (1 - p, p)
+    rows) itself: `x_trees_py2mojo`, 1 in every build unless `-D
+    ANONLIB_PY2MOJO_trees_OFF` (lane apple-fast-py2mojo-trees, the A/B
+    arm A that restores main's Python row loops)."""
+    query = getattr(est._bind(), "x_trees_py2mojo", None)
+    return callable(query) and int(query()) != 0
+
+
+def _trees_native_glue(est):
+    """`est` when its binding builds the cv bookkeeping (`_trees_py2mojo`,
+    or ANONLIB_TE_NATIVE_SPLITS on the FAST tier with a binding that
+    carries `x_trees_device_folds`), else None."""
+    return est
+
+
+def _trees_ada_session_default(est):
+    """The `ANONLIB_FOREST_SESSION` default an AdaBoost fit passes to
+    `_trees_member_session`: "share" under ANONLIB_TE_ADA_SESSION_SHARE,
+    "1" under ANONLIB_TE_ADA_SESSION, else main's "0" (each member stages
+    X itself unless the env says otherwise)."""
+    if _trees_switch(est, _TE_ADA_SESSION_SHARE):
+        return "share"
+    if _trees_switch(est, _TE_ADA_SESSION):
+        return "1"
+    # lane fam-forests: the IDENTICAL build's exact session (never "share")
+    if not _trees_fast_tier(est) and _trees_build_switch(est, _IDN_ADA_SESSION):
+        return "1"
+    return "0"
+
+
+def _trees_label_words(Y):
+    """A numeric 2-D label buffer as a C-order (n, m) Array of 8-byte words
+    whose `tolist()` labels are the Python ones: float64 for a float dtype,
+    int64 for a signed or unsigned int dtype that fits it; None for anything
+    else (bool, str, object, nested lists, uint64), which keeps the Python
+    rows (lane apple-fast-py2mojo-trees)."""
+    d = getattr(Y, "dtype", None)
+    if getattr(Y, "ndim", None) != 2:
+        return None
+    kind = getattr(d, "kind", None)
+    if kind is None:
+        if not isinstance(d, str):
+            return None
+        kind = d.lstrip("<>=|")[:1]
+    if kind not in ("f", "i", "u"):
+        return None
+    try:
+        if kind == "f":
+            return as_f64_c(Y, ndim=2, name="Y")[0]
+        arr, _ = _materialize(Y, "Y")
+        if arr.ndim != 2 or arr.dtype not in ("<i1", "<i2", "<i4", "<i8", "|i1", "|u1", "<u1", "<u2", "<u4"):
+            return None
+        if arr.dtype != "<i8":
+            arr = arr.astype("<i8")
+        return arr._as_c()
+    except (TypeError, ValueError):
+        return None  # the Python rows name the refusal
+
+
+def _trees_binary_proba(est, p, n):
+    """(n, 2) float64 rows (1 - p, p) of a float32 positive-class column, in
+    the binding (x_trees_binary_proba: the exact widening and one IEEE
+    subtract, the Python `[[1.0 - v, v] for v in p.tolist()]` word for word;
+    lane apple-fast-py2mojo-trees)."""
+    p = as_f32_c(p, ndim=1, name="p")[0]
+    out = empty((2 * n,), "<f8")
+    est._bind().x_trees_binary_proba(addr_ro(p, name="p"), addr(out, name="proba"), [n])
+    return out.reshape((n, 2))
+
+
+def _trees_float_dtype(Y):
+    """True for a buffer whose dtype is a float (an ndarray's `kind`, or an
+    `Array`'s format string): its `tolist()` labels are Python floats, the
+    classes a native float64 column encodes to."""
+    d = getattr(Y, "dtype", None)
+    kind = getattr(d, "kind", None)
+    if kind is not None:
+        return kind == "f"
+    return isinstance(d, str) and d.lstrip("<>=|").startswith("f")
+
+
+class _TreesEnsembleBase(NumericModeMixin):
+    """The lane's binding (`_bind()`) and its row/column helpers."""
+    _BINDING = "_anonlib_x_trees"
+
+    def _arange(self, n):
+        """int32 0 .. n - 1, written by the binding (`x_trees_iota_i32`, a
+        device kernel on a GPU build), not a Python list of n ints."""
+        n = int(n)
+        out = empty((n,), "<i4")
+        if n > 0:
+            self._bind().x_trees_iota_i32(addr(out, name="iota"), [n])
+        return out
+
+    def _class_major(self, inits, n):
+        """K * n float64, class c's block all `inits[c]` (class-major), filled
+        by the binding (`x_trees_fill_class_major_f64`, a device kernel on a
+        GPU build); K = 1 is (n,)."""
+        K, n = len(inits), int(n)
+        vals = Array.from_list([float(v) for v in inits], "<f8")  # glue: the K class inits
+        out = empty((K * n,), "<f8")
+        if K * n > 0:
+            self._bind().x_trees_fill_class_major_f64(addr_ro(vals, name="inits"), addr(out, name="score"), [n, K])
+        return out
+
+    def _indices(self, n_pool, n_draw, replace, seed, stream):
+        """`n_draw` indices of [0, n_pool): with replacement in draw order;
+        without, the drawn SET in ascending index order (xtrees/ops.mojo
+        `sample_indices`' random-key selection)."""
+        out = empty((n_draw,), "<i4")
+        self._bind().x_trees_sample_indices(addr(out, name="indices"),
+                                            [int(n_pool), int(n_draw), 1 if replace else 0, int(seed), int(stream)])
+        return out
+
+    def _gather(self, Xa, rows, cols):
+        n_src, d_src = Xa.shape
+        out = empty((len(rows), len(cols)), "<f4")
+        self._bind().x_trees_gather_f32(addr_ro(Xa, name="X"), addr_ro(rows, name="rows"), addr_ro(cols, name="cols"),
+                                        addr(out, name="gathered"), [n_src, d_src, len(rows), len(cols)])
+        return out
+
+    def _gather_codes(self, codes, rows):
+        out = empty((len(rows),), "<i4")
+        self._bind().x_trees_gather_i32(addr_ro(codes, name="codes"), addr_ro(rows, name="rows"),
+                                        addr(out, name="gathered"), [len(codes), len(rows)])
+        return out
+
+    def _gather_vec(self, v, rows):
+        """A float32 vector gathered at rows (as an n x 1 matrix)."""
+        col = Array.from_list([0], "<i4")
+        return self._gather(v.reshape((len(v), 1)), rows, col).reshape((len(rows),))
+
+    def _acc_cols(self, acc, x, cols, n, k, weight=1.0):
+        xa, _ = as_f32_c(x, ndim=2, name="sub-estimator output")
+        self._bind().x_trees_accumulate_cols(addr(acc, name="acc"), addr_ro(xa, name="x"),
+                                             addr_ro(cols, name="cols"), [n, k, len(cols), float(weight)])
+
+    def _acc(self, acc, x, n, weight=1.0):
+        xa, _ = as_f32_c(x, ndim=1, name="sub-estimator output")
+        self._bind().x_trees_accumulate(addr(acc, name="acc"), addr_ro(xa, name="x"), [n, float(weight)])
+
+    def _acc_votes(self, acc, codes, n, k, on, off=0.0):
+        self._bind().x_trees_accumulate_onehot(addr(acc, name="acc"), addr_ro(codes, name="codes"),
+                                               [n, k, float(on), float(off)])
+
+    def _scale(self, acc, divisor):
+        self._bind().x_trees_scale(addr(acc, name="acc"), [len(acc), float(divisor)])
+
+    def _argmax(self, acc, n, k):
+        out = empty((n,), "<i4")
+        self._bind().x_trees_argmax_rows(addr_ro(acc, name="scores"), addr(out, name="argmax"), [n, k])
+        return out
+
+    def _codes_of(self, labels_out, classes):
+        """Map an estimator's predicted labels (its classes_ are our codes)
+        to int32 codes."""
+        return as_i32_c(labels_out, ndim=1, name="predicted codes")[0]
+
+
+def _trees_sub_cols(est):
+    """The ensemble columns an estimator fitted on codes predicts: its
+    classes_ ARE codes."""
+    return Array.from_list([int(c) for c in est.classes_], "<i4")  # glue: fitted member classes as k codes
+
+
+# ------------------------------------------------------------------ Bagging
+# Reference: scikit-learn `sklearn/ensemble/_bagging.py` (BaseBagging.fit
+# :330, _parallel_build_estimators :120, BaggingClassifier.predict_proba
+# :960, BaggingRegressor.predict :1270). Deviations: rows are always drawn by
+# INDEXING (sklearn turns bootstrap counts into sample weights when the base
+# estimator takes them; the regressor tree here does not); draws come from
+# the lane's counter RNG (xtrees/ops.mojo), so `random_state` is an int;
+# warm_start is refused by name. oob_score (`_set_oob_score` :1000 / :1310)
+# sums each member's output on the rows it never drew, in member order.
+class _BaggingBase(_TreesEnsembleBase):
+    def __init__(self, estimator, n_estimators, max_samples, max_features, bootstrap,
+                 bootstrap_features, oob_score, warm_start, n_jobs, random_state, verbose):
+        # Stored as given; `_validate_params` checks them at fit (scikit-learn's convention).
+        self.estimator = estimator
+        self.n_estimators = n_estimators
+        self.max_samples = max_samples
+        self.max_features = max_features
+        self.bootstrap = bootstrap
+        self.bootstrap_features = bootstrap_features
+        self.oob_score = oob_score
+        self.warm_start = warm_start
+        self.n_jobs = n_jobs
+        self.random_state = random_state
+        self.verbose = verbose
+
+    def _validate_params(self):
+        if self.oob_score and not self.bootstrap:
+            raise ValueError("Out of bag estimation only available if bootstrap=True")
+        if self.warm_start:
+            _refuse("warm_start=True", "there is no incremental fit here.")
+        if self.n_jobs is not None:
+            _refuse("n_jobs", "the sub-fits run one after another on the device.")
+        if self.verbose:
+            _refuse("verbose", "nothing logs per estimator.")
+        if int(self.n_estimators) < 1:
+            raise ValueError("n_estimators must be >= 1")
+        _trees_seed(self.random_state)
+
+    @staticmethod
+    def _count(v, total, name):
+        if isinstance(v, numbers.Integral) and not is_bool(v):
+            k = int(v)
+        elif isinstance(v, numbers.Real):
+            if not 0.0 < float(v) <= 1.0:
+                raise ValueError(f"{name}={v} is outside (0, 1]")
+            k = int(float(v) * total)
+        else:
+            raise ValueError(f"{name} must be an int or a float")
+        if not 1 <= k <= total:
+            raise ValueError(f"{name} resolves to {k}, outside [1, {total}]")
+        return k
+
+    # -- lane hr2-gbdt-host: the members as ONE forest fit -------------------
+    # A bag of best-splitter decision trees over every feature, without row
+    # weights or out-of-bag scoring, IS a random forest of `n_estimators`
+    # trees with the member's tree parameters and the bag's bootstrap: the
+    # forest builder grows every member on the device in one fit (one
+    # staging of X, the trees batched) instead of a Python loop that draws,
+    # gathers and stages X per member. The members' rows are drawn by the
+    # forest's own bootstrap stream. `estimators_` slices the forest into
+    # per-tree members when it is read. `ANONLIB_HR2_BAGGING_MEMBERS=1`
+    # keeps the per-member loop (the A/B arm; deleted once the gates pass).
+    def _batched_ok(self, base, n_rows, n, n_feat, d, sample_weight):
+        if os.environ.get("ANONLIB_HR2_BAGGING_MEMBERS") == "1":
+            return False
+        if type(base) not in (DecisionTreeClassifier, DecisionTreeRegressor):
+            return False
+        if base.splitter != "best" or getattr(base, "max_leaf_nodes", None) is not None:
+            return False
+        if sample_weight is not None or self.oob_score or self.bootstrap_features or n_feat != d:
+            return False
+        if not self.bootstrap and n_rows != n:
+            return False  # sampling without replacement: not the forest's draw
+        return True
+
+    def _fit_batched(self, Xa, y, base, n_rows, n, seed):
+        common = dict(n_estimators=int(self.n_estimators), criterion=base.criterion,
+                      max_depth=base.max_depth, min_samples_split=base.min_samples_split,
+                      min_samples_leaf=base.min_samples_leaf,
+                      max_features=1.0 if base.max_features is None else base.max_features,
+                      min_impurity_decrease=base.min_impurity_decrease,
+                      bootstrap=bool(self.bootstrap),
+                      max_samples=(n_rows / n) if self.bootstrap else None,
+                      random_state=seed,
+                      n_bins=_dt_tier_bins(base) if isinstance(base, DecisionTreeRegressor) else base.n_bins,
+                      numeric_mode=getattr(base, "numeric_mode", None))
+        if isinstance(base, DecisionTreeClassifier):
+            forest = RandomForestClassifier(class_weight=base.class_weight, **common)
+        else:
+            forest = RandomForestRegressor(**common)
+        forest.fit(Xa, y)
+        self._batched = (forest, base)
+        self._estimators = None
+        d = Xa.shape[1]
+        self.estimators_features_ = [self._arange(d)] * int(forest._n_trees)  # one shared all-columns array
+        self._oob_rows = []
+        self.n_features_in_ = d
+        return self
+
+    @property
+    def estimators_(self):
+        """The fitted members, as a list of estimators."""
+        if getattr(self, "_estimators", None) is None and getattr(self, "_batched", None) is not None:
+            self._estimators = self._slice_members()
+        if getattr(self, "_estimators", None) is None:
+            raise AttributeError("estimators_")
+        return self._estimators
+
+    @estimators_.setter
+    def estimators_(self, value):
+        self._estimators = value
+        self._batched = None
+
+    def _slice_members(self):
+        """The batched forest's trees as fitted member estimators."""
+        forest, base = self._batched
+        offsets = forest._offsets.tolist()  # glue: T + 1 tree boundaries
+        no = int(forest._num_outputs)
+        # each member's node arrays are native block copies of the forest's
+        # (Array slicing), never Python lists of every node
+        colid, ques, left, leaves = forest._colid, forest._quesval, forest._left_child, forest._leaves
+        seed = _trees_seed(self.random_state)
+        out = []
+        for t in range(int(forest._n_trees)):  # glue: one member per fitted tree
+            lo, hi = offsets[t], offsets[t + 1]
+            est = _trees_clone(base, random_state=_trees_sub_seed(seed, t))
+            est._refresh_config()
+            est._capture_fit_mode()
+            est._offsets = Array.from_list([0, hi - lo], "<i4")
+            est._colid = colid[lo:hi]
+            est._quesval = ques[lo:hi]
+            est._left_child = left[lo:hi]
+            est._leaves = leaves[lo * no:hi * no]
+            est._n_trees = 1
+            est._num_outputs = no
+            est.n_features_in_ = forest.n_features_in_
+            if hasattr(forest, "classes_"):
+                est.classes_ = forest.classes_
+                est.n_classes_ = forest.n_classes_
+            out.append(est)
+        return out
+
+    def _fit_bags(self, X, y_sub, sample_weight, make_default):
+        Xa, _ = as_f32_c(X, ndim=2, name="X")
+        n, d = Xa.shape
+        seed = _trees_seed(self.random_state)
+        n_rows = self._count(self.max_samples, n, "max_samples")
+        n_feat = self._count(self.max_features, d, "max_features")
+        base = self.estimator if self.estimator is not None else make_default()
+        if self._batched_ok(base, n_rows, n, n_feat, d, sample_weight):
+            return self._fit_batched(Xa, y_sub(None, True), base, n_rows, n, seed)
+        # scikit-learn's _check_sample_weight: the shape, sign and all-zero
+        # refusals before any member is fitted (a bootstrap gather never
+        # reads past row n, so a too-long vector was accepted silently)
+        sw = None if sample_weight is None else check_sample_weight(sample_weight, n)
+        if sw is not None:
+            import inspect
+            try:
+                takes = "sample_weight" in inspect.signature(base.fit).parameters
+            except (TypeError, ValueError):
+                takes = False
+            if not takes:  # scikit-learn's BaseBagging refusal and words
+                raise ValueError("The base estimator doesn't support sample weight")
+        self.estimators_, self.estimators_features_, self._oob_rows = [], [], []
+        all_rows = n_rows == n and not self.bootstrap
+        all_cols = n_feat == d and not self.bootstrap_features
+        for k in range(int(self.n_estimators)):  # glue: one member fit per estimator
+            rows = self._arange(n) if all_rows else self._indices(n, n_rows, self.bootstrap, seed, 2 * k)
+            if all_cols:
+                cols = self._arange(d)
+            else:
+                cols = self._indices(d, n_feat, self.bootstrap_features, seed, 2 * k + 1)
+            Xs = Xa if (all_rows and all_cols) else self._gather(Xa, rows, cols)
+            ys = y_sub(rows, all_rows)
+            est = _trees_clone(base, random_state=_trees_sub_seed(seed, k))
+            if sw is None:
+                est.fit(Xs, ys)
+            else:
+                est.fit(Xs, ys, sample_weight=sw if all_rows else self._gather_vec(sw, rows))
+            self.estimators_.append(est)
+            self.estimators_features_.append(cols)
+            if self.oob_score:
+                self._oob_rows.append(self._oob_of(rows, n, self))
+        self.n_features_in_ = d
+        return self
+
+    @staticmethod
+    def _oob_of(rows, n, est=None):
+        """The rows a member never drew, ascending (sklearn `indices_to_mask`
+        negated): one native pass (`x_trees_unseen_rows`, on the device in a
+        GPU build)."""
+        r = rows if isinstance(rows, Array) else Array.from_list(list(rows), "<i4")
+        out = empty((max(1, n),), "<i4")
+        k = int(_trees_x_bind(est).x_trees_unseen_rows(addr_ro(r, name="rows"), addr(out, name="oob"),
+                                                       [len(r), n]))
+        return out[:k]
+
+    def _oob_outputs(self, Xa, k, member_out):
+        """(sums n x k float64, per-row member count): each member's output on
+        its out-of-bag rows, added in member order (sklearn `_set_oob_score`)."""
+        n = Xa.shape[0]
+        acc = self._class_major([0.0], n * k)  # zero votes, filled by the binding
+        # the member counts in the binding (x_trees_count_rows, int32 per row)
+        counts = zeros((n,), "<i4")
+        for est, cols, oob in zip(self.estimators_, self.estimators_features_, self._oob_rows):  # glue: one member prediction per estimator
+            m = len(oob)
+            if m == 0:
+                continue
+            out = member_out(est, self._gather(Xa, oob, cols), m)
+            self._bind().x_trees_accumulate_rows(addr(acc, name="oob"), addr_ro(out, name="member"),
+                                                 addr_ro(oob, name="rows"), [n, k, m])
+            self._bind().x_trees_count_rows(addr(counts, name="counts"), addr_ro(oob, name="rows"), [n, m])
+        return acc, counts
+
+    def _check_X(self, X):
+        if getattr(self, "_batched", None) is None and getattr(self, "_estimators", None) is None:
+            raise RuntimeError("this estimator is not fitted yet")
+        Xa, _ = as_f32_c(X, ndim=2, name="X")
+        if Xa.shape[1] != self.n_features_in_:
+            raise ValueError(f"X has {Xa.shape[1]} features, fit saw {self.n_features_in_}")
+        return Xa
+
+    def _sub_X(self, Xa, cols, rows_all):
+        if len(cols) == Xa.shape[1] and cols.tolist() == list(range(Xa.shape[1])):
+            return Xa
+        return self._gather(Xa, rows_all, cols)
+
+
+class BaggingClassifier(ClassifierScoreMixin, _BaggingBase):
+    """A bagging ensemble of classifiers.
+
+    Follows scikit-learn's ``BaggingClassifier``: each member is fitted on a
+    random draw of rows and features, and ``predict_proba`` averages the
+    members' ``predict_proba`` (a member without ``predict_proba`` votes with
+    ``predict``), returned as float64. Any anonlib classifier can be a
+    member; the default is ``DecisionTreeClassifier()``. When the members are
+    best-splitter decision trees over every feature, without
+    ``sample_weight``, ``oob_score`` or feature bootstrap, the whole bag is
+    grown as one random forest fit.
+
+    Parameters
+    ----------
+    estimator : estimator or None, default=None
+        The member to clone. None uses ``DecisionTreeClassifier()``.
+    n_estimators : int, default=10
+        Number of members; must be at least 1.
+    max_samples : int or float, default=1.0
+        Rows drawn for each member: an int count, or a fraction in (0, 1] of
+        the rows.
+    max_features : int or float, default=1.0
+        Features drawn for each member: an int count, or a fraction in (0, 1]
+        of the features.
+    bootstrap : bool, default=True
+        Draw rows with replacement.
+    bootstrap_features : bool, default=False
+        Draw features with replacement.
+    oob_score : bool, default=False
+        Score the ensemble on the rows each member did not draw. Requires
+        ``bootstrap=True`` (``ValueError`` otherwise).
+    warm_start : bool, default=False
+        Only False is accepted; True raises ``NotImplementedError``.
+    n_jobs : None, default=None
+        Only None is accepted; members are fitted one after another on the
+        device.
+    random_state : int or None, default=None
+        Seed for the row and feature draws and the members' seeds. None means
+        seed 0, so repeated fits are the same (unlike scikit-learn). A
+        ``RandomState`` object raises ``ValueError``.
+    verbose : int, default=0
+        Only 0 is accepted.
+
+    Attributes
+    ----------
+    classes_ : array of shape (n_classes,)
+        Class labels seen in ``fit``.
+    n_classes_ : int
+        Number of classes.
+    estimators_ : list of estimators
+        The fitted members.
+    estimators_features_ : list of arrays
+        The feature indices each member was fitted on.
+    n_features_in_ : int
+        Number of features seen in ``fit``.
+    oob_score_ : float
+        Out-of-bag accuracy (with ``oob_score=True``).
+    oob_decision_function_ : array of shape (n_samples, n_classes)
+        Out-of-bag class scores, normalized per row (with ``oob_score=True``).
+        A row that no member left out gets the uniform 1 / n_classes, where
+        scikit-learn would divide 0 by 0.
+
+    Examples
+    --------
+    >>> import numpy as np, anonlib
+    >>> rng = np.random.default_rng(0)
+    >>> X = rng.random((1000, 8), dtype=np.float32)
+    >>> y = (X[:, 0] + X[:, 1] > 1.0).astype(np.int32)
+    >>> model = anonlib.BaggingClassifier(n_estimators=20, random_state=0).fit(X, y)
+    >>> proba = model.predict_proba(X)
+    """
+    _estimator_type = "classifier"
+
+    def __init__(self, estimator=None, n_estimators=10, *, max_samples=1.0, max_features=1.0,
+                 bootstrap=True, bootstrap_features=False, oob_score=False, warm_start=False,
+                 n_jobs=None, random_state=None, verbose=0):
+        super().__init__(estimator, n_estimators, max_samples, max_features, bootstrap,
+                         bootstrap_features, oob_score, warm_start, n_jobs, random_state, verbose)
+
+    def fit(self, X, y, sample_weight=None):
+        """Fit the bag.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+            Training data, read as float32.
+        y : array-like of shape (n_samples,)
+            Class labels; at least two classes are required.
+        sample_weight : array-like of shape (n_samples,), default=None
+            Per-row weights, passed to each member for the rows it drew. The
+            member must accept ``sample_weight``.
+
+        Returns
+        -------
+        self
+        """
+        self._validate_params()
+        self.classes_, codes = encode_labels(y)
+        self.n_classes_ = len(self.classes_)
+        if self.n_classes_ < 2:
+            raise ValueError("y has fewer than 2 classes")
+        self._fit_bags(X, lambda rows, all_rows: codes if all_rows else self._gather_codes(codes, rows),
+                       sample_weight, DecisionTreeClassifier)
+        if self.oob_score:
+            self._set_oob_score(X, codes)
+        return self
+
+    def _member_proba(self, est, Xs, m):
+        """A member's class scores on Xs as dense m x k float64 (its predict_proba
+        in the columns of the classes it saw, else a one-hot vote)."""
+        k = self.n_classes_
+        out = zeros((m * k,), "<f8")
+        if hasattr(est, "predict_proba"):
+            self._acc_cols(out, est.predict_proba(Xs), _trees_sub_cols(est), m, k)
+        else:
+            self._acc_votes(out, self._codes_of(est.predict(Xs), est.classes_), m, k, 1.0)
+        return out
+
+    def _set_oob_score(self, X, codes):
+        """sklearn BaggingClassifier._set_oob_score: the out-of-bag class scores
+        summed per row, normalised (a row no member left out is uniform 1 / k,
+        DEVIATION 5605, where sklearn divides 0 / 0), accuracy of their argmax."""
+        Xa, _ = as_f32_c(X, ndim=2, name="X")
+        n, k = Xa.shape[0], self.n_classes_
+        acc, _ = self._oob_outputs(Xa, k, self._member_proba)
+        self._bind().x_trees_normalize_rows(addr(acc, name="oob"), [n, k])
+        self.oob_decision_function_ = acc.reshape((n, k))
+        # the per-row match is the native elementwise compare (two int32
+        # Arrays), not a Python loop over the rows
+        pred, truth = self._argmax(acc, n, k), as_i32_c(codes, ndim=1, name="codes")[0]
+        # the hit count in the binding
+        hit_count = int(self._bind().x_trees_count_equal(addr_ro(pred, name="pred"), addr_ro(truth, name="codes"),
+                                                         [n]))
+        self.oob_score_ = hit_count / n
+
+    def predict_proba(self, X):
+        """Mean of the members' class probabilities, float64.
+
+        Returns an array of shape (n_samples, n_classes), columns in the
+        order of ``classes_``.
+        """
+        Xa = self._check_X(X)
+        n, k = Xa.shape[0], self.n_classes_
+        if getattr(self, "_batched", None) is not None:
+            # lane hr2-gbdt-host: the forest's mean of the trees' leaf
+            # distributions, every tree in one device walk
+            return self._batched[0].predict_proba(Xa).astype("<f8")
+        acc = self._class_major([0.0], n * k)  # zero votes, filled by the binding
+        rows_all = self._arange(n)
+        for est, cols in zip(self.estimators_, self.estimators_features_):  # glue: one member prediction per estimator
+            Xs = self._sub_X(Xa, cols, rows_all)
+            sub = _trees_sub_cols(est)
+            if hasattr(est, "predict_proba"):
+                self._acc_cols(acc, est.predict_proba(Xs), sub, n, k)
+            else:
+                codes = self._codes_of(est.predict(Xs), est.classes_)
+                self._acc_votes(acc, codes, n, k, 1.0)
+        self._scale(acc, len(self.estimators_))
+        return acc.reshape((n, k))
+
+    def predict(self, X):
+        """Predict the class with the highest mean probability."""
+        p = self.predict_proba(X)
+        return decode_labels(self.classes_, self._argmax(p, p.shape[0], self.n_classes_))
+
+
+class BaggingRegressor(RegressorScoreMixin, _BaggingBase):
+    """A bagging ensemble of regressors.
+
+    Follows scikit-learn's ``BaggingRegressor``: each member is fitted on a
+    random draw of rows and features, and ``predict`` is the members' mean,
+    returned as float64. Any anonlib regressor can be a member; the default
+    is ``DecisionTreeRegressor()``. When the members are best-splitter
+    decision trees over every feature, without ``sample_weight``,
+    ``oob_score`` or feature bootstrap, the whole bag is grown as one random
+    forest fit.
+
+    Parameters
+    ----------
+    estimator : estimator or None, default=None
+        The member to clone. None uses ``DecisionTreeRegressor()``.
+    n_estimators : int, default=10
+        Number of members; must be at least 1.
+    max_samples : int or float, default=1.0
+        Rows drawn for each member: an int count, or a fraction in (0, 1] of
+        the rows.
+    max_features : int or float, default=1.0
+        Features drawn for each member: an int count, or a fraction in (0, 1]
+        of the features.
+    bootstrap : bool, default=True
+        Draw rows with replacement.
+    bootstrap_features : bool, default=False
+        Draw features with replacement.
+    oob_score : bool, default=False
+        Score the ensemble on the rows each member did not draw. Requires
+        ``bootstrap=True`` (``ValueError`` otherwise).
+    warm_start : bool, default=False
+        Only False is accepted; True raises ``NotImplementedError``.
+    n_jobs : None, default=None
+        Only None is accepted; members are fitted one after another on the
+        device.
+    random_state : int or None, default=None
+        Seed for the row and feature draws and the members' seeds. None means
+        seed 0, so repeated fits are the same (unlike scikit-learn). A
+        ``RandomState`` object raises ``ValueError``.
+    verbose : int, default=0
+        Only 0 is accepted.
+
+    Attributes
+    ----------
+    estimators_ : list of estimators
+        The fitted members.
+    estimators_features_ : list of arrays
+        The feature indices each member was fitted on.
+    n_features_in_ : int
+        Number of features seen in ``fit``.
+    oob_score_ : float
+        Out-of-bag R^2 (with ``oob_score=True``).
+    oob_prediction_ : array of shape (n_samples,)
+        Out-of-bag prediction of each row (with ``oob_score=True``).
+
+    Examples
+    --------
+    >>> import numpy as np, anonlib
+    >>> rng = np.random.default_rng(0)
+    >>> X = rng.random((1000, 8), dtype=np.float32)
+    >>> y = X @ rng.random(8, dtype=np.float32)
+    >>> model = anonlib.BaggingRegressor(n_estimators=20, random_state=0).fit(X, y)
+    >>> pred = model.predict(X)
+    """
+    _estimator_type = "regressor"
+
+    def __init__(self, estimator=None, n_estimators=10, *, max_samples=1.0, max_features=1.0,
+                 bootstrap=True, bootstrap_features=False, oob_score=False, warm_start=False,
+                 n_jobs=None, random_state=None, verbose=0):
+        super().__init__(estimator, n_estimators, max_samples, max_features, bootstrap,
+                         bootstrap_features, oob_score, warm_start, n_jobs, random_state, verbose)
+
+    def fit(self, X, y, sample_weight=None):
+        """Fit the bag.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+            Training data, read as float32.
+        y : array-like of shape (n_samples,)
+            Target values, read as float32.
+        sample_weight : array-like of shape (n_samples,), default=None
+            Per-row weights, passed to each member for the rows it drew. The
+            member must accept ``sample_weight`` (the default
+            ``DecisionTreeRegressor`` does not).
+
+        Returns
+        -------
+        self
+        """
+        self._validate_params()
+        y32, _ = as_f32_c(y, ndim=1, name="y")
+        self._fit_bags(X, lambda rows, all_rows: y32 if all_rows else self._gather_vec(y32, rows),
+                       sample_weight, DecisionTreeRegressor)
+        if self.oob_score:
+            self._set_oob_score(X, y32)
+        return self
+
+    def _set_oob_score(self, X, y32):
+        """sklearn BaggingRegressor._set_oob_score: the out-of-bag predictions
+        summed per row over member order, divided by their count (a row no
+        member left out divides by 1, as sklearn does), R^2 against y."""
+        Xa, _ = as_f32_c(X, ndim=2, name="X")
+        n = Xa.shape[0]
+
+
+        def member_out(est, Xs, m):
+            p, _ = as_f32_c(est.predict(Xs), ndim=1, name="prediction")
+            return p.astype("<f8")
+
+        acc, counts = self._oob_outputs(Xa, 1, member_out)
+        # the oob prediction and the three exactly rounded sums in the
+        # binding (x_trees_oob_r2, on the device in a GPU build): fsum's
+        # words. A non-finite term or an overflowing sum is refused (Python's
+        # fsum raised on both; lane pyglue-numeric deleted its row route).
+        y32, _ = as_f32_c(y32, ndim=1, name="y")
+        pred, words, flags = empty((n,), "<f8"), empty((4,), "<f8"), empty((4,), "<i4")
+        self._bind().x_trees_oob_r2([addr_ro(acc, name="oob"), addr_ro(counts, name="counts"),
+                                     addr_ro(y32, name="y"), addr(pred, name="pred"), addr(words, name="sums"),
+                                     addr(flags, name="flags")], [n])
+        if flags[0] or flags[1]:
+            raise ValueError("BaggingRegressor oob_score: a non-finite target or out-of-bag prediction, "
+                             "or a sum that overflows float64")
+        self.oob_prediction_ = pred
+        ss_tot, ss_res = words[1], words[2]
+        self.oob_score_ = 1.0 - ss_res / ss_tot if ss_tot > 0 else (1.0 if ss_res == 0 else 0.0)
+
+    def predict(self, X):
+        """Mean of the members' predictions, float64."""
+        Xa = self._check_X(X)
+        n = Xa.shape[0]
+        if getattr(self, "_batched", None) is not None:
+            # lane hr2-gbdt-host: the forest's mean over the trees
+            return as_f32_c(self._batched[0].predict(Xa), ndim=1, name="prediction")[0].astype("<f8")
+        acc = zeros((n,), "<f8")
+        rows_all = self._arange(n)
+        for est, cols in zip(self.estimators_, self.estimators_features_):  # glue: one member prediction per estimator
+            self._acc(acc, est.predict(self._sub_X(Xa, cols, rows_all)), n)
+        self._scale(acc, len(self.estimators_))
+        return acc
+
+
+# ----------------------------------------------------------------- AdaBoost
+# Reference: scikit-learn `sklearn/ensemble/_weight_boosting.py`
+# (BaseWeightBoosting.fit :118, AdaBoostClassifier._boost_discrete :560 --
+# SAMME, the only algorithm sklearn 1.6+ keeps --, decision_function :660,
+# _compute_proba_from_decision :740; AdaBoostRegressor._boost :1030 --
+# AdaBoost.R2 --, _get_median_predict :1120). The weight update, the error,
+# the estimator weight and the weighted median are `xtrees/ops.mojo`
+# (`samme_step`, `r2_step`, `weighted_median`); R2's weighted bootstrap is the
+# lane's counter RNG, not numpy's `choice`.
+def _trees_normalized_weights(sample_weight, n, est=None):
+    if est is not None:
+        return _trees_normalized_weights_native(est, sample_weight, n)
+    if sample_weight is None:
+        return full((n,), 1.0 / n, "<f8")
+    sw = check_sample_weight(sample_weight, n)
+    out = zeros((max(n, 1),), "<f8")
+    status = int(_trees_x_bind(est).x_trees_normalized_weights(addr_ro(sw, name="sample_weight"),
+                                                               addr(out, name="weights"), [n]))
+    if status == 1:
+        raise ValueError("sample_weight must be finite and nonnegative")
+    if status == 2:
+        raise ValueError(ZERO_WEIGHTS_MSG)
+    return out
+
+
+def _trees_normalized_weights_native(est, sample_weight, n):
+    """`_trees_normalized_weights` in the binding (lane
+    apple-fast-py2mojo-trees): the checks, the exactly rounded total
+    (`fsum`'s word) and every v / total in one x_trees_exact_sum call, the
+    same refusals in the same order and the same float64 words."""
+    if sample_weight is None:
+        return est._class_major([1.0 / n], n)
+    sw = check_sample_weight(sample_weight, n)
+    out, flags = empty((n + 1,), "<f8"), empty((8,), "<i4")
+    est._bind().x_trees_exact_sum(addr_ro(sw, name="sample_weight"), addr(out, name="weights"),
+                                  addr(flags, name="flags"), [n, 1])
+    if flags[0] or flags[1] or flags[2] or flags[3]:
+        raise ValueError("sample_weight must be finite and nonnegative")
+    if not flags[4]:
+        raise ValueError(ZERO_WEIGHTS_MSG)
+    return out[1:n + 1]
+
+
+class _AdaBoostBase(_TreesEnsembleBase):
+    def __init__(self, estimator, n_estimators, learning_rate, random_state):
+        # Stored as given; `_validate_params` checks them at fit (scikit-learn's convention).
+        self.estimator = estimator
+        self.n_estimators = n_estimators
+        self.learning_rate = learning_rate
+        self.random_state = random_state
+
+    def _validate_params(self):
+        if int(self.n_estimators) < 1:
+            raise ValueError("n_estimators must be >= 1")
+        if not float(self.learning_rate) > 0:
+            raise ValueError("learning_rate must be > 0")
+        _trees_seed(self.random_state)
+
+    def _w32(self, w, n):
+        """The boosting weights (summing to one) times n, float32: the
+        members' `sample_weight` (the criterion is scale-free; the factor
+        keeps the fixed-point weight plane well inside its resolution)."""
+        out = empty((n,), "<f4")
+        self._bind().x_trees_scale_to_f32(addr_ro(w, name="w"), addr(out, name="w32"), [n, float(n)])
+        return out
+
+    def _check_X(self, X):
+        if not hasattr(self, "estimators_"):
+            raise RuntimeError("this estimator is not fitted yet")
+        Xa, _ = as_f32_c(X, ndim=2, name="X")
+        if Xa.shape[1] != self.n_features_in_:
+            raise ValueError(f"X has {Xa.shape[1]} features, fit saw {self.n_features_in_}")
+        return Xa
+
+
+class AdaBoostClassifier(ClassifierScoreMixin, _AdaBoostBase):
+    """An AdaBoost classifier (SAMME).
+
+    Follows scikit-learn's ``AdaBoostClassifier`` with the SAMME algorithm:
+    each member is fitted on every row, with the current boosting weights
+    (scaled by the number of rows, float32) as its ``sample_weight``. Any
+    anonlib classifier that accepts ``sample_weight`` can be a member; the
+    default is a decision stump, ``DecisionTreeClassifier(max_depth=1)``.
+
+    Parameters
+    ----------
+    estimator : estimator or None, default=None
+        The member to clone. None uses
+        ``DecisionTreeClassifier(max_depth=1)``.
+    n_estimators : int, default=50
+        Maximum number of boosting rounds; must be at least 1. Boosting can
+        stop earlier, as in scikit-learn.
+    learning_rate : float, default=1.0
+        Shrinks each member's weight; must be > 0.
+    algorithm : {"SAMME"}, default="SAMME"
+        Only SAMME is supported (scikit-learn 1.6 removed SAMME.R);
+        ``"SAMME.R"`` raises ``NotImplementedError``.
+    random_state : int or None, default=None
+        Seed for the members' seeds. None means seed 0, so repeated fits
+        are the same (unlike scikit-learn). A ``RandomState`` object raises
+        ``ValueError``.
+
+    Attributes
+    ----------
+    estimators_ : list of estimators
+        The fitted members.
+    estimator_weights_ : list of float
+        Weight of each member.
+    estimator_errors_ : list of float
+        Weighted training error of each member.
+    classes_ : array of shape (n_classes,)
+        Class labels seen in ``fit``.
+    n_classes_ : int
+        Number of classes.
+    n_features_in_ : int
+        Number of features seen in ``fit``.
+
+    Examples
+    --------
+    >>> import numpy as np, anonlib
+    >>> rng = np.random.default_rng(0)
+    >>> X = rng.random((1000, 8), dtype=np.float32)
+    >>> y = (X[:, 0] + X[:, 1] > 1.0).astype(np.int32)
+    >>> model = anonlib.AdaBoostClassifier(n_estimators=50).fit(X, y)
+    >>> proba = model.predict_proba(X)
+    """
+    _estimator_type = "classifier"
+
+    def __init__(self, estimator=None, *, n_estimators=50, learning_rate=1.0, algorithm="SAMME",
+                 random_state=None):
+        super().__init__(estimator, n_estimators, learning_rate, random_state)
+        self.algorithm = algorithm
+
+    def _validate_params(self):
+        if self.algorithm not in ("SAMME", "deprecated"):
+            _refuse(f"algorithm={self.algorithm!r}", "SAMME.R was removed from the reference (sklearn 1.6);"
+                    " SAMME is the algorithm.")
+        super()._validate_params()
+
+    def fit(self, X, y, sample_weight=None):
+        """Fit the boosted ensemble.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+            Training data, read as float32. NaN or infinity raises
+            ``ValueError``.
+        y : array-like of shape (n_samples,)
+            Class labels; at least two classes are required.
+        sample_weight : array-like of shape (n_samples,), default=None
+            Initial row weights; must be finite, nonnegative and have a
+            positive total. None weights every row equally.
+
+        Returns
+        -------
+        self
+
+        Raises
+        ------
+        ValueError
+            If the first member is worse than random guessing.
+        """
+        self._validate_params()
+        Xa, _ = as_f32_c(X, ndim=2, name="X")
+        n = Xa.shape[0]
+        self.classes_, codes = encode_labels(y)
+        k = self.n_classes_ = len(self.classes_)
+        if k < 2:
+            raise ValueError("y has fewer than 2 classes")
+        seed = _trees_seed(self.random_state)
+        base = self.estimator if self.estimator is not None else DecisionTreeClassifier(max_depth=1)
+        # scikit-learn's AdaBoostClassifier refusal: SAMME hands every member
+        # row weights (glue: one signature lookup)
+        import inspect
+        try:
+            takes = "sample_weight" in inspect.signature(base.fit).parameters
+        except (TypeError, ValueError):
+            takes = False
+        if not takes:
+            raise ValueError(f"{type(base).__name__} doesn't support sample_weight.")
+        w = _trees_normalized_weights(sample_weight, n, self)
+        stats = zeros((4,), "<f8")
+        self.estimators_, self.estimator_weights_, self.estimator_errors_ = [], [], []
+        b = self._bind()
+        m = int(self.n_estimators)
+        # A best-splitter DecisionTreeClassifier member fits column-major X
+        # with weights: transpose and finite-scan X ONCE for every member
+        # (the member's own `fit` did both per member on the same bytes).
+        Xcm = None
+        member_enc = None
+        if type(base) is DecisionTreeClassifier and base.splitter == "best":
+            Xcm = _trees_colmajor(Xa, self)
+            if not all_finite(Xcm):
+                raise ValueError("X contains NaN or infinity; the forest has no missing-value arm")
+            # every member encodes the SAME codes: once, for all of them
+            # (`ANONLIB_ADABOOST_REENCODE=1` re-encodes per member, the
+            # A/B arm)
+            if os.environ.get("ANONLIB_ADABOOST_REENCODE") != "1":
+                member_enc = encode_labels(codes)
+        # trees-apple3: every member fits the SAME X, staged on the device
+        # once for all of them (None: each member stages it, as before)
+        session = None
+        if Xcm is not None:
+            session = _trees_member_session(base, Xcm, False, x_finite=True,
+                                            default=_trees_ada_session_default(self))
+        try:
+            self._fit_members(base, seed, m, Xa, Xcm, codes, w, n, k, member_enc, session, b, stats)
+        finally:
+            if session is not None:
+                session.close()
+        self.n_features_in_ = Xa.shape[1]
+        return self
+
+    def _fit_members(self, base, seed, m, Xa, Xcm, codes, w, n, k, member_enc, session, b, stats):
+        for it in range(m):  # glue: one member fit per estimator
+            est = _trees_clone(base, random_state=_trees_sub_seed(seed, it))
+            if Xcm is not None:
+                est._fit_weighted(Xcm, codes, self._w32(w, n), x_finite=True, encoded=member_enc,
+                                  session=session)
+            else:
+                est.fit(Xa, codes, sample_weight=self._w32(w, n))
+            pred = as_i32_c(est.predict(Xa), ndim=1, name="predicted codes")[0]
+            b.x_trees_samme_step(addr(w, name="w"), addr_ro(pred, name="pred"), addr_ro(codes, name="y"),
+                                 addr(stats, name="stats"),
+                                 [n, k, float(self.learning_rate), 1 if it == m - 1 else 0,
+                                  int(isinstance(base, DecisionTreeClassifier))])
+            status, alpha, err, total = stats.tolist()
+            if status == 2.0:
+                if not self.estimators_:
+                    raise ValueError("BaseClassifier in AdaBoostClassifier ensemble is worse than random,"
+                                     " ensemble can not be fit.")
+                break
+            self.estimators_.append(est)
+            self.estimator_weights_.append(alpha)
+            self.estimator_errors_.append(err)
+            if status == 1.0 or not total > 0:
+                break
+            if it < m - 1:
+                self._scale(w, total)
+
+    def _decision(self, Xa):
+        n, k = Xa.shape[0], self.n_classes_
+        acc = self._class_major([0.0], n * k)  # zero votes, filled by the binding
+        for est, a in zip(self.estimators_, self.estimator_weights_):  # glue: one member prediction per estimator
+            pred = as_i32_c(est.predict(Xa), ndim=1, name="predicted codes")[0]
+            self._acc_votes(acc, pred, n, k, a, -a / (k - 1))
+        self._scale(acc, math.fsum(self.estimator_weights_))  # glue: the native fsum (core fsum_f64) of the k estimator weights
+        return acc
+
+    def decision_function(self, X):
+        """Weighted member votes, float64.
+
+        Returns shape (n_samples,) for two classes (positive favors
+        ``classes_[1]``) and (n_samples, n_classes) otherwise.
+        """
+        Xa = self._check_X(X)
+        n, k = Xa.shape[0], self.n_classes_
+        acc = self._decision(Xa)
+        if k == 2:
+            d = empty((n,), "<f8")
+            self._bind().x_trees_margin2(addr_ro(acc, name="votes"), addr(d, name="margin"), [n, 0])
+            return d
+        return acc.reshape((n, k))
+
+    def predict_proba(self, X):
+        """Class probabilities from the decision function (softmax), float64.
+
+        Returns an array of shape (n_samples, n_classes), columns in the
+        order of ``classes_``.
+        """
+        Xa = self._check_X(X)
+        n, k = Xa.shape[0], self.n_classes_
+        acc = self._decision(Xa)
+        if k == 2:
+            pairs = empty((n * 2,), "<f8")
+            self._bind().x_trees_margin2(addr_ro(acc, name="votes"), addr(pairs, name="pairs"), [n, 2])
+            acc = pairs
+        else:
+            self._scale(acc, k - 1)
+        self._bind().x_trees_softmax_rows(addr(acc, name="proba"), [n, k])
+        return acc.reshape((n, k))
+
+    def predict(self, X):
+        """Predict the class with the highest weighted vote."""
+        Xa = self._check_X(X)
+        n, k = Xa.shape[0], self.n_classes_
+        acc = self._decision(Xa)
+        if k == 2:
+            codes = empty((n,), "<i4")
+            self._bind().x_trees_margin2(addr_ro(acc, name="votes"), addr(codes, name="codes"), [n, 1])
+        else:
+            codes = self._argmax(acc, n, k)
+        return decode_labels(self.classes_, codes)
+
+
+class AdaBoostRegressor(RegressorScoreMixin, _AdaBoostBase):
+    """An AdaBoost regressor (AdaBoost.R2).
+
+    Follows scikit-learn's ``AdaBoostRegressor``: each member is fitted on a
+    weighted bootstrap draw of the rows, and ``predict`` is the weighted
+    median of the members' predictions. Any anonlib regressor can be a
+    member; the default is ``DecisionTreeRegressor(max_depth=3)``. The
+    bootstrap draws come from anonlib's own random generator, so they
+    differ from scikit-learn's for the same seed.
+
+    Parameters
+    ----------
+    estimator : estimator or None, default=None
+        The member to clone. None uses
+        ``DecisionTreeRegressor(max_depth=3)``.
+    n_estimators : int, default=50
+        Maximum number of boosting rounds; must be at least 1. Boosting can
+        stop earlier, as in scikit-learn.
+    learning_rate : float, default=1.0
+        Shrinks each member's weight; must be > 0.
+    loss : {"linear", "square", "exponential"}, default="linear"
+        Loss used to update the row weights after each round.
+    random_state : int or None, default=None
+        Seed for the members' seeds and the bootstrap draws. None means seed 0, so repeated fits
+        are the same (unlike scikit-learn). A ``RandomState`` object raises
+        ``ValueError``.
+
+    Attributes
+    ----------
+    estimators_ : list of estimators
+        The fitted members.
+    estimator_weights_ : list of float
+        Weight of each member.
+    estimator_errors_ : list of float
+        Weighted average loss of each member.
+    n_features_in_ : int
+        Number of features seen in ``fit``.
+
+    Examples
+    --------
+    >>> import numpy as np, anonlib
+    >>> rng = np.random.default_rng(0)
+    >>> X = rng.random((1000, 8), dtype=np.float32)
+    >>> y = X @ rng.random(8, dtype=np.float32)
+    >>> model = anonlib.AdaBoostRegressor(n_estimators=50, random_state=0).fit(X, y)
+    >>> pred = model.predict(X)
+    """
+    _estimator_type = "regressor"
+    _LOSSES = {"linear": 0, "square": 1, "exponential": 2}
+
+    def __init__(self, estimator=None, *, n_estimators=50, learning_rate=1.0, loss="linear",
+                 random_state=None):
+        super().__init__(estimator, n_estimators, learning_rate, random_state)
+        self.loss = loss
+
+    def _validate_params(self):
+        if self.loss not in self._LOSSES:
+            raise ValueError(f"loss must be one of {tuple(self._LOSSES)}, got {self.loss!r}")
+        super()._validate_params()
+
+    def fit(self, X, y, sample_weight=None):
+        """Fit the boosted ensemble.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+            Training data, read as float32.
+        y : array-like of shape (n_samples,)
+            Target values, read as float32.
+        sample_weight : array-like of shape (n_samples,), default=None
+            Initial row weights; must be finite, nonnegative and have a
+            positive total. None weights every row equally.
+
+        Returns
+        -------
+        self
+        """
+        self._validate_params()
+        Xa, _ = as_f32_c(X, ndim=2, name="X")
+        n, d = Xa.shape
+        y32, _ = as_f32_c(y, ndim=1, name="y")
+        if len(y32) != n:
+            raise ValueError(f"y has {len(y32)} rows, X has {n}")
+        seed = _trees_seed(self.random_state)
+        base = self.estimator if self.estimator is not None else DecisionTreeRegressor(max_depth=3)
+        w = _trees_normalized_weights(sample_weight, n, self)
+        stats = zeros((4,), "<f8")
+        cols = self._arange(d)
+        self.estimators_, self.estimator_weights_, self.estimator_errors_ = [], [], []
+        b = self._bind()
+        m = int(self.n_estimators)
+        # trees-apple3: a best-splitter squared-error DecisionTreeRegressor
+        # member fits rows of the SAME X, staged on the device once; the
+        # member's rows are gathered there (None: gathered on the host and
+        # staged per member, as before)
+        session = None
+        dflt = _trees_ada_session_default(self)
+        if (forest_data_session_choice(None, dflt) is not None
+                and type(base) is DecisionTreeRegressor and base.splitter == "best"
+                and base.criterion in ("squared_error", "mse")
+                and hasattr(_trees_member_native(base), "rf_regressor_fit_session_rows_export")):
+            session = _trees_member_session(base, Xa, True, default=dflt)
+        try:
+            self._fit_members(base, seed, m, Xa, y32, w, n, cols, session, b, stats)
+        finally:
+            if session is not None:
+                session.close()
+        self.n_features_in_ = d
+        return self
+
+    def _fit_members(self, base, seed, m, Xa, y32, w, n, cols, session, b, stats):
+        for it in range(m):  # glue: one member fit per estimator
+            rows = empty((n,), "<i4")
+            b.x_trees_weighted_sample(addr_ro(w, name="w"), addr(rows, name="rows"), [n, n, seed, it])
+            est = _trees_clone(base, random_state=_trees_sub_seed(seed, it))
+            if session is not None:
+                est._fit_in_session(session, self._gather_vec(y32, rows), rows=rows)
+            else:
+                est.fit(self._gather(Xa, rows, cols), self._gather_vec(y32, rows))
+            pred, _ = as_f32_c(est.predict(Xa), ndim=1, name="prediction")
+            b.x_trees_r2_step(addr(w, name="w"), addr_ro(pred, name="pred"), addr_ro(y32, name="y"),
+                              addr(stats, name="stats"),
+                              [n, self._LOSSES[self.loss], float(self.learning_rate), 1 if it == m - 1 else 0,
+                               int(isinstance(base, DecisionTreeRegressor))])
+            status, alpha, err, total = stats.tolist()
+            if status == 2.0:
+                if not self.estimators_:
+                    self.estimators_.append(est)
+                    self.estimator_weights_.append(0.0)
+                    self.estimator_errors_.append(err)
+                break
+            self.estimators_.append(est)
+            self.estimator_weights_.append(alpha)
+            self.estimator_errors_.append(err)
+            if status == 1.0 or not total > 0:
+                break
+            if it < m - 1:
+                self._scale(w, total)
+
+    def predict(self, X):
+        """Weighted median of the members' predictions."""
+        Xa = self._check_X(X)
+        n, m = Xa.shape[0], len(self.estimators_)
+        preds = empty((m * n,), "<f4")
+        b = self._bind()
+        for j, est in enumerate(self.estimators_):  # glue: one member prediction per estimator
+            p, _ = as_f32_c(est.predict(Xa), ndim=1, name="prediction")
+            b.x_trees_put_f32(addr(preds, name="preds"), addr_ro(p, name="p"), [j * n, n])
+        weights = Array.from_list([float(a) for a in self.estimator_weights_], "<f8")  # glue: member weights as float64 words
+        out = empty((n,), "<f4")
+        b.x_trees_weighted_median(addr_ro(preds, name="preds"), addr_ro(weights, name="weights"),
+                                  addr(out, name="median"), [n, m])
+        return out
+
+
+# --------------------------------------------------------------------- DART
+# Reference: LightGBM `src/boosting/dart.hpp` (DART::DroppingTrees,
+# ::Normalize, ::TrainOneIter) over `gbdt.cpp`'s boosting loop, with
+# `regression_objective.hpp` (L2), `binary_objective.hpp` (logloss, sigmoid
+# 1) and `multiclass_objective.hpp` (MulticlassSoftmax: one tree per class
+# per iteration, h = K / (K - 1) p (1 - p), start log(class prior)) for the
+# gradients. Carried: drop_rate, max_drop, skip_drop, uniform_drop,
+# xgboost_dart_mode, drop_seed, the tree weights and their normalisation
+# (per iteration: a dropped iteration drops all of its K trees), the leaf
+# values of `CalculateSplittedLeafOutput` -ThresholdL1(sum g, reg_alpha) /
+# (sum h + reg_lambda) clipped to max_delta_step, per-tree feature sampling
+# (colsample_bytree, `col_sampler.hpp` GetCnt: round(d * fraction), at least
+# 1) and row bagging (subsample every subsample_freq iterations; the tree and
+# its leaf values see the bag, every row's score moves, `bagging.hpp`).
+# DEVIATIONS: each tree is the forest builder's (level-order, quantile bins,
+# `num_leaves` as cuML's `max_leaves` cap) fitted by squared error to -g,
+# where LightGBM grows leaf-wise on the g/h histogram gain (so
+# min_child_weight, LightGBM's min_sum_hessian_in_leaf, is refused); the leaf
+# VALUES are LightGBM's. Every draw comes from the lane's counter RNG (drops
+# seeded by drop_seed; the bag, one Bernoulli(subsample) per row in row order,
+# by bagging_seed; the feature subset, a sorted draw without replacement, by
+# feature_fraction_seed), not LightGBM's LCG; the average / log-odds /
+# log-prior start is a constant outside the trees (never dropped), where
+# LightGBM folds it into tree 0's bias.
+class _DARTBase(_TreesEnsembleBase):
+    _KIND = 0
+
+    def __init__(self, n_estimators, learning_rate, num_leaves, max_depth, min_child_samples, reg_lambda,
+                 max_bin, drop_rate, max_drop, skip_drop, xgboost_dart_mode, uniform_drop, drop_seed,
+                 random_state, reg_alpha=0.0, max_delta_step=0.0, colsample_bytree=1.0, subsample=1.0,
+                 subsample_freq=0, feature_fraction_seed=2, bagging_seed=3):
+        if int(n_estimators) < 1:
+            raise ValueError("n_estimators must be >= 1")
+        if not float(learning_rate) > 0:
+            raise ValueError("learning_rate must be > 0")
+        if not 0.0 <= float(drop_rate) <= 1.0 or not 0.0 <= float(skip_drop) <= 1.0:
+            raise ValueError("drop_rate and skip_drop must be in [0, 1]")
+        if float(reg_lambda) < 0 or float(reg_alpha) < 0:
+            raise ValueError("reg_lambda and reg_alpha must be >= 0")
+        if not 0.0 < float(colsample_bytree) <= 1.0 or not 0.0 < float(subsample) <= 1.0:
+            raise ValueError("colsample_bytree and subsample must be in (0, 1]")
+        if int(subsample_freq) < 0:
+            raise ValueError("subsample_freq must be >= 0")
+        self.n_estimators = n_estimators
+        self.learning_rate = learning_rate
+        self.num_leaves = num_leaves
+        self.max_depth = max_depth
+        self.min_child_samples = min_child_samples
+        self.reg_lambda = reg_lambda
+        self.max_bin = max_bin
+        self.drop_rate = drop_rate
+        self.max_drop = max_drop
+        self.skip_drop = skip_drop
+        self.xgboost_dart_mode = xgboost_dart_mode
+        self.uniform_drop = uniform_drop
+        self.drop_seed = drop_seed
+        self.random_state = random_state
+        self.reg_alpha = reg_alpha
+        self.max_delta_step = max_delta_step
+        self.colsample_bytree = colsample_bytree
+        self.subsample = subsample
+        self.subsample_freq = subsample_freq
+        self.feature_fraction_seed = feature_fraction_seed
+        self.bagging_seed = bagging_seed
+        for sd in (random_state, drop_seed, feature_fraction_seed, bagging_seed):  # glue: validates the four seed arguments
+            _trees_seed(sd)
+
+    def _bag(self, n, it):
+        """The bagged rows of iteration `it` (row order), or None for all."""
+        freq, frac = int(self.subsample_freq), float(self.subsample)
+        if freq <= 0 or not frac < 1.0:
+            return None
+        start = it - it % freq
+        if getattr(self, "_bag_at", None) is not None and self._bag_at[0] == start:
+            return self._bag_at[1]
+        # the rows whose draw is below frac (none: the smallest draw's row),
+        # drawn and compacted natively (`x_trees_bag_rows`, on the device in
+        # a GPU build); the draws are `x_trees_uniform`'s stream
+        out = empty((max(1, n),), "<i4")
+        k = int(self._bind().x_trees_bag_rows(addr(out, name="bag"), [n, _trees_seed(self.bagging_seed), start, frac]))
+        self._bag_at = (start, out[:k])
+        return self._bag_at[1]
+
+    def _cols(self, d, t):
+        """The sorted feature subset of tree `t`, or None for all."""
+        frac = float(self.colsample_bytree)
+        if not frac < 1.0:
+            return None
+        cnt = max(int(d * frac + 0.5), min(1, d))
+        if cnt >= d:
+            return None
+        # without replacement the draw is already the ascending set
+        return self._indices(d, cnt, False, _trees_seed(self.feature_fraction_seed), t)
+
+    def _boost(self, Xa, y32, n_classes=1):
+        n, d = Xa.shape
+        K = int(n_classes)
+        b = self._bind()
+        seed = _trees_seed(self.random_state)
+        drop_seed = _trees_seed(self.drop_seed)
+        if self._KIND == 0:
+            inits = [_trees_fsum_f32(b, y32) / n]
+        elif self._KIND == 1:
+            p = _trees_fsum_f32(b, y32) / n
+            if not 0.0 < p < 1.0:
+                raise ValueError("y must hold both classes")
+            inits = [float(b.x_trees_log64(p / (1.0 - p)))]
+        else:
+            # the class counts and the K priors log(max(1e-15, count / n))
+            # in the binding (lane py-runtime-b: `x_trees_class_priors`)
+            cnt = empty((K,), "<i4")
+            b.x_trees_class_counts(addr_ro(y32, name="y"), addr(cnt, name="counts"), [n, K])
+            priors = empty((K,), "<f8")
+            b.x_trees_class_priors(addr_ro(cnt, name="counts"), addr(priors, name="priors"), [n, K])
+            inits = priors.tolist()
+        self.init_score_ = inits[0] if K == 1 else inits
+        lr = float(self.learning_rate)
+        l1, mds, lam = float(self.reg_alpha), float(self.max_delta_step), float(self.reg_lambda)
+        self.n_classes_ = K
+        self.trees_, self.tree_values_, self.tree_coefs_, self.tree_weights_ = [], [], [], []
+        self._bag_at = None
+        max_depth = None if self.max_depth is None or int(self.max_depth) <= 0 else int(self.max_depth)
+        # trees-apple3: members that fit every row and column of X share ONE
+        # staged copy of it (a bagged or column-sampled member gathers its
+        # own X and fits as before)
+        session = None
+        if not (float(self.subsample) < 1.0 and int(self.subsample_freq) > 0) \
+                and not float(self.colsample_bytree) < 1.0:
+            # lane/gap-nv-classical2: DART opens the exact session by default
+            # (ANONLIB_FOREST_SESSION=0 still turns it off). Without it each
+            # of the n_estimators members scanned, transposed, staged and
+            # uploaded the whole of X and rebuilt its quantiles; in the
+            # session each member still draws its own quantile sample, so
+            # each member's forest is the one its own fit returns.
+            session = _trees_member_session(
+                RandomForestRegressor(n_estimators=1, numeric_mode=self.numeric_mode), Xa, True,
+                default="1")
+        try:
+            # lane py-runtime-b: the round is the binding's (`x_trees_dart_*`)
+            # on every build; main's host loop over Python lists is deleted
+            self._dart_device(b, session, K)
+            self._boost_loop_device(Xa, y32, K, b, seed, drop_seed, inits, lr, l1, mds, lam, max_depth, session)
+        finally:
+            if session is not None:
+                session.close()
+        self._bag_at = None
+        self.n_features_in_ = d
+        return self
+
+    # -------------------------------------------- lane/apple-fast-dart
+    # The boosting round on the device (xtrees/dart_device.mojo): FAST on
+    # every GPU vendor (Apple since lane/apple-fast-dart, NVIDIA and AMD since
+    # lane cpu2-l5-trees; default unless -D ANONLIB_DART_DEVICE_OFF) and, since lane
+    # fam2-forests, every IDENTICAL build (GPU kernels and the host twin
+    # xtrees/dart_host.mojo, default unless -D ANONLIB_IDN_DART_DEVICE_OFF);
+    # the only builds that register x_trees_dart_open; lane py-runtime-b deleted
+    # main's host loop `_boost_loop`, so the round is required). The score, gradients and leaf values are
+    # float32 on the device and the dropped trees come off and go back as
+    # one gathered sum per row (the docstring of dart_device.mojo).
+    _DART_VALUES_CAP = 1 << 26
+
+    def _dart_device(self, b, session, K):
+        """Refuses a binary without the round's entries (a FAST CPU-only
+        install, the _OFF defines) and a fit past the node or leaf-value cap
+        below (lane py-runtime-b deleted main's host loop over Python lists
+        that took them). Every other fit, with or without a forest data
+        session, bagged and column-sampled included, takes the round."""
+        if not callable(getattr(b, "x_trees_dart_open", None)):
+            raise NotImplementedError(
+                "anonlib DART: this binary has no x_trees_dart_* round (a FAST CPU-only install or a "
+                "ANONLIB_*DART_DEVICE_OFF build); the host loop is removed, so the fit is refused by name")
+        node_cap = 2 * int(self.num_leaves) - 1
+        if not (1 <= node_cap <= 65535 and int(self.n_estimators) * K * node_cap <= self._DART_VALUES_CAP):
+            raise NotImplementedError(
+                f"anonlib DART: n_estimators * classes * (2 * num_leaves - 1) must be at most "
+                f"{self._DART_VALUES_CAP} and num_leaves at most 32768 (the round's leaf-value store); refused by name")
+
+    @staticmethod
+    def _dart_thr(v):
+        """Encode the scalar skip_drop argument for the binding's 53-bit draw.
+
+        For u = m / 2**53, u < v is exactly m < ceil(v * 2**53).
+        This converts one API parameter; the binding performs all draws.
+        """
+        if not v > 0.0:
+            return 0
+        if v >= 1.0:
+            return 1 << 53
+        return int(math.ceil(v * 9007199254740992.0))
+
+    def _boost_loop_device(self, Xa, y32, K, b, seed, drop_seed, inits, lr, l1, mds, lam, max_depth, session):
+        n, d = Xa.shape
+        n_iters = int(self.n_estimators)
+        node_cap = 2 * int(self.num_leaves) - 1
+        all_cols = self._arange(d)
+        inits32 = Array.from_list([float(v) for v in inits], "<f4")  # glue: class starts as float32 words
+        skip_thr = self._dart_thr(float(self.skip_drop))
+        bad = empty((1,), "<i4")
+        # lane py-runtime-b: the tree weights, the coefficients and the weight
+        # sum live in binary64 buffers the binding updates
+        # (`x_trees_dart_thresholds` before the step, `x_trees_dart_rescale`
+        # after it), the same words main's Python lists held
+        weights64 = empty((n_iters,), "<f8")
+        coefs64 = empty((n_iters * K,), "<f8")
+        coef32 = empty((n_iters * K,), "<f4")
+        thr64 = empty((n_iters,), "<i8")
+        flags = empty((n_iters,), "<i4")
+        state = Array.from_list([0.0], "<f8")
+        book = [int(K), 1 if self.uniform_drop else 0]
+        handle = b.x_trees_dart_open(addr_ro(Xa, name="X"), addr_ro(y32, name="y"), addr_ro(inits32, name="inits"),
+                                     [n, d, K, self._KIND, n_iters, node_cap])
+        try:
+            for it in range(n_iters):  # glue: one boosting round per estimator
+                t = it
+                b.x_trees_dart_thresholds(addr(weights64, name="weights"), addr(coefs64, name="coefs"),
+                                          addr(coef32, name="coef32"), addr(thr64, name="thr"),
+                                          addr(state, name="state"), [t] + book + [int(self.max_drop)],
+                                          float(self.drop_rate))
+                # The K n-sized targets stay in the DART session's target
+                # plane (cpu4-forest): each member tree fits there
+                # (`_fit_in_dart`), as do the score, gradients and leaf sums
+                b.x_trees_dart_step(handle, addr_ro(coef32, name="coef"), addr_ro(thr64, name="thr"),
+                                    addr(flags, name="flags"), addr(bad, name="bad"),
+                                    [], [t, drop_seed, it, skip_thr])
+                if bad.tolist()[0]:
+                    raise RuntimeError("x_trees dart: a tree walk left its tree (child or column out of range)")
+                _, shrink, factor = b.x_trees_dart_rescale(addr(weights64, name="weights"),
+                                                           addr(coefs64, name="coefs"), addr_ro(flags, name="flags"),
+                                                           addr(state, name="state"),
+                                                           [t] + book + [1 if self.xgboost_dart_mode else 0], lr)
+                # the round's bag rows (device-drawn `x_trees_bag_rows`; None:
+                # every row), drawn after the step so the last round's list
+                # (its copies landed at the step's sync) may be replaced
+                rows = self._bag(n, it)
+                m = 0 if rows is None else len(rows)
+                for c in range(K):  # glue: one member tree per class (K classes)
+                    j = it * K + c
+                    cols = self._cols(d, j)
+                    tree = RandomForestRegressor(
+                        n_estimators=1, bootstrap=False, max_features=1.0, max_depth=max_depth,
+                        max_leaves=int(self.num_leaves), min_samples_leaf=int(self.min_child_samples),
+                        n_bins=int(self.max_bin), random_state=_trees_sub_seed(seed, j), n_streams=1,
+                        numeric_mode=self.numeric_mode)
+                    # the member on the DART session's X and class-c target,
+                    # at the bag rows and the tree's columns (device gathers);
+                    # the colid back in X's columns (device remap)
+                    tree._fit_in_dart(handle, c, n, d, rows=rows, cols=cols)
+                    if cols is not None:
+                        cid = tree._colid.copy()
+                        b.x_trees_remap_cols(addr(cid, name="colid"), addr_ro(cols, name="cols"),
+                                             [len(cid), len(cols)])
+                        tree._colid = cid
+                    offs = tree._offsets.tolist()
+                    lo, n_nodes = int(offs[0]), int(offs[1]) - int(offs[0])
+                    values = empty((n_nodes,), "<f4")
+                    b.x_trees_dart_add(handle, addr_ro(tree._colid, name="colid"),
+                                       addr_ro(tree._quesval, name="quesval"), addr_ro(tree._left_child, name="left"),
+                                       addr(values, name="values"),
+                                       addr_ro(rows if rows is not None else all_cols, name="bag rows"),
+                                       [j, c, lo, n_nodes, float(shrink), float(factor), lam, l1, mds, m])
+                    self.trees_.append(tree)
+                    self.tree_values_.append(values)
+        finally:
+            b.x_trees_dart_close(handle, addr(bad, name="bad"))
+        if bad.tolist()[0]:
+            raise RuntimeError("x_trees dart: a tree walk left its tree (child or column out of range)")
+        self.tree_coefs_ = coefs64.tolist()
+        self.tree_weights_ = weights64.tolist()
+
+    def _raw(self, X):
+        """Class-major raw scores (K * n) float64; K = 1 is (n,)."""
+        if not hasattr(self, "trees_"):
+            raise RuntimeError("this estimator is not fitted yet")
+        Xa, _ = as_f32_c(X, ndim=2, name="X")
+        if Xa.shape[1] != self.n_features_in_:
+            raise ValueError(f"X has {Xa.shape[1]} features, fit saw {self.n_features_in_}")
+        n, d = Xa.shape
+        K = int(getattr(self, "n_classes_", 1))
+        inits = [self.init_score_] if K == 1 else list(self.init_score_)
+        score = empty((K * n,), "<f8")
+        if n == 0:
+            return score
+        # lane cpu2-l5-trees: ONE native entry (`x_trees_dart_predict`, a device
+        # kernel on a GPU build, its host twin on the host column) walks every
+        # row through every tree and folds coef x leaf value onto the class
+        # start, trees ascending per (class, row), in soft binary64: the words
+        # main's per-tree `x_trees_apply` + host `x_trees_tree_score_add` loop
+        # wrote under IDENTICAL. Below is glue: one address per tree and array.
+        cols, ques, lefts, vals, sizes, coefs = [], [], [], [], [], []
+        for tree, values, coef in zip(self.trees_, self.tree_values_, self.tree_coefs_):  # glue: T tree addresses
+            offs = tree._offsets.tolist()
+            lo = int(offs[0])
+            cols.append(addr_ro(tree._colid, name="colid") + 4 * lo)
+            ques.append(addr_ro(tree._quesval, name="quesval") + 4 * lo)
+            lefts.append(addr_ro(tree._left_child, name="left") + 4 * lo)
+            vals.append(addr_ro(values, name="values"))
+            sizes.append(int(offs[1]) - lo)
+            coefs.append(float(coef))
+        starts = [float(v) for v in inits]  # glue: the K class starts
+        self._bind().x_trees_dart_predict(addr_ro(Xa, name="X"), [cols, ques, lefts, vals], sizes, coefs,
+                                          starts, addr(score, name="score"), [n, d, K])
+        return score
+
+    def _raw_rows(self, X):
+        """The raw scores as (n, K) row-major, K >= 2."""
+        raw = self._raw(X)
+        K = self.n_classes_
+        n = len(raw) // K
+        out = empty((n * K,), "<f8")
+        self._bind().x_trees_transpose_f64(addr_ro(raw, name="raw"), addr(out, name="raw rows"), [K, n])
+        return out.reshape((n, K))
+
+
+class DARTRegressor(RegressorScoreMixin, _DARTBase):
+    """Gradient boosting with DART dropout, squared-error loss.
+
+    Follows LightGBM's ``boosting="dart"`` with the L2 objective: in each
+    iteration a random subset of the earlier trees is dropped while the new
+    tree is fitted, and the trees are then renormalized. ``predict`` returns
+    the raw score as float64. ``X`` and ``y`` are read as float32.
+
+    Each tree is grown by the forest builder (level-order, quantile bins) on
+    the negative gradient; leaf values follow LightGBM (the L1/L2-regularized
+    Newton step, clipped by ``max_delta_step``). The draws (dropout, bagging,
+    feature sampling) come from anonlib's own random generator, not
+    LightGBM's, and the starting score is a constant kept outside the trees.
+    A fit with ``n_estimators * n_classes * (2 * num_leaves - 1)`` above
+    2**26, or ``num_leaves`` above 32768, raises ``NotImplementedError``.
+
+    Parameters
+    ----------
+    n_estimators : int, default=100
+        Number of boosting iterations; must be at least 1.
+    learning_rate : float, default=0.1
+        Shrinkage; must be > 0.
+    num_leaves : int, default=31
+        Maximum leaves per tree, applied as a cap on level-order growth
+        (LightGBM grows leaf-wise), so trees can differ from LightGBM's.
+    max_depth : int, default=-1
+        Maximum tree depth; -1 or any value <= 0 means no limit.
+    min_child_samples : int, default=20
+        Minimum number of rows in each leaf.
+    reg_lambda : float, default=0.0
+        L2 regularization on leaf values; must be >= 0.
+    max_bin : int, default=255
+        Number of quantile bins per feature used for the split search.
+    drop_rate : float, default=0.1
+        Fraction of earlier trees dropped each iteration, in [0, 1].
+    max_drop : int, default=50
+        Maximum number of trees dropped per iteration.
+    skip_drop : float, default=0.5
+        Probability of skipping the dropout in an iteration, in [0, 1].
+    xgboost_dart_mode : bool, default=False
+        Use XGBoost's DART normalization.
+    uniform_drop : bool, default=False
+        Drop trees uniformly instead of in proportion to their weights.
+    drop_seed : int, default=4
+        Seed for the dropout draws.
+    random_state : int or None, default=None
+        Seed for the trees. None means seed 0.
+    reg_alpha : float, default=0.0
+        L1 regularization on leaf values; must be >= 0.
+    max_delta_step : float, default=0.0
+        Clip on each leaf value; 0 means no clip.
+    colsample_bytree : float, default=1.0
+        Fraction of features sampled for each tree, in (0, 1].
+    subsample : float, default=1.0
+        Fraction of rows bagged, in (0, 1]; used when ``subsample_freq > 0``.
+    subsample_freq : int, default=0
+        Re-draw the row bag every this many iterations; 0 disables bagging.
+    feature_fraction_seed : int, default=2
+        Seed for the per-tree feature sampling.
+    bagging_seed : int, default=3
+        Seed for the row bagging.
+
+    Attributes
+    ----------
+    init_score_ : float or list of float
+        Starting score (one per class for more than two classes).
+    tree_weights_ : list of float
+        Final weight of each tree after DART normalization.
+    n_features_in_ : int
+        Number of features seen in ``fit``.
+
+    Examples
+    --------
+    >>> import numpy as np, anonlib
+    >>> rng = np.random.default_rng(0)
+    >>> X = rng.random((1000, 8), dtype=np.float32)
+    >>> y = X @ rng.random(8, dtype=np.float32)
+    >>> model = anonlib.DARTRegressor(n_estimators=50).fit(X, y)
+    >>> pred = model.predict(X)
+    """
+    _estimator_type = "regressor"
+    _KIND = 0
+
+    def __init__(self, *, n_estimators=100, learning_rate=0.1, num_leaves=31, max_depth=-1,
+                 min_child_samples=20, reg_lambda=0.0, max_bin=255, drop_rate=0.1, max_drop=50,
+                 skip_drop=0.5, xgboost_dart_mode=False, uniform_drop=False, drop_seed=4, random_state=None,
+                 reg_alpha=0.0, max_delta_step=0.0, colsample_bytree=1.0, subsample=1.0, subsample_freq=0,
+                 feature_fraction_seed=2, bagging_seed=3):
+        super().__init__(n_estimators, learning_rate, num_leaves, max_depth, min_child_samples, reg_lambda,
+                         max_bin, drop_rate, max_drop, skip_drop, xgboost_dart_mode, uniform_drop, drop_seed,
+                         random_state, reg_alpha, max_delta_step, colsample_bytree, subsample, subsample_freq,
+                         feature_fraction_seed, bagging_seed)
+
+    def fit(self, X, y):
+        """Fit the boosted trees on ``X`` (n_samples, n_features) and target ``y``.
+
+        Returns
+        -------
+        self
+        """
+        Xa, _ = as_f32_c(X, ndim=2, name="X")
+        y32, _ = as_f32_c(y, ndim=1, name="y")
+        if len(y32) != Xa.shape[0]:
+            raise ValueError(f"y has {len(y32)} rows, X has {Xa.shape[0]}")
+        return self._boost(Xa, y32)
+
+    def predict(self, X):
+        """Raw boosted score of each row, float64."""
+        return self._raw(X)
+
+
+class DARTClassifier(ClassifierScoreMixin, _DARTBase):
+    """Gradient boosting with DART dropout, classification.
+
+    Follows LightGBM's ``boosting="dart"``: binary log loss for two classes,
+    multiclass softmax (one tree per class per iteration) for more. In each
+    iteration a random subset of the earlier iterations is dropped while the
+    new trees are fitted, and the trees are then renormalized. ``X`` is read
+    as float32.
+
+    Each tree is grown by the forest builder (level-order, quantile bins) on
+    the negative gradient; leaf values follow LightGBM (the L1/L2-regularized
+    Newton step, clipped by ``max_delta_step``). The draws (dropout, bagging,
+    feature sampling) come from anonlib's own random generator, not
+    LightGBM's, and the starting score is a constant kept outside the trees.
+    A fit with ``n_estimators * n_classes * (2 * num_leaves - 1)`` above
+    2**26, or ``num_leaves`` above 32768, raises ``NotImplementedError``.
+
+    Parameters
+    ----------
+    n_estimators : int, default=100
+        Number of boosting iterations; must be at least 1.
+    learning_rate : float, default=0.1
+        Shrinkage; must be > 0.
+    num_leaves : int, default=31
+        Maximum leaves per tree, applied as a cap on level-order growth
+        (LightGBM grows leaf-wise), so trees can differ from LightGBM's.
+    max_depth : int, default=-1
+        Maximum tree depth; -1 or any value <= 0 means no limit.
+    min_child_samples : int, default=20
+        Minimum number of rows in each leaf.
+    reg_lambda : float, default=0.0
+        L2 regularization on leaf values; must be >= 0.
+    max_bin : int, default=255
+        Number of quantile bins per feature used for the split search.
+    drop_rate : float, default=0.1
+        Fraction of earlier trees dropped each iteration, in [0, 1].
+    max_drop : int, default=50
+        Maximum number of trees dropped per iteration.
+    skip_drop : float, default=0.5
+        Probability of skipping the dropout in an iteration, in [0, 1].
+    xgboost_dart_mode : bool, default=False
+        Use XGBoost's DART normalization.
+    uniform_drop : bool, default=False
+        Drop trees uniformly instead of in proportion to their weights.
+    drop_seed : int, default=4
+        Seed for the dropout draws.
+    random_state : int or None, default=None
+        Seed for the trees. None means seed 0.
+    reg_alpha : float, default=0.0
+        L1 regularization on leaf values; must be >= 0.
+    max_delta_step : float, default=0.0
+        Clip on each leaf value; 0 means no clip.
+    colsample_bytree : float, default=1.0
+        Fraction of features sampled for each tree, in (0, 1].
+    subsample : float, default=1.0
+        Fraction of rows bagged, in (0, 1]; used when ``subsample_freq > 0``.
+    subsample_freq : int, default=0
+        Re-draw the row bag every this many iterations; 0 disables bagging.
+    feature_fraction_seed : int, default=2
+        Seed for the per-tree feature sampling.
+    bagging_seed : int, default=3
+        Seed for the row bagging.
+
+    Attributes
+    ----------
+    classes_ : array of shape (n_classes,)
+        Class labels seen in ``fit``.
+    init_score_ : float or list of float
+        Starting score (one per class for more than two classes).
+    tree_weights_ : list of float
+        Final weight of each tree after DART normalization.
+    n_features_in_ : int
+        Number of features seen in ``fit``.
+
+    Examples
+    --------
+    >>> import numpy as np, anonlib
+    >>> rng = np.random.default_rng(0)
+    >>> X = rng.random((1000, 8), dtype=np.float32)
+    >>> y = (X[:, 0] + X[:, 1] > 1.0).astype(np.int32)
+    >>> model = anonlib.DARTClassifier(n_estimators=50).fit(X, y)
+    >>> proba = model.predict_proba(X)
+    """
+    _estimator_type = "classifier"
+    _KIND = 1
+
+    def __init__(self, *, n_estimators=100, learning_rate=0.1, num_leaves=31, max_depth=-1,
+                 min_child_samples=20, reg_lambda=0.0, max_bin=255, drop_rate=0.1, max_drop=50,
+                 skip_drop=0.5, xgboost_dart_mode=False, uniform_drop=False, drop_seed=4, random_state=None,
+                 reg_alpha=0.0, max_delta_step=0.0, colsample_bytree=1.0, subsample=1.0, subsample_freq=0,
+                 feature_fraction_seed=2, bagging_seed=3):
+        super().__init__(n_estimators, learning_rate, num_leaves, max_depth, min_child_samples, reg_lambda,
+                         max_bin, drop_rate, max_drop, skip_drop, xgboost_dart_mode, uniform_drop, drop_seed,
+                         random_state, reg_alpha, max_delta_step, colsample_bytree, subsample, subsample_freq,
+                         feature_fraction_seed, bagging_seed)
+
+    def fit(self, X, y):
+        """Fit the boosted trees on ``X`` (n_samples, n_features) and labels ``y``.
+
+        At least two classes are required.
+
+        Returns
+        -------
+        self
+        """
+        Xa, _ = as_f32_c(X, ndim=2, name="X")
+        self.classes_, codes = encode_labels(y)
+        K = len(self.classes_)
+        if K < 2:
+            raise ValueError("y must hold at least two classes")
+        if len(codes) != Xa.shape[0]:
+            raise ValueError(f"y has {len(codes)} rows, X has {Xa.shape[0]}")
+        y32, _ = as_f32_c(codes, ndim=1, name="y")
+        self._KIND = 1 if K == 2 else 2
+        return self._boost(Xa, y32, 1 if K == 2 else K)
+
+    def decision_function(self, X):
+        """Raw boosted scores, float64.
+
+        Shape (n_samples,) for two classes (the log-odds of ``classes_[1]``),
+        (n_samples, n_classes) otherwise.
+        """
+        if int(getattr(self, "n_classes_", 1)) > 1:
+            return self._raw_rows(X)
+        return self._raw(X)
+
+    def predict_proba(self, X):
+        """Class probabilities, float64, shape (n_samples, n_classes).
+
+        For two classes the columns are ``[1 - p, p]`` with ``p`` the sigmoid
+        of the raw score; for more, the softmax of the per-class raw scores.
+        """
+        if int(getattr(self, "n_classes_", 1)) > 1:
+            acc = self._raw_rows(X)
+            n, K = acc.shape
+            acc = acc.reshape((n * K,))
+            self._bind().x_trees_softmax_rows(addr(acc, name="proba"), [n, K])
+            return acc.reshape((n, K))
+        # the (0, raw) rows stacked natively
+        raw = self._raw(X)
+        n = len(raw)
+        acc = empty((2 * n,), "<f8")
+        # The binding borrows addresses, not array owners. Keep the zero
+        # column alive until it has been copied: an inline temporary dies
+        # after addr_ro(), before the native call, corrupting the first row.
+        zero = zeros((n,), "<f8")
+        self._bind().x_trees_stack_w64([addr_ro(zero, name="zero"), addr_ro(raw, name="raw")],
+                                       addr(acc, name="proba"), [n])
+        self._bind().x_trees_softmax_rows(addr(acc, name="proba"), [n, 2])
+        return acc.reshape((n, 2))
+
+    def predict(self, X):
+        """Predict the class with the highest score."""
+        if int(getattr(self, "n_classes_", 1)) > 1:
+            acc = self._raw_rows(X)
+            n, K = acc.shape
+            return decode_labels(self.classes_, self._argmax(acc.reshape((n * K,)), n, K))
+        raw = self._raw(X)
+        codes = empty((len(raw),), "<i4")
+        self._bind().x_trees_positive_codes(addr_ro(raw, name="raw"), addr(codes, name="codes"), [len(raw)])
+        return decode_labels(self.classes_, codes)
+
+
+# ----------------------------------------------------- RandomTreesEmbedding
+# Reference: scikit-learn `sklearn/ensemble/_forest.py` RandomTreesEmbedding
+# (:2700; fit :2870 draws y ~ U(0, 1) and fits ExtraTreeRegressor members
+# with max_features=1; transform :2960 one-hot encodes `apply`, the leaves
+# of each tree in node order). The members are this library's
+# ExtraTreesRegressor (one fit of n_estimators trees); y is drawn from the
+# lane's counter RNG. DEVIATION: the output is a dense float64 Array;
+# `sparse_output=True` (sklearn's default) is refused by name, there being no
+# sparse container in the NumPy-free layer.
+class RandomTreesEmbedding(_TreesEnsembleBase):
+    """An unsupervised embedding by totally random trees.
+
+    Follows scikit-learn's ``RandomTreesEmbedding``: a forest of extremely
+    randomized trees (one random feature per split) is fitted to uniform
+    random targets, and ``transform`` one-hot encodes the leaf each row
+    reaches in every tree. Unlike scikit-learn, the output is a dense float64
+    array; ``sparse_output=True`` raises ``NotImplementedError``.
+
+    Parameters
+    ----------
+    n_estimators : int, default=100
+        Number of trees.
+    max_depth : int, default=5
+        Maximum depth of each tree.
+    min_samples_split : int, default=2
+        Minimum number of rows a node needs before it can be split.
+    min_samples_leaf : int, default=1
+        Minimum number of rows in each leaf.
+    min_weight_fraction_leaf : float, default=0.0
+        Stored for scikit-learn compatibility; not used by the fit.
+    max_leaf_nodes : int or None, default=None
+        Grow each tree best-first to at most this many leaves.
+    min_impurity_decrease : float, default=0.0
+        A node is split only if the split decreases impurity by at least this
+        much.
+    sparse_output : bool, default=False
+        Only False is accepted.
+    n_jobs : None, default=None
+        Only None is accepted.
+    random_state : int or None, default=None
+        Seed for the random targets and the trees. None means seed 0. A
+        ``RandomState`` object raises ``ValueError``.
+    verbose : int, default=0
+        Only 0 is accepted.
+    warm_start : bool, default=False
+        Only False is accepted.
+
+    Attributes
+    ----------
+    forest_ : ExtraTreesRegressor
+        The fitted forest.
+    n_trees_ : int
+        Number of trees.
+    ``n_output_features_`` : int
+        Width of the embedding: the total number of leaves.
+    n_features_in_ : int
+        Number of features seen in ``fit``.
+
+    Examples
+    --------
+    >>> import numpy as np, anonlib
+    >>> X = np.random.default_rng(0).random((1000, 8), dtype=np.float32)
+    >>> emb = anonlib.RandomTreesEmbedding(n_estimators=10, random_state=0).fit_transform(X)
+    """
+
+    def __init__(self, n_estimators=100, *, max_depth=5, min_samples_split=2, min_samples_leaf=1,
+                 min_weight_fraction_leaf=0.0, max_leaf_nodes=None, min_impurity_decrease=0.0,
+                 sparse_output=False, n_jobs=None, random_state=None, verbose=0, warm_start=False):
+        # Stored as given; `_validate_params` checks them at fit (scikit-learn's convention).
+        self.n_estimators = n_estimators
+        self.max_depth = max_depth
+        self.min_samples_split = min_samples_split
+        self.min_samples_leaf = min_samples_leaf
+        self.min_weight_fraction_leaf = min_weight_fraction_leaf
+        self.max_leaf_nodes = max_leaf_nodes
+        self.min_impurity_decrease = min_impurity_decrease
+        self.sparse_output = sparse_output
+        self.n_jobs = n_jobs
+        self.random_state = random_state
+        self.verbose = verbose
+        self.warm_start = warm_start
+
+    def _validate_params(self):
+        if self.sparse_output:
+            _refuse("sparse_output=True", "the NumPy-free layer has no sparse container; the dense"
+                    " one-hot is returned.")
+        if self.n_jobs is not None or self.verbose or self.warm_start:
+            _refuse("n_jobs/verbose/warm_start", "not carried in pass 1.")
+        _trees_seed(self.random_state)
+
+    # sk-edges: no `sample_weight` parameter. The totally random trees here
+    # take no row weights (scikit-learn drops zero-weight rows from every node
+    # and weighs the leaf limits), so an advertised parameter could only
+    # refuse; it is left out until the builder takes weights.
+    def fit(self, X, y=None):
+        """Fit the random trees on ``X`` (n_samples, n_features).
+
+        ``y`` is ignored.
+
+        Returns
+        -------
+        self
+        """
+        self._validate_params()
+        Xa, _ = as_f32_c(X, ndim=2, name="X")
+        n, d = Xa.shape
+        seed = _trees_seed(self.random_state)
+        u = empty((n,), "<f8")
+        self._bind().x_trees_uniform(addr(u, name="u"), [n, seed, 0])
+        yr, _ = as_f32_c(u, ndim=1, name="y")
+        self.forest_ = ExtraTreesRegressor(
+            n_estimators=int(self.n_estimators), max_depth=self.max_depth, max_features=1,
+            min_samples_split=self.min_samples_split, min_samples_leaf=self.min_samples_leaf,
+            max_leaf_nodes=self.max_leaf_nodes, min_impurity_decrease=self.min_impurity_decrease,
+            random_state=seed, numeric_mode=self.numeric_mode).fit(Xa, yr)
+        f = self.forest_
+        # the leaf numbering in the binding (a parallel scan over the leaf
+        # flags in node order; a fresh forest's offsets start at 0)
+        n_trees = len(f._offsets) - 1
+        nn = int(f._offsets[n_trees])
+        left = as_i32_c(f._left_child, ndim=1, name="left")[0]
+        node_col = empty((nn,), "<i4")
+        col = int(self._bind().x_trees_leaf_numbering(addr_ro(left, name="left"), addr(node_col, name="node_col"),
+                                                      [nn]))
+        self._tree_base = f._offsets[0:n_trees]
+        self._node_col = node_col
+        self.n_trees_ = n_trees
+        self.n_output_features_ = col
+        self.n_features_in_ = d
+        return self
+
+    def apply(self, X):
+        """Leaf reached by each row in each tree.
+
+        Returns an int32 array of shape (n_samples, n_trees) of node ids,
+        numbered within each tree.
+        """
+        if not hasattr(self, "forest_"):
+            raise RuntimeError("this estimator is not fitted yet")
+        Xa, _ = as_f32_c(X, ndim=2, name="X")
+        n, d = Xa.shape
+        if d != self.n_features_in_:
+            raise ValueError(f"X has {d} features, fit saw {self.n_features_in_}")
+        f = self.forest_
+        out = empty((n * self.n_trees_,), "<i4")
+        self._bind().x_trees_apply(addr_ro(f._offsets, name="offsets"), addr_ro(f._colid, name="colid"),
+                                   addr_ro(f._quesval, name="quesval"), addr_ro(f._left_child, name="left"),
+                                   addr_ro(Xa, name="X"), addr(out, name="nodes"), [n, d, 0, self.n_trees_])
+        return out.reshape((n, self.n_trees_))
+
+    def transform(self, X):
+        """One-hot encode the leaves of ``X``.
+
+        Returns a dense float64 array of shape
+        (n_samples, ``n_output_features_``).
+        """
+        nodes = self.apply(X)
+        n = nodes.shape[0]
+        out = zeros((n * self.n_output_features_,), "<f8")
+        self._bind().x_trees_onehot_leaves(addr_ro(nodes, name="nodes"), addr_ro(self._tree_base, name="base"),
+                                           addr_ro(self._node_col, name="cols"), addr(out, name="embedding"),
+                                           [n, self.n_trees_, self.n_output_features_])
+        return out.reshape((n, self.n_output_features_))
+
+    def fit_transform(self, X, y=None):
+        """Fit on ``X``, then return ``transform(X)``."""
+        self._validate_params()
+        return self.fit(X, y).transform(X)
+
+
+# ------------------------------------------------------ wrappers: helpers
+def _trees_cv(cv, default=5):
+    """An int number of folds (None: `default`), or `cv` itself when it is a
+    splitter (has `split`) or an iterable of (train, test) index pairs."""
+    if cv is None:
+        return default
+    if hasattr(cv, "split") or (not isinstance(cv, (str, bytes, numbers.Number)) and hasattr(cv, "__iter__")):
+        return cv
+    if is_bool(cv) or not isinstance(cv, numbers.Integral) or cv < 2:
+        raise ValueError(f"cv={cv!r}: an int >= 2, a splitter with split(X, y), or an iterable of"
+                         " (train, test) index pairs")
+    return int(cv)
+
+
+class _FoldRows(list):
+    """The [(train rows, test rows)] of `_trees_native_folds`: int32 views into
+    the one buffer the device filled, kept alive here."""
+    __slots__ = ("_owner",)
+
+
+def _trees_native_folds(est, n_splits, n, codes, n_classes=0):
+    """`_trees_splits` for an int cv with the fold assignment and the fold
+    row lists made on the device (xtrees/folds_device.mojo through
+    `x_trees_device_folds`: sklearn's unshuffled StratifiedKFold / KFold law,
+    sklearn's unshuffled StratifiedKFold / KFold law; the host column runs
+    the same law in Mojo (lane cgr4-py-compute), every tier
+    (lane/apple-fast-trees-ensembles, 2026-10-02). `codes` is an int32 code
+    Array in [0, n_classes) (stratified) or None (KFold). The lists are
+    zero-copy int32 views into one downloaded buffer: fold i's rows outside
+    it, ascending, then inside it, ascending."""
+    b = est._bind()
+    counts = empty((n_splits + 1,), "<i4")
+    rows = empty((n_splits * n,), "<i4")
+    if codes is not None:
+        c32 = as_i32_c(codes, ndim=1, name="codes")[0]
+        k = int(n_classes)
+    else:
+        c32, k = counts, 0
+    status = int(b.x_trees_device_folds(addr_ro(c32, name="codes"), addr(rows, name="rows"),
+                                        addr(counts, name="counts"), [n, n_splits, k]))
+    if status == 1:
+        raise ValueError(f"n_splits={n_splits} cannot be greater than the number of members in each class")
+    if status != 0:
+        raise ValueError("y codes outside [0, n_classes)")
+    cnt = [int(v) for v in counts.tolist()[:n_splits]]  # glue: fold sizes and offsets over n_splits folds
+    used = max([i for i in range(n_splits) if cnt[i] > 0] or [0]) + 1  # glue: fold sizes and offsets over n_splits folds
+    out = _FoldRows()
+    out._owner = rows
+    for i in range(used):  # glue: fold sizes and offsets over n_splits folds
+        base = rows._addr + 4 * i * n
+        tr = memory_at(base, 4 * (n - cnt[i]), writable=False).cast("i")
+        te = memory_at(base + 4 * (n - cnt[i]), 4 * cnt[i], writable=False).cast("i")
+        out.append((tr, te))
+    return out
+
+
+def _trees_splits(cv, X, y, n, codes=None, partition=False, native=None, n_classes=0):
+    """[(train rows, test rows)] as int32 Arrays. An int is sklearn's
+    unshuffled StratifiedKFold (with `codes`) or KFold; a splitter object's
+    `split(X, y)` and an iterable of pairs are taken as given (sklearn
+    `check_cv`), their indices in the order they come. `partition`: every row
+    must be in exactly one test set (sklearn cross_val_predict). `native`:
+    the estimator whose binding builds an int cv's folds on the device
+    (`_trees_native_folds`; `codes` is then an int32 Array in
+    [0, n_classes)), else None."""
+    c = _trees_cv(cv)
+    # sk-edges: a y shorter than X made the device fold builder read past
+    # the codes buffer (CUDA_ERROR_ILLEGAL_ADDRESS, sticky for the whole
+    # process); scikit-learn's check_consistent_length refusal comes first.
+    n_x = getattr(X, "shape", None)
+    n_x = int(n_x[0]) if n_x is not None and len(n_x) else n
+    n_y = len(codes) if codes is not None else n
+    if len({int(n), n_x, int(n_y)}) != 1:  # glue: three row counts
+        raise ValueError("Found input variables with inconsistent numbers of samples: "
+                         f"[{n_x}, {int(n_y)}]")
+    if isinstance(c, int):
+        if native is None:
+            raise ValueError("anonlib: an int cv needs the estimator whose binding builds the folds")
+        return _trees_native_folds(native, c, n, codes, n_classes)
+    from ._buffer import _native
+    pairs = c.split(X, y) if hasattr(c, "split") else c
+    out = []
+    seen = zeros((max(n, 1),), "<i8")
+    check = _native("check_indices_i64")
+    for pair in pairs:  # cpu-route: user cv splitter or iterable of index pairs, validated natively per pair [py-data-loop]
+        tr, te = (_trees_index_i64(v) for v in pair)  # cpu-route: user cv splitter or iterable of index pairs, validated natively per pair [py-data-loop]
+        if tr.size == 0 or te.size == 0:
+            raise ValueError("every cv split needs train and test rows")
+        for v in (tr, te):  # cpu-route: user cv splitter or iterable of index pairs, validated natively per pair [py-data-loop]
+            # range only: a repeated index is the splitter's to give
+            if int(check(addr_ro(v, name="cv rows"), v.size, n)) == 1:
+                raise ValueError(f"a cv index is outside [0, {n})")
+        _native("bincount_i64")(addr_ro(te, name="cv rows"), 3, te.size, n, addr(seen, name="seen"), 1)
+        out.append((tr.astype("<i4"), te.astype("<i4")))
+    if not out:
+        raise ValueError("cv produced no splits")
+    if partition and (seen.min() != 1 or seen.max() != 1):
+        raise ValueError("cross_val_predict only works for partitions: every row must be in exactly one test set")
+    return out
+
+
+def _trees_index_i64(v):
+    """A cv index list as an int64 Array (the native cast of an array; a
+    Python list goes in through array('q'), in C)."""
+    if isinstance(v, Array):
+        return v.astype("<i8") if v.dtype != "<i8" else v
+    try:
+        from ._buffer import _materialize
+        a, _ = _materialize(v, "cv rows")
+        return a.astype("<i8") if a.dtype != "<i8" else a
+    except (TypeError, ValueError):
+        import array as _array
+        store = _array.array("q", v)
+        return Array._owned(store, (len(store),), "<i8", "C")
+
+
+def _trees_estimators(estimators):
+    if not estimators:
+        raise ValueError("estimators must be a non-empty list of (name, estimator)")
+    names = [n for n, _ in estimators]  # glue: estimator names and drop markers
+    if len(set(names)) != len(names):
+        raise ValueError("estimator names must be unique")
+    active = [(n, e) for n, e in estimators if e != "drop"]  # glue: estimator names and drop markers
+    if not active:
+        raise ValueError("all estimators are 'drop'")
+    return active
+
+
+def _trees_output_2d(x, n):
+    """A member's output as a float32 (n, c) Array (a 1-D output is c = 1)."""
+    a, _ = as_f32_c(x, ndim=2, name="output") if len(getattr(x, "shape", ())) == 2 else \
+        (as_f32_c(x, ndim=1, name="output")[0].reshape((n, 1)), None)
+    return a
+
+
+class _FitTransformMixin:
+    """scikit-learn's `TransformerMixin.fit_transform` for the ensembles
+    with a `transform` (voting and stacking)."""
+
+    def fit_transform(self, X, y=None, **fit_params):
+        """Fit, then return ``transform(X)``.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+            Training data.
+        y : array-like of shape (n_samples,)
+            Targets.
+        **fit_params
+            Passed to ``fit`` (``sample_weight``).
+
+        Returns
+        -------
+        array of shape (n_samples, n_output_features), float64
+            The transformed training data.
+        """
+        return self.fit(X, y, **fit_params).transform(X)
+
+
+class _TreesWrapperBase(_TreesEnsembleBase):
+    def _check_X(self, X):
+        if not getattr(self, "_fitted", False):
+            raise RuntimeError("this estimator is not fitted yet")
+        Xa, _ = as_f32_c(X, ndim=2, name="X")
+        if Xa.shape[1] != self.n_features_in_:
+            raise ValueError(f"X has {Xa.shape[1]} features, fit saw {self.n_features_in_}")
+        return Xa
+
+    def _place(self, dst, n_rows, n_cols, out, rows, col0):
+        m = len(rows)
+        blk = _trees_output_2d(out, m)
+        self._bind().x_trees_scatter(addr(dst, name="dst"), addr_ro(blk, name="src"), addr_ro(rows, name="rows"),
+                                     [n_rows, n_cols, m, blk.shape[1], col0])
+        return blk.shape[1]
+
+    def _column(self, M, j):
+        n = M.shape[0]
+        return self._gather(M, self._arange(n), Array.from_list([j], "<i4")).reshape((n,))
+
+
+# ------------------------------------------------------------------ Voting
+# Reference: scikit-learn `sklearn/ensemble/_voting.py` (VotingClassifier
+# :200 -- fit on the label-encoded y, 'hard' = weighted bincount argmax,
+# 'soft' = weighted np.average of predict_proba --, VotingRegressor :500 --
+# weighted np.average of predict). Members are cloned, never refitted in
+# place; n_jobs and verbose are refused by name.
+class VotingClassifier(ClassifierScoreMixin, _FitTransformMixin, _TreesWrapperBase):
+    """Combine classifiers by a weighted majority vote or averaged probabilities.
+
+    Follows scikit-learn's ``VotingClassifier``. ``fit`` clones every estimator
+    and fits the clones on the label-encoded ``y``; the estimators you pass are
+    never fitted in place. ``voting="hard"`` predicts the weighted majority of
+    the members' predicted labels; ``voting="soft"`` predicts the argmax of the
+    weighted average of their ``predict_proba``. The members fit one after
+    another.
+
+    Parameters
+    ----------
+    estimators : list of (str, estimator)
+        Named anonlib classifiers. Names must be unique; an entry whose
+        estimator is the string ``"drop"`` is skipped. An empty list, duplicate
+        names, or every entry ``"drop"`` raise ``ValueError``.
+    voting : {"hard", "soft"}, default "hard"
+        Majority vote on predicted labels, or argmax of the averaged
+        probabilities (every member then needs ``predict_proba``). Any other
+        value raises ``ValueError``.
+    weights : sequence of float, default None
+        One weight per active estimator; None weighs them equally. A length
+        that does not match the active estimators raises ``ValueError``.
+    n_jobs : None
+        Only None is accepted; any other value raises ``NotImplementedError``.
+    flatten_transform : bool, default True
+        Kept for scikit-learn compatibility; ``transform`` always returns a 2-D
+        array.
+    verbose : bool, default False
+        Only False is accepted; True raises ``NotImplementedError``.
+
+    Attributes
+    ----------
+    estimators_ : list
+        The fitted clones, in order (fitted on integer class codes).
+    named_estimators_ : dict
+        The fitted clones by name.
+    classes_ : array
+        The class labels seen in ``fit``, sorted.
+    n_classes_ : int
+        Number of classes.
+    n_features_in_ : int
+        Number of features seen in ``fit``.
+
+    Examples
+    --------
+    >>> import numpy as np, anonlib
+    >>> rng = np.random.default_rng(0)
+    >>> X = rng.random((1000, 8), dtype=np.float32)
+    >>> y = (X[:, 0] > 0.5).astype(np.int32)
+    >>> model = anonlib.VotingClassifier(
+    ...     [("rf", anonlib.RandomForestClassifier()),
+    ...      ("dt", anonlib.DecisionTreeClassifier())], voting="soft").fit(X, y)
+    >>> model.predict(X[:5]).shape
+    (5,)
+    """
+    _estimator_type = "classifier"
+
+    def __init__(self, estimators, *, voting="hard", weights=None, n_jobs=None, flatten_transform=True,
+                 verbose=False):
+        # Stored as given; `_validate_params` checks them at fit (scikit-learn's convention).
+        self.estimators = estimators
+        self.voting = voting
+        self.weights = weights
+        self.n_jobs = n_jobs
+        self.flatten_transform = flatten_transform
+        self.verbose = verbose
+
+    def _validate_params(self):
+        if self.voting not in ("hard", "soft"):
+            raise ValueError("voting must be 'hard' or 'soft'")
+        if self.n_jobs is not None or self.verbose:
+            _refuse("n_jobs/verbose", "the members fit one after another.")
+
+    def _weights(self):
+        m = len(self.estimators_)
+        w = [1.0] * m if self.weights is None else [float(v) for v in self.weights]  # glue: user weights argument as floats
+        if len(w) != m:
+            raise ValueError(f"weights has {len(w)} entries, there are {m} estimators")
+        return w
+
+    def fit(self, X, y, sample_weight=None):
+        """Fit a clone of every active estimator on ``X`` and ``y``.
+
+        Parameters
+        ----------
+        X : array of shape (n_samples, n_features)
+            Training data, converted to float32.
+        y : array of shape (n_samples,)
+            Class labels.
+        sample_weight : array of shape (n_samples,), default None
+            Passed to every member's ``fit`` when given.
+
+        Returns
+        -------
+        self
+        """
+        self._validate_params()
+        Xa, _ = as_f32_c(X, ndim=2, name="X")
+        self.classes_, codes = encode_labels(y)
+        self.n_classes_ = len(self.classes_)
+        active = _trees_estimators(self.estimators)
+        sample_weight = _trees_member_weights(active, sample_weight, Xa.shape[0])
+        self.estimators_ = []
+        for _, est in active:  # glue: one member fit per estimator
+            e = _trees_clone(est)
+            e.fit(Xa, codes) if sample_weight is None else e.fit(Xa, codes, sample_weight=sample_weight)
+            self.estimators_.append(e)
+        self.named_estimators_ = dict((n, e) for (n, _), e in zip(active, self.estimators_))  # glue: named estimators map over members
+        self.n_features_in_ = Xa.shape[1]
+        self._fitted = True
+        self._weights()
+        return self
+
+    def _soft(self, Xa):
+        n, k = Xa.shape[0], self.n_classes_
+        acc = self._class_major([0.0], n * k)  # zero votes, filled by the binding
+        w = self._weights()
+        for e, wi in zip(self.estimators_, w):  # glue: one member prediction per estimator
+            self._acc_cols(acc, e.predict_proba(Xa), _trees_sub_cols(e), n, k, wi)
+        self._scale(acc, math.fsum(w))  # glue: the native fsum (core fsum_f64) of the k estimator weights
+        return acc
+
+    @available_if(lambda self: self.voting != "hard")
+    def predict_proba(self, X):
+        """Weighted average of the members' class probabilities.
+
+        Only available with ``voting="soft"``; with ``voting="hard"`` it raises
+        ``AttributeError``.
+
+        Returns
+        -------
+        array of shape (n_samples, n_classes), float64
+        """
+        if self.voting == "hard":
+            raise AttributeError("predict_proba is not available when voting='hard'")
+        Xa = self._check_X(X)
+        return self._soft(Xa).reshape((Xa.shape[0], self.n_classes_))
+
+    def predict(self, X):
+        """Predict class labels by weighted vote (hard) or averaged probabilities (soft).
+
+        Returns
+        -------
+        array of shape (n_samples,)
+            Labels from ``classes_``.
+        """
+        Xa = self._check_X(X)
+        n, k = Xa.shape[0], self.n_classes_
+        if self.voting == "soft":
+            acc = self._soft(Xa)
+        else:
+            acc = zeros((n * k,), "<f8")
+            for e, wi in zip(self.estimators_, self._weights()):  # glue: one member prediction per estimator
+                self._acc_votes(acc, as_i32_c(e.predict(Xa), ndim=1, name="codes")[0], n, k, wi)
+        return decode_labels(self.classes_, self._argmax(acc, n, k))
+
+    def transform(self, X):
+        """The members' outputs side by side.
+
+        Returns
+        -------
+        array, float64
+            With ``voting="soft"``, every member's class probabilities, shape
+            (n_samples, n_estimators * n_classes); with ``voting="hard"``, every
+            member's predicted class code, shape (n_samples, n_estimators).
+        """
+        Xa = self._check_X(X)
+        n, k, m = Xa.shape[0], self.n_classes_, len(self.estimators_)
+        width = m * k if self.voting == "soft" else m
+        out = zeros((n * width,), "<f8")
+        rows = self._arange(n)
+        for j, e in enumerate(self.estimators_):  # glue: one member prediction per estimator
+            if self.voting == "soft":
+                p = zeros((n * k,), "<f8")
+                self._acc_cols(p, e.predict_proba(Xa), _trees_sub_cols(e), n, k)
+                self._place(out, n, width, as_f32_c(p.reshape((n, k)), ndim=2, name="p")[0], rows, j * k)
+            else:
+                self._place(out, n, width, as_f32_c(e.predict(Xa), ndim=1, name="codes")[0], rows, j)
+        return out.reshape((n, width))
+
+
+class VotingRegressor(RegressorScoreMixin, _FitTransformMixin, _TreesWrapperBase):
+    """Average the predictions of several regressors.
+
+    Follows scikit-learn's ``VotingRegressor``. ``fit`` clones every estimator
+    and fits the clones; the estimators you pass are never fitted in place.
+    ``predict`` is the weighted average of the members' predictions. The
+    members fit one after another.
+
+    Parameters
+    ----------
+    estimators : list of (str, estimator)
+        Named anonlib regressors. Names must be unique; an entry whose
+        estimator is the string ``"drop"`` is skipped. An empty list, duplicate
+        names, or every entry ``"drop"`` raise ``ValueError``.
+    weights : sequence of float, default None
+        One weight per active estimator; None weighs them equally. A length
+        that does not match the active estimators raises ``ValueError`` in
+        ``predict``.
+    n_jobs : None
+        Only None is accepted; any other value raises ``NotImplementedError``.
+    verbose : bool, default False
+        Only False is accepted; True raises ``NotImplementedError``.
+
+    Attributes
+    ----------
+    estimators_ : list
+        The fitted clones, in order.
+    named_estimators_ : dict
+        The fitted clones by name.
+    n_features_in_ : int
+        Number of features seen in ``fit``.
+
+    Examples
+    --------
+    >>> import numpy as np, anonlib
+    >>> rng = np.random.default_rng(0)
+    >>> X = rng.random((1000, 8), dtype=np.float32)
+    >>> y = X @ np.arange(8, dtype=np.float32)
+    >>> model = anonlib.VotingRegressor(
+    ...     [("rf", anonlib.RandomForestRegressor()),
+    ...      ("dt", anonlib.DecisionTreeRegressor())]).fit(X, y)
+    >>> model.predict(X[:5]).shape
+    (5,)
+    """
+    _estimator_type = "regressor"
+
+    def __init__(self, estimators, *, weights=None, n_jobs=None, verbose=False):
+        # Stored as given; `_validate_params` checks them at fit (scikit-learn's convention).
+        self.estimators = estimators
+        self.weights = weights
+        self.n_jobs = n_jobs
+        self.verbose = verbose
+
+    def _validate_params(self):
+        if self.n_jobs is not None or self.verbose:
+            _refuse("n_jobs/verbose", "the members fit one after another.")
+
+    def fit(self, X, y, sample_weight=None):
+        """Fit a clone of every active estimator on ``X`` and ``y``.
+
+        Parameters
+        ----------
+        X : array of shape (n_samples, n_features)
+            Training data, converted to float32.
+        y : array of shape (n_samples,)
+            Targets.
+        sample_weight : array of shape (n_samples,), default None
+            Passed to every member's ``fit`` when given.
+
+        Returns
+        -------
+        self
+        """
+        self._validate_params()
+        Xa, _ = as_f32_c(X, ndim=2, name="X")
+        active = _trees_estimators(self.estimators)
+        sample_weight = _trees_member_weights(active, sample_weight, Xa.shape[0])
+        self.estimators_ = []
+        for _, est in active:  # glue: one member fit per estimator
+            e = _trees_clone(est)
+            e.fit(Xa, y) if sample_weight is None else e.fit(Xa, y, sample_weight=sample_weight)
+            self.estimators_.append(e)
+        self.named_estimators_ = dict((n, e) for (n, _), e in zip(active, self.estimators_))  # glue: named estimators map over members
+        self.n_features_in_ = Xa.shape[1]
+        self._fitted = True
+        return self
+
+    def predict(self, X):
+        """Weighted average of the members' predictions.
+
+        Returns
+        -------
+        array of shape (n_samples,), float64
+        """
+        Xa = self._check_X(X)
+        n, m = Xa.shape[0], len(self.estimators_)
+        w = [1.0] * m if self.weights is None else [float(v) for v in self.weights]  # glue: user weights argument as floats
+        if len(w) != m:
+            raise ValueError(f"weights has {len(w)} entries, there are {m} estimators")
+        acc = zeros((n,), "<f8")
+        for e, wi in zip(self.estimators_, w):  # glue: one member prediction per estimator
+            self._acc(acc, e.predict(Xa), n, wi)
+        self._scale(acc, math.fsum(w))  # glue: the native fsum (core fsum_f64) of the k estimator weights
+        return acc
+
+    def transform(self, X):
+        """Every member's prediction side by side.
+
+        Returns
+        -------
+        array of shape (n_samples, n_estimators), float64
+        """
+        Xa = self._check_X(X)
+        n, m = Xa.shape[0], len(self.estimators_)
+        out = zeros((n * m,), "<f8")
+        rows = self._arange(n)
+        for j, e in enumerate(self.estimators_):  # glue: one member prediction per estimator
+            self._place(out, n, m, as_f32_c(e.predict(Xa), ndim=1, name="p")[0], rows, j)
+        return out.reshape((n, m))
+
+
+# ---------------------------------------------------------------- Stacking
+# Reference: scikit-learn `sklearn/ensemble/_stacking.py` (_BaseStacking.fit
+# :150 -- every member refitted on all rows, the meta features from
+# cross_val_predict --, _concatenate_predictions :80 -- a binary
+# predict_proba keeps only its second column --, stack_method 'auto' =
+# predict_proba, decision_function, predict). cv is an int of unshuffled
+# folds (StratifiedKFold for the classifier, KFold for the regressor), a
+# splitter object or an iterable of (train, test) pairs whose test sets
+# partition the rows (`_trees_splits`).
+# DEVIATION: the default final estimators are this library's
+# LogisticRegression and Ridge (sklearn: LogisticRegression, RidgeCV).
+class _StackingBase(_FitTransformMixin, _TreesWrapperBase):
+    def __init__(self, estimators, final_estimator, cv, stack_method, n_jobs, passthrough, verbose):
+        # Stored as given; `_validate_params` checks them at fit (scikit-learn's convention).
+        self.estimators = estimators
+        self.final_estimator = final_estimator
+        self.cv = cv
+        self.stack_method = stack_method
+        self.n_jobs = n_jobs
+        self.passthrough = passthrough
+        self.verbose = verbose
+
+    def _validate_params(self):
+        if self.n_jobs is not None or self.verbose:
+            _refuse("n_jobs/verbose", "the members fit one after another.")
+        if self.stack_method not in ("auto", "predict_proba", "decision_function", "predict"):
+            raise ValueError("stack_method must be auto, predict_proba, decision_function or predict")
+        _trees_cv(self.cv)
+
+    def _method(self, est):
+        if self.stack_method != "auto":
+            return self.stack_method
+        for m in (("predict_proba", "decision_function", "predict") if self._estimator_type == "classifier"  # glue: stack method names tried in order
+                  else ("predict",)):
+            if hasattr(est, m):
+                return m
+        return "predict"
+
+    def _out(self, est, method, Xs):
+        out = getattr(est, method)(Xs)
+        if method == "predict_proba" and self._binary:
+            n = Xs.shape[0]
+            p = _trees_output_2d(out, n)
+            return self._gather(p, self._arange(n), Array.from_list([1], "<i4"))
+        return out
+
+    def _widths(self, Xa, y_fit):
+        return None
+
+    def _fit_stack(self, X, y_fit, splits, final, sample_weight=None):
+        Xa, _ = as_f32_c(X, ndim=2, name="X")
+        n, d = Xa.shape
+        active = _trees_estimators(self.estimators)
+        # scikit-learn: the weights go to every member's fit (all rows and
+        # each fold's training rows) and to the final estimator's
+        sw = _trees_member_weights(active + [("final_estimator", final)], sample_weight, n)
+
+        def fit_member(e, Xs, ys, rows=None):
+            if sw is None:
+                return e.fit(Xs, ys)
+            return e.fit(Xs, ys, sample_weight=sw if rows is None else self._gather_vec(sw, rows))
+        self.estimators_ = []
+        for _, est in active:  # glue: one member fit per estimator
+            e = _trees_clone(est)
+            fit_member(e, Xa, y_fit(None))
+            self.estimators_.append(e)
+        self.stack_method_ = [self._method(e) for e in self.estimators_]  # glue: one stack method per member
+        widths = []
+        for e, m in zip(self.estimators_, self.stack_method_):  # glue: output widths over the members
+            widths.append(_trees_output_2d(self._out(e, m, Xa[0:2]), 2).shape[1])
+        width = sum(widths) + (d if self.passthrough else 0)  # glue: output widths over the members
+        meta = zeros((n * width,), "<f8")
+        cols = self._arange(d)
+        for tr, te in splits:  # glue: one member fit per fold and member
+            col0 = 0
+            for (_, est), m, w in zip(active, self.stack_method_, widths):  # glue: one member fit per fold and member
+                e = _trees_clone(est)
+                fit_member(e, self._gather(Xa, tr, cols), y_fit(tr), tr)
+                got = self._place(meta, n, width, self._out(e, m, self._gather(Xa, te, cols)), te, col0)
+                if got != w:
+                    raise ValueError("a member's output width changed between folds (a class missing from a fold)")
+                col0 += w
+        if self.passthrough:
+            self._place(meta, n, width, Xa, self._arange(n), sum(widths))  # glue: sum of the members' output widths
+        self._widths_ = widths
+        self.named_estimators_ = dict((nm, e) for (nm, _), e in zip(active, self.estimators_))  # glue: named estimators map over members
+        self.final_estimator_ = _trees_clone(final)
+        fit_member(self.final_estimator_, as_f32_c(meta.reshape((n, width)), ndim=2, name="meta")[0], y_fit(None))
+        self.n_features_in_ = d
+        self._fitted = True
+        return self
+
+    def transform(self, X):
+        """The meta features the final estimator reads.
+
+        Each member's output (per ``stack_method_``) side by side, followed by
+        ``X`` itself when ``passthrough=True``. For a binary classifier,
+        ``predict_proba`` contributes only its second column.
+
+        Returns
+        -------
+        array of shape (n_samples, n_meta_features), float64
+        """
+        Xa = self._check_X(X)
+        n, d = Xa.shape
+        width = sum(self._widths_) + (d if self.passthrough else 0)  # glue: output widths over the members
+        meta = zeros((n * width,), "<f8")
+        rows, col0 = self._arange(n), 0
+        for e, m in zip(self.estimators_, self.stack_method_):  # glue: one member prediction per estimator
+            col0 += self._place(meta, n, width, self._out(e, m, Xa), rows, col0)
+        if self.passthrough:
+            self._place(meta, n, width, Xa, rows, col0)
+        return meta.reshape((n, width))
+
+    def _meta32(self, X):
+        return as_f32_c(self.transform(X), ndim=2, name="meta")[0]
+
+
+class StackingClassifier(ClassifierScoreMixin, _StackingBase):
+    """Stack classifiers and train a final classifier on their cross-validated outputs.
+
+    Follows scikit-learn's ``StackingClassifier``. ``fit`` refits every member on
+    all rows, and trains ``final_estimator`` on the members' out-of-fold
+    outputs (``cross_val_predict``). The members and folds fit one after
+    another.
+
+    Differs from scikit-learn: the default ``final_estimator`` is
+    anonlib's ``LogisticRegression``.
+
+    Parameters
+    ----------
+    estimators : list of (str, estimator)
+        Named anonlib classifiers. Names must be unique; an entry whose
+        estimator is the string ``"drop"`` is skipped.
+    final_estimator : estimator, default None
+        The classifier fitted on the meta features; None uses
+        ``LogisticRegression()``.
+    cv : int, splitter or iterable of (train, test), default None
+        An int is the number of unshuffled stratified folds (``>= 2``); None
+        means 5. A splitter object's ``split(X, y)`` or an iterable of index
+        pairs is used as given, but its test sets must cover every row exactly
+        once, else ``ValueError``.
+    stack_method : {"auto", "predict_proba", "decision_function", "predict"}, default "auto"
+        The member method whose output is stacked. ``"auto"`` takes the first
+        of ``predict_proba``, ``decision_function``, ``predict`` the member has.
+        For a binary problem ``predict_proba`` contributes only its second
+        column.
+    n_jobs : None
+        Only None is accepted; any other value raises ``NotImplementedError``.
+    passthrough : bool, default False
+        Also give the final estimator the original features.
+    verbose : int, default 0
+        Only 0 is accepted; any other value raises ``NotImplementedError``.
+
+    Attributes
+    ----------
+    estimators_ : list
+        The members refitted on all rows (fitted on integer class codes).
+    named_estimators_ : dict
+        The fitted members by name.
+    stack_method_ : list of str
+        The method stacked for each member.
+    final_estimator_ : estimator
+        The fitted final classifier.
+    classes_ : array
+        The class labels seen in ``fit``, sorted.
+    n_features_in_ : int
+        Number of features seen in ``fit``.
+
+    Examples
+    --------
+    >>> import numpy as np, anonlib
+    >>> rng = np.random.default_rng(0)
+    >>> X = rng.random((1000, 8), dtype=np.float32)
+    >>> y = (X[:, 0] + X[:, 1] > 1.0).astype(np.int32)
+    >>> model = anonlib.StackingClassifier(
+    ...     [("rf", anonlib.RandomForestClassifier()),
+    ...      ("dt", anonlib.DecisionTreeClassifier())]).fit(X, y)
+    >>> model.predict_proba(X[:5]).shape
+    (5, 2)
+    """
+    _estimator_type = "classifier"
+
+    def __init__(self, estimators, final_estimator=None, *, cv=None, stack_method="auto", n_jobs=None,
+                 passthrough=False, verbose=0):
+        super().__init__(estimators, final_estimator, cv, stack_method, n_jobs, passthrough, verbose)
+
+    def fit(self, X, y, sample_weight=None):
+        """Fit the members, their out-of-fold outputs, and the final estimator.
+
+        Parameters
+        ----------
+        X : array of shape (n_samples, n_features)
+            Training data, converted to float32.
+        y : array of shape (n_samples,)
+            Class labels.
+        sample_weight : array of shape (n_samples,), default None
+            Passed to every member's ``fit`` (each fold's rows) and to the
+            final estimator's; every one of them must accept it.
+
+        Returns
+        -------
+        self
+
+        Raises
+        ------
+        ValueError
+            When a member's output width differs between folds (a class missing
+            from a fold's training rows).
+        """
+        self._validate_params()
+        self.classes_, codes = encode_labels(y)
+        self._binary = len(self.classes_) == 2
+        nat = _trees_native_glue(self)
+        splits = _trees_splits(self.cv, X, y, len(codes), codes=codes,
+                               partition=True, native=nat, n_classes=len(self.classes_))
+        final = self.final_estimator
+        if final is None:
+            from .linear_model import LogisticRegression
+            final = LogisticRegression()
+        return self._fit_stack(X, lambda rows: codes if rows is None else self._gather_codes(codes, rows),
+                               splits, final, sample_weight)
+
+    def predict(self, X):
+        """Predict class labels with the final estimator on the stacked outputs.
+
+        Returns
+        -------
+        array of shape (n_samples,)
+            Labels from ``classes_``.
+        """
+        codes = as_i32_c(self.final_estimator_.predict(self._meta32(X)), ndim=1, name="codes")[0]
+        return decode_labels(self.classes_, codes)
+
+    def predict_proba(self, X):
+        """The final estimator's class probabilities on the stacked outputs.
+
+        Returns
+        -------
+        array of shape (n_samples, n_classes), float64
+        """
+        k = len(self.classes_)
+        Xm = self._meta32(X)
+        n = Xm.shape[0]
+        acc = self._class_major([0.0], n * k)  # zero votes, filled by the binding
+        self._acc_cols(acc, self.final_estimator_.predict_proba(Xm), _trees_sub_cols(self.final_estimator_), n, k)
+        return acc.reshape((n, k))
+
+
+class StackingRegressor(RegressorScoreMixin, _StackingBase):
+    """Stack regressors and train a final regressor on their cross-validated outputs.
+
+    Follows scikit-learn's ``StackingRegressor``. ``fit`` refits every member on
+    all rows, and trains ``final_estimator`` on the members' out-of-fold
+    ``predict`` outputs (``cross_val_predict``). The members and folds fit one
+    after another.
+
+    Differs from scikit-learn: the default ``final_estimator`` is anonlib's
+    ``Ridge`` (scikit-learn uses ``RidgeCV``).
+
+    Parameters
+    ----------
+    estimators : list of (str, estimator)
+        Named anonlib regressors. Names must be unique; an entry whose
+        estimator is the string ``"drop"`` is skipped.
+    final_estimator : estimator, default None
+        The regressor fitted on the meta features; None uses ``Ridge()``.
+    cv : int, splitter or iterable of (train, test), default None
+        An int is the number of unshuffled ``KFold`` folds (``>= 2``); None
+        means 5. A splitter object's ``split(X, y)`` or an iterable of index
+        pairs is used as given, but its test sets must cover every row exactly
+        once, else ``ValueError``.
+    n_jobs : None
+        Only None is accepted; any other value raises ``NotImplementedError``.
+    passthrough : bool, default False
+        Also give the final estimator the original features.
+    verbose : int, default 0
+        Only 0 is accepted; any other value raises ``NotImplementedError``.
+
+    Attributes
+    ----------
+    estimators_ : list
+        The members refitted on all rows.
+    named_estimators_ : dict
+        The fitted members by name.
+    stack_method_ : list of str
+        The method stacked for each member (``"predict"``).
+    final_estimator_ : estimator
+        The fitted final regressor.
+    n_features_in_ : int
+        Number of features seen in ``fit``.
+
+    Examples
+    --------
+    >>> import numpy as np, anonlib
+    >>> rng = np.random.default_rng(0)
+    >>> X = rng.random((1000, 8), dtype=np.float32)
+    >>> y = X @ np.arange(8, dtype=np.float32)
+    >>> model = anonlib.StackingRegressor(
+    ...     [("rf", anonlib.RandomForestRegressor()),
+    ...      ("dt", anonlib.DecisionTreeRegressor())]).fit(X, y)
+    >>> model.predict(X[:5]).shape
+    (5,)
+    """
+    _estimator_type = "regressor"
+    _binary = False
+
+    def __init__(self, estimators, final_estimator=None, *, cv=None, n_jobs=None, passthrough=False, verbose=0):
+        super().__init__(estimators, final_estimator, cv, "auto", n_jobs, passthrough, verbose)
+
+    def fit(self, X, y, sample_weight=None):
+        """Fit the members, their out-of-fold predictions, and the final estimator.
+
+        Parameters
+        ----------
+        X : array of shape (n_samples, n_features)
+            Training data, converted to float32.
+        y : array of shape (n_samples,)
+            Targets, converted to float32.
+        sample_weight : array of shape (n_samples,), default None
+            Passed to every member's ``fit`` (each fold's rows) and to the
+            final estimator's; every one of them must accept it.
+
+        Returns
+        -------
+        self
+        """
+        self._validate_params()
+        y32, _ = as_f32_c(y, ndim=1, name="y")
+        splits = _trees_splits(self.cv, X, y, len(y32), partition=True, native=_trees_native_glue(self))
+        final = self.final_estimator
+        if final is None:
+            from .linear_model import Ridge
+            final = Ridge()
+        return self._fit_stack(X, lambda rows: y32 if rows is None else self._gather_vec(y32, rows), splits, final,
+                               sample_weight)
+
+    def predict(self, X):
+        """Predict with the final estimator on the stacked member predictions.
+
+        Returns
+        -------
+        array of shape (n_samples,)
+        """
+        return self.final_estimator_.predict(self._meta32(X))
+
+
+# ------------------------------------------------------------- MultiOutput
+# Reference: scikit-learn `sklearn/multioutput.py` (_MultiOutputEstimator.fit
+# :200, one clone per column of Y; predict stacks the columns;
+# MultiOutputClassifier.predict_proba :500 returns a list). Y is a numeric
+# 2-D buffer; a classifier's labels per column are encoded to codes.
+#: lane apple-fast-meta (FAST + Apple default, -D ANONLIB_MULTIOUT_RIDGE_OFF turns it off):
+#: MultiOutputRegressor(Ridge) fits every target in ONE ridge program
+#: (glm/impl/ridge_multi.mojo: X up once, one eigendecomposition, one U^T b
+#: and one V (S b) per target) and predicts every target in one launch. The
+#: estimators binding built with the define exports ridge_fit_multi; every
+#: other binding takes the per-target route below.
+def _multiout_ridge_entry(est, sample_weight):
+    """The estimators binding when it has the one-program ridge and `est`
+    is a plain Ridge (eig arm, no normalize), else None."""
+    from .linear_model import Ridge
+    if type(est) is Ridge:
+        est._validate_params()  # Ridge checks its parameters at fit; this route skips Ridge.fit
+    if sample_weight is not None or type(est) is not Ridge or est.normalize:
+        return None
+    try:
+        b = est._bind("_anonlib_estimators")
+        return b if hasattr(b, "ridge_fit_multi") else None
+    except Exception:
+        return None
+
+
+class MultiOutputRegressor(RegressorScoreMixin, _TreesWrapperBase):
+    """Fit one regressor per target column.
+
+    Follows scikit-learn's ``MultiOutputRegressor``: ``fit`` clones
+    ``estimator`` once per column of ``Y`` and fits each clone on that column;
+    ``predict`` stacks their predictions. The columns fit one after another.
+
+    Parameters
+    ----------
+    estimator : estimator
+        A anonlib regressor; it is cloned, never fitted in place.
+    n_jobs : None
+        Only None is accepted; any other value raises ``NotImplementedError``.
+
+    Attributes
+    ----------
+    estimators_ : list
+        One fitted clone per column of ``Y``.
+    n_features_in_ : int
+        Number of features seen in ``fit``.
+
+    Examples
+    --------
+    >>> import numpy as np, anonlib
+    >>> rng = np.random.default_rng(0)
+    >>> X = rng.random((1000, 8), dtype=np.float32)
+    >>> Y = np.stack([X[:, 0] + X[:, 1], X[:, 2] - X[:, 3]], axis=1)
+    >>> model = anonlib.MultiOutputRegressor(anonlib.Ridge()).fit(X, Y)
+    >>> model.predict(X[:5]).shape
+    (5, 2)
+    """
+    _estimator_type = "regressor"
+    # scikit-learn's multi-output-only target tags: its checks pass a 2-D y.
+    _sklearn_target_tags = {"single_output": False, "multi_output": True}
+
+    def __init__(self, estimator, *, n_jobs=None):
+        # Stored as given; `_validate_params` checks them at fit (scikit-learn's convention).
+        self.estimator = estimator
+        self.n_jobs = n_jobs
+
+    def _validate_params(self):
+        if self.n_jobs is not None:
+            _refuse("n_jobs", "the columns fit one after another.")
+
+    def _fit_ridge_multi(self, b, Xa, Ya):
+        """The one-program fit: X centered once (Ridge.fit's own device
+        helpers), Y's columns centered and solved on the device, m Ridge
+        objects filled from the words so `estimators_` reads as before."""
+        from .linear_model import _center, _column_means
+        n, d = Xa.shape
+        m = Ya.shape[1]
+        est = self.estimator
+        if est.fit_intercept:
+            mu32 = _column_means(b, Xa, None)
+            work_x = _center(b, Xa, mu32)
+        else:
+            mu32 = [0.0] * d
+            work_x = Xa
+        coef = empty((m * d,), "<f4")
+        ymean = empty((m,), "<f4")
+        icpt32 = zeros((m,), "<f4")
+        xm = Array.from_list(mu32, "<f4") if not isinstance(mu32, Array) else mu32
+        params = [n, d, m, float(est.alpha), 1 if est.fit_intercept else 0]
+        if est.fit_intercept:
+            # the intercepts ymean - xmean . coef in the binding
+            params += [addr_ro(xm, name="xmean"), addr(icpt32, name="intercepts")]
+        b.ridge_fit_multi(addr_ro(work_x, name="X"), addr_ro(Ya, name="Y"), addr(coef, name="coef"),
+                          addr(ymean, name="ymean"), params)
+        self.estimators_ = []
+        for j in range(m):  # glue: one fitted ridge per output column
+            e = _trees_clone(est)
+            e.solver_ = "eig"
+            e.coef_ = coef[j * d:(j + 1) * d]
+            e._x_mean = xm
+            e._y_mean = float(ymean[j]) if est.fit_intercept else 0.0
+            e.intercept_ = float(icpt32[j]) if est.fit_intercept else 0.0
+            e.n_features_in_ = d
+            self.estimators_.append(e)
+        self._multi_ridge = (coef, icpt32, m)
+        self.n_features_in_ = d
+        self._fitted = True
+        return self
+
+    def fit(self, X, y, sample_weight=None):
+        """Fit one clone of ``estimator`` per column of ``y``.
+
+        Parameters
+        ----------
+        X : array of shape (n_samples, n_features)
+            Training data, converted to float32.
+        y : array of shape (n_samples, n_outputs)
+            Numeric targets, converted to float32. A row count that differs from
+            ``X`` raises ``ValueError``.
+        sample_weight : array of shape (n_samples,), default None
+            Passed to every clone's ``fit`` when given.
+
+        Returns
+        -------
+        self
+        """
+        self._validate_params()
+        Xa, _ = as_f32_c(X, ndim=2, name="X")
+        _trees_multioutput_y(y)
+        Ya, _ = as_f32_c(y, ndim=2, name="y")
+        if Ya.shape[0] != Xa.shape[0]:
+            raise ValueError(f"y has {Ya.shape[0]} rows, X has {Xa.shape[0]}")
+        sample_weight = _trees_member_weights([(None, self.estimator)], sample_weight, Xa.shape[0])
+        self._multi_ridge = None
+        b = _multiout_ridge_entry(self.estimator, sample_weight)
+        if b is not None and Ya.shape[1] > 0:
+            return self._fit_ridge_multi(b, Xa, Ya)
+        self.estimators_ = []
+        for j in range(Ya.shape[1]):  # glue: one member fit per output column
+            e = _trees_clone(self.estimator)
+            yj = self._column(Ya, j)
+            e.fit(Xa, yj) if sample_weight is None else e.fit(Xa, yj, sample_weight=sample_weight)
+            self.estimators_.append(e)
+        self.n_features_in_ = Xa.shape[1]
+        self._fitted = True
+        return self
+
+    def predict(self, X):
+        """Every target's prediction, one column per output.
+
+        Returns
+        -------
+        array of shape (n_samples, n_outputs)
+        """
+        Xa = self._check_X(X)
+        n, m = Xa.shape[0], len(self.estimators_)
+        mr = getattr(self, "_multi_ridge", None)
+        if mr is not None:
+            coef, icpt, m = mr
+            out = empty((n, m), "<f4")
+            self.estimators_[0]._bind("_anonlib_estimators").ridge_predict_multi(
+                addr_ro(Xa, name="X"), addr_ro(coef, name="coef"), addr_ro(icpt, name="intercepts"),
+                addr(out, name="predictions"), [n, Xa.shape[1], m])
+            return out
+        out = zeros((n * m,), "<f8")
+        rows = self._arange(n)
+        for j, e in enumerate(self.estimators_):  # glue: one member prediction per estimator
+            self._place(out, n, m, as_f32_c(e.predict(Xa), ndim=1, name="p")[0], rows, j)
+        return out.reshape((n, m))
+
+
+class MultiOutputClassifier(_TreesWrapperBase):
+    """Fit one classifier per label column.
+
+    Follows scikit-learn's ``MultiOutputClassifier``: ``fit`` clones
+    ``estimator`` once per column of ``Y``, encodes that column's labels and
+    fits the clone on them; ``predict`` stacks the decoded predictions and
+    ``predict_proba`` returns a list with one probability array per output.
+    The columns fit one after another.
+
+    Parameters
+    ----------
+    estimator : estimator
+        A anonlib classifier; it is cloned, never fitted in place.
+    n_jobs : None
+        Only None is accepted; any other value raises ``NotImplementedError``.
+
+    Attributes
+    ----------
+    estimators_ : list
+        One fitted clone per column of ``Y`` (fitted on integer class codes).
+    classes_ : list of arrays
+        The sorted class labels of each output column.
+    n_features_in_ : int
+        Number of features seen in ``fit``.
+
+    Examples
+    --------
+    >>> import numpy as np, anonlib
+    >>> rng = np.random.default_rng(0)
+    >>> X = rng.random((1000, 8), dtype=np.float32)
+    >>> Y = np.stack([X[:, 0] > 0.5, X[:, 1] > 0.5], axis=1).astype(np.int64)
+    >>> model = anonlib.MultiOutputClassifier(anonlib.DecisionTreeClassifier()).fit(X, Y)
+    >>> model.predict(X[:5]).shape
+    (5, 2)
+    """
+    _estimator_type = "classifier"
+    # scikit-learn's multi-output-only target tags: its checks pass a 2-D y.
+    _sklearn_target_tags = {"single_output": False, "multi_output": True}
+
+    def __init__(self, estimator, *, n_jobs=None):
+        # Stored as given; `_validate_params` checks them at fit (scikit-learn's convention).
+        self.estimator = estimator
+        self.n_jobs = n_jobs
+
+    def _validate_params(self):
+        if self.n_jobs is not None:
+            _refuse("n_jobs", "the columns fit one after another.")
+
+    def fit(self, X, y, sample_weight=None):
+        """Fit one clone of ``estimator`` per label column of ``y``.
+
+        Parameters
+        ----------
+        X : array of shape (n_samples, n_features)
+            Training data, converted to float32.
+        y : array of shape (n_samples, n_outputs)
+            Class labels, one column per output. A row count that differs from
+            ``X`` raises ``ValueError``.
+        sample_weight : array of shape (n_samples,), default None
+            Passed to every clone's ``fit`` when given.
+
+        Returns
+        -------
+        self
+        """
+        self._validate_params()
+        Xa, _ = as_f32_c(X, ndim=2, name="X")
+        if getattr(y, "ndim", None) == 1:
+            raise ValueError("y must have at least two dimensions for multi-output "
+                             "classification but has only one.")
+        if (not isinstance(y, (list, tuple)) and not _has_buffer(y)
+                and callable(getattr(y, "__array__", None))):
+            # A pandas DataFrame (scikit-learn's check_sample_weights_pandas_series)
+            # has no buffer and iterates its column names: its own `__array__`
+            # hands back the host block, as `_buffer._materialize` takes X.
+            # Glue: one conversion call.
+            y = y.__array__()
+        _trees_multioutput_y(y)
+        sample_weight = _trees_member_weights([(None, self.estimator)], sample_weight, Xa.shape[0])
+        W = _trees_label_words(y)
+        if W is not None:
+            return self._fit_words(Xa, W, sample_weight)
+        Ya = None
+        if _trees_float_dtype(y):
+            # a float y: each column natively (x_trees_column_f64), the same
+            # float labels its `tolist()` rows hold
+            Ya, _ = as_f64_c(y, ndim=2, name="y")
+            rows = None
+            if Ya.shape[0] != Xa.shape[0]:
+                raise ValueError(f"y has {Ya.shape[0]} rows, X has {Xa.shape[0]}")
+            m = Ya.shape[1]
+        else:
+            # glue: label objects (str, mixed) no Array holds, per output column
+            rows = y.tolist() if hasattr(y, "tolist") else [list(r) for r in y]  # cpu-route: label objects (str/mixed) no Array holds, one output column at a time [py-data-loop]
+            if len(rows) != Xa.shape[0]:
+                raise ValueError(f"y has {len(rows)} rows, X has {Xa.shape[0]}")
+            if rows and not hasattr(rows[0], "__len__"):
+                raise ValueError("y must have at least two dimensions for multi-output "
+                                 "classification but has only one.")
+            m = len(rows[0])
+        self.estimators_, self.classes_ = [], []
+        for j in range(m):  # glue: one member fit per estimator
+            if Ya is not None:
+                n = Ya.shape[0]
+                col = empty((n,), "<f8")
+                self._bind().x_trees_column_f64(addr_ro(Ya, name="y"), addr(col, name="column"), [n, m, j])  # cpu-route: label column extracted for encode_labels at API entry
+                classes, codes = encode_labels(col)
+            else:
+                classes, codes = encode_labels([r[j] for r in rows])  # cpu-route: label objects (str/mixed) no Array holds, one output column at a time [py-data-loop]
+            e = _trees_clone(self.estimator)
+            e.fit(Xa, codes) if sample_weight is None else e.fit(Xa, codes, sample_weight=sample_weight)
+            self.estimators_.append(e)
+            self.classes_.append(classes)
+        self.n_features_in_ = Xa.shape[1]
+        self._fitted = True
+        return self
+
+    def _fit_words(self, Xa, W, sample_weight):
+        """`fit` for a numeric Y (`_trees_label_words`): the label columns are
+        one native transpose (x_trees_transpose_f64 moves the 8-byte words of
+        an int64 or float64 Y), each encoded natively; the same classes and
+        codes the Python `tolist()` columns gave (lane apple-fast-py2mojo-trees)."""
+        n, m = W.shape
+        if n != Xa.shape[0]:
+            raise ValueError(f"Y has {n} rows, X has {Xa.shape[0]}")
+        T = empty((m * n,), W.dtype)
+        self._bind().x_trees_transpose_f64(addr_ro(W, name="Y"), addr(T, name="Y^T"), [n, m])
+        T = T.reshape((m, n))
+        self.estimators_, self.classes_ = [], []
+        for j in range(m):  # glue: one member fit per estimator
+            classes, codes = encode_labels(T[j])
+            e = _trees_clone(self.estimator)
+            e.fit(Xa, codes) if sample_weight is None else e.fit(Xa, codes, sample_weight=sample_weight)
+            self.estimators_.append(e)
+            self.classes_.append(classes)
+        self.n_features_in_ = Xa.shape[1]
+        self._fitted = True
+        return self
+
+    def predict(self, X):
+        """Predict every output's labels.
+
+        Returns
+        -------
+        array of shape (n_samples, n_outputs)
+            For numeric labels, int64 when every output's labels are integers,
+            else float64.
+        """
+        Xa = self._check_X(X)
+        out = self._predict_stacked(Xa)
+        if out is not None:
+            return out
+        # glue: label objects (str, mixed) no Array holds, row tuples of them
+        cols = [decode_labels(c, as_i32_c(e.predict(Xa), ndim=1, name="codes")[0]).tolist()
+                for e, c in zip(self.estimators_, self.classes_)]  # cpu-route: label objects (str/mixed) no Array holds, one output column at a time [py-data-loop]
+        kind = "<i8" if all(isinstance(v, int) for col in cols for v in col[:1]) else "<f8"  # cpu-route: label objects (str/mixed) no Array holds, one output column at a time [py-data-loop]
+        return Array.from_list([list(r) for r in zip(*cols)], kind)  # cpu-route: label objects (str/mixed) no Array holds, one output column at a time [py-data-loop]
+
+    def _predict_stacked(self, Xa):
+        """`predict` with the decoded columns stacked natively
+        (x_trees_stack_w64), or None when some output's classes are not all
+        int or all float (labels no Array holds take the Python rows). The
+        dtype rule is the Python one: int64 when every column is int64, else
+        float64 with the int columns widened exactly as `Array.from_list`
+        did (lane apple-fast-py2mojo-trees)."""
+        n = Xa.shape[0]
+        cols = []
+        for e, c in zip(self.estimators_, self.classes_):  # glue: one member prediction per estimator
+            col = decode_labels(c, as_i32_c(e.predict(Xa), ndim=1, name="codes")[0])
+            if not isinstance(col, Array) or col.dtype not in ("<i8", "<f8"):
+                return None
+            cols.append(col)
+        kind = "<i8" if all(col.dtype == "<i8" for col in cols) else "<f8"  # glue: dtype check over the output columns
+        cols = [col if col.dtype == kind else col.astype(kind) for col in cols]  # glue: dtype check over the output columns
+        out = empty((n * len(cols),), kind)
+        self._bind().x_trees_stack_w64([addr_ro(col, name="column") for col in cols], addr(out, name="Y"), [n])  # glue: column addresses for the native stack
+        return out.reshape((n, len(cols)))
+
+    def predict_proba(self, X):
+        """Every output's class probabilities.
+
+        Returns
+        -------
+        list of arrays
+            One float64 array of shape (n_samples, n_classes_j) per output, its
+            columns in the order of ``classes_[j]``.
+        """
+        Xa = self._check_X(X)
+        n = Xa.shape[0]
+        out = []
+        for e, c in zip(self.estimators_, self.classes_):  # glue: one member prediction per estimator
+            acc = zeros((n * len(c),), "<f8")
+            self._acc_cols(acc, e.predict_proba(Xa), _trees_sub_cols(e), n, len(c))
+            out.append(acc.reshape((n, len(c))))
+        return out
+
+    def score(self, X, y, sample_weight=None):
+        """Subset accuracy: the fraction of rows whose every output is
+        predicted correctly, as scikit-learn's ``MultiOutputClassifier.score``.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+            Test samples.
+        y : array-like of shape (n_samples, n_outputs)
+            True labels, numeric.
+        sample_weight : array-like of shape (n_samples,), default None
+            Sample weights.
+
+        Returns
+        -------
+        float
+            Fraction of rows with all outputs correct (weighted when
+            ``sample_weight`` is given).
+        """
+        pred = self.predict(X)
+        truth, _ = _materialize(y, "y")
+        if truth.shape != pred.shape:
+            raise ValueError(f"y has shape {truth.shape}, the predictions have shape {pred.shape}")
+        n, m = pred.shape
+        # One mismatch flag per cell (the native elementwise compare), one
+        # all-match flag per row (x_neighbors `xn_row_all_zero` over the
+        # mismatch flags), then the metrics binding's (weighted) accuracy of
+        # those flags against 1.
+        miss = (truth != pred).astype("<i4")
+        hit = empty((n,), "<i4")
+        self._bind("_anonlib_x_neighbors").xn_row_all_zero(
+            [addr_ro(miss, name="mismatch flags"), addr(hit, name="row matches")], [n, m], [])
+        from ._expansion_metrics import accuracy_fraction
+        return accuracy_fraction(full((n,), 1, "<i4"), hit, sample_weight,
+                                 getattr(self, "numeric_mode", None))
+
+
+# --------------------------------------------------------------- OneVsRest
+# Reference: scikit-learn `sklearn/multiclass.py` OneVsRestClassifier (fit
+# :330, one binary clone per class -- a single one for two classes --;
+# predict :420 argmax of decision_function, else of predict_proba[:, 1];
+# predict_proba :470 each class's positive probability, rows normalised in
+# the multiclass case). DEVIATION: a row whose scores sum to 0 is uniform,
+# where sklearn divides 0 / 0.
+class OneVsRestClassifier(ClassifierScoreMixin, _TreesWrapperBase):
+    """Multiclass classification with one binary classifier per class.
+
+    Follows scikit-learn's ``OneVsRestClassifier``: ``fit`` trains one clone of
+    ``estimator`` per class (that class against the rest), or a single clone
+    when there are two classes. ``predict`` takes the class whose clone scores
+    highest, using ``decision_function`` when the estimator has one, else the
+    positive-class column of ``predict_proba``. The classes fit one after
+    another.
+
+    Differs from scikit-learn: in ``predict_proba``, a row whose per-class
+    probabilities are all 0 gets uniform probabilities (scikit-learn divides
+    0 by 0).
+
+    Parameters
+    ----------
+    estimator : estimator
+        A anonlib binary classifier; it is cloned, never fitted in place.
+    n_jobs : None
+        Only None is accepted; any other value raises ``NotImplementedError``.
+    verbose : int, default 0
+        Only 0 is accepted; any other value raises ``NotImplementedError``.
+
+    Attributes
+    ----------
+    estimators_ : list
+        The fitted clones, one per class (one in total for two classes).
+    classes_ : array
+        The class labels seen in ``fit``, sorted.
+    n_features_in_ : int
+        Number of features seen in ``fit``.
+
+    Examples
+    --------
+    >>> import numpy as np, anonlib
+    >>> rng = np.random.default_rng(0)
+    >>> X = rng.random((1000, 8), dtype=np.float32)
+    >>> y = (3 * X[:, 0]).astype(np.int32)
+    >>> model = anonlib.OneVsRestClassifier(anonlib.LogisticRegression()).fit(X, y)
+    >>> model.predict_proba(X[:5]).shape
+    (5, 3)
+    """
+    _estimator_type = "classifier"
+
+    def __init__(self, estimator, *, n_jobs=None, verbose=0):
+        # Stored as given; `_validate_params` checks them at fit (scikit-learn's convention).
+        self.estimator = estimator
+        self.n_jobs = n_jobs
+        self.verbose = verbose
+
+    def _validate_params(self):
+        if self.n_jobs is not None or self.verbose:
+            _refuse("n_jobs/verbose", "the classes fit one after another.")
+
+    def fit(self, X, y):
+        """Fit one binary clone per class.
+
+        Parameters
+        ----------
+        X : array of shape (n_samples, n_features)
+            Training data, converted to float32.
+        y : array of shape (n_samples,)
+            Class labels; fewer than two classes raise ``ValueError``.
+
+        Returns
+        -------
+        self
+        """
+        self._validate_params()
+        Xa, _ = as_f32_c(X, ndim=2, name="X")
+        self.classes_, codes = encode_labels(y)
+        k = len(self.classes_)
+        if k < 2:
+            raise ValueError("y has fewer than 2 classes")
+        # the 0/1 targets natively (x_trees_indicator_codes); lane py-runtime-b
+        # deleted the never-taken Python list route
+        targets = [codes] if k == 2 else [self._indicator(codes, j) for j in range(k)]  # glue: one native indicator per class (k classes)
+        self.estimators_ = []
+        for t in targets:  # glue: one member fit per estimator
+            e = _trees_clone(self.estimator)
+            e.fit(Xa, t)
+            self.estimators_.append(e)
+        self.n_features_in_ = Xa.shape[1]
+        self._fitted = True
+        return self
+
+    def _indicator(self, codes, j):
+        n = len(codes)
+        yj = empty((n,), "<i4")
+        self._bind().x_trees_indicator_codes(addr_ro(codes, name="codes"), addr(yj, name="y"), 0, [n, j])
+        return yj
+
+    def _positive(self, e, Xa):
+        """The estimator's score for class 1, float32 (n,): decision_function
+        when it has one, else predict_proba's column for code 1."""
+        n = Xa.shape[0]
+        if hasattr(e, "decision_function"):
+            return as_f32_c(e.decision_function(Xa), ndim=1, name="score")[0]
+        p = _trees_output_2d(e.predict_proba(Xa), n)
+        subs = [int(c) for c in e.classes_]  # glue: fitted member classes as k codes
+        if 1 not in subs:
+            return as_f32_c(zeros((n,), "<f8"), ndim=1, name="score")[0]
+        return self._gather(p, self._arange(n), Array.from_list([subs.index(1)], "<i4")).reshape((n,))
+
+    def _proba_positive(self, e, Xa):
+        n = Xa.shape[0]
+        p = _trees_output_2d(e.predict_proba(Xa), n)
+        subs = [int(c) for c in e.classes_]  # glue: fitted member classes as k codes
+        if 1 not in subs:
+            return as_f32_c(zeros((n,), "<f8"), ndim=1, name="p")[0]
+        return self._gather(p, self._arange(n), Array.from_list([subs.index(1)], "<i4")).reshape((n,))
+
+    def predict(self, X):
+        """Predict the class whose binary classifier scores highest.
+
+        Returns
+        -------
+        array of shape (n_samples,)
+            Labels from ``classes_``.
+        """
+        Xa = self._check_X(X)
+        n, k = Xa.shape[0], len(self.classes_)
+        if k == 2:
+            codes = as_i32_c(self.estimators_[0].predict(Xa), ndim=1, name="codes")[0]
+            return decode_labels(self.classes_, codes)
+        acc = self._class_major([0.0], n * k)  # zero votes, filled by the binding
+        rows = self._arange(n)
+        for j, e in enumerate(self.estimators_):  # glue: one member prediction per estimator
+            self._place(acc, n, k, self._positive(e, Xa), rows, j)
+        return decode_labels(self.classes_, self._argmax(acc, n, k))
+
+    def predict_proba(self, X):
+        """Class probabilities.
+
+        Each class's positive-class probability from its clone, with every row
+        normalized to sum to 1 when there are more than two classes. For two
+        classes the rows are ``(1 - p, p)``.
+
+        Returns
+        -------
+        array of shape (n_samples, n_classes), float64
+        """
+        Xa = self._check_X(X)
+        n, k = Xa.shape[0], len(self.classes_)
+        acc = self._class_major([0.0], n * k)  # zero votes, filled by the binding
+        rows = self._arange(n)
+        if k == 2:
+            return _trees_binary_proba(self, self._proba_positive(self.estimators_[0], Xa), n)
+        for j, e in enumerate(self.estimators_):  # glue: one member prediction per estimator
+            self._place(acc, n, k, self._proba_positive(e, Xa), rows, j)
+        self._bind().x_trees_normalize_rows(addr(acc, name="proba"), [n, k])
+        return acc.reshape((n, k))
+
+
+# ------------------------------------------------------------- Calibration
+# Reference: scikit-learn `sklearn/calibration.py` (CalibratedClassifierCV.fit
+# :300 -- ensemble=True: one (member, calibrators) pair per fold; False:
+# cross_val_predict scores, one calibrator set, the member refitted on all
+# rows --, _fit_calibrator :650 one calibrator per class, OvR; _CalibratedClassifier
+# .predict_proba :720 -- binary: [1 - p, p]; multiclass: normalised, a zero
+# row uniform --, _sigmoid_calibration :800, IsotonicRegression(out_of_bounds
+# ='clip')). Scores are decision_function, else predict_proba (its class-1
+# column when binary). DEVIATIONS: Platt's minimiser is Newton with
+# backtracking (xtrees/ops.mojo platt_fit) on sklearn's objective, not
+# L-BFGS; the default estimator is this library's LinearSVC as sklearn's.
+#: CalibratedClassifierCV's per-class epilogue runs in xtrees (strided
+#: calibrators, native columns and 0/1 targets); the Python reference route
+#: (an [fb] arm no install reached: every x_trees binding carries the strided
+#: entries) is deleted (lane apple-fast-py2mojo-trees).
+
+
+#: lane apple-fast-meta (FAST + Apple default, -D ANONLIB_CALIB_GNB_FOLDS_OFF turns it off):
+#: CalibratedClassifierCV(GaussianNB, method="sigmoid", ensemble=True, cv=int)
+#: as ONE x_prep program per fit and one per predict (x_prep/calib.mojo: the
+#: folds, every fold's statistics, the held-out scores and Platt's sigmoids on
+#: the device, X uploaded once). The binding built with the define exports
+#: x_prep_calib_folds; every other binding takes the reference route below.
+_CAL_XB = 2048      # rows per block of the fold-assignment partials
+_CAL_PB = 512       # rows per block of the Platt partials
+_CAL_ITERS = 40     # Newton iterations unrolled (platt_fit's cap is 100; a stopped problem's stages are no-ops)
+_CAL_TOL = 1e-5     # |gradient| / rows of the fold below this stops a problem
+
+
+def _cal_fast_consts(base, method, ensemble, cv, sample_weight):
+    """[CAL_ST, CAL_LS] of the x_prep binding's calibration program, or None
+    when the binding lacks it or the request is outside what it covers."""
+    from ._expansion_prep import GaussianNB, _mode, _optional_prep_entry, _prep_binding
+    if sample_weight is not None or method != "sigmoid" or not ensemble or not isinstance(base, GaussianNB):
+        return None
+    if base.priors is not None or not isinstance(_trees_cv(cv), int):
+        return None
+    try:
+        entry = _optional_prep_entry(_prep_binding(_mode()), "x_prep_calib_folds")
+    except Exception:
+        return None
+    if entry is None:
+        return None
+    return [int(v) for v in entry()]  # glue: binding constants as integers
+
+
+class CalibratedClassifierCV(ClassifierScoreMixin, _TreesWrapperBase):
+    """Calibrate a classifier's probabilities with cross-validation.
+
+    Follows scikit-learn's ``CalibratedClassifierCV``. The calibrator reads the
+    estimator's ``decision_function``, else its ``predict_proba`` (the positive
+    column for a binary problem), and fits one calibrator per class
+    (one-vs-rest): Platt's sigmoid or isotonic regression (clipped outside the
+    fitted range). Multiclass probabilities are normalized per row; a row of
+    zeros becomes uniform. The folds fit one after another.
+
+    Differs from scikit-learn: Platt's sigmoid minimizes scikit-learn's
+    objective with Newton steps and a backtracking line search instead of
+    L-BFGS, so its parameters can differ in the last digits.
+
+    Parameters
+    ----------
+    estimator : estimator, default None
+        The anonlib classifier to calibrate; it is cloned, never fitted in
+        place. None uses ``LinearSVC()``, as scikit-learn does.
+    method : {"sigmoid", "isotonic"}, default "sigmoid"
+        Platt's sigmoid or isotonic regression. Any other value raises
+        ``ValueError``.
+    cv : int, splitter or iterable of (train, test), default None
+        An int is the number of unshuffled stratified folds (``>= 2``); None
+        means 5. A splitter object's ``split(X, y)`` or an iterable of index
+        pairs is used as given; with ``ensemble=False`` their test sets must
+        cover every row exactly once, else ``ValueError``.
+    n_jobs : None
+        Only None is accepted; any other value raises ``NotImplementedError``.
+    ensemble : bool, default True
+        True: one (classifier, calibrators) pair per fold, the classifier fitted
+        on the fold's training rows and calibrated on its test rows;
+        ``predict_proba`` averages the pairs. False: one set of calibrators fitted
+        on the out-of-fold scores, and the classifier refitted on all rows.
+        Values other than True or False raise ``NotImplementedError``.
+
+    Attributes
+    ----------
+    calibrated_classifiers_ : list
+        One (fitted classifier, calibrators) pair per fold, or a single pair
+        when ``ensemble=False``. The classifiers are fitted on integer class
+        codes.
+    classes_ : array
+        The class labels seen in ``fit``, sorted.
+    n_features_in_ : int
+        Number of features seen in ``fit``.
+
+    Examples
+    --------
+    >>> import numpy as np, anonlib
+    >>> rng = np.random.default_rng(0)
+    >>> X = rng.random((1000, 8), dtype=np.float32)
+    >>> y = (X[:, 0] + 0.2 * rng.random(1000) > 0.6).astype(np.int32)
+    >>> model = anonlib.CalibratedClassifierCV(anonlib.GaussianNB(), cv=3).fit(X, y)
+    >>> model.predict_proba(X[:5]).shape
+    (5, 2)
+    """
+    _estimator_type = "classifier"
+
+    def __init__(self, estimator=None, *, method="sigmoid", cv=None, n_jobs=None, ensemble=True):
+        # Stored as given; `_validate_params` checks them at fit (scikit-learn's convention).
+        self.estimator = estimator
+        self.method = method
+        self.cv = cv
+        self.n_jobs = n_jobs
+        self.ensemble = ensemble
+
+    def _validate_params(self):
+        if self.method not in ("sigmoid", "isotonic"):
+            raise ValueError("method must be 'sigmoid' or 'isotonic'")
+        if self.n_jobs is not None:
+            _refuse("n_jobs", "the folds fit one after another.")
+        if self.ensemble not in (True, False):
+            _refuse(f"ensemble={self.ensemble!r}", "True or False.")
+        _trees_cv(self.cv)
+
+    def _scores(self, e, Xa):
+        """(n, c) float64 scores: c = 1 when binary, else one column per class
+        (columns in the member's class-code order, mapped to all k)."""
+        n, k = Xa.shape[0], len(self.classes_)
+        if hasattr(e, "decision_function"):
+            out = e.decision_function(Xa)
+        else:
+            out = e.predict_proba(Xa)
+        blk = _trees_output_2d(out, n)
+        subs = [int(c) for c in e.classes_]  # glue: fitted member classes as k codes
+        if k == 2:
+            if blk.shape[1] == 1:
+                col = blk
+            else:
+                col = self._gather(blk, self._arange(n), Array.from_list([subs.index(1)], "<i4"))
+            acc = zeros((n,), "<f8")
+            self._acc(acc, col.reshape((n,)), n)
+            return acc.reshape((n, 1))
+        acc = self._class_major([0.0], n * k)  # zero votes, filled by the binding
+        self._acc_cols(acc, blk, Array.from_list(subs, "<i4"), n, k)
+        return acc.reshape((n, k))
+
+    def _fit_calibrators(self, S, codes):
+        """One calibrator per class column, the column and its 0/1 target
+        made natively (one x_trees_transpose_f64 of the score block,
+        x_trees_indicator_codes): the same float64 and int32 words the old
+        list comprehensions built."""
+        n, c = S.shape
+        b = self._bind()
+        codes = as_i32_c(codes, ndim=1, name="codes")[0]
+        St = None
+        if c > 1:
+            Sa = as_f64_c(S, ndim=2, name="scores")[0]
+            St = empty((c * n,), "<f8")
+            b.x_trees_transpose_f64(addr_ro(Sa, name="S"), addr(St, name="S^T"), [n, c])
+            St = St.reshape((c, n))
+        yj = empty((n,), "<i4")
+        y64 = empty((n,), "<f8") if self.method != "sigmoid" else None
+        cals = []
+        for j in range(c):  # glue: one calibrator per class column
+            cls = 1 if c == 1 else j
+            f = S.reshape((n,)) if c == 1 else St[j]
+            b.x_trees_indicator_codes(addr_ro(codes, name="codes"), addr(yj, name="y"),
+                                      addr(y64, name="y64") if y64 is not None else 0, [n, cls])
+            if self.method == "sigmoid":
+                ab = zeros((2,), "<f8")
+                b.x_trees_platt_fit(addr_ro(f, name="f"), addr_ro(yj, name="y"), addr(ab, name="ab"), [n])
+                cals.append(("sigmoid", tuple(ab.tolist())))
+            else:
+                kx, ky = empty((n,), "<f8"), empty((n,), "<f8")
+                m = int(b.x_trees_isotonic_fit(addr_ro(f, name="x"), addr_ro(y64, name="y"), addr(kx, name="kx"),
+                                               addr(ky, name="ky"), [n]))
+                cals.append(("isotonic", (kx[0:m], ky[0:m], m)))
+        return cals
+
+    def _calibrated(self, e, cals, Xa):
+        """The (n, k) probabilities: each calibrator reading its column of the score
+        block in place and writing its column of the (n, k) block (binary:
+        column 1, then column 0 = 1 - column 1, one IEEE subtract), then the
+        same x_trees_normalize_rows: no per-class list and no Python
+        interleave. The per-element operations are the contiguous entries'."""
+        n, k = Xa.shape[0], len(self.classes_)
+        S = as_f64_c(self._scores(e, Xa), ndim=2, name="scores")[0]
+        c = S.shape[1]
+        b = self._bind()
+        w = 2 if k == 2 else k
+        acc = empty((n * w,), "<f8")
+        for j, (kind, par) in enumerate(cals):  # glue: one calibrator per class column
+            col = 1 if k == 2 else j
+            if kind == "sigmoid":
+                b.x_trees_platt_apply_strided(addr_ro(S, name="f"), addr(acc, name="p"),
+                                              [n, par[0], par[1], n * c, c, j, n * w, w, col])
+            else:
+                kx, ky, m = par
+                b.x_trees_isotonic_predict_strided(addr_ro(kx, name="kx"), addr_ro(ky, name="ky"),
+                                                   addr_ro(S, name="t"), addr(acc, name="p"),
+                                                   [m, n, n * c, c, j, n * w, w, col])
+        if k == 2:
+            b.x_trees_complement_pairs(addr(acc, name="proba"), [n])
+            return acc
+        b.x_trees_normalize_rows(addr(acc, name="proba"), [n, k])
+        return acc
+
+    # sk-edges: no `sample_weight` parameter. scikit-learn weights the
+    # calibrators too, and the platt / isotonic fits here (x_trees_platt_fit,
+    # x_trees_isotonic_fit) take no row weights, so an advertised parameter
+    # could only refuse; it is left out until those kernels take weights.
+    def fit(self, X, y):
+        """Fit the classifier and its calibrators over the cross-validation folds.
+
+        Parameters
+        ----------
+        X : array of shape (n_samples, n_features)
+            Training data, converted to float32.
+        y : array of shape (n_samples,)
+            Class labels; fewer than two classes raise ``ValueError``.
+
+        Returns
+        -------
+        self
+
+        Raises
+        ------
+        ValueError
+            When ``cv`` asks for more folds than some class has members.
+        """
+        self._validate_params()
+        Xa, _ = as_f32_c(X, ndim=2, name="X")
+        n, d = Xa.shape
+        self.classes_, codes = encode_labels(y)
+        if len(self.classes_) < 2:
+            raise ValueError("y has fewer than 2 classes")
+        base = self.estimator
+        if base is None:
+            from .svm import LinearSVC
+            base = LinearSVC()
+        self._cal_fast = None
+        consts = _cal_fast_consts(base, self.method, self.ensemble, self.cv, None)
+        if consts is not None:
+            return self._fit_fast(Xa, codes, base, consts)
+        nat = _trees_native_glue(self)
+        splits = _trees_splits(self.cv, X, y, n, codes=codes,
+                               partition=not self.ensemble, native=nat, n_classes=len(self.classes_))
+        cols = self._arange(d)
+        self.calibrated_classifiers_ = []
+        if self.ensemble:
+            for tr, te in splits:  # glue: one member fit per fold
+                e = _trees_clone(base)
+                e.fit(self._gather(Xa, tr, cols), self._gather_codes(codes, tr))
+                Xte = self._gather(Xa, te, cols)
+                cals = self._fit_calibrators(self._scores(e, Xte), self._gather_codes(codes, te))
+                self.calibrated_classifiers_.append((e, cals))
+        else:
+            k = len(self.classes_)
+            c = 1 if k == 2 else k
+            S = zeros((n * c,), "<f8")
+            for tr, te in splits:  # glue: one member fit per fold
+                e = _trees_clone(base)
+                e.fit(self._gather(Xa, tr, cols), self._gather_codes(codes, tr))
+                self._place(S, n, c, as_f32_c(self._scores(e, self._gather(Xa, te, cols)), ndim=2,
+                                              name="scores")[0], te, 0)
+            e = _trees_clone(base)
+            e.fit(Xa, codes)
+            self.calibrated_classifiers_.append((e, self._fit_calibrators(S.reshape((n, c)), codes)))
+        self.n_features_in_ = d
+        self._fitted = True
+        return self
+
+    def _fit_fast(self, Xa, codes, base, consts):
+        """The one-program fit (x_prep/calib.mojo, lane apple-fast-meta): the
+        members are GaussianNB objects filled from the program's per-fold
+        words, so the reference `calibrated_classifiers_` route still reads
+        them; `_cal_fast` holds the words the one-program predict uploads."""
+        from ._expansion_prep import _NONE, _Prog, _class_stats, _mode
+        cal_st, cal_ls = consts
+        n, d = Xa.shape
+        K = len(self.classes_)
+        F = _trees_cv(self.cv)
+        c = 1 if K == 2 else K
+        FK, FC = F * K, F * c
+        nb = (n + _CAL_XB - 1) // _CAL_XB
+        nbp = (n + _CAL_PB - 1) // _CAL_PB
+        pr = _Prog()
+        xo = pr.put(Xa)
+        co = pr.put_words(codes)
+        # StratifiedKFold(shuffle=False)'s test fold of every row
+        pcnt, pmin = pr.work(nb * K), pr.work(nb * K)
+        pr.stage("cal_fold_part", nb * K, co, n, K, _CAL_XB, pcnt, pmin)
+        ccnt, cfirst, prefix = pr.alloc(K), pr.alloc(K), pr.work(nb * K)
+        pr.stage("cal_fold_scan", K, pcnt, pmin, nb, K, ccnt, cfirst, prefix)
+        rank = pr.work(n)
+        pr.stage("cal_fold_rank", nb * K, co, n, K, _CAL_XB, prefix, rank)
+        fold, pcode, foldf = pr.work(n), pr.work(n), pr.work(n)
+        pr.stage("cal_fold_assign", n, co, rank, n, K, ccnt, cfirst, F, fold, pcode, foldf)
+        # per (fold, class) and per fold column statistics -> each fold's train statistics
+        cnt_fk, mean_fk, var_fk = pr.work(FK), pr.work(FK * d), pr.work(FK * d)
+        _class_stats(pr, None, FK * d, xo, n, d, pcode, FK, cnt_fk, mean_fk, var_fk, _NONE)
+        cnt_f, mean_f, var_f = pr.work(F), pr.work(F * d), pr.work(F * d)
+        _class_stats(pr, None, F * d, xo, n, d, foldf, F, cnt_f, mean_f, var_f, _NONE)
+        tcnt, theta, var = pr.alloc(FK), pr.alloc(FK * d), pr.alloc(FK * d)
+        pr.stage("cal_lofo_merge", FK * d, cnt_fk, mean_fk, var_fk, F, K, d, tcnt, theta, var)
+        ntr, cmean, cvar = pr.work(F), pr.work(F * d), pr.work(F * d)
+        pr.stage("cal_lofo_merge", F * d, cnt_f, mean_f, var_f, F, 1, d, ntr, cmean, cvar)
+        eps, vs = pr.alloc(F), pr.put_scalar(base.var_smoothing)
+        pr.stage("cal_eps_folds", F, cvar, F, d, eps, vs)
+        prior, const = pr.alloc(FK), pr.alloc(FK)
+        pr.stage("cal_params_folds", FK, tcnt, var, K, d, ntr, eps, prior, const)
+        # every row scored by the model that left it out
+        jll, proba = pr.work(n * K), pr.work(n * K)
+        pr.stage("cal_jll_folds", n * K, xo, n, d, theta, var, const, K, fold, jll, F)
+        pr.stage("row_softmax", n, jll, n, K, _NONE, proba)
+        # Platt's sigmoid per (fold, column): Newton with a T-step line search
+        part2 = pr.work(nbp * FC * 2)
+        pr.stage("cal_platt_init", nbp * FC, co, fold, n, F, c, _CAL_PB, part2)
+        state = pr.alloc(FC * cal_st)
+        pr.stage("cal_platt_setup", FC, part2, nbp, F, c, state)
+        part6, part_ls, tol = pr.work(nbp * FC * 6), pr.work(nbp * FC * cal_ls), pr.put_scalar(_CAL_TOL)
+        for _ in range(_CAL_ITERS):  # glue: one Newton stage pair per iteration
+            pr.stage("cal_platt_part", nbp * FC, proba, K, co, fold, n, F, c, _CAL_PB, state, part6)
+            pr.stage("cal_platt_step", FC, part6, nbp, F, c, state, tol)
+            pr.stage("cal_platt_ls_part", nbp * FC, proba, K, co, fold, n, F, c, _CAL_PB, state, part_ls, cal_ls)
+            pr.stage("cal_platt_ls_pick", FC, part_ls, nbp, F, c, state, cal_ls)
+        mode = _mode()
+        pr.run(mode)
+        counts = pr.get_i32(ccnt, K).tolist()
+        if F > max(counts):  # glue: fold count check over the k class counts
+            raise ValueError(f"n_splits={F} cannot be greater than the number of members in each class")
+        theta_a, var_a = pr.get(theta, (FK * d,)), pr.get(var, (FK * d,))
+        const_a, prior_a, tcnt_a = pr.get(const, (FK,)), pr.get(prior, (FK,)), pr.get(tcnt, (FK,))
+        eps_a, st = pr.get(eps, (F,)), pr.get(state, (FC * cal_st,))
+        self.calibrated_classifiers_ = []
+        for fo in range(F):  # glue: one fitted member per fold
+            e = _trees_clone(base)
+            e.classes_ = list(range(K))
+            e.theta_ = theta_a[fo * K * d:(fo + 1) * K * d].reshape((K, d))
+            e.var_ = var_a[fo * K * d:(fo + 1) * K * d].reshape((K, d))
+            e.class_count_ = tcnt_a[fo * K:(fo + 1) * K]
+            e.class_prior_ = prior_a[fo * K:(fo + 1) * K]
+            e.epsilon_ = float(eps_a[fo])
+            e._const = const_a[fo * K:(fo + 1) * K]
+            e._raw_var = e.var_
+            e.numeric_mode_, e.n_features_in_ = mode, d
+            cals = [("sigmoid", (float(st[(fo * c + j) * cal_st]), float(st[(fo * c + j) * cal_st + 1])))
+                    for j in range(c)]  # glue: one fitted member per fold
+            self.calibrated_classifiers_.append((e, cals))
+        self._cal_fast = dict(F=F, c=c, K=K, theta=theta_a, var=var_a, const=const_a, state=st)
+        self.n_features_in_ = d
+        self._fitted = True
+        return self
+
+    def _predict_proba_fast(self, Xa, want):
+        """The one-program predict: every member's joint log likelihood of
+        every row, softmax, the members' sigmoids averaged; `want` "proba"
+        gives the (n, K) float32 block, "predict" the int32 argmax codes."""
+        from ._expansion_prep import _NONE, _Prog, _mode
+        cf = self._cal_fast
+        F, c, K = cf["F"], cf["c"], cf["K"]
+        n, d = Xa.shape
+        pr = _Prog()
+        xo = pr.put(Xa)
+        th, va, co, sto = pr.put(cf["theta"]), pr.put(cf["var"]), pr.put(cf["const"]), pr.put(cf["state"])
+        jll, proba = pr.work(n * F * K), pr.work(n * F * K)
+        pr.stage("cal_jll_folds", n * F * K, xo, n, d, th, va, co, K, _NONE, jll, F)
+        pr.stage("row_softmax", n * F, jll, n * F, K, _NONE, proba)
+        out = pr.alloc(n * K)
+        pr.stage("cal_sigmoid_avg", n, proba, n, F, K, sto, c, out)
+        am = pr.alloc(n) if want == "predict" else _NONE
+        if am != _NONE:
+            pr.stage("row_argmax", n, out, n, K, am)
+        pr.run(_mode())
+        if want == "predict":
+            return pr.get_i32(am, n)
+        return pr.get(out, (n, K))
+
+    def predict_proba(self, X):
+        """Calibrated class probabilities.
+
+        With ``ensemble=True`` the average of every fold's calibrated
+        probabilities.
+
+        Returns
+        -------
+        array of shape (n_samples, n_classes)
+        """
+        Xa = self._check_X(X)
+        if getattr(self, "_cal_fast", None) is not None:
+            return self._predict_proba_fast(Xa, "proba")
+        n, k = Xa.shape[0], len(self.classes_)
+        acc = self._class_major([0.0], n * k)  # zero votes, filled by the binding
+        for e, cals in self.calibrated_classifiers_:  # glue: one member prediction per estimator
+            p = self._calibrated(e, cals, Xa)
+            self._acc(acc, p, n * k)
+        self._scale(acc, len(self.calibrated_classifiers_))
+        return acc.reshape((n, k))
+
+    def predict(self, X):
+        """Predict the class with the highest calibrated probability.
+
+        Returns
+        -------
+        array of shape (n_samples,)
+            Labels from ``classes_``.
+        """
+        if getattr(self, "_cal_fast", None) is not None:
+            return decode_labels(self.classes_, self._predict_proba_fast(self._check_X(X), "predict"))
+        p = self.predict_proba(X)
+        return decode_labels(self.classes_, self._argmax(p, p.shape[0], len(self.classes_)))
+
+
+# -------------------------------------------------------------------- SHAP
+# TreeExplainer: the `shap` package's exact path-dependent TreeSHAP
+# (`shap/explainers/_tree.py` -> `shap/cext/tree_shap.h`), restated in
+# xtrees/shap.mojo (float32, per-leaf paths, fixed folds) over this
+# library's flat forests (RandomForest*, ExtraTrees*, DecisionTree*) and
+# DART, on the device on GPU installs. DEVIATION: the node cover is the
+# count of BACKGROUND rows (`data`, required) reaching each node, since the
+# flat forest stores no instance counts. KernelExplainer and
+# PermutationExplainer: cuML's `explainer/kernel_shap.cu` and
+# `permutation_shap.cu` build the coalition datasets; the sampling and the
+# solve follow `shap`'s KernelExplainer (`_kernel.py`: full enumeration of
+# the small coalition sizes, then weighted sampling of the rest, the
+# efficiency-constrained weighted least squares) and PermutationExplainer
+# (`_permutation.py`: forward then backward passes over each permutation).
+# Lane cgr2-metrics-shap: every step but the model call runs on the device
+# over a chunk of rows at once (xtrees/agnostic*.mojo). DEVIATIONS: draws
+# come from the lane's counter RNG; KernelExplainer's sampled coalitions are
+# pairs (a draw and its complement) without de-duplication (cuML's
+# schedule), carries no l1 feature selection (`l1_reg` is refused) and
+# treats every feature as varying.
+def _trees_forest_arrays(est):
+    """(offsets, colid, quesval, left, leaves, k, scale) of a fitted flat
+    forest, or None."""
+    if not hasattr(est, "_offsets"):
+        return None
+    k = int(getattr(est, "_num_outputs", 1))
+    return (est._offsets, est._colid, est._quesval, est._left_child, est._leaves, k,
+            1.0 / int(est._n_trees))
+
+
+def _trees_dart_forest(b, model, K):
+    """(arrays, tscale) of a DART model as ONE flat forest, in boosting order:
+    the node arrays joined as bytes (memory copies, no per-node Python), a
+    multiclass tree's leaf values spread into column j % K natively
+    (x_trees_spread_leaves). The words the per-node Python lists built (lane
+    apple-fast-py2mojo-trees); O(trees) Python for the offsets and scales."""
+    offs = [0]
+    for tree in model.trees_:  # glue: tree offsets over the fitted trees
+        to = tree._offsets
+        if len(to) != 2:
+            raise ValueError("a DART tree must hold one tree")
+        offs.append(offs[-1] + int(to[1]) - int(to[0]))
+
+    def join(arrs, conv, dtype):
+        raw = b"".join(conv(a, ndim=1, name="tree")[0].tobytes() for a in arrs)  # glue: joins the fitted trees byte blocks
+        return frombytes(raw, dtype, (len(raw) // 4,))
+
+    col = join([t._colid for t in model.trees_], as_i32_c, "<i4")  # glue: tree offsets over the fitted trees
+    q = join([t._quesval for t in model.trees_], as_f32_c, "<f4")  # glue: tree offsets over the fitted trees
+    lc = join([t._left_child for t in model.trees_], as_i32_c, "<i4")  # glue: tree offsets over the fitted trees
+    vals = join(model.tree_values_, as_f32_c, "<f4")
+    if K > 1:
+        nn = len(vals)
+        lv = empty((nn * K,), "<f4")
+        offs_a = Array.from_list(offs, "<i4")
+        b.x_trees_spread_leaves(addr_ro(vals, name="values"), addr_ro(offs_a, name="offsets"), addr(lv, name="leaves"),
+                                [nn, len(model.trees_), K])
+    else:
+        lv = vals
+    tscale = Array.from_list([float(c) for c in model.tree_coefs_], "<f4")  # glue: tree coefficients as float32 words
+    return (Array.from_list(offs, "<i4"), col, q, lc, lv), tscale
+
+
+# GPU installs run it on the device (xtrees/shap_device.mojo), CPU-only
+# installs on the host (xtrees/shap_host.mojo); both run the units of
+# xtrees/shap.mojo in the same fixed orders, so the values are the same
+# bits on every column. Float32 throughout (Metal has no float64).
+class TreeExplainer(_TreesEnsembleBase):
+    """Exact SHAP values for anonlib tree models.
+
+    Computes the exact path-dependent TreeSHAP of the ``shap`` package for a
+    fitted ``RandomForestClassifier``, ``RandomForestRegressor``,
+    ``ExtraTreesClassifier``, ``ExtraTreesRegressor``,
+    ``DecisionTreeClassifier``, ``DecisionTreeRegressor``, ``DARTClassifier`` or
+    ``DARTRegressor``. On GPU installs it runs on the device. Values are
+    float32.
+
+    Differs from ``shap``: the tree models store no per-node training counts,
+    so ``data`` is required and each node's cover is the number of background
+    rows that reach it.
+
+    Parameters
+    ----------
+    model : estimator
+        A fitted anonlib tree model from the list above. Any other model
+        raises ``NotImplementedError``; an unfitted DART model raises
+        ``RuntimeError``.
+    data : array of shape (n_background, n_features)
+        Background rows that define the node covers. Required: None raises
+        ``NotImplementedError``.
+    feature_perturbation : {"tree_path_dependent", "auto"}, default "tree_path_dependent"
+        Only the path-dependent algorithm is available; ``"interventional"``
+        raises ``NotImplementedError``.
+    model_output : {"raw"}, default "raw"
+        Only the raw model output is explained; other values raise
+        ``NotImplementedError``.
+
+    Attributes
+    ----------
+    expected_value : float or array of shape (n_outputs,)
+        The base value the SHAP values add up from: a float for one output,
+        else a float32 array.
+    n_outputs_ : int
+        Number of model outputs explained.
+    n_features_in_ : int
+        Number of features in ``data``.
+
+    Raises
+    ------
+    NotImplementedError
+        When a root-to-leaf path splits on more than 255 distinct features.
+
+    Examples
+    --------
+    >>> import numpy as np, anonlib
+    >>> rng = np.random.default_rng(0)
+    >>> X = rng.random((1000, 8), dtype=np.float32)
+    >>> y = X @ np.arange(8, dtype=np.float32)
+    >>> model = anonlib.RandomForestRegressor().fit(X, y)
+    >>> explainer = anonlib.TreeExplainer(model, X[:200])
+    >>> explainer.shap_values(X[:10]).shape
+    (10, 8)
+    """
+
+    def __init__(self, model, data=None, *, feature_perturbation="tree_path_dependent", model_output="raw"):
+        if feature_perturbation not in ("tree_path_dependent", "auto"):
+            _refuse(f"feature_perturbation={feature_perturbation!r}", "the interventional algorithm is not"
+                    " carried; the path-dependent one is.")
+        if model_output != "raw":
+            _refuse(f"model_output={model_output!r}", "only the raw model output is explained.")
+        if data is None:
+            _refuse("data=None", "the flat forests store no node sample counts, so the cover comes from a"
+                    " background dataset; pass data=.")
+        self.model = model
+        self.data = data
+        self.feature_perturbation = feature_perturbation
+        self.model_output = model_output
+        self.numeric_mode = getattr(model, "numeric_mode", None)
+        bg, _ = as_f32_c(data, ndim=2, name="data")
+        self._bg = bg
+        init = 0.0
+        if isinstance(model, _DARTBase):
+            if not hasattr(model, "trees_"):
+                raise RuntimeError("the model is not fitted yet")
+            K = int(getattr(model, "n_classes_", 1))
+            init = float(model.init_score_) if K == 1 else [float(v) for v in model.init_score_]  # glue: class start scores as floats
+            # one forest of every boosted tree, in boosting order, each tree
+            # scaled by its coefficient; a multiclass tree scores one class:
+            # its leaf values in column j % K.
+            arrays, tscale = _trees_dart_forest(self._bind(), model, K)
+            k = K
+        else:
+            fa = _trees_forest_arrays(model)
+            if fa is None:
+                _refuse(f"TreeExplainer over {type(model).__name__}", "the explainer reads the flat forests"
+                        " (RandomForest*, ExtraTrees*, DecisionTree*) and DART models.")
+            arrays = fa[:5]
+            k = fa[5]
+            tscale = full((len(arrays[0]) - 1,), fa[6], "<f4")
+        self.n_outputs_ = k
+        n_trees = len(arrays[0]) - 1
+        n_nodes = int(arrays[0].tolist()[-1])
+        if n_trees < 1 or n_nodes < 1:
+            raise ValueError("TreeExplainer: the model holds no trees")
+        ev = Array.from_list(init, "<f4") if isinstance(init, list) else full((k,), init, "<f4")
+        cover = zeros((n_nodes,), "<i4")
+        meta = zeros((3,), "<i4")
+        native = self._bind()
+        prep_args = ([addr_ro(a, name="forest") for a in arrays],  # glue: forest array addresses for the binding
+                     addr_ro(tscale, name="tscale"), addr_ro(bg, name="data"),
+                     addr(cover, name="cover"), addr(ev, name="ev"), addr(meta, name="meta"),
+                     [bg.shape[0], bg.shape[1], n_trees, k, n_nodes])
+        # lane gap-shap-nb: the device binding's retained prepare uploads the
+        # forest once, keeps the device cover and builds the leaf table here;
+        # `shap_values` then uploads X only (xtrees/shap_device.mojo). The
+        # same outputs and the same bits as the plain prepare + shap call.
+        retain = getattr(native, "x_trees_tree_shap_prepare_retain", None)
+        self._shap_cache = None
+        self._shap_closed = False
+        if callable(retain):
+            self._shap_cache = retain(*prep_args)
+            self._shap_cache_finalizer = weakref.finalize(
+                self, native.x_trees_tree_shap_cache_release, self._shap_cache)
+        else:
+            native.x_trees_tree_shap_prepare(*prep_args)
+        slots, depth, _ = meta.tolist()
+        need = min(depth, slots) + 1
+        width = 8
+        while width < need:
+            width *= 2
+        if width > 256:
+            _refuse("a leaf path of more than 255 distinct split features", "the device path is compiled up to"
+                    " 255 features per root-to-leaf path.")
+        self._forest = arrays
+        self._tscale = tscale
+        self._cover = cover
+        self._shape = (n_trees, k, n_nodes, int(slots), width)
+        self.expected_value = ev.tolist()[0] if k == 1 else ev
+        self.n_features_in_ = bg.shape[1]
+        # T44/C51 (the host binding's opt-in snapshot; the device binding's
+        # retained prepare above replaces it there) owns an immutable native
+        # snapshot for this explainer. A model refit cannot leave pointers
+        # into mutable/released model arrays.
+        # NOT COMPILED — NOT TESTED — IDENTITY NOT VERIFIED — QUALITY NOT VERIFIED — NOT MEASURED.
+        enabled = getattr(native, "x_trees_tree_shap_cache_enabled", None)
+        if self._shap_cache is None and callable(enabled) and enabled():
+            self._shap_cache = native.x_trees_tree_shap_cache_create(
+                [addr_ro(a, name="forest") for a in self._forest],  # glue: five model addresses
+                addr_ro(self._tscale, name="tscale"), addr_ro(self._cover, name="cover"),
+                [self.n_features_in_, n_trees, k, n_nodes])
+            self._shap_cache_finalizer = weakref.finalize(
+                self, native.x_trees_tree_shap_cache_release, self._shap_cache)
+
+    def close(self):
+        """Release the explainer's native resources.
+
+        After ``close``, ``shap_values`` raises ``RuntimeError``.
+        """
+        finalizer = getattr(self, "_shap_cache_finalizer", None)
+        if finalizer is not None and finalizer.alive:
+            finalizer()
+        self._shap_cache = None
+        self._shap_closed = True
+
+    def shap_values(self, X):
+        """SHAP values of the rows of ``X``.
+
+        Parameters
+        ----------
+        X : array of shape (n_samples, n_features)
+            Rows to explain, converted to float32. A feature count different from
+            ``data`` raises ``ValueError``.
+
+        Returns
+        -------
+        array, float32
+            Shape (n_samples, n_features) for one output, else
+            (n_samples, n_features, n_outputs).
+        """
+        if getattr(self, "_shap_closed", False):
+            raise RuntimeError("this TreeExplainer has been closed")
+        Xa, _ = as_f32_c(X, ndim=2, name="X")
+        n, d = Xa.shape
+        if d != self.n_features_in_:
+            raise ValueError(f"X has {d} features, data has {self.n_features_in_}")
+        n_trees, k, n_nodes, slots, width = self._shape
+        phi = zeros((n * d * k,), "<f4")
+        if self._shap_cache is not None:
+            self._bind().x_trees_tree_shap_cache_values(
+                self._shap_cache, addr_ro(Xa, name="X"), addr(phi, name="phi"),
+                [n, slots, width])
+            return phi.reshape((n, d)) if k == 1 else phi.reshape((n, d, k))
+        self._bind().x_trees_tree_shap([addr_ro(a, name="forest") for a in self._forest],  # glue: forest array addresses for the binding
+                                       addr_ro(self._tscale, name="tscale"), addr_ro(self._cover, name="cover"),
+                                       addr_ro(Xa, name="X"), addr(phi, name="phi"),
+                                       [n, d, n_trees, k, n_nodes, slots, width])
+        return phi.reshape((n, d)) if k == 1 else phi.reshape((n, d, k))
+
+
+#: xtrees/agnostic.mojo AGN_BUDGET: synthetic words per explainer chunk
+_AGN_BUDGET = 1 << 25
+#: ANONLIB_IDN_PSHAP_RESIDENT (lane/neighbors-small-ports, default off;
+#: `x_trees_pshap_linear_ok`): PermutationExplainer over this library's
+#: linear regressors keeps a chunk's synthetic rows on the device
+#: (xtrees/agnostic_device.mojo `pshap_values_linear`), so a chunk is bounded
+#: by device memory, not by a host matrix: 2^28 float32 words (1 GiB of
+#: synthetic rows), a memory bound that fits every supported GPU, no shape rule.
+_AGN_BUDGET_RESIDENT = 1 << 28
+#: ANONLIB_IDN_SHAP_DEVICE_MODEL (lane fam2-forests; an IDENTICAL GPU
+#: build's switch, `x_trees_fast_switches` bit 64, -D
+#: ANONLIB_IDN_SHAP_DEVICE_MODEL_OFF clears it): Kernel/Permutation SHAP
+#: over one of this library's flat forests evaluate the model on the device
+#: inside the explainer (xtrees/agnostic_device.mojo `model_kernel`): no
+#: synthetic matrix, no model call per chunk. Moves no bit.
+_AGN_IDN_DEVICE_MODEL = 64
+#: ANONLIB_KSHAP_FAST_DEVICE_MODEL / ANONLIB_PSHAP_FAST_DEVICE_MODEL
+#: (lane apple-fast-round2, FAST + Apple experiments, default off; bits 1024
+#: and 2048 of `x_trees_fast_switches`): the FAST KernelExplainer /
+#: PermutationExplainer take the device-model route above instead of
+#: downloading every chunk's synthetic matrix to call the model's predict
+#: (xtrees/agnostic_device.mojo has the cost reasoning). The model's
+#: predict on the host inside a GPU explain is host-route debt; this route
+#: removes it for this library's flat forests.
+_KSHAP_FAST_DEVICE_MODEL = 1024
+_PSHAP_FAST_DEVICE_MODEL = 2048
+
+
+def _agn_device_forest(explainer, model):
+    """(arrays, k, n_trees, rf_input) when `model` is one of this library's
+    flat forests whose predict is the strict increasing-tree device kernel
+    (IDENTICAL, the `sequential` engine served resident) and the explainer's
+    binding carries ANONLIB_IDN_SHAP_DEVICE_MODEL; else None (the model
+    callback). The arrays are the snapshot the forest's own predict
+    validated and froze (`_prepare_resident_forest`). rf_input: the random
+    forest's predict flushes the compared feature, ExtraTrees' does not."""
+    if _trees_fast_tier(explainer):
+        # FAST experiments: one bit per explainer (routing only, no compute)
+        bit = _PSHAP_FAST_DEVICE_MODEL if isinstance(explainer, PermutationExplainer) else _KSHAP_FAST_DEVICE_MODEL
+        if not _trees_switch(explainer, bit):
+            return None
+        fast = True
+    elif not _trees_build_switch(explainer, _AGN_IDN_DEVICE_MODEL):
+        return None
+    else:
+        fast = False
+    m = getattr(model, "_random_inner", None)
+    if m is None:
+        m = model
+    if isinstance(m, (RandomForestClassifier, RandomForestRegressor)):
+        rf_input = 1
+    elif isinstance(m, (_ET_CLS, ExtraTreesRegressor)):
+        rf_input = 0
+    else:
+        return None
+    if not type(m).__module__.startswith(__package__ + "."):   # a subclass outside the library may predict otherwise
+        return None
+    if not hasattr(m, "_offsets") or not callable(getattr(m, "_ordered_resident_auto", None)):
+        return None
+    try:
+        if fast:
+            # FAST: the forest's own predict may be parallel_groves; the
+            # device walk is the strict increasing-tree sum over the same
+            # validated snapshot (no bits requirement in FAST).
+            # _prepare_resident_forest refuses (ValueError) a forest with
+            # neither resident route, which keeps the callback.
+            if m._effective_mode() not in ("fast", "identical"):
+                return None
+        elif m._effective_mode() != "identical" or not m._ordered_resident_auto():
+            return None
+        m._prepare_resident_forest()
+    except (AttributeError, ImportError, RuntimeError, ValueError):
+        return None
+    names = ("_offsets", "_colid", "_quesval", "_left_child", "_leaves")
+    arrays = tuple(getattr(m, name) for name in names)  # glue: the five model arrays by name
+    return arrays, int(m._num_outputs), int(m._n_trees), rf_input
+
+
+def _f64_word(x):
+    """The binary64 bits of x as a signed int (a binding param word)."""
+    import struct
+    return struct.unpack("<q", struct.pack("<d", float(x)))[0]
+
+
+def _trees_model_fn(model):
+    """The function an agnostic explainer explains: a callable as given, a
+    classifier's predict_proba, else predict."""
+    if callable(model) and not hasattr(model, "predict"):
+        return model
+    if getattr(model, "_estimator_type", None) == "classifier" and hasattr(model, "predict_proba"):
+        return model.predict_proba
+    return model.predict
+
+
+class _AgnosticExplainer(_TreesEnsembleBase):
+    def __init__(self, model, data, random_state):
+        self.model = model
+        self.data = data
+        self.random_state = random_state
+        self.numeric_mode = getattr(model, "numeric_mode", None)
+        _trees_seed(random_state)
+        self._f = _trees_model_fn(model)
+        bg, _ = as_f32_c(data, ndim=2, name="data")
+        self._bg = bg
+        out = self._eval(bg)
+        self.n_outputs_ = out.shape[1]
+        ev = zeros((self.n_outputs_,), "<f8")
+        self._bind().x_trees_block_mean(addr_ro(out, name="y"), addr(ev, name="ev"),
+                                        [1, bg.shape[0], self.n_outputs_])
+        self._fnull = ev
+        self.expected_value = ev.tolist()[0] if self.n_outputs_ == 1 else ev
+        self.n_features_in_ = bg.shape[1]
+        dev = _agn_device_forest(self, model)
+        if dev is not None and (dev[1] != self.n_outputs_ or int(getattr(model, "n_features_in_", -1)) != bg.shape[1]):
+            dev = None
+        self._dev = dev
+
+    def _model_load(self, b):
+        """ANONLIB_IDN_SHAP_DEVICE_MODEL: uploads the explained forest and
+        the background for this `shap_values` call (`x_trees_agn_model_load`);
+        True when the chunks run the model on the device, False for the
+        callback route. The caller releases it (`x_trees_agn_model_release`)."""
+        dev = getattr(self, "_dev", None)
+        if dev is None:
+            return False
+        arrays, k, n_trees, rf_input = dev
+        faddr = [addr_ro(a, name="forest") for a in arrays]  # glue: one address per model array (five)
+        b.x_trees_agn_model_load(faddr, addr_ro(self._bg, name="data"),
+                                 [n_trees, arrays[1].size, k, self._bg.shape[1], self._bg.shape[0], rf_input])
+        return True
+
+    def _eval(self, X):
+        """The model output on X as a float32 (n, k) Array."""
+        out = self._f(X)
+        n = X.shape[0]
+        return _trees_output_2d(out, n)
+
+    def _chunk(self, per_row, n):
+        """Rows per chunk: as many as keep a chunk's synthetic matrix under
+        the budget (xtrees/agnostic.mojo AGN_BUDGET words), at least one."""
+        return max(1, min(n, _AGN_BUDGET // max(1, per_row)))
+
+    def _model_rows(self, syn, rows, d):
+        """The model on a chunk's synthetic matrix: float32 (rows, k)."""
+        return self._eval(syn.reshape((rows, d)))
+
+    def _check(self, X):
+        Xa, _ = as_f32_c(X, ndim=2, name="X")
+        if Xa.shape[1] != self.n_features_in_:
+            raise ValueError(f"X has {Xa.shape[1]} features, data has {self.n_features_in_}")
+        return Xa
+
+    def _shape(self, phi, n, d):
+        k = self.n_outputs_
+        return phi.reshape((n, d)) if k == 1 else phi.reshape((n, d, k))
+
+
+class KernelExplainer(_AgnosticExplainer):
+    """Model-agnostic Kernel SHAP values.
+
+    Follows the ``shap`` package's ``KernelExplainer``: every coalition size
+    small enough is enumerated in full, the rest are sampled with Kernel SHAP
+    weights, and the values come from the efficiency-constrained weighted
+    least squares. Every step except the model call runs on the device on GPU
+    installs. The model is called on synthetic rows built from ``data``, so
+    explaining ``n`` rows makes ``n * n_coalitions * n_background`` model
+    evaluations.
+
+    Differs from ``shap``: random draws come from anonlib's own seeded
+    generator, so values differ from ``shap``'s for the same seed; sampled
+    coalitions come in complementary pairs and are not de-duplicated (as in
+    cuML); there is no l1 feature selection; every feature is treated as
+    varying.
+
+    Parameters
+    ----------
+    model : estimator or callable
+        A fitted anonlib estimator, or a function mapping an
+        (n, n_features) array to outputs. For a classifier with
+        ``predict_proba`` the probabilities are explained, otherwise
+        ``predict``.
+    data : array of shape (n_background, n_features)
+        Background rows that stand in for missing features.
+    link : {"identity", "logit"}, default "identity"
+        Applied to the model output before it is explained, by name; a link
+        object or any other name raises ``NotImplementedError``.
+    random_state : int or None, default None
+        Seed for the coalition sampling: None (seed 0) or a nonnegative int.
+        Anything else, including a ``RandomState`` object, raises
+        ``ValueError``.
+
+    Attributes
+    ----------
+    expected_value : float or array of shape (n_outputs,)
+        The mean model output over ``data``, through ``link``: a float for one
+        output, else a float64 array.
+    n_outputs_ : int
+        Number of model outputs explained.
+    n_features_in_ : int
+        Number of features in ``data``.
+
+    Examples
+    --------
+    >>> import numpy as np, anonlib
+    >>> rng = np.random.default_rng(0)
+    >>> X = rng.random((1000, 8), dtype=np.float32)
+    >>> y = X @ np.arange(8, dtype=np.float32)
+    >>> model = anonlib.RandomForestRegressor().fit(X, y)
+    >>> explainer = anonlib.KernelExplainer(model, X[:50], random_state=0)
+    >>> explainer.shap_values(X[:10]).shape
+    (10, 8)
+    """
+
+    def __init__(self, model, data, *, link="identity", random_state=None):
+        if link not in ("identity", "logit"):
+            _refuse(f"link={link!r}", "the identity and logit links are carried (by name; a link object is not).")
+        self.link = link
+        super().__init__(model, data, random_state)
+        if link == "logit":
+            # shap KernelExplainer: expected_value = link(fnull); the link meets
+            # each output AFTER the background mean (fx, fnull, ey).
+            self._fnull = self._link(self._fnull)
+            self.expected_value = self._fnull.tolist()[0] if self.n_outputs_ == 1 else self._fnull
+
+    def _link(self, a):
+        """`a` (float64 Array) through the link, in place; returned."""
+        if self.link == "logit":
+            self._bind().x_trees_logit(addr(a, name="linked"), [len(a)])
+        return a
+
+    def _schedule(self, M, nsamples):
+        """shap `KernelExplainer.explain`'s coalition schedule, built in Mojo
+        (`x_trees_kshap_schedule`, xtrees/api.mojo; lane cgr4-py-compute):
+        (m, nfixed, nfull, npaired, tables, L, wrand_bits) with tables =
+        (size_off Int64, size_w float64, cdf float64). Every mask is made on
+        the device from these (xtrees/agnostic.mojo kshap_mask_unit)."""
+        h = max(1, M // 2)
+        tables = (zeros((h + 1,), "<i8"), zeros((h,), "<f8"), zeros((h,), "<f8"))
+        out = zeros((6,), "<i8")
+        if M > 1:
+            taddrs = tuple(addr(t, name="schedule") for t in tables)  # glue: the three schedule table addresses
+            self._bind().x_trees_kshap_schedule(taddrs, addr(out, name="schedule"), [M, nsamples])  # cpu-route: coalition-size weight schedule over M/2 sizes, launch parameters only
+        m, nfixed, nfull, npaired, L, wbits = out.tolist()
+        return m, nfixed, nfull, npaired, tables, L, wbits
+
+    def shap_values(self, X, nsamples="auto", l1_reg="auto"):
+        """Kernel SHAP values of the rows of ``X``.
+
+        Parameters
+        ----------
+        X : array of shape (n_samples, n_features)
+            Rows to explain, converted to float32. A feature count different from
+            ``data`` raises ``ValueError``.
+        nsamples : int or "auto", default "auto"
+            Number of coalitions per row. ``"auto"`` is ``2 * n_features + 2048``.
+            With 30 features or fewer it is capped at ``2**n_features - 2``.
+        l1_reg : {"auto", False, 0}, default "auto"
+            Accepted for compatibility; no l1 feature selection is done, and any
+            other value raises ``NotImplementedError``.
+
+        Returns
+        -------
+        array, float64
+            Shape (n_samples, n_features) for one output, else
+            (n_samples, n_features, n_outputs).
+        """
+        if l1_reg not in ("auto", False, 0):
+            _refuse(f"l1_reg={l1_reg!r}", "no l1 feature selection is carried.")
+        Xa = self._check(X)
+        n, d = Xa.shape
+        M = d
+        ns = 2 * M + 2048 if nsamples == "auto" else int(nsamples)
+        if M <= 30:
+            ns = min(ns, 2 ** M - 2)
+        seed = _trees_seed(self.random_state)
+        k = self.n_outputs_
+        b = self._bind()
+        nb = self._bg.shape[0]
+        m, nfixed, nfull, npaired, tables, L, wbits = self._schedule(M, max(ns, 0))
+        taddr = tuple(addr_ro(t, name="schedule") for t in tables)  # glue: forest array addresses for the binding
+        phi = zeros((max(n * d * k, 1),), "<f8")
+        if n == 0:
+            return self._shape(zeros((0,), "<f8"), 0, d)
+        fx = self._eval(Xa)                       # the explained rows, one model call
+        x0, f0, p0 = addr_ro(Xa, name="X"), addr_ro(fx, name="fx"), addr(phi, name="phi")
+        fnull = self._fnull
+        R = self._chunk(m * nb * d, n)
+        # ANONLIB_KSHAP_FAST_DEVICE_MODEL: a loaded device model (self._dev,
+        # only set on FAST when that bit is on) wins over the batched download
+        if m > 0 and _trees_switch(self, _KSHAP_FAST_BATCH) and getattr(self, "_dev", None) is None:
+            self._batched(b, Xa, fx, taddr, phi, n, d, k, nb, m, nfixed, nfull, npaired, L, seed, wbits, R)
+            return self._shape(phi, n, d)
+        if self._model_load(b):
+            # the forest on the device: masks -> model -> means -> solve per
+            # chunk, nothing crossing but the chunk's rows and phi
+            link = 1 if self.link == "logit" else 0
+            nl = addr_ro(fnull, name="fnull")
+            try:
+                for r0 in range(0, n, R):  # glue: chunk loop (one binding call per chunk)
+                    rows = min(R, n - r0)
+                    b.x_trees_kshap_solve_model(x0 + 4 * r0 * d, f0 + 4 * r0 * k, nl, taddr, p0 + 8 * r0 * d * k,
+                                                [rows, nb, d, nfixed, m, nfull, L, npaired, r0, seed, wbits, k, link])
+            finally:
+                b.x_trees_agn_model_release()
+            return self._shape(phi, n, d)
+        reuse = _trees_build_switch(self, _AGN_IDN_SYN_POOL)   # one synthetic buffer for every chunk
+        syn = None
+        try:
+            for r0 in range(0, n, R):  # glue: one binding call per row chunk
+                rows = min(R, n - r0)
+                params = [rows, nb, d, nfixed, m, nfull, L, npaired, r0, seed, wbits]
+                out = None
+                if m > 0:
+                    if not reuse or syn is None or syn.size != rows * m * nb * d:
+                        syn = None
+                        syn = empty((rows * m * nb * d,), "<f4")
+                    b.x_trees_kshap_synth(x0 + 4 * r0 * d, addr_ro(self._bg, name="data"), taddr,
+                                          addr(syn, name="synthetic"), params)
+                    out = self._model_rows(syn, rows * m * nb, d)
+                    if not reuse:
+                        syn = None
+                b.x_trees_kshap_solve(addr_ro(out, name="y") if out is not None else 0, f0 + 4 * r0 * k,
+                                      addr_ro(fnull, name="fnull"), taddr, p0 + 8 * r0 * d * k,
+                                      params + [k, 1 if self.link == "logit" else 0])
+        finally:
+            if reuse:
+                _agn_pool_release(b)   # the pooled device buffer does not outlive the explanation
+        return self._shape(phi, n, d)
+
+
+    def _batched(self, b, Xa, fx, taddr, phi, n, d, k, nb, m, nfixed, nfull, npaired, L, seed, wbits, R):
+        """ANONLIB_KSHAP_FAST_BATCH: one host buffer for every chunk's
+        synthetic rows, each chunk's linked background means into one
+        float64 (n, m, k) block, then the solve over as many rows per call
+        as the budget holds (the same words as the per-chunk solve)."""
+        link = 1 if self.link == "logit" else 0
+        ey = zeros((n * m * k,), "<f8")
+        e0 = addr(ey, name="ey")
+        x0, bg0 = addr_ro(Xa, name="X"), addr_ro(self._bg, name="data")
+        # TOMBSTONE: ANONLIB_KSHAP_FAST_OVERLAP (DROPPED-noise) deleted 2026-10-09 on lane/owed-deletions-D1 (`_overlapped`);
+        # code recoverable at b639a2bd2. Restore: git apply experiments/removed/ANONLIB_KSHAP_FAST_OVERLAP.patch.
+        syn = empty((R * m * nb * d,), "<f4")
+        for r0 in range(0, n, R):  # glue: one binding call per row chunk
+            rows = min(R, n - r0)
+            if rows < R:
+                syn = empty((rows * m * nb * d,), "<f4")
+            b.x_trees_kshap_synth(x0 + 4 * r0 * d, bg0, taddr, addr(syn, name="synthetic"),
+                                  [rows, nb, d, nfixed, m, nfull, L, npaired, r0, seed, wbits])
+            out = self._model_rows(syn, rows * m * nb, d)
+            b.x_trees_kshap_means(addr_ro(out, name="y"), e0 + 8 * r0 * m * k, [rows, nb, m, k, link])
+            del out
+        del syn
+        f0, p0 = addr_ro(fx, name="fx"), addr(phi, name="phi")
+        nl = addr_ro(self._fnull, name="fnull")
+        S = self._chunk(m * d, n)
+        for s0 in range(0, n, S):  # glue: solve-batch loop (one binding call per batch)
+            rows = min(S, n - s0)
+            b.x_trees_kshap_solve_ey(e0 + 8 * s0 * m * k, f0 + 4 * s0 * k, nl, taddr, p0 + 8 * s0 * d * k,
+                                     [rows, nb, d, nfixed, m, nfull, L, npaired, s0, seed, wbits, k, link])
+
+
+class PermutationExplainer(_AgnosticExplainer):
+    """Model-agnostic Permutation SHAP values.
+
+    Follows the ``shap`` package's ``PermutationExplainer``: each random
+    permutation of the features adds them one by one (forward), then removes
+    them (backward), and each feature's marginal contribution is averaged over
+    the background rows and the permutations. Every step except the model call
+    runs on the device on GPU installs.
+
+    Differs from ``shap``: random permutations come from anonlib's own
+    seeded generator, so values differ from ``shap``'s for the same seed.
+
+    Parameters
+    ----------
+    model : estimator or callable
+        A fitted anonlib estimator, or a function mapping an
+        (n, n_features) array to outputs. For a classifier with
+        ``predict_proba`` the probabilities are explained, otherwise
+        ``predict``.
+    data : array of shape (n_background, n_features)
+        Background rows that stand in for missing features.
+    random_state : int or None, default None
+        Seed for the permutations: None (seed 0) or a nonnegative int.
+        Anything else, including a ``RandomState`` object, raises
+        ``ValueError``.
+
+    Attributes
+    ----------
+    expected_value : float or array of shape (n_outputs,)
+        The mean model output over ``data``: a float for one output, else a
+        float64 array.
+    n_outputs_ : int
+        Number of model outputs explained.
+    n_features_in_ : int
+        Number of features in ``data``.
+
+    Examples
+    --------
+    >>> import numpy as np, anonlib
+    >>> rng = np.random.default_rng(0)
+    >>> X = rng.random((1000, 8), dtype=np.float32)
+    >>> y = X @ np.arange(8, dtype=np.float32)
+    >>> model = anonlib.Ridge().fit(X, y)
+    >>> explainer = anonlib.PermutationExplainer(model, X[:50], random_state=0)
+    >>> explainer.shap_values(X[:10], npermutations=5).shape
+    (10, 8)
+    """
+
+    def __init__(self, model, data, *, random_state=None):
+        super().__init__(model, data, random_state)
+
+    def _linear_wb(self, b):
+        """ANONLIB_IDN_PSHAP_RESIDENT: ([w | b] float32 block, link) when
+        the binding carries the switch and the explained model's predict is
+        this library's linear `link(X W^T + b)` (x_linear `decision_kernel`);
+        else None (the model callback). Routing and byte copies only."""
+        try:
+            ok = int(b.x_trees_pshap_linear_ok()) == 1
+        except (AttributeError, ImportError):
+            return None
+        if not ok:
+            return None
+        m = self.model
+        pred = getattr(type(m), "predict", None)
+        if getattr(pred, "__qualname__", "") != "_LinearRegressorMixin.predict":
+            return None
+        if int(getattr(m, "n_features_in_", -1)) != self._bg.shape[1]:
+            return None
+        from ._expansion_linear import _coef_block   # glue: the model's own [w | b] byte copies
+        intercept = m.intercept_
+        if not hasattr(intercept, "shape"):
+            intercept = full((1,), float(intercept), "<f4")
+        wb = _coef_block(m.coef_, intercept)
+        if wb.size != self.n_outputs_ * (self._bg.shape[1] + 1):
+            return None
+        return wb, int(m._link)
+
+    def shap_values(self, X, npermutations=10):
+        """Permutation SHAP values of the rows of ``X``.
+
+        Parameters
+        ----------
+        X : array of shape (n_samples, n_features)
+            Rows to explain, converted to float32. A feature count different from
+            ``data`` raises ``ValueError``.
+        npermutations : int, default 10
+            Number of random feature permutations per row; less than 1 raises
+            ``ValueError``.
+
+        Returns
+        -------
+        array, float64
+            Shape (n_samples, n_features) for one output, else
+            (n_samples, n_features, n_outputs).
+        """
+        Xa = self._check(X)
+        n, d = Xa.shape
+        k = self.n_outputs_
+        seed = _trees_seed(self.random_state)
+        npm = int(npermutations)
+        if npm < 1:
+            raise ValueError("npermutations must be >= 1")
+        nb = self._bg.shape[0]
+        b = self._bind()
+        phi = zeros((max(n * d * k, 1),), "<f8")
+        if n == 0:
+            return self._shape(zeros((0,), "<f8"), 0, d)
+        mm = npm * (2 * d + 1)
+        x0, p0 = addr_ro(Xa, name="X"), addr(phi, name="phi")
+        R = self._chunk(mm * nb * d, n)
+        if self._model_load(b):
+            # the forest on the device: permutations -> model -> means ->
+            # marginals per chunk, nothing crossing but the chunk's rows and phi
+            try:
+                for r0 in range(0, n, R):  # glue: chunk loop (one binding call per chunk)
+                    rows = min(R, n - r0)
+                    b.x_trees_pshap_values_model(x0 + 4 * r0 * d, p0 + 8 * r0 * d * k, [rows, nb, d, npm, r0, seed, k])
+            finally:
+                b.x_trees_agn_model_release()
+            return self._shape(phi, n, d)
+        lin = self._linear_wb(b)
+        if lin is not None:
+            # IDN_PSHAP_RESIDENT: synthetic rows, the linear predict, means
+            # and marginals on the device per chunk; only x rows and phi cross
+            wb, link = lin
+            bg0, wb0 = addr_ro(self._bg, name="data"), addr_ro(wb, name="coef")
+            Rl = max(1, min(n, _AGN_BUDGET_RESIDENT // max(1, mm * nb * d)))
+            for r0 in range(0, n, Rl):  # glue: chunk loop (one binding call per chunk)
+                rows = min(Rl, n - r0)
+                b.x_trees_pshap_values_linear(x0 + 4 * r0 * d, bg0, wb0, p0 + 8 * r0 * d * k,
+                                              [rows, nb, d, npm, r0, seed, k, link])
+            return self._shape(phi, n, d)
+        # one synthetic buffer for every chunk
+        idn_pool = _trees_build_switch(self, _AGN_IDN_SYN_POOL)
+        reuse = _trees_switch(self, _KSHAP_FAST_BATCH) or idn_pool
+        if _trees_switch(self, _PSHAP_DELTA):
+            self._delta(b, Xa, phi, n, d, k, nb, npm, seed, R, mm)
+            return self._shape(phi, n, d)
+        syn = None
+        try:
+            for r0 in range(0, n, R):  # glue: chunk loop (one model call per chunk)
+                rows = min(R, n - r0)
+                params = [rows, nb, d, npm, r0, seed]
+                if not reuse or syn is None or syn.size != rows * mm * nb * d:
+                    syn = None
+                    syn = empty((rows * mm * nb * d,), "<f4")
+                b.x_trees_pshap_synth(x0 + 4 * r0 * d, addr_ro(self._bg, name="data"), addr(syn, name="synthetic"),
+                                      params)
+                out = self._model_rows(syn, rows * mm * nb, d)
+                if not reuse:
+                    syn = None
+                b.x_trees_pshap_values(addr_ro(out, name="y"), p0 + 8 * r0 * d * k, params + [k])
+        finally:
+            if idn_pool:
+                _agn_pool_release(b)   # the pooled device buffer does not outlive the explanation
+        return self._shape(phi, n, d)
+
+    def _delta(self, b, Xa, phi, n, d, k, nb, npm, seed, R, mm):
+        """ANONLIB_PSHAP_DELTA: per chunk, the device builds only the
+        synthetic rows that differ from their previous coalition's into the
+        front of one reused host buffer (their count into `tot`), the model
+        runs on that prefix, and the device expands the outputs back to
+        every (coalition, background row)."""
+        x0, bg0, p0 = addr_ro(Xa, name="X"), addr_ro(self._bg, name="data"), addr(phi, name="phi")
+        # the device keeps three Int64 words per (coalition, background row):
+        # bound them as if d were at least 16 (a narrow X would else index
+        # up to the whole synthetic budget in Int64 triples)
+        R = min(R, self._chunk(mm * nb * max(d, 16), n))
+        # TOMBSTONE: ANONLIB_PSHAP_FAST_OVERLAP (DROPPED-slower) deleted 2026-10-09 on lane/owed-deletions-D1
+        # (`_delta_overlapped`); code recoverable at b639a2bd2. Restore: git apply experiments/removed/ANONLIB_PSHAP_FAST_OVERLAP.patch.
+        tot = zeros((1,), "<i8")
+        t0 = addr(tot, name="count")
+        syn = empty((R * mm * nb * d,), "<f4")
+        for r0 in range(0, n, R):  # glue: chunk loop (one model call per chunk)
+            rows = min(R, n - r0)
+            params = [rows, nb, d, npm, r0, seed]
+            b.x_trees_pshap_dsynth(x0 + 4 * r0 * d, bg0, addr(syn, name="synthetic"), t0, params)
+            nv = int(tot.tolist()[0])
+            # the first nv rows of syn, zero-copy (syn stays alive in this frame)
+            front = memory_at(addr(syn, name="synthetic"), 4 * nv * d, writable=True).cast("f")
+            out = self._eval(Array.from_buffer(front).reshape((nv, d)))
+            del front
+            b.x_trees_pshap_dvalues(x0 + 4 * r0 * d, bg0, addr_ro(out, name="y"), p0 + 8 * r0 * d * k, t0,
+                                    params + [k])
+            del out

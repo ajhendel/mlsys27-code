@@ -1,0 +1,159 @@
+"""Lane py-shared: the `_portable_math` fast paths give the exact paths'
+bits.
+
+`fsum` is the core helper `fsum_f64` (Shewchuk's partials in Mojo, lane
+py-runtime round 3); this file keeps the exact big-integer sum as its
+definition (`_fsum_exact` below, the reference the package carried until
+182248f55);
+`isfinite`, `isinf` and `isnan` take IEEE comparisons for a Python float
+and the bit test otherwise. This file holds each fast path to its
+definition: the same float bits, or the same exception type and message.
+No binding is needed.
+"""
+import os
+import random
+import struct
+import math
+
+from anonlib import _portable_math as pm
+
+
+def test_integer_and_scaling_adapters_match_standard_library():
+    rng = random.Random(2891)
+    words = [0, 1 << 63, 1, 0x000fffffffffffff, 0x0010000000000000,
+             0x7fefffffffffffff, 0x7ff0000000000000, 0xfff0000000000000,
+             0x7ff8000000000123] + [rng.getrandbits(64) for _ in range(2000)]
+    for word in words:
+        x = struct.unpack('<d', struct.pack('<Q', word))[0]
+        actual, exponent = pm.frexp(x)
+        expected, reference_exponent = math.frexp(x)
+        assert (struct.pack('<d', actual), exponent) == (struct.pack('<d', expected), reference_exponent)
+        if math.isfinite(x):
+            assert pm.floor(x) == math.floor(x)
+            assert pm.ceil(x) == math.ceil(x)
+    assert struct.pack('<d', pm.pi) == struct.pack('<d', math.pi)
+    for n in range(70):
+        for k in range(n + 3):
+            assert pm.comb(n, k) == math.comb(n, k)
+    for a in (-math.inf, -1.0, -0.0, 0.0, 1.0, 1.000000001, math.inf, math.nan):
+        for b in (-math.inf, -1.0, 0.0, 1.0, math.inf, math.nan):
+            assert pm.isclose(a, b) == math.isclose(a, b)
+
+
+def _fsum_exact(values):
+    """The definition: the exact sum, one nearest/even binary64 rounding,
+    math.fsum's NaN and infinity rules (the package's reference until
+    182248f55, kept here as the test's oracle)."""
+    total = 0
+    positive_inf = negative_inf = False
+    nan_value = None
+    for value in values:
+        value = float(value)
+        if math.isnan(value):
+            nan_value = value
+        elif math.isinf(value):
+            positive_inf |= value > 0
+            negative_inf |= value < 0
+        else:
+            numerator, denominator = value.as_integer_ratio()
+            total += numerator << (1074 - (denominator.bit_length() - 1))
+    if positive_inf and negative_inf:
+        raise ValueError("-inf + inf in fsum")
+    if nan_value is not None:
+        return nan_value
+    if positive_inf or negative_inf:
+        return math.inf if positive_inf else -math.inf
+    return pm._scaled_integer(total, -1074)
+
+
+def _bits(x):
+    return struct.pack("<d", x)
+
+
+def _outcome(fn, values):
+    try:
+        r = fn(values)
+    except Exception as exc:  # the exception is part of the answer
+        return (type(exc).__name__, str(exc))
+    return ("ok", _bits(r) if isinstance(r, float) else r)
+
+
+def _cases():
+    rng = random.Random(20260928)
+    inf, nan = float("inf"), float("nan")
+    out = [
+        [], [-0.0], [-0.0, -0.0], [1.0, -1.0], [0.1] * 10,
+        [1e308, 1e308, -1e308],            # intermediate overflow, finite exact sum
+        [1e308, 1e308],                    # the exact sum overflows
+        [inf], [-inf, 1.0], [inf, -inf], [nan, 1.0], [1.0, -nan],
+        [5e-324, 5e-324, -1e-320],         # subnormal
+        [1e16, 1.0, -1e16], [2.0 ** 53, 1.0, 1.0], [2.0 ** 53, 1.0],
+        # ["1.5", 2] left: fsum reads its terms as array('d') since lane
+        # py-runtime round 3, which refuses a string (TypeError) as math.fsum does
+        [10 ** 400],                       # an int too large for a float
+        [1, 2, 3], [True, 0.5],
+    ]
+    for _ in range(4000):
+        k = rng.randint(0, 48)
+        out.append([rng.choice([
+            rng.uniform(-1, 1) * 10.0 ** rng.randint(-320, 308),
+            rng.gauss(0.0, 1.0),
+            5e-324 * rng.randint(-9, 9),
+            float(rng.randint(-5, 5)),
+            rng.choice([1.0, -1.0]) * 2.0 ** rng.randint(-1074, 1023),
+        ]) for _ in range(k)])
+    return out
+
+
+def test_fsum_fast_path_is_the_exact_sum():
+    for values in _cases():
+        ref = _outcome(_fsum_exact, values)
+        assert _outcome(pm.fsum, values) == ref, values[:6]
+        assert _outcome(pm.fsum, iter(values)) == ref, values[:6]
+        assert _outcome(pm.fsum, tuple(values)) == ref, values[:6]
+
+
+def test_fsum_reference_arm_is_the_exact_sum(monkeypatch):
+    monkeypatch.setenv("ANONLIB_HOTPATH", "python")
+    for values in _cases()[:400]:
+        assert _outcome(pm.fsum, values) == _outcome(_fsum_exact, values)
+
+
+def _slow(kind, x):
+    b = struct.unpack("<Q", struct.pack("<d", float(x)))[0]
+    if kind == "isfinite":
+        return (b & 0x7ff0000000000000) != 0x7ff0000000000000
+    if kind == "isinf":
+        return (b & 0x7fffffffffffffff) == 0x7ff0000000000000
+    return (b & 0x7fffffffffffffff) > 0x7ff0000000000000
+
+
+def test_predicates_fast_path_is_the_bit_test():
+    words = [0, 1 << 63, 1, 0x000fffffffffffff, 0x0010000000000000, 0x7fefffffffffffff,
+             0x7ff0000000000000, 0xfff0000000000000, 0x7ff0000000000001, 0x7ff8000000000000,
+             0xfff8000000000123, 0x7fffffffffffffff, 0x3ff0000000000000]
+    values = [struct.unpack("<d", struct.pack("<Q", w))[0] for w in words]
+    rng = random.Random(3)
+    values += [struct.unpack("<d", struct.pack("<Q", rng.getrandbits(64)))[0] for _ in range(20000)]
+    for x in values:
+        for kind in ("isfinite", "isinf", "isnan"):
+            assert getattr(pm, kind)(x) == _slow(kind, x), (kind, x)
+    for x in (0, 7, -3, True, 2 ** 60):
+        for kind in ("isfinite", "isinf", "isnan"):
+            assert getattr(pm, kind)(x) == _slow(kind, x)
+
+
+if __name__ == "__main__":
+    test_fsum_fast_path_is_the_exact_sum()
+    old = os.environ.get("ANONLIB_HOTPATH")
+    os.environ["ANONLIB_HOTPATH"] = "python"
+    try:
+        for v in _cases()[:400]:
+            assert _outcome(pm.fsum, v) == _outcome(_fsum_exact, v)
+    finally:
+        if old is None:
+            del os.environ["ANONLIB_HOTPATH"]
+        else:
+            os.environ["ANONLIB_HOTPATH"] = old
+    test_predicates_fast_path_is_the_bit_test()
+    print("test_portable_math_fast: PASS")

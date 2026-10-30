@@ -1,0 +1,298 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 the authors. Part of anonlib, DOI-WITHHELD
+"""The static half of the release gate: the checks a box with no GPU can honestly make.
+
+Run by `.github/workflows/wheel-ci.yml`. Every check here is a fact about the
+SOURCE TREE or about a wheel's INVENTORY, never about a kernel, because the
+runner that runs it has no GPU and a check that cannot run must say so rather
+than be allowed to fail quietly.
+
+WHY THIS FILE EXISTS. Wheel CI tried to build the real wheel on a hosted macOS
+runner for its whole history and failed 124 times out of 127; the three greens
+were on 2026-08-20 and one of them was, by its own commit message, "a green CI
+run in which all five interpreters had failed". Two releases were cut past that
+red gate and both shipped a defect. A gate that verifies less and is GREEN is
+worth more than one that pretends to build a GPU wheel and never can.
+
+    inventory <package-dir> [<extra-root.py> ...]
+        Every .py in the shipped package must be REACHABLE by import from a
+        root. `anonlib/torch_ops.py`, 1,138 lines, shipped in the 0.2.x and
+        0.3.x wheels having never been imported, compiled or executed by
+        anything (CHANGELOG.md, "Removed", 2026-08-31). `packages =
+        ["anonlib"]` in pyproject.toml sweeps the directory, so nothing
+        downstream could have noticed. This walks the import graph instead.
+
+    versions <repo-root>
+        python/pyproject.toml, python/anonlib/_version.py and CITATION.cff
+        must agree. The release workflow's "Version agreement" step reads the
+        first two only, and a wrong CITATION.cff `version` is minted
+        permanently into a DOI.
+
+    pins <repo-root>
+        Every bindings/build_*.sh must pin BOTH cpu baselines, and MACOS_FLOOR
+        must equal setup.py's DEFAULT_MACOS_TARGET. macOS pinned
+        `--target-cpu apple-m1` from 0.1.0; Linux pinned nothing until
+        2026-08-31, and that is exactly why 0.3.0's Linux wheel carried
+        unconditional AVX-512 and SIGILLed on every host without it. This
+        gate cannot catch a bad BINARY -- `packaging/linux/isa_baseline_linux.py`
+        on the shipped artifact is the only thing that can, and it belongs in
+        the release path -- but it does stop the SOURCE regressing to the
+        state that produced one.
+"""
+
+import ast
+import pathlib
+import re
+import sys
+import subprocess
+
+
+# --------------------------------------------------------------------------
+# inventory
+# --------------------------------------------------------------------------
+def _intra_package_imports(path, pkg):
+    """Names of sibling modules `path` imports from within `pkg`."""
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    out = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            # `from . import x, y`  /  `from .x import y`  /  `from .x.y import z`
+            if node.level and not node.module:
+                out.update(a.name for a in node.names)
+            elif node.level and node.module:
+                out.add(node.module.split(".")[0])
+            elif node.module and node.module.split(".")[0] == pkg:
+                parts = node.module.split(".")
+                if len(parts) > 1:
+                    out.add(parts[1])
+                else:
+                    out.update(a.name for a in node.names)
+        elif isinstance(node, ast.Import):
+            for a in node.names:
+                parts = a.name.split(".")
+                if parts[0] == pkg and len(parts) > 1:
+                    out.add(parts[1])
+    return out
+
+
+def inventory(argv):
+    pkgdir = pathlib.Path(argv[0]).resolve()
+    pkg = pkgdir.name
+    extra_roots = [pathlib.Path(p).resolve() for p in argv[1:]]
+
+    present = {p.stem: p for p in sorted(pkgdir.glob("*.py"))}
+    if "__init__" not in present:
+        print(f"FAIL {pkgdir} has no __init__.py", file=sys.stderr)
+        return 1
+
+    # ROOTS. `__init__` is what `import anonlib` runs. `__main__` is
+    # `python -m anonlib` and is the ONLY importer of `_verify`. The extra
+    # roots are the top-level modules pyproject.toml ships outside the
+    # package -- today `anonlib_diagnostics`, which pyproject.toml names as
+    # the `anonlib` console script and which is deliberately kept OUT of
+    # the package so it still runs when importing the package is the thing a
+    # user needs to diagnose.
+    roots = ["__init__", "__main__"]
+    queue = [r for r in roots if r in present]
+    # BUILD-TIME COPIES REACHED THROUGH importlib, NOT A STATIC IMPORT (the
+    # packaging lane, 2026-09-14). `_verify.load_differ` imports
+    # `anonlib._identity_trace_diff` and `_identity.load_harness` imports
+    # `anonlib._identity_break` by name at run time, because each is a copy
+    # of a tools/ file made by the wheel build and is absent from a checkout
+    # (python/.gitignore). ast cannot see those edges, so they are declared
+    # here, keyed by the importer, and only count when the importer itself is
+    # reached; an unrelated copy left in the package still fails as an orphan.
+    dynamic = {"_verify": ["_identity_trace_diff"], "_identity": ["_identity_break"]}
+    # THE EXPANSION LANES' FRAGMENTS (lane/algos-prep, 2026-09-27), also
+    # reached by path, never by an import: host_surface.py reads each lane's
+    # `_surface_<lane>.py`, and the harness copy each `_identity_lane_<lane>.py`
+    # (a build-time copy of tools/identity_lanes/<lane>.py). Declared by
+    # pattern under the importer that reads them, which is the same rule as
+    # above: they count only when that importer is reached.
+    dynamic["host_surface"] = [s for s in present if s.startswith("_surface_")]
+    dynamic["_identity_break"] = [s for s in present if s.startswith("_identity_lane_")]
+    # A submodule the user documentation tells people to import by its own
+    # path is public, not abandoned: the multi-GPU drivers are reached as
+    # `from anonlib.parallel_ensemble import fit_forest`
+    # (docs/multi_gpu/README.md) and never through __init__. Only a literal
+    # `from <pkg>.<module> import` line in a docs/**/*.md file counts, so a
+    # module whose last documented import is deleted is an orphan again. The
+    # other spelling that counts is a qualified call in backticks,
+    # `anonlib.parallel_graph.fit_graph(...)`.
+    docs = pkgdir.parent.parent / "docs"
+    q = re.escape(pkg)
+    documented = re.compile(r'^\s*from ' + q + r'\.([A-Za-z_][A-Za-z0-9_]*) import\b'
+                            r'|`' + q + r'\.([A-Za-z_][A-Za-z0-9_]*)\.[A-Za-z_][A-Za-z0-9_]*\(', re.M)
+    if docs.is_dir():
+        for md in sorted(docs.rglob("*.md")):
+            for a, b in documented.findall(md.read_text(encoding="utf-8")):
+                if (a or b) in present:
+                    queue.append(a or b)
+    # A module PREPARED for a later exposure (IVF-FLAT's `_ivf_impl.py`,
+    # workstream D) ships on purpose and raises by name until exposed. It
+    # counts only when BOTH hold: its docstring's first line says
+    # "PREPARED AND NOT EXPOSED", and __init__.py names the file, so the
+    # package root states the decision where a reader of the imports sees it.
+    init_text = present["__init__"].read_text(encoding="utf-8")
+    for stem, path in present.items():
+        doc = ast.get_docstring(ast.parse(path.read_text(encoding="utf-8"))) or ""
+        if "PREPARED AND NOT EXPOSED" in doc.split("\n", 1)[0] and f"`{stem}.py`" in init_text:
+            queue.append(stem)
+    # A module a package module launches as `python -m <pkg>.<module>` (the
+    # multi-GPU pool starts `-m anonlib._parallel_worker`) is reached by
+    # that module, though no import statement names it.
+    launched = re.compile(r"""['"]-m['"]\s*,\s*['"]""" + q + r"""\.([A-Za-z_][A-Za-z0-9_]*)['"]""")
+    # A LAZY EXPORT TABLE is an import too: `_LAZY_EXPORTS = {'GARCH': ('_x_sequence_garch', 'GARCH'), ...}`
+    # with a module `__getattr__` that runs `import_module("." + module, __package__)` on first access
+    # (_expansion_sequence.py). The table's string literals name the submodules, so the module holding the
+    # table reaches each of them; a stem the table no longer names is an orphan again.
+    def lazy_targets(path):
+        out = []
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if (isinstance(node, (ast.Assign, ast.AnnAssign)) and isinstance(node.value, ast.Dict)
+                    and any(isinstance(t, ast.Name) and t.id == "_LAZY_EXPORTS"
+                            for t in (node.targets if isinstance(node, ast.Assign) else [node.target]))):
+                for v in node.value.values:
+                    if (isinstance(v, ast.Tuple) and v.elts and isinstance(v.elts[0], ast.Constant)
+                            and isinstance(v.elts[0].value, str)):
+                        out.append(v.elts[0].value.lstrip("."))
+        return out
+    # A standalone top-level module may pull package modules in too.
+    for f in extra_roots:
+        queue.extend(_intra_package_imports(f, pkg))
+
+    reached = set()
+    while queue:
+        name = queue.pop()
+        if name in reached:
+            continue
+        reached.add(name)
+        if name in present:
+            queue.extend(_intra_package_imports(present[name], pkg))
+            queue.extend(dynamic.get(name, []))
+            queue.extend(launched.findall(present[name].read_text(encoding="utf-8")))
+            queue.extend(lazy_targets(present[name]))
+
+    orphans = sorted(set(present) - reached)
+    if orphans:
+        print(
+            "FAIL these modules ship in the wheel and NOTHING imports them:\n"
+            + "".join(f"    {pkg}/{o}.py\n" for o in orphans)
+            + "  `packages = [\"anonlib\"]` sweeps the directory, so an\n"
+            "  abandoned module is not absent from the wheel -- it SHIPS.\n"
+            "  anonlib/torch_ops.py did, for two minor releases, having\n"
+            "  never been imported by anything. Delete it, or import it.",
+            file=sys.stderr,
+        )
+        return 1
+    print(f"  inventory: {len(present)} modules in {pkg}/, all reachable by import")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# versions
+# --------------------------------------------------------------------------
+def _one(pattern, path):
+    text = pathlib.Path(path).read_text(encoding="utf-8")
+    m = re.search(pattern, text, re.M)
+    if not m:
+        raise SystemExit(f"FAIL {path}: no line matching {pattern!r}")
+    return m.group(1)
+
+
+def versions(argv):
+    root = pathlib.Path(argv[0]).resolve()
+    found = {
+        "python/pyproject.toml": _one(
+            r'^version = "([^"]+)"', root / "python/pyproject.toml"),
+        "python/anonlib/_version.py": _one(
+            r'^__version__ = "([^"]+)"', root / "python/anonlib/_version.py"),
+        "CITATION.cff": _one(
+            r'^version: *"?([^"\s]+)"?', root / "CITATION.cff"),
+    }
+    if len(set(found.values())) != 1:
+        print("FAIL the version is written in three places and they disagree:",
+              file=sys.stderr)
+        for k, v in found.items():
+            print(f"    {v:<12} {k}", file=sys.stderr)
+        print("  A wrong CITATION.cff version is minted permanently into a DOI.",
+              file=sys.stderr)
+        return 1
+    if subprocess.call([sys.executable, str(root / "tools/citation_metadata.py"),
+                        "--root", str(root)]):
+        return 1
+    print(f"  versions: {next(iter(found.values()))} in all three places")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# pins
+# --------------------------------------------------------------------------
+def pins(argv):
+    root = pathlib.Path(argv[0]).resolve()
+    target = _one(r'^DEFAULT_MACOS_TARGET = "([^"]+)"', root / "python/setup.py")
+    scripts = sorted((root / "bindings").glob("build*.sh"))
+    if not scripts:
+        print("FAIL no bindings/build*.sh found", file=sys.stderr)
+        return 1
+    bad = 0
+    # A wrapper whose whole body is one `exec sh "$(dirname -- "$0")/<b>.sh" ...`
+    # line pins nothing itself; the builder it execs does (the twelve
+    # build_<family>_host.sh wrappers over build_host_family.sh since 8c61806a6).
+    # Check the builder's text in the wrapper's name, and only when that
+    # builder is itself one of the scanned build*.sh files.
+    wrapper = re.compile(r'^exec sh "\$\(dirname -- "\$0"\)/(build[A-Za-z0-9_]*\.sh)"( .*)?$')
+    for s in scripts:
+        text = s.read_text(encoding="utf-8")
+        body = [ln for ln in text.splitlines() if ln.strip() and not ln.lstrip().startswith("#")]
+        m = wrapper.match(body[0]) if len(body) == 1 else None
+        if m:
+            target_script = s.parent / m.group(1)
+            if target_script not in scripts or target_script == s:
+                print(f"FAIL {s.name}: execs {m.group(1)}, which is not a scanned "
+                      f"bindings/build*.sh", file=sys.stderr)
+                bad += 1
+                continue
+            text = target_script.read_text(encoding="utf-8")
+        floor = re.search(r'^MACOS_FLOOR="([^"]+)"', text, re.M)
+        if not floor:
+            print(f"FAIL {s.name}: no MACOS_FLOOR", file=sys.stderr); bad += 1
+        elif floor.group(1) != target:
+            print(f"FAIL {s.name}: MACOS_FLOOR {floor.group(1)} but "
+                  f"setup.py tags {target}. One wheel carries one tag and the "
+                  f"tag is the floor of everything inside.", file=sys.stderr)
+            bad += 1
+        # THE LINE THAT WAS MISSING WHEN 0.3.0 SHIPPED. Without it `mojo build`
+        # targets the build box's own CPU; four build boxes in a row happened
+        # to have AVX-512 and the wheel SIGILLed everywhere else.
+        # The quotes are OPTIONAL, and that is deliberate. This check rejected
+        # `--target-cpu "${ANONLIB_LINUX_CPU:-x86-64-v3}"` for months of
+        # nobody writing it, then build_byte_lm_host.sh wrote the quoted form
+        # -- which is the SAFER shell spelling -- and turned main red while
+        # pinning exactly the right baseline. Accepting both spellings weakens
+        # the assertion not at all: the variable and the default are still
+        # required verbatim.
+        if not re.search(r'--target-cpu "?\$\{ANONLIB_LINUX_CPU:-x86-64-v3\}"?', text):
+            print(f"FAIL {s.name}: does not pin the Linux x86-64 baseline to "
+                  f"x86-64-v3. 0.3.0 shipped without this and SIGILLed on "
+                  f"every host without AVX-512.", file=sys.stderr)
+            bad += 1
+        if "apple-m1" not in text:
+            print(f"FAIL {s.name}: does not pin --target-cpu apple-m1",
+                  file=sys.stderr)
+            bad += 1
+    if bad:
+        return 1
+    print(f"  pins: {len(scripts)} build scripts, macOS floor {target}, "
+          f"Linux baseline x86-64-v3")
+    return 0
+
+
+CHECKS = {"inventory": inventory, "versions": versions, "pins": pins}
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2 or sys.argv[1] not in CHECKS:
+        print(f"usage: wheel_ci.py {{{'|'.join(CHECKS)}}} ...", file=sys.stderr)
+        raise SystemExit(2)
+    raise SystemExit(CHECKS[sys.argv[1]](sys.argv[2:]))

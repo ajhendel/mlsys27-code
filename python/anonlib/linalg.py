@@ -1,0 +1,104 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Float32 linear algebra: a bit-identical matrix product, low-bit products and
+NumPy-named decompositions.
+
+`matmul` computes ``op(a) @ op(b)`` in float32 under the profile
+``anonlib.identical.gemm.fp32.v1``: the same bits on Apple, NVIDIA and AMD for the same
+inputs. It supports the NN, NT and TN products; asking for both transposes raises
+`ValueError`. By default it requires the identical build and raises when another
+build is loaded; ``identical=False`` uses whichever build is loaded, with no
+identity guarantee. `numeric_mode`, `profile` and `require_identical` report and
+check what this process loaded.
+
+`matmul_bf16`, `matmul_int8` and `matmul_int15` are the low-bit profiles, with
+`to_bf16`, `from_bf16`, `quantize_int8`, `dequantize_int8`, `quantize_int15` and
+`dequantize_int15` to prepare and recover their operands.
+
+`qr`, `eigh`, `svdvals` and `svd` carry NumPy's names and meanings for the modes
+they support (note that `qr` defaults to ``mode='r'``); unsupported modes are refused
+by name rather than approximated. They run on the device on a GPU install and on the
+host binding on a CPU-only install, with the same bits. `Cholesky` factors a
+symmetric positive-definite matrix and solves with the factor.
+
+Importing this module does not run numerical computation.
+
+Examples
+--------
+>>> import numpy as np
+>>> from anonlib import linalg
+>>> a = np.random.default_rng(0).random((256, 64), dtype=np.float32)
+>>> b = np.random.default_rng(1).random((64, 32), dtype=np.float32)
+>>> c = np.asarray(linalg.matmul(a, b))
+"""
+from ._linalg_impl import (
+    PROFILE,
+    PROFILE_BF16,
+    PROFILE_FAMILY,
+    INT15_MAX_K,
+    PROFILE_INT15,
+    PROFILE_INT8,
+    PROFILE_VERSION,
+    dequantize_int15,
+    dequantize_int8,
+    eigh,
+    from_bf16,
+    matmul,
+    matmul_bf16,
+    matmul_int15,
+    matmul_int8,
+    numeric_mode,
+    profile,
+    qr,
+    quantize_int15,
+    quantize_int8,
+    require_identical,
+    svd,
+    svdvals,
+    to_bf16,
+)
+# `Cholesky` (workstream D, 2026-09-14) binds `_anonlib_gp`, not
+# `_anonlib_linalg`: the GP build already links every Cholesky kernel
+# and a second copy would be a second binary of the same arithmetic.
+from ._cholesky_impl import Cholesky
+
+# Import-time aliases only: FAST BF16 selection, argument handling, packing,
+# launches and completion are compiled native operations. Keep IDENTICAL's
+# existing surface and low-bit profile guard unchanged. The native capability
+# defaults on in Apple FAST; a binding compiled with the explicit BF16=0
+# switch reports unavailable. Other vendors and IDENTICAL stay gated out.
+from . import _backend as _linalg_backend
+
+_bf16_native = None
+if _linalg_backend.default_mode() == "fast":
+    from ._linalg_impl import _load as _load_selected_linalg
+    # A fast request on an install without a fast linalg binary (a partial
+    # build, a source checkout with no fast set, a CPU-only install) must not
+    # take `import anonlib` down: `_backend.select()` stubs a missing binding
+    # so the package imports and its users refuse BY NAME on use. Loading the
+    # binding here, at import, raised that refusal at package import instead
+    # (`python -m anonlib verify --compare` under ANONLIB_NUMERIC_MODE=fast,
+    # test_verify_all). Without a binding the names below stay the identical
+    # surface's, whose own `_load()` raises the same refusal when called.
+    try:
+        _bf16_native = _load_selected_linalg()
+    except (ImportError, ValueError):
+        _bf16_native = None
+if _bf16_native is not None:
+    _fast_bf16_available = _bf16_native.fast_bf16_available
+    to_bf16 = _bf16_native.public_fast_to_bf16
+    from_bf16 = _bf16_native.public_fast_from_bf16
+    matmul_bf16 = _bf16_native.fast_matmul_bf16
+
+__all__ = ['matmul', 'numeric_mode', 'profile', 'require_identical',
+           # the three decompositions under their own names
+           # (lane/linalg-public, 2026-09-19). numpy's names, numpy's
+           # meanings, and the modes this tree does not compute refused BY
+           # NAME rather than approximated: see each docstring.
+           'qr', 'eigh', 'svdvals', 'svd',
+           'PROFILE', 'PROFILE_FAMILY', 'PROFILE_VERSION', 'Cholesky',
+           # the low-bit profiles (gemm/IDENTICAL_LOWBIT_CONTRACT.md)
+           'matmul_bf16', 'matmul_int8', 'to_bf16', 'from_bf16',
+           'quantize_int8', 'dequantize_int8', 'PROFILE_BF16', 'PROFILE_INT8',
+           # the fifteen-bit profile (contract section 6, lane/lowbit-int15)
+           'matmul_int15', 'quantize_int15', 'dequantize_int15', 'PROFILE_INT15',
+           'INT15_MAX_K']

@@ -1,0 +1,1739 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 the authors. Part of anonlib, DOI-WITHHELD
+"""Host-pointer surface for exact dense GP REGRESSION: what a binding calls.
+
+Wired: `bindings/_anonlib_gp.mojo` (built by `bindings/build_gp.sh`)
+calls this file, and `python/anonlib/_gp_impl.py` exposes it as
+`anonlib.GaussianProcessRegressor`. This file is the entry that binding
+reaches, shaped like `cholesky/estimator.mojo` and
+`kde/estimator.mojo::kde_score_samples_host`.
+
+**THERE IS NO UPSTREAM GAUSSIAN PROCESS.** cuML, cuVS and RAFT implement
+none at the pinned commits, so `CONTRIBUTING.md` (Algorithms and references)'s settled-answer rule does
+not apply here, because there is nothing to copy. scikit-learn's
+`sklearn/gaussian_process/_gpr.py` is the SEMANTICS reference and the ORACLE
+and is never the design source; every step below cites the line of it that
+says what the step means.
+
+    _gpr.py:349-367  fit:      K = kernel(X); K[diag] += alpha;
+                               L = cholesky(K); alpha_ = cho_solve(L, y)
+    _gpr.py:613-617  lml:      -0.5 y^T alpha_ - sum(log diag L)
+                               - n/2 log(2 pi)
+    _gpr.py:446-447  predict:  K_trans = kernel(X_test, X_train);
+                               y_mean = K_trans @ alpha_
+    _gpr.py:460-462  predict:  V = solve_triangular(L, K_trans.T, lower)
+    _gpr.py:480-491  predict:  y_var = kernel.diag(X_test)
+                               - einsum("ij,ji->i", V.T, V), clamped at 0
+    _gpr.py:500      predict:  return_std returns sqrt(y_var)
+
+TWO NAMES CALLED `alpha`, AND THE COLLISION IS SCIKIT-LEARN'S
+--------------------------------------------------------------
+`GaussianProcessRegressor(alpha=...)` is the RIDGE added to the diagonal
+(`_gpr.py:224`, `:350`). `self.alpha_` is the vector `K^-1 y`
+(`_gpr.py:363`). They are different objects with one name one underscore
+apart, and a lane that carried both under the same word would eventually add
+one to the other. Here the ridge is `alpha`, matching the constructor
+argument a user types, and `K^-1 y` is `dual_coef`. Every docstring that
+says "alpha" says which.
+
+THE RIDGE IS THE CHOLESKY LANE'S JITTER, PASSED THROUGH UNCHANGED
+------------------------------------------------------------------
+**DEVIATION 1751, and it is the design decision in this file.** There is no
+second jitter knob. `alpha` is handed to `cholesky_factor_host` as its
+`jitter` argument and that is the only ridge applied anywhere in this lane.
+Under `NUMERIC_IDENTICAL` the Cholesky profile accepts exactly two values,
+`+0.0` and `2^-20`, and refuses anything else BY NAME (DEVIATION 1637) --
+including scikit-learn's default `alpha = 1e-10`.
+
+**And 1e-10 would be a NO-OP anyway, which is DEVIATION 1752 and is a
+finding rather than a nuisance.** Every kernel matrix this lane builds has a
+unit diagonal (`cholesky/README.md`'s first correction, and
+`kernels.mojo`'s header derives it), and in float32 `1.0 + 1e-10` rounds to
+exactly `1.0`: the gap above 1.0 is `2^-23 = 1.19e-7`, three orders of
+magnitude larger than the ridge. So on a float32 GP, sklearn's default ridge
+adds nothing at all, and a user who implemented a working float64 script would
+get an unridged factorization and a pivot refusal with no idea why.
+`check_duplicate_inputs_need_the_ridge` asserts the no-op by bits.
+
+`cholesky_profile_jitter()` returns `2^-20 = 9.54e-7`, which IS above the
+float32 gap at 1.0 and is the smallest ridge on this column that can do
+anything. If a marginal likelihood needs a LARGER ridge than that, per
+`cholesky/README.md`'s second finding, **that is a finding to write down and
+not a number to quietly raise**; the way to express a larger ridge under
+IDENTICAL is to apply the pinned one more than once and record how many
+times, and the way to change the value is a v2 of the Cholesky profile.
+
+HYPERPARAMETER OPTIMIZATION LIVES OUTSIDE THIS ONE-SHOT FIT
+-----------------------------------------------------------
+`gpr_fit_host` still accepts only `optimizer="none"` (DEVIATION 1761's
+refusal, kept at this entry): it fits the kernel it is handed. The optimizer
+(2026-09-15) evaluates `gpr_lml_grad_host` below at each candidate kernel
+(DEVIATION 2880: the likelihood, and its gradient through the identical
+Cholesky and one pinned fold) and runs its state machine on the device in
+`gaussian_process/gp_optim.mojo` (DEVIATION 2881), whose every stop rule
+reads those bits alone, so the iteration count is the same on every column.
+The Python surface then calls this fit once with the optimized kernel.
+
+A CALLER THAT KEEPS ITS MATRICES ON THE DEVICE should call
+`gaussian_process/checks/kernels.mojo::gp_kernel_matrix` and the Cholesky
+lane's `potrf_lower` / `cho_solve` directly and keep its own `DeviceBuffer`s
+-- which is exactly what a hyperparameter search would want, and is why
+`cholesky/estimator.mojo`'s header offers the device-level form. This entry
+is the one-shot form, which is what the gates and the card use.
+"""
+
+# DEVIATION 2486: bulk host staging; stream/lifetime boundaries unchanged.
+from bindings.hostptr import copy_f32
+from std.memory import bitcast
+from max.gpu.host import DeviceBuffer, DeviceContext
+from checks.numerics import GLOBAL_NUMERIC_MODE as _CTX_MODE, NUMERIC_IDENTICAL as _CTX_IDENTICAL
+from core.neural_context import neural_ctx
+from std.sys.compile import is_defined
+# ONE PROCESS-LIFETIME DeviceContext per binding and tier (CURRENT DIRECTIVES;
+# lane/neighbors-apple 2026-09-28): a new context per entry is a new Metal
+# queue and a pipeline load per call. Same kernels, same launches, same order
+# on one stream, and every entry still synchronizes before it returns, so no
+# bit moves. This module is compiled into ONE GPU binding, so the slot name
+# (per module and tier) is that binding's own.
+comptime _FAMILY_CTX = "MojoGpContextIdentical" if _CTX_MODE == _CTX_IDENTICAL else "MojoGpContextOther"
+
+
+def _family_ctx() raises -> DeviceContext:
+    """The binding's process-lifetime context; `-D ANONLIB_FAMILY_CTX_PER_CALL`
+    restores a new context per entry (the A/B arm)."""
+    comptime if is_defined["ANONLIB_FAMILY_CTX_PER_CALL"]():
+        return DeviceContext()
+    return neural_ctx[_FAMILY_CTX]()
+
+from cholesky.estimator import (
+    CholeskyFactor,
+    cholesky_profile_jitter,
+)
+from cholesky.checks.potrf import (
+    CHOL_ELEM_TPB,
+    CHOL_NB_PINNED,
+    CHOL_PANEL_TPB,
+    add_jitter,
+    chol_default_nb_hint,
+    chol_jitter_pinned,
+    chol_logdet,
+    chol_nb_for,
+    chol_validate_jitter,
+    chol_workspace_floats,
+    potrf_lower,
+)
+from cholesky.checks.trsm import cho_solve
+from core.device_zero import enqueue_fill
+from gaussian_process.unnorm import GP_UNNORM_COV, GP_UNNORM_MEAN, GP_UNNORM_STD, gp_unnorm_cell
+from gaussian_process.gpc_items import gpc_fold_blocks, gpr_ydot_fin, gpr_ydot_part_item
+from cholesky.checks.trsm import CHOL_SOLVE_TPB, trsm_lower
+from core.identity_trace import IdentityTrace
+from gaussian_process.checks.gp_sabotage import (
+    GP_SAB_LOGDET_RECOMPUTED,
+    GP_SAB_MEAN_DESCENDING,
+    GP_SAB_NONE,
+    GP_SAB_YALPHA_DESCENDING,
+    gp_sabotage_name,
+    sabotage_mean_kernel,
+)
+from gaussian_process.checks.kernels import (
+    GP_ELEM_TPB,
+    GP_PROFILE,
+    GPKernelSpec,
+    gp_hex32_bits,
+    gp_kernel_diag,
+    gp_kernel_matrix,
+    gp_kernel_name,
+    gp_kernel_stack_floats,
+    gp_log_2pi,
+    gp_predictive_variance,
+    gp_validate_kernel,
+)
+from gaussian_process.checks.kernel_gradient import gp_kernel_matrix_grad
+from gaussian_process.host.gp_theta import gp_grad_half
+from gaussian_process.gp_grad_items import gp_free_count, gp_grad_blocks, gp_grad_part_item, gp_grad_fin_item
+from std.gpu import block_idx as _gb_idx, thread_idx as _gt_idx
+from gemm.checks.gemm_identical import (
+    identical_gemm_into,
+    identical_gemm_workspace_max_floats,
+)
+from gemm.contract import OP_NN, OP_TN
+from gaussian_process.checks.sample_y import (
+    gp_sample_y_check_factor,
+    gp_sample_y_key,
+    gp_sample_y_normal,
+    gp_sample_y_validate,
+)
+from checks.numerics import (
+    GLOBAL_NUMERIC_MODE,
+    NUMERIC_IDENTICAL,
+    ftz,
+    identical_log,
+    identical_mul,
+    identical_mul_add,
+)
+
+
+#: The only accepted spelling of scikit-learn's `optimizer=None`.
+comptime GP_OPTIMIZER_NONE = "none"
+
+
+@fieldwise_init
+struct GPRegressor(Movable):
+    """A fitted `GaussianProcessRegressor`, and everything a caller must not
+    recompute for itself.
+
+    Shaped after `cholesky/estimator.mojo::CholeskyFactor` and for the same
+    reason: the numbers that are expensive AND order-dependent are computed
+    once, here, and handed over already done, so two callers cannot arrive
+    at two fold orders for one quantity.
+    """
+
+    var x_train: List[Float32]
+    """`n_train x n_features` row-major, kept because `predict` needs it."""
+
+    var y_train: List[Float32]
+    var n_train: Int
+    var n_features: Int
+
+    var kernel: GPKernelSpec
+    """The FITTED kernel. Identical to the one passed in: there is no
+    optimizer, so sklearn's `kernel_` (the optimized clone) and `kernel`
+    (the caller's) are the same object here. DEVIATION 1761."""
+
+    var alpha: Float32
+    """The RIDGE, sklearn's `GaussianProcessRegressor(alpha=...)`, which is
+    also the Cholesky profile's jitter (DEVIATION 1751). By value, because a
+    factor that does not carry its ridge cannot be compared with another."""
+
+    var l: List[Float32]
+    """`n_train x n_train` row-major lower Cholesky factor of `K + alpha I`.
+    sklearn's `L_`."""
+
+    var dual_coef: List[Float32]
+    """`K^-1 y`, `n_train` floats. **sklearn's `alpha_`**, which is NOT this
+    struct's `alpha`. See this file's header."""
+
+    var logdet: Float32
+    """`log |K + alpha I|`, from `cholesky_logdet_host` and NEVER recomputed
+    (DEVIATION 1757). sklearn's `sum(log(diag(L)))` is half of this."""
+
+    var ydotalpha: Float32
+    """`y^T dual_coef`, sklearn's `einsum("ik,ik->k", y_train, alpha)`."""
+
+    var lml: Float32
+    """The log marginal likelihood at the fitted kernel. sklearn's
+    `log_marginal_likelihood_value_`."""
+
+    var info: Int
+    """LAPACK's `info` from the factorization. **CHECK IT.** 0 means `l` is a
+    factor; `k > 0` means the leading minor of order `k` was not positive
+    definite, which for a GP means the kernel matrix was numerically
+    singular and the ridge did not save it. DEVIATION 1634."""
+
+    var nb: Int
+    """The Cholesky panel width that ran. Part of the profile."""
+
+
+@fieldwise_init
+struct GPPrediction(Movable):
+    """One `predict(X_star, return_std=True)`."""
+
+    var mean: List[Float32]
+    var variance: List[Float32]
+    var std: List[Float32]
+    """`sqrt(variance)`, which is what sklearn's `return_std` returns
+    (`_gpr.py:500`). Both are handed over so a caller does not square a root
+    to get back the variance."""
+
+    var clamped: List[Int32]
+    """One flag per test point: 1 where the predictive variance came out
+    non-positive and was replaced by `+0.0`. **DEVIATION 1760.** A vector
+    rather than a count, because a count is a total and says nothing about
+    placement, and because a flag vector is what a cross-vendor card diff
+    can align."""
+
+    var n_clamped: Int
+    """The host sum of `clamped`. REPORTED by every caller in this lane; it
+    is never hidden and never defaulted away."""
+
+    var kss: Float32
+    """`k(x*, x*)`, one scalar for every test point because every kernel
+    this lane implements has a coordinate-independent diagonal. DEVIATION
+    1770."""
+
+    var n_star: Int
+
+
+# ===========================================================================
+# VALIDATION, ALL OF IT ON THE HOST AND BEFORE ANY LAUNCH
+# ===========================================================================
+
+
+def gp_profile_alpha() -> Float32:
+    """The ridge the profile pins, re-exported so a caller never reaches
+    into `cholesky/checks/` for it and so that when it appears in a
+    user's source it appears as a NAME rather than as a literal somebody
+    will later change. It IS `cholesky_profile_jitter()`; there is no second
+    jitter knob (DEVIATION 1751)."""
+    return cholesky_profile_jitter()
+
+
+def gp_validate_alpha(alpha: Float32) raises:
+    """**DEVIATION 1751 and 1752.** The ridge, refused by name.
+
+    Everything a Gaussian process can get wrong about its ridge is refused
+    here with the reason and, where there is one, the closure condition.
+    `cholesky/checks/potrf.mojo::chol_validate_jitter` refuses the same
+    set one layer down; this one exists to say it in a GP's vocabulary and
+    to name the 1e-10 trap before a user meets it as a pivot failure.
+    """
+    if alpha != alpha:
+        raise Error(
+            "gpr_fit_host: alpha is NaN; refused by name (DEVIATION 1768)"
+        )
+    if alpha < Float32(0.0):
+        raise Error(
+            "gpr_fit_host: alpha must be non-negative, got bits 0x"
+            + gp_hex32_bits(alpha)
+            + ". alpha is a RIDGE added to the diagonal of the kernel"
+            " matrix (scikit-learn _gpr.py:350); a negative one subtracts"
+            " from the diagonal and turns a positive-definite kernel"
+            " matrix indefinite, which the factorization would then report"
+            " as a pivot failure several stages downstream of the actual"
+            " mistake"
+        )
+    if alpha > Float32(3.4028234663852886e38):
+        raise Error("gpr_fit_host: alpha is +inf; refused by name")
+    # IDENTICAL accepts any finite non-negative ridge (sk-edges, 2026-10-15;
+    # was DEVIATION 1637's two-value pin). The ridge is the caller's own,
+    # recorded parameter (scikit-learn's `alpha`), and adding it is one
+    # flush-to-zero float32 add per diagonal entry, the same word on every
+    # vendor, so any value keeps the cross-vendor identity. The pin made
+    # scikit-learn's estimator checks (alpha=0.01) and every user ridge fail.
+
+
+def gp_validate_data(
+    x: List[Float32], rows: Int, cols: Int, what: String
+) raises:
+    """**DEVIATION 1768.** Finite, on the HOST, before any upload, naming the
+    cell and the value by bits.
+
+    A NaN carries the VENDOR's payload (IDENTITY_PATHS row 39 measured three
+    payloads for one IEEE answer across the three columns), and every stage
+    in this lane is a certified card stage, so a NaN that reaches one makes
+    the card differ for a reason that has nothing to do with the algorithm.
+    An infinity reaches `exp` and comes back as a zero or a NaN depending on
+    the sign, which is a silently wrong covariance rather than an error.
+    """
+    if rows <= 0:
+        raise Error(
+            "gpr: " + what + " must have at least one row, got "
+            + String(rows)
+        )
+    if cols <= 0:
+        raise Error(
+            "gpr: " + what + " must have at least one feature, got "
+            + String(cols)
+        )
+    if len(x) != rows * cols:
+        raise Error(
+            "gpr: "
+            + what
+            + " holds "
+            + String(len(x))
+            + " floats, "
+            + String(rows)
+            + " x "
+            + String(cols)
+            + " needs "
+            + String(rows * cols)
+        )
+    for i in range(len(x)):
+        var v = x[i]
+        if v != v:
+            raise Error(
+                "gpr: "
+                + what
+                + " contains NaN at row "
+                + String(i // cols)
+                + ", feature "
+                + String(i % cols)
+                + "; refused by name before any launch, because a NaN"
+                " carries the VENDOR's payload and every stage here is a"
+                " certified card stage (IDENTITY_PATHS row 39)"
+            )
+        if v > Float32(3.4028234663852886e38) or v < Float32(
+            -3.4028234663852886e38
+        ):
+            raise Error(
+                "gpr: "
+                + what
+                + " contains infinity at row "
+                + String(i // cols)
+                + ", feature "
+                + String(i % cols)
+                + " (bits 0x"
+                + gp_hex32_bits(v)
+                + "); refused by name. An infinite coordinate reaches exp"
+                " and returns a zero or a NaN rather than an error"
+            )
+
+
+def gp_validate_targets(y: List[Float32], n_train: Int) raises:
+    """`y` is ONE target, `n_train` finite floats. DEVIATION 1763."""
+    if len(y) != n_train:
+        raise Error(
+            "gpr_fit_host: y holds "
+            + String(len(y))
+            + " values for "
+            + String(n_train)
+            + " training rows. **MULTI-OUTPUT IS NOT IMPLEMENTED**"
+            " (gaussian_process/NOT_IMPLEMENTED.tsv, DEVIATION 1763):"
+            " scikit-learn's fit accepts y of shape (n_samples, n_targets)"
+            " and sums the per-target log marginal likelihoods"
+            " (_gpr.py:613-617), which needs a multi-column cho_solve and"
+            " a per-target dot. Refused by name rather than silently"
+            " reading the first column"
+        )
+    for i in range(len(y)):
+        var v = y[i]
+        if v != v:
+            raise Error(
+                "gpr_fit_host: y contains NaN at index "
+                + String(i)
+                + "; refused by name (DEVIATION 1768)"
+            )
+        if v > Float32(3.4028234663852886e38) or v < Float32(
+            -3.4028234663852886e38
+        ):
+            raise Error(
+                "gpr_fit_host: y contains infinity at index "
+                + String(i)
+                + "; refused by name (DEVIATION 1768)"
+            )
+
+
+def gp_validate_optimizer(
+    optimizer: String, n_restarts_optimizer: Int, normalize_y: Bool
+) raises:
+    """**DEVIATIONS 1761 and 1764.** The three fit-time knobs that are not
+    implemented, each refused by name with the reason."""
+    if optimizer != GP_OPTIMIZER_NONE:
+        raise Error(
+            "gpr_fit_host: refusing optimizer='"
+            + optimizer
+            + "'. Hyperparameter optimization is NOT IMPLEMENTED and"
+            " '"
+            + GP_OPTIMIZER_NONE
+            + "' is the only accepted value; it is this lane's spelling"
+            " of scikit-learn's optimizer=None (_gpr.py:299).\n"
+            "  The reason is that an optimizer's ITERATION COUNT is data"
+            " dependent, so the convergence test is part of the"
+            " arithmetic. Two vendors that agree bit for bit on every"
+            " L-BFGS step still return two different models if one takes"
+            " 41 steps and the other 42, and nothing about per-step"
+            " agreement prevents that. Making it identical means pinning"
+            " the line search, the gradient's own fold, the scaling of"
+            " theta and the tolerance comparison, and it means a gate"
+            " that can tell a converged run from a lucky one. None of"
+            " that is written.\n"
+            "  To close this refusal, implement the kernel gradients"
+            " (scikit-learn kernels.py's eval_gradient arms) and a"
+            " convergence test that is itself bit-identical, and gate"
+            " both. To work around it today, choose the hyperparameters"
+            " outside this library, evaluate"
+            " gpr_log_marginal_likelihood on each candidate, and pick"
+            " the best -- every one of those evaluations IS identical."
+            " DEVIATION 1761"
+        )
+    if n_restarts_optimizer != 0:
+        raise Error(
+            "gpr_fit_host: refusing n_restarts_optimizer="
+            + String(n_restarts_optimizer)
+            + ". There is no optimizer to restart (DEVIATION 1761), and"
+            " scikit-learn's restarts additionally draw from a random"
+            " number generator (_gpr.py:329-341), which would put an RNG"
+            " stream inside a reproducibility claim"
+        )
+    if normalize_y:
+        raise Error(
+            "gpr_fit_host: refusing normalize_y=True. **NOT IMPLEMENTED**"
+            " (DEVIATION 1764). scikit-learn centers and scales y by its"
+            " training mean and standard deviation (_gpr.py:275-285) and"
+            " undoes it in predict (_gpr.py:81, :100, :125). The scaling"
+            " is a MEAN and a STANDARD DEVIATION over the training"
+            " targets -- two folds over n values, and a fold is exactly"
+            " what IDENTITY_PATHS row 21 is about -- so implementing it means"
+            " pinning two more summation orders and a division, and every"
+            " predicted value passes through both. It is a real feature"
+            " and it belongs in a later rung. Refused by name rather than"
+            " silently ignored, because silently ignoring it returns"
+            " numbers on the wrong scale"
+        )
+
+
+# ===========================================================================
+# UPLOAD / DOWNLOAD
+# ===========================================================================
+
+
+def _trace_for(trace_path: String, truncate: Bool) raises -> IdentityTrace:
+    """The card this call records into.
+
+    Empty `trace_path` -- the shipping state and what `gp_main.mojo` uses --
+    reads `ANONLIB_IDENTITY_TRACE` from the environment, exactly as every
+    other estimator in this tree does. A NON-EMPTY one points the card at an
+    explicit file and ignores the environment, which is what
+    `core/identity_trace.mojo::IdentityTrace.to_path` exists for and says so
+    in its own docstring: "a check whose behavior depends on whether the
+    operator happens to have ANONLIB_IDENTITY_TRACE exported is a check
+    that passes or fails for reasons outside itself".
+
+    `truncate` is TRUE for `fit` and FALSE for `predict`, so one path
+    collects a fit's stages followed by a prediction's, in that order, and a
+    re-run of the pair does not read back its own previous run concatenated
+    with this one.
+
+    **A NOTE FOR A READER OF A CARD.** When the environment variable is set,
+    `cholesky_factor_host` and `cholesky_solve_host` write their OWN stages
+    (`chol.jittered`, `chol.panelNNN.*`, `chol.factor`, `chol.nb`,
+    `chol.diag`, `chol.logdet`, `chol.solve.*`) into the same file, because
+    they construct their trace from the environment too. That is a feature:
+    a GP card then carries the Cholesky sub-card and a divergence inside the
+    factorization has a per-panel address. With an explicit `trace_path` the
+    Cholesky stages go to the environment's file if one is set and nowhere
+    otherwise, so this lane's card is exactly this lane's stages.
+    """
+    if trace_path == "":
+        return IdentityTrace()
+    return IdentityTrace.to_path(trace_path, "", truncate)
+
+
+def _upload(
+    ctx: DeviceContext, values: List[Float32]
+) raises -> DeviceBuffer[DType.float32]:
+    var n = len(values)
+    var buf = ctx.enqueue_create_buffer[DType.float32](n)
+    var host = ctx.enqueue_create_host_buffer[DType.float32](n)
+    copy_f32(values.unsafe_ptr(), host.unsafe_ptr(), n)
+    ctx.enqueue_copy(dst_buf=buf, src_ptr=host.unsafe_ptr())
+    ctx.synchronize()
+    _ = host^
+    return buf^
+
+
+#: fam-kernel-gp (2026-10-04), IDENTICAL, ON by default
+#: (`-D ANONLIB_IDN_GP_BULK_DOWNLOAD_OFF` restores the appends): `_download`
+#: fills a list of the final length 8 floats a step. The fit reads the n x n
+#: factor back through it (GPR and GPC), which was n^2 appends into a growing
+#: list on one host thread. The same words: no bit moves.
+comptime GP_IDN_BULK_DOWNLOAD = _CTX_MODE == _CTX_IDENTICAL and not (
+    is_defined["ANONLIB_IDN_GP_BULK_DOWNLOAD_OFF"]() or is_defined["ANONLIB_IDN_ALL_OFF"]()
+)
+
+#: fam-kernel-gp (2026-10-04), IDENTICAL, ON by default
+#: (`-D ANONLIB_IDN_GP_PREDICT_LAZY_L_OFF` restores the upload):
+#: `gpr_predict_host` uploads the n_train x n_train factor only when
+#: `return_std` asks for the variance; the mean reads K_trans and the dual
+#: alone. No kernel reads the factor on the mean-only path: no bit moves.
+comptime GP_IDN_PREDICT_LAZY_L = _CTX_MODE == _CTX_IDENTICAL and not (
+    is_defined["ANONLIB_IDN_GP_PREDICT_LAZY_L_OFF"]() or is_defined["ANONLIB_IDN_ALL_OFF"]()
+)
+
+
+def _download(
+    ctx: DeviceContext, mut buf: DeviceBuffer[DType.float32], n: Int
+) raises -> List[Float32]:
+    var h = ctx.enqueue_create_host_buffer[DType.float32](n)
+    ctx.enqueue_copy(dst_ptr=h.unsafe_ptr(), src_buf=buf)
+    ctx.synchronize()
+    comptime if GP_IDN_BULK_DOWNLOAD:
+        # fam-kernel-gp: 8 floats a step into a list of the final length
+        # (`copy_f32`'s own loop), not n appends into a growing one. A copy:
+        # the same words in the same cells.
+        var packed = List[Float32](unsafe_uninit_length=n)
+        var pdst = packed.unsafe_ptr()
+        var psrc = h.unsafe_ptr()
+        var pi = 0
+        var pbody = n - n % 8
+        while pi < pbody:
+            pdst.unsafe_store[width=8](pi, psrc.unsafe_load[width=8](pi))
+            pi += 8
+        while pi < n:
+            pdst.unsafe_store(pi, psrc.unsafe_load(pi))
+            pi += 1
+        _ = h^
+        return packed^
+    comptime if is_defined["ANONLIB_GP_BULK_DOWNLOAD"]():
+        # lane neighbors-apple3, OPT-IN: one vector copy into a list of the
+        # final length, not n appends into a growing one. A copy.
+        var bulk = List[Float32](length=n, fill=Float32(0.0))
+        copy_f32(
+            rebind[MutPointer[Float32, MutUntrackedOrigin]](h.unsafe_ptr()),
+            MutPointer[Float32, MutUntrackedOrigin](unsafe_from_address=Int(bulk.unsafe_ptr())),
+            n,
+        )
+        _ = h^
+        return bulk^
+    var out = List[Float32]()
+    for i in range(n):
+        out.append(h.unsafe_ptr().unsafe_load(i))
+    _ = h^
+    return out^
+
+
+def _download_i32(
+    ctx: DeviceContext, mut buf: DeviceBuffer[DType.int32], n: Int
+) raises -> List[Int32]:
+    var h = ctx.enqueue_create_host_buffer[DType.int32](n)
+    ctx.enqueue_copy(dst_ptr=h.unsafe_ptr(), src_buf=buf)
+    ctx.synchronize()
+    var out = List[Int32]()
+    for i in range(n):
+        out.append(h.unsafe_ptr().unsafe_load(i))
+    _ = h^
+    return out^
+
+
+# ===========================================================================
+# FIT
+# ===========================================================================
+
+
+def gpr_fit_host(
+    x: List[Float32],
+    n_train: Int,
+    n_features: Int,
+    y: List[Float32],
+    kernel: GPKernelSpec,
+    alpha: Float32,
+    optimizer: String = GP_OPTIMIZER_NONE,
+    n_restarts_optimizer: Int = 0,
+    normalize_y: Bool = False,
+    elem_tpb: Int = GP_ELEM_TPB,
+    sabotage: Int = GP_SAB_NONE,
+    trace_path: String = "",
+) raises -> GPRegressor:
+    """`GaussianProcessRegressor(kernel, alpha, optimizer=None).fit(X, y)`,
+    host in and host out, one shot. scikit-learn `_gpr.py:233-368`.
+
+        K       = kernel(X)                       _gpr.py:349
+        K[diag] += alpha                          _gpr.py:350
+        L       = cholesky(K, lower=True)         _gpr.py:352
+        alpha_  = cho_solve((L, True), y)         _gpr.py:363
+
+    `alpha` is not defaulted, on purpose, exactly as `cholesky_factor_host`'s
+    `jitter` is not: every caller needs a ridge and every one of them needs
+    to have decided about it, and a default lets the decision be made by not
+    making it. Pass `gp_profile_alpha()` for the profile's ridge or
+    `Float32(0.0)` for none. There is no `nb` argument, because there is no
+    block size to express (DEVIATION 1630 lives one layer down).
+
+    **A FAILED FACTORIZATION IS NOT AN EXCEPTION HERE.** `info != 0` is
+    LAPACK's contract and it is returned in the struct, because for a
+    Gaussian process it is a RESULT: it says this kernel and this ridge do
+    not describe these points. `gpr_log_marginal_likelihood` and
+    `gpr_predict_host` both refuse a failed fit by name, so nothing can
+    quietly solve against a partial factor.
+
+    Records the card stages `gp.x_train`, `gp.y_train`, `gp.kernel`,
+    `gp.ridged`, `gp.factor`, `gp.dual_coef`, `gp.logdet`, `gp.ydotalpha`
+    and `gp.lml`, in that order.
+    """
+    gp_validate_optimizer(optimizer, n_restarts_optimizer, normalize_y)
+    gp_validate_data(x, n_train, n_features, String("X"))
+    gp_validate_targets(y, n_train)
+    gp_validate_kernel(kernel, n_features)
+    gp_validate_alpha(alpha)
+
+    var trace = _trace_for(trace_path, True)
+    # ============ WHAT THE HEADER HAS TO SAY, AND WHY THIS LIST ============
+    # **A HEADER THAT CANNOT TELL TWO BLOCKS APART CANNOT NAME EITHER.**
+    # One `ANONLIB_IDENTITY_TRACE` file collects EVERY fit a run makes --
+    # `gaussian_process/checks/gp_check.mojo` writes thirty blocks of the
+    # planted fixture alone into one card -- so the header is the only thing
+    # that separates them, and until 2026-09-01 it carried `n_train`, `d`,
+    # a kernel name that omitted its hyperparameters, and `alpha_bits`, all
+    # four of which are equal across all thirty.
+    # `bench/results/e1/GP_CROSS_VENDOR_DIVERGENCE.md` is what that cost: a
+    # block whose `gp.kernel` differed from its twenty-nine siblings could
+    # be located in the card and could not be NAMED from it.
+    #
+    # Every remaining argument of this function is now accounted for:
+    #   `x`, `y`               hashed as `gp.x_train` and `gp.y_train`
+    #   `n_train`, `n_features`, `alpha`, `kernel`   in the header below,
+    #                          the kernel WITH its hyperparameters as bits
+    #   `sabotage`             in the header below. It is the one argument
+    #                          that changes the ARITHMETIC without changing
+    #                          any input, so it is exactly a decision the
+    #                          ALGORITHM makes and `archive/plans/CARD_GAPS.md`'s rule
+    #                          admits it
+    #   `optimizer`,           cannot vary: `gp_validate_optimizer` accepts
+    #   `n_restarts_optimizer`,  only "none", 0 and False and refuses the
+    #   `normalize_y`          rest BY NAME (DEVIATIONS 1761, 1764)
+    #   `elem_tpb`             DELIBERATELY ABSENT. Threads per block is
+    #                          SCHEDULING, `check_launch_invariance` exists
+    #                          to prove no bit reads it, and `archive/plans/CARD_GAPS.md`
+    #                          forbids launch geometry in an identity trace
+    #                          because recording it would break the very
+    #                          property that check establishes
+    #   `trace_path`          selects this file and enters no arithmetic
+    #
+    # This is a `#` comment line (`core/identity_trace.mojo:231-239`), which
+    # both readers drop, so adding fields moves no record, changes no stage
+    # list and does NOT make a v2 of the profile.
+    trace.header(
+        "gaussian_process fit: profile="
+        + GP_PROFILE
+        + " n_train="
+        + String(n_train)
+        + " d="
+        + String(n_features)
+        + " kernel="
+        + gp_kernel_name(kernel)
+        + " alpha_bits=0x"
+        + gp_hex32_bits(alpha)
+        + " sabotage="
+        + gp_sabotage_name(sabotage)
+    )
+    # TOMBSTONE: ANONLIB_KERNEL_FAST_GPR_RESIDENT (DROPPED-semantics) deleted 2026-10-03 by cc300add8; code recoverable at cc300add8^.
+    # Restore: git apply experiments/removed/ANONLIB_KERNEL_FAST_GPR_RESIDENT.patch; record in docs/TOMBSTONES.md.
+    trace.record_list_f32("gp.x_train", x)
+    trace.record_list_f32("gp.y_train", y)
+
+    # --- K = kernel(X, X), on the device ---------------------------------
+    var ctx = _family_ctx()
+    var dx = _upload(ctx, x)
+    # DEVIATION 2487: self-kernel borrows dx twice; one upload.
+    var dls = _upload(ctx, _length_scale_table(kernel))
+    var dk = ctx.enqueue_create_buffer[DType.float32](n_train * n_train)
+    var dstack = ctx.enqueue_create_buffer[DType.float32](
+        gp_kernel_stack_floats(n_train, n_train)
+    )
+    ctx.synchronize()
+    gp_kernel_matrix(
+        ctx,
+        dk,
+        dx,
+        dx,
+        dls,
+        dstack,
+        n_train,
+        n_train,
+        n_features,
+        kernel,
+        True,
+        trace,
+        "gp.kernel",
+        elem_tpb,
+        sabotage,
+    )
+    # --- L = cholesky(K + alpha I); alpha_ = cho_solve(L, y), RESIDENT ----
+    # (lane/cgr-kernel) K, its factor and the dual never leave the device
+    # until the fit's outputs are read back. Before, K was downloaded, then
+    # uploaded again by `cholesky_factor_host`, its factor downloaded and
+    # uploaded again by `cholesky_solve_host`. The same Cholesky calls in
+    # the same order (alpha IS the profile's jitter, DEVIATION 1751), so
+    # the factor, the dual and the log-determinant keep their bits.
+    chol_validate_jitter(alpha)
+    var n = n_train
+    var nb_pin = chol_nb_for(n, CHOL_NB_PINNED)
+    var ws = ctx.enqueue_create_buffer[DType.float32](chol_workspace_floats(n, nb_pin))
+    var dwork = ctx.enqueue_create_buffer[DType.float32](n + 1)
+    ctx.synchronize()
+    var ctrace = IdentityTrace()
+    add_jitter(ctx, dk, n, alpha, CHOL_ELEM_TPB)
+    trace.record_device(ctx, "gp.ridged", dk, n * n)
+    var run = potrf_lower(ctx, dk, ws, n, ctrace, chol_default_nb_hint(), CHOL_PANEL_TPB, CHOL_ELEM_TPB)
+    var dev_logdet = Float32(0.0)
+    if run.info == 0:
+        dev_logdet = chol_logdet(ctx, dk, dwork, n, ctrace, CHOL_ELEM_TPB)
+    var factor_l = _download(ctx, dk, n * n)
+    trace.record_list_f32("gp.factor", factor_l)
+
+    var dual = List[Float32]()
+    var logdet = Float32(0.0)
+    var ydotalpha = Float32(0.0)
+    var lml = Float32(0.0)
+    if run.info == 0:
+        var dy = _upload(ctx, y)
+        var ddual = _upload(ctx, y)
+        cho_solve(ctx, dk, ddual, n, 1, ctrace, CHOL_SOLVE_TPB)
+        dual = _download(ctx, ddual, n)
+        trace.record_list_f32("gp.dual_coef", dual)
+        if sabotage == GP_SAB_LOGDET_RECOMPUTED:
+            var prod = Float32(1.0)
+            for j in range(n):
+                var d = factor_l[j * n + j]
+                prod = ftz(identical_mul(prod, ftz(identical_mul(d, d))))
+            logdet = ftz(identical_log(prod))
+        else:
+            logdet = dev_logdet
+        trace.record_scalar_f32("gp.logdet", logdet)
+        if sabotage == GP_SAB_YALPHA_DESCENDING:
+            ydotalpha = _y_dot_alpha(y, dual, n, sabotage)
+        else:
+            ydotalpha = _gpr_ydot_device(ctx, dy, ddual, n)
+        trace.record_scalar_f32("gp.ydotalpha", ydotalpha)
+        lml = gp_log_marginal_likelihood_value(ydotalpha, logdet, n_train)
+        trace.record_scalar_f32("gp.lml", lml)
+        _ = dy^
+        _ = ddual^
+    else:
+        for _i in range(n_train):
+            dual.append(Float32(0.0))
+    _ = dx^
+    _ = dls^
+    _ = dk^
+    _ = dstack^
+    _ = ws^
+    _ = dwork^
+    # DEVIATION 1946: the context dies LAST, after every value built on it.
+    _ = ctx^
+
+    return GPRegressor(
+        x.copy(),
+        y.copy(),
+        n_train,
+        n_features,
+        kernel.copy(),
+        alpha,
+        factor_l^,
+        dual^,
+        logdet,
+        ydotalpha,
+        lml,
+        run.info,
+        run.nb,
+    )
+
+
+def _length_scale_table(kernel: GPKernelSpec) -> List[Float32]:
+    """The flat length-scale table, never empty. A kernel of constants and
+    white noise has no length scale at all, and a zero-length buffer is not
+    constructible, so one unused `1.0` stands in. No kernel reads it: only
+    RBF and MATERN nodes address the table and `gp_validate_kernel` has
+    already bounded every offset."""
+    if len(kernel.length_scales) > 0:
+        return kernel.length_scales.copy()
+    var one = List[Float32]()
+    one.append(Float32(1.0))
+    return one^
+
+
+def _y_dot_alpha(
+    y: List[Float32], dual: List[Float32], n: Int, sabotage: Int
+) -> Float32:
+    """The GP_SAB_YALPHA_DESCENDING arm only: `y^T alpha_` as one serial
+    chain, i DESCENDING, on the host, so the gate can see a fold order that
+    is not the product's. The product folds on the device
+    (`_gpr_ydot_device`, lane/cgr-kernel)."""
+    var acc = Float32(0.0)
+    for ii in range(n):
+        var i = n - 1 - ii
+        acc = ftz(identical_mul_add(ftz(y[i]), ftz(dual[i]), acc))
+    return ftz(acc)
+
+
+def gp_log_marginal_likelihood_value(
+    ydotalpha: Float32, logdet: Float32, n: Int
+) -> Float32:
+    """`-0.5 y^T alpha - 0.5 log|K| - (n/2) log(2 pi)`, in a PINNED order.
+
+    scikit-learn `_gpr.py:613-617` writes it as three in-place subtractions
+    from `-0.5 * y^T alpha`:
+
+        ll  = -0.5 * einsum("ik,ik->k", y_train, alpha)
+        ll -= np.log(np.diag(L)).sum()
+        ll -= K.shape[0] / 2 * np.log(2 * np.pi)
+
+    Their middle term is `sum(log(diag(L)))`, which is exactly HALF of
+    `log|K|`, because `|K| = |L|^2`. So `-0.5 * logdet` here is their
+    `-sum(log(diag(L)))` and no second fold over the diagonal happens
+    anywhere in this lane (DEVIATION 1757).
+
+    THE ORDER IS PINNED AND IT IS THEIRS: the first two terms are combined,
+    then the third is added. Written as two named partials and one final
+    add rather than as one expression, so no codegen may re-associate the
+    three (IDENTITY_PATHS row 9), and every product is `identical_mul`.
+
+    `-0.5` and `n/2` are exact: the first is a power of two, and `Float32(n)`
+    is exact for every `n` below `2^24`, which is four orders of magnitude
+    past the largest matrix a dense GP can factor. `log(2 pi)` is the pinned
+    constant `GP_LOG_2PI_BITS` (DEVIATION 1767).
+    """
+    var t1 = ftz(identical_mul(Float32(-0.5), ftz(ydotalpha)))
+    var t2 = ftz(identical_mul(Float32(-0.5), ftz(logdet)))
+    var half_n = ftz(identical_mul(Float32(-0.5), Float32(n)))
+    var t3 = ftz(identical_mul(half_n, gp_log_2pi()))
+    return ftz(ftz(t1 + t2) + t3)
+
+
+@fieldwise_init
+struct GPLmlGrad(Movable):
+    """The log marginal likelihood and its gradient at one kernel
+    (DEVIATION 2880). `info != 0` means the factorization failed: `lml` is
+    +0.0 and `grad` all +0.0, and the caller reads that as scikit-learn's
+    `(-inf, zeros)` (`_gpr.py:593`)."""
+
+    var lml: Float32
+    var grad: List[Float32]
+    var info: Int
+
+
+comptime GP_GRAD_TPB = 128
+
+
+@always_inline
+def _gp(buf: DeviceBuffer[DType.float32]) -> MutPointer[Float32, MutAnyOrigin]:
+    return MutPointer[Float32, MutAnyOrigin](unsafe_from_address=Int(buf.unsafe_ptr()))
+
+
+def gp_grad_part_kernel(
+    dual: MutPointer[Float32, MutAnyOrigin], kinv: MutPointer[Float32, MutAnyOrigin],
+    dk: MutPointer[Float32, MutAnyOrigin], n: Int32, nb: Int32, total: Int32, part: MutPointer[Float32, MutAnyOrigin],
+):
+    var t = Int(_gb_idx.x) * GP_GRAD_TPB + Int(_gt_idx.x)
+    if t < Int(total):
+        gp_grad_part_item(t, dual, kinv, dk, Int(n), Int(nb), part)
+
+
+def gp_grad_fin_kernel(
+    part: MutPointer[Float32, MutAnyOrigin], nb: Int32, nf: Int32, half: Float32, dst: MutPointer[Float32, MutAnyOrigin],
+):
+    var p = Int(_gb_idx.x) * GP_GRAD_TPB + Int(_gt_idx.x)
+    if p < Int(nf):
+        gp_grad_fin_item(p, part, Int(nb), half, dst)
+
+
+#: threads per block of the GPR y^T alpha_ fold and the identity fill
+comptime GP_YDOT_TPB = 256
+
+
+def gpr_ydot_part_kernel(
+    y: MutPointer[Float32, MutAnyOrigin], dual: MutPointer[Float32, MutAnyOrigin], n: Int32,
+    part: MutPointer[Float32, MutAnyOrigin], nb: Int32,
+):
+    var b = Int(_gb_idx.x) * GP_YDOT_TPB + Int(_gt_idx.x)
+    if b < Int(nb):
+        gpr_ydot_part_item(b, y, dual, Int(n), part)
+
+
+def gpr_ydot_fin_kernel(part: MutPointer[Float32, MutAnyOrigin], nb: Int32, dst: MutPointer[Float32, MutAnyOrigin]):
+    if Int(_gb_idx.x) == 0 and Int(_gt_idx.x) == 0:
+        dst.unsafe_store(0, gpr_ydot_fin(part, Int(nb)))
+
+
+def gp_eye_kernel(dst: MutPointer[Float32, MutAnyOrigin], n: Int32):
+    var i = Int(_gb_idx.x) * GP_YDOT_TPB + Int(_gt_idx.x)
+    if i < Int(n):
+        dst.unsafe_store(i * Int(n) + i, Float32(1.0))
+
+
+def gp_cov_kernel(
+    dst: MutPointer[Float32, MutAnyOrigin], kss: MutPointer[Float32, MutAnyOrigin],
+    vtv: MutPointer[Float32, MutAnyOrigin], n: Int32,
+):
+    """`gp_sample_y_covariance`, one thread per cell: the lower cell's
+    `ftz(ftz(K**) - ftz(V^T V))`, mirrored to the upper."""
+    var t = Int(_gb_idx.x) * GP_YDOT_TPB + Int(_gt_idx.x)
+    var nn = Int(n)
+    if t < nn * nn:
+        var r = t // nn
+        var c = t - r * nn
+        var i = r if r >= c else c
+        var j = c if r >= c else r
+        dst.unsafe_store(t, ftz(ftz(kss.unsafe_load(i * nn + j)) - ftz(vtv.unsafe_load(i * nn + j))))
+
+
+def gp_unnorm_kernel(
+    src: MutPointer[Float32, MutAnyOrigin], dst: MutPointer[Float32, MutAnyOrigin], n: Int32,
+    s: Float32, mu: Float32, mode: Int32,
+):
+    """`normalize_y`'s un-normalization, one thread per value
+    (`gaussian_process/unnorm.mojo`; lane apple-fast-py2mojo-cluster, it ran
+    in Python). In place when src is dst."""
+    var t = Int(_gb_idx.x) * GP_YDOT_TPB + Int(_gt_idx.x)
+    if t < Int(n):
+        dst.unsafe_store(t, gp_unnorm_cell(src.unsafe_load(t), s, mu, Int(mode)))
+
+
+def _gp_unnorm(
+    ctx: DeviceContext, src: DeviceBuffer[DType.float32], dst: DeviceBuffer[DType.float32], n: Int,
+    s: Float32, mu: Float32, mode: Int,
+) raises:
+    if n > 0:
+        ctx.enqueue_function[gp_unnorm_kernel](
+            _gp(src), _gp(dst), Int32(n), s, mu, Int32(mode),
+            grid_dim=(n + GP_YDOT_TPB - 1) // GP_YDOT_TPB, block_dim=GP_YDOT_TPB,
+        )
+
+
+def gp_normals_kernel(dst: MutPointer[Float32, MutAnyOrigin], n_star: Int32, n_samples: Int32, k0: UInt32, k1: UInt32):
+    """`gp_sample_y_normals`, one thread per draw `Z[i, s]`."""
+    var t = Int(_gb_idx.x) * GP_YDOT_TPB + Int(_gt_idx.x)
+    var ns = Int(n_samples)
+    if t < Int(n_star) * ns:
+        var key = SIMD[DType.uint32, 2](k0, k1)
+        dst.unsafe_store(t, ftz(gp_sample_y_normal(key, t - (t // ns) * ns, t // ns)))
+
+
+def gp_add_mean_kernel(
+    dst: MutPointer[Float32, MutAnyOrigin], mean: MutPointer[Float32, MutAnyOrigin],
+    lz: MutPointer[Float32, MutAnyOrigin], n_star: Int32, n_samples: Int32,
+):
+    """`gp_sample_y_add_mean`, one thread per draw."""
+    var t = Int(_gb_idx.x) * GP_YDOT_TPB + Int(_gt_idx.x)
+    var ns = Int(n_samples)
+    if t < Int(n_star) * ns:
+        dst.unsafe_store(t, ftz(ftz(mean.unsafe_load(t // ns)) + ftz(lz.unsafe_load(t))))
+
+
+def _gpr_ydot_device(
+    ctx: DeviceContext, mut dy: DeviceBuffer[DType.float32], mut ddual: DeviceBuffer[DType.float32], n: Int
+) raises -> Float32:
+    """`y^T alpha_` on the device (lane/cgr-kernel): GPC_FOLD-row blocks,
+    each its fused multiply-add chain from zero ascending, the block
+    partials added ascending (`gpc_items.gpr_ydot_part_item` / `_fin`, the
+    host column's words). Only the scalar comes back."""
+    var nbf = gpc_fold_blocks(n)
+    var dpart = ctx.enqueue_create_buffer[DType.float32](max(nbf, 1))
+    var dyd = ctx.enqueue_create_buffer[DType.float32](1)
+    if nbf > 0:
+        ctx.enqueue_function[gpr_ydot_part_kernel](
+            _gp(dy), _gp(ddual), Int32(n), _gp(dpart), Int32(nbf),
+            grid_dim=(nbf + GP_YDOT_TPB - 1) // GP_YDOT_TPB, block_dim=GP_YDOT_TPB,
+        )
+    ctx.enqueue_function[gpr_ydot_fin_kernel](_gp(dpart), Int32(nbf), _gp(dyd), grid_dim=1, block_dim=1)
+    var h = ctx.enqueue_create_host_buffer[DType.float32](1)
+    ctx.enqueue_copy(dst_ptr=h.unsafe_ptr(), src_buf=dyd)
+    ctx.synchronize()
+    var v = h.unsafe_ptr().unsafe_load(0)
+    _ = dpart^
+    _ = dyd^
+    _ = h^
+    return v
+
+
+def gpr_lml_grad_host(
+    x: List[Float32],
+    n_train: Int,
+    n_features: Int,
+    y: List[Float32],
+    kernel: GPKernelSpec,
+    free: List[Int32],
+    alpha: Float32,
+    elem_tpb: Int = GP_ELEM_TPB,
+) raises -> GPLmlGrad:
+    """scikit-learn `log_marginal_likelihood(theta, eval_gradient=True)`
+    (`_gpr.py:575-653`) at the kernel handed in, whose FREE leaves are
+    flagged one per postfix node (DEVIATION 2880).
+
+        K, dK   = kernel(X, eval_gradient=True)   device, kernel_gradient.mojo
+        L       = cholesky(K + alpha I)           potrf_lower, resident
+        alpha_  = cho_solve(L, y)                 cho_solve, resident
+        lml     = gp_log_marginal_likelihood_value, fit's own
+        K_inv   = cho_solve(L, eye)               cho_solve, n rhs, resident
+        grad    = gp_grad_part / fin kernels       gp_grad_items.mojo, on the device
+
+    K here is bit for bit the K `gpr_fit_host` builds (the same value
+    launches), so the likelihood at the optimizer's answer is the fit's.
+    No card stage is recorded: the optimizer evaluates many kernels and a
+    card of them would be a function of the iteration count."""
+    gp_validate_data(x, n_train, n_features, String("X"))
+    gp_validate_targets(y, n_train)
+    gp_validate_kernel(kernel, n_features)
+    gp_validate_alpha(alpha)
+    var n = n_train
+    var cells = n * n
+    var n_free = gp_free_count(kernel.kinds, kernel.ls_len, free)
+
+    var ctx = _family_ctx()
+    var dx = _upload(ctx, x)
+    var dls = _upload(ctx, _length_scale_table(kernel))
+    var dk = ctx.enqueue_create_buffer[DType.float32](cells)
+    var dstack = ctx.enqueue_create_buffer[DType.float32](
+        gp_kernel_stack_floats(n, n)
+    )
+    var dgrad = ctx.enqueue_create_buffer[DType.float32](max(n_free * cells, 1))
+    ctx.synchronize()
+    _ = gp_kernel_matrix_grad(
+        ctx, dk, dx, dls, dstack, dgrad, n, n_features, kernel, free, elem_tpb
+    )
+    # L, alpha_ and K_inv RESIDENT (lane/cgr-kernel): the fit's Cholesky
+    # calls in the fit's order on K where the launch left it; before, K, L
+    # and K_inv each crossed to the host and back
+    chol_validate_jitter(alpha)
+    var nb_pin = chol_nb_for(n, CHOL_NB_PINNED)
+    var ws = ctx.enqueue_create_buffer[DType.float32](chol_workspace_floats(n, nb_pin))
+    var dwork = ctx.enqueue_create_buffer[DType.float32](n + 1)
+    ctx.synchronize()
+    var ctrace = IdentityTrace()
+    add_jitter(ctx, dk, n, alpha, CHOL_ELEM_TPB)
+    var run = potrf_lower(ctx, dk, ws, n, ctrace, chol_default_nb_hint(), CHOL_PANEL_TPB, CHOL_ELEM_TPB)
+    if run.info != 0:
+        _ = dx^
+        _ = dls^
+        _ = dk^
+        _ = dstack^
+        _ = ws^
+        _ = dwork^
+        _ = dgrad^
+        _ = ctx^
+        return GPLmlGrad(
+            Float32(0.0),
+            List[Float32](length=n_free, fill=Float32(0.0)),
+            run.info,
+        )
+    var logdet = chol_logdet(ctx, dk, dwork, n, ctrace, CHOL_ELEM_TPB)
+    var dy = _upload(ctx, y)
+    var ddual = _upload(ctx, y)
+    cho_solve(ctx, dk, ddual, n, 1, ctrace, CHOL_SOLVE_TPB)
+    var ydotalpha = _gpr_ydot_device(ctx, dy, ddual, n)
+    var lml = gp_log_marginal_likelihood_value(ydotalpha, logdet, n)
+    var dkinv = ctx.enqueue_create_buffer[DType.float32](cells)
+    enqueue_fill(ctx, dkinv, Float32(0.0))
+    ctx.enqueue_function[gp_eye_kernel](
+        _gp(dkinv), Int32(n), grid_dim=(n + GP_YDOT_TPB - 1) // GP_YDOT_TPB, block_dim=GP_YDOT_TPB
+    )
+    cho_solve(ctx, dk, dkinv, n, n, ctrace, CHOL_SOLVE_TPB)
+    # the gradient fold on the device, dK_p where the launch left it
+    # (gaussian_process/gp_grad_items.mojo, the host column's items;
+    # cpu-gpu-cleanup c-gp-kernel: every dK_p was downloaded and folded on
+    # the host)
+    var grad = List[Float32](length=n_free, fill=Float32(0.0))
+    if n_free > 0:
+        var nb = gp_grad_blocks(n)
+        var dpart = ctx.enqueue_create_buffer[DType.float32](max(n_free * nb, 1))
+        var dout = ctx.enqueue_create_buffer[DType.float32](n_free)
+        ctx.enqueue_function[gp_grad_part_kernel](
+            _gp(ddual), _gp(dkinv), _gp(dgrad), Int32(n), Int32(nb), Int32(n_free * nb), _gp(dpart),
+            grid_dim=(n_free * nb + GP_GRAD_TPB - 1) // GP_GRAD_TPB, block_dim=GP_GRAD_TPB,
+        )
+        ctx.enqueue_function[gp_grad_fin_kernel](
+            _gp(dpart), Int32(nb), Int32(n_free), gp_grad_half(), _gp(dout),
+            grid_dim=(n_free + GP_GRAD_TPB - 1) // GP_GRAD_TPB, block_dim=GP_GRAD_TPB,
+        )
+        ctx.enqueue_copy(dst_ptr=grad.unsafe_ptr(), src_buf=dout)
+        ctx.synchronize()
+        _ = dpart^
+        _ = dout^
+    ctx.synchronize()
+    _ = dx^
+    _ = dls^
+    _ = dk^
+    _ = dstack^
+    _ = ws^
+    _ = dwork^
+    _ = dy^
+    _ = ddual^
+    _ = dkinv^
+    _ = dgrad^
+    # DEVIATION 1946: the context dies LAST, after every value built on it.
+    _ = ctx^
+    return GPLmlGrad(lml, grad^, 0)
+
+
+def gpr_log_marginal_likelihood(model: GPRegressor) raises -> Float32:
+    """`log_marginal_likelihood()` at the fitted kernel, scikit-learn
+    `_gpr.py:575` (the `theta is None` arm, which returns the value
+    `log_marginal_likelihood_value_` computed during `fit`).
+
+    A function rather than a bare field read so that a caller who reaches
+    for it on a FAILED fit is refused rather than handed `+0.0`. sklearn
+    returns `-inf` from `log_marginal_likelihood(theta)` when the Cholesky
+    raises (`_gpr.py:593`); that is the right answer for an OPTIMIZER
+    comparing candidates, and there is no optimizer here (DEVIATION 1761),
+    so a caller asking this question about a fit that did not factor is
+    asking about nothing and is told so.
+    """
+    if model.info != 0:
+        raise Error(
+            "gpr_log_marginal_likelihood: the factorization failed (info="
+            + String(model.info)
+            + "), so the leading minor of order "
+            + String(model.info)
+            + " of K + alpha I was not positive definite and there is no"
+            " marginal likelihood to report. For a Gaussian process that"
+            " is a RESULT and not a bug: this kernel and this ridge do"
+            " not describe these points. The usual causes are duplicate"
+            " or near-duplicate training rows (see"
+            " check_duplicate_inputs_need_the_ridge), a length scale far"
+            " larger than the spread of the data, and alpha = 0."
+            " scikit-learn's optimizer answers -inf here (_gpr.py:593)"
+            " because it is comparing candidates; there is no optimizer"
+            " in this lane (DEVIATION 1761), so this refuses instead."
+            " DEVIATION 1634"
+        )
+    return model.lml
+
+
+# ===========================================================================
+# PREDICT
+# ===========================================================================
+
+
+def gpr_predict_host(
+    model: GPRegressor,
+    x_star: List[Float32],
+    n_star: Int,
+    return_std: Bool = True,
+    elem_tpb: Int = GP_ELEM_TPB,
+    solve_tpb: Int = CHOL_SOLVE_TPB,
+    sabotage: Int = GP_SAB_NONE,
+    trace_path: String = "",
+    unnorm: Bool = False,
+    y_std: Float32 = Float32(1.0),
+    y_mean: Float32 = Float32(0.0),
+) raises -> GPPrediction:
+    """`predict(X_star, return_std)`, scikit-learn `_gpr.py:446-500`.
+
+        K_trans = kernel(X_test, X_train)              _gpr.py:446
+        y_mean  = K_trans @ alpha_                     _gpr.py:447
+        V       = solve_triangular(L, K_trans.T)       _gpr.py:460
+        y_var   = kernel.diag(X_test) - einsum(V, V)   _gpr.py:480-481
+        clamp negatives at zero                        _gpr.py:485-491
+        return sqrt(y_var)                             _gpr.py:500
+
+    **THE CROSS-COVARIANCE IS STORED `n_train x n_star`, WHICH IS
+    `K_trans^T`, AND NOTHING IS EVER TRANSPOSED. DEVIATION 1758.** That one
+    orientation serves both consumers:
+
+    - `trsm_lower` wants its right-hand sides as `n x nrhs` row-major, so
+      `V = L^-1 K_trans^T` is computed IN PLACE over this buffer with no
+      copy and no transpose;
+    - the mean is `identical_gemm_into` at `OP_TN`, whose contract is
+      `C[m x n] = A[k x m]^T . B[k x n]` (`gemm_oracle.mojo:198`), so with
+      `A` = this buffer (`k = n_train` by `m = n_star`) and `B` = the dual
+      coefficients (`n_train x 1`), `C` is `n_star x 1`. Exactly
+      `K_trans @ alpha_`.
+
+    It is legitimate because every kernel here is EXACTLY symmetric in its
+    two arguments, bit for bit and not merely mathematically: `x_f/l -
+    y_f/l` and `y_f/l - x_f/l` differ only in sign, their squares are
+    identical bit patterns, and the sum over `f` is ascending in both
+    orders. So `k(X_train, X_star) == k(X_star, X_train)^T` by bits.
+    `check_kernels_vs_oracle` asserts that rather than assuming it.
+
+    The mean is computed BEFORE the triangular solve, because the solve
+    overwrites the cross-covariance in place. The two are enqueued on one
+    queue in that order, which is what orders them.
+
+    Records `gp.kss`, `gp.kcross`, `gp.mean`, `gp.v`, `gp.var`,
+    `gp.clamped` and `gp.std`.
+    """
+    if model.info != 0:
+        raise Error(
+            "gpr_predict_host: refusing to predict from a FAILED fit"
+            " (info="
+            + String(model.info)
+            + "). The factor's columns from "
+            + String(model.info - 1)
+            + " onward are unfinished, and solving against them returns"
+            " infinities that look like numbers. DEVIATION 1634"
+        )
+    if n_star <= 0:
+        raise Error(
+            "gpr_predict_host: n_star must be positive, got "
+            + String(n_star)
+        )
+    gp_validate_data(x_star, n_star, model.n_features, String("X_star"))
+
+    var n_train = model.n_train
+    var d = model.n_features
+    var kss = gp_kernel_diag(model.kernel)
+
+    var trace = _trace_for(trace_path, False)
+    # The fit header's argument, applied here: `kernel` and `sabotage` are
+    # what separate two predictions of the same shape, and the kernel was
+    # not named here at all. `solve_tpb` is SCHEDULING and stays out for the
+    # same reason `elem_tpb` does.
+    trace.header(
+        "gaussian_process predict: profile="
+        + GP_PROFILE
+        + " n_train="
+        + String(n_train)
+        + " n_star="
+        + String(n_star)
+        + " d="
+        + String(d)
+        + " kernel="
+        + gp_kernel_name(model.kernel)
+        + " return_std="
+        + String(return_std)
+        + " sabotage="
+        + gp_sabotage_name(sabotage)
+    )
+    trace.record_scalar_f32("gp.kss", kss)
+
+    var ctx = _family_ctx()
+    var dx = _upload(ctx, model.x_train)
+    var dxs = _upload(ctx, x_star)
+    var dls = _upload(ctx, _length_scale_table(model.kernel))
+    var ddual = _upload(ctx, model.dual_coef)
+    # GP_IDN_PREDICT_LAZY_L: the factor crosses only for the variance; the
+    # mean-only path holds a one-word stand-in nothing reads.
+    var want_l = True
+    comptime if GP_IDN_PREDICT_LAZY_L:
+        want_l = return_std
+    var dl = _upload(ctx, model.l) if want_l else ctx.enqueue_create_buffer[DType.float32](1)
+    var dkcross = ctx.enqueue_create_buffer[DType.float32](n_train * n_star)
+    var dstack = ctx.enqueue_create_buffer[DType.float32](
+        gp_kernel_stack_floats(n_train, n_star)
+    )
+    var dmean = ctx.enqueue_create_buffer[DType.float32](n_star)
+    var dws = ctx.enqueue_create_buffer[DType.float32](
+        identical_gemm_workspace_max_floats(n_star, 1, n_train)
+    )
+    var dvar = ctx.enqueue_create_buffer[DType.float32](n_star)
+    var dstd = ctx.enqueue_create_buffer[DType.float32](n_star)
+    var dclamp = ctx.enqueue_create_buffer[DType.int32](n_star)
+    ctx.synchronize()
+
+    # K_trans^T = k(X_train, X_star). `is_self` is FALSE: this is
+    # scikit-learn's `Y is not None` arm, so a WhiteKernel contributes
+    # ZERO here and its noise appears only on the training diagonal
+    # (kernels.py:1419, DEVIATION 1762).
+    gp_kernel_matrix(
+        ctx,
+        dkcross,
+        dx,
+        dxs,
+        dls,
+        dstack,
+        n_train,
+        n_star,
+        d,
+        model.kernel,
+        False,
+        trace,
+        "gp.kcross",
+        elem_tpb,
+        sabotage,
+    )
+
+    if sabotage == GP_SAB_MEAN_DESCENDING:
+        var grid = (n_star + elem_tpb - 1) // elem_tpb
+        ctx.enqueue_function[sabotage_mean_kernel](
+            dmean.unsafe_ptr(),
+            dkcross.unsafe_ptr(),
+            ddual.unsafe_ptr(),
+            Int32(n_train),
+            Int32(n_star),
+            grid_dim=(grid, 1, 1),
+            block_dim=(elem_tpb, 1, 1),
+        )
+    else:
+        identical_gemm_into(
+            ctx, dmean, dkcross, ddual, dws, n_star, 1, n_train, OP_TN
+        )
+    trace.record_device(ctx, "gp.mean", dmean, n_star)
+    if unnorm:
+        # `unnorm`: normalize_y's mean, on the device (it ran in Python)
+        _gp_unnorm(ctx, dmean, dmean, n_star, y_std, y_mean, GP_UNNORM_MEAN)
+
+    var mean = _download(ctx, dmean, n_star)
+    var variance = List[Float32]()
+    var std = List[Float32]()
+    var clamped = List[Int32]()
+    var n_clamped = 0
+
+    if return_std:
+        # V = L^-1 K_trans^T, IN PLACE over the cross-covariance.
+        trsm_lower(
+            ctx,
+            dl,
+            dkcross,
+            n_train,
+            n_star,
+            trace,
+            "gp.v",
+            solve_tpb,
+        )
+        gp_predictive_variance(
+            ctx,
+            dvar,
+            dstd,
+            dclamp,
+            dkcross,
+            n_train,
+            n_star,
+            kss,
+            trace,
+            elem_tpb,
+            sabotage,
+        )
+        if unnorm:
+            # the standard deviation from the variance times std**2; the
+            # variance itself stays in the normalized scale
+            _gp_unnorm(ctx, dvar, dstd, n_star, y_std, y_mean, GP_UNNORM_STD)
+        variance = _download(ctx, dvar, n_star)
+        std = _download(ctx, dstd, n_star)
+        clamped = _download_i32(ctx, dclamp, n_star)
+        for i in range(n_star):
+            if clamped[i] != Int32(0):
+                n_clamped += 1
+
+    _ = dx^
+    _ = dxs^
+    _ = dls^
+    _ = ddual^
+    _ = dl^
+    _ = dkcross^
+    _ = dstack^
+    _ = dmean^
+    _ = dws^
+    _ = dvar^
+    _ = dstd^
+    _ = dclamp^
+    # DEVIATION 1946: the context dies LAST, after every value built on it.
+    _ = ctx^
+    return GPPrediction(
+        mean^, variance^, std^, clamped^, n_clamped, kss, n_star
+    )
+
+
+# ===========================================================================
+# WHAT THIS LANE REFUSES, AS ENTRY POINTS RATHER THAN AS ABSENCES
+#
+# CONTRIBUTING.md (Evidence must be able to fail)'s other failure mode is an unimplemented thing that is
+# INVISIBLE. A caller reaching for classification or for posterior sampling
+# should meet a named refusal that says where the work went, not a missing
+# symbol and a guess.
+# ===========================================================================
+
+
+def gpr_classify_host(
+    x: List[Float32],
+    n_train: Int,
+    n_features: Int,
+    y: List[Int32],
+    kernel: GPKernelSpec,
+) raises -> List[Int32]:
+    """The regressor's classification door. It still raises, and names
+    where classification lives: `gaussian_process/classifier.mojo::
+    gpc_fit_binary_host` and `gpc_predict_binary_host`, exposed as
+    `anonlib.GaussianProcessClassifier`. DEVIATION 1766's refusal is
+    closed by DEVIATION 2830 (the Newton loop's stop test reads an identical
+    float32 likelihood, so its iteration count is the same on every column).
+    """
+    raise Error(
+        "gpr_classify_host: the REGRESSOR does not classify. Gaussian process"
+        " classification is a Laplace approximation (scikit-learn _gpc.py"
+        " _posterior_mode), not a wrapper over this fit: it is"
+        " gaussian_process/classifier.mojo (gpc_fit_binary_host,"
+        " gpc_predict_binary_host), anonlib.GaussianProcessClassifier in"
+        " Python. DEVIATION 1766 is closed by DEVIATION 2830"
+    )
+
+
+@fieldwise_init
+struct GPPosteriorCov(Movable):
+    """`predict(X, return_cov=True)`: the mean (`n_star`) and the full
+    posterior covariance (`n_star x n_star` row-major), in the model's
+    normalized scale."""
+
+    var mean: List[Float32]
+    var cov: List[Float32]
+
+
+def gpr_predict_cov_host(
+    model: GPRegressor,
+    x_star: List[Float32],
+    n_star: Int,
+    elem_tpb: Int = GP_ELEM_TPB,
+    solve_tpb: Int = CHOL_SOLVE_TPB,
+    unnorm: Bool = False,
+    y_std: Float32 = Float32(1.0),
+    y_mean: Float32 = Float32(0.0),
+) raises -> GPPosteriorCov:
+    """`predict(X, return_cov=True)`, scikit-learn `_gpr.py:495-506`:
+
+        y_mean = K_trans @ alpha_
+        V      = solve_triangular(L, K_trans.T)
+        y_cov  = kernel_(X) - V.T @ V
+
+    Every step is `gpr_sample_y_host`'s (DEVIATION 2793): the
+    cross-covariance, the mean at `OP_TN`, `V` in place by `trsm_lower`,
+    `V^T V` through the identical GEMM at `OP_TN`, `K** = k(X, X)` with
+    `is_self` true (a WhiteKernel's noise on its diagonal, as theirs), and
+    `C` assembled on the host from the lower triangle, row ascending, and
+    mirrored (`gp_sample_y_covariance`), so the matrix is exactly
+    symmetric. Not clamped (theirs is not either)."""
+    if model.info != 0:
+        raise Error(
+            "gpr_predict_cov_host: refusing to predict from a FAILED fit"
+            " (info=" + String(model.info) + "). DEVIATION 1634"
+        )
+    if n_star <= 0:
+        raise Error("gpr_predict_cov_host: n_star must be positive, got " + String(n_star))
+    gp_validate_data(x_star, n_star, model.n_features, String("X_star"))
+    var n_train = model.n_train
+    var d = model.n_features
+    var trace = _trace_for("", False)
+    var ctx = _family_ctx()
+    var dx = _upload(ctx, model.x_train)
+    var dxs = _upload(ctx, x_star)
+    var dls = _upload(ctx, _length_scale_table(model.kernel))
+    var ddual = _upload(ctx, model.dual_coef)
+    var dl = _upload(ctx, model.l)
+    var dkcross = ctx.enqueue_create_buffer[DType.float32](n_train * n_star)
+    var dstack = ctx.enqueue_create_buffer[DType.float32](
+        gp_kernel_stack_floats(n_train, n_star)
+    )
+    var dmean = ctx.enqueue_create_buffer[DType.float32](n_star)
+    var dws = ctx.enqueue_create_buffer[DType.float32](
+        identical_gemm_workspace_max_floats(n_star, 1, n_train)
+    )
+    ctx.synchronize()
+    gp_kernel_matrix(
+        ctx, dkcross, dx, dxs, dls, dstack, n_train, n_star, d,
+        model.kernel, False, trace, "gp.cov.kcross", elem_tpb,
+    )
+    identical_gemm_into(
+        ctx, dmean, dkcross, ddual, dws, n_star, 1, n_train, OP_TN
+    )
+    if unnorm:
+        _gp_unnorm(ctx, dmean, dmean, n_star, y_std, y_mean, GP_UNNORM_MEAN)
+    var mean = _download(ctx, dmean, n_star)
+    trsm_lower(ctx, dl, dkcross, n_train, n_star, trace, "gp.cov.v", solve_tpb)
+    # GEMM takes two mutable operands, so V is copied once more as B, on
+    # the device (lane/cgr-kernel; it crossed to the host and back)
+    var dv2 = ctx.enqueue_create_buffer[DType.float32](n_train * n_star)
+    ctx.enqueue_copy(dst_buf=dv2, src_buf=dkcross)
+    var dvtv = ctx.enqueue_create_buffer[DType.float32](n_star * n_star)
+    var dws2 = ctx.enqueue_create_buffer[DType.float32](
+        identical_gemm_workspace_max_floats(n_star, n_star, n_train)
+    )
+    var dkss = ctx.enqueue_create_buffer[DType.float32](n_star * n_star)
+    var dstack2 = ctx.enqueue_create_buffer[DType.float32](
+        gp_kernel_stack_floats(n_star, n_star)
+    )
+    ctx.synchronize()
+    identical_gemm_into(
+        ctx, dvtv, dkcross, dv2, dws2, n_star, n_star, n_train, OP_TN
+    )
+    gp_kernel_matrix(
+        ctx, dkss, dxs, dxs, dls, dstack2, n_star, n_star, d,
+        model.kernel, True, trace, "gp.cov.kss", elem_tpb,
+    )
+    # C = K** - V^T V on the device, one thread per cell (lane/cgr-kernel;
+    # both were downloaded and subtracted on the host)
+    var nn = n_star * n_star
+    var dcov = ctx.enqueue_create_buffer[DType.float32](nn)
+    ctx.enqueue_function[gp_cov_kernel](
+        _gp(dcov), _gp(dkss), _gp(dvtv), Int32(n_star),
+        grid_dim=(nn + GP_YDOT_TPB - 1) // GP_YDOT_TPB, block_dim=GP_YDOT_TPB,
+    )
+    if unnorm:
+        # each cell times std**2 on the device (it ran in Python over n^2)
+        _gp_unnorm(ctx, dcov, dcov, nn, y_std, y_mean, GP_UNNORM_COV)
+    var cov = _download(ctx, dcov, nn)
+    _ = dcov^
+    _ = dx^
+    _ = dxs^
+    _ = dls^
+    _ = ddual^
+    _ = dl^
+    _ = dkcross^
+    _ = dstack^
+    _ = dmean^
+    _ = dws^
+    _ = dv2^
+    _ = dvtv^
+    _ = dws2^
+    _ = dkss^
+    _ = dstack2^
+    # DEVIATION 1946: the context dies LAST, after every value built on it.
+    _ = ctx^
+    return GPPosteriorCov(mean^, cov^)
+
+
+def gpr_sample_y_host(
+    model: GPRegressor,
+    x_star: List[Float32],
+    n_star: Int,
+    n_samples: Int,
+    seed: UInt64,
+    elem_tpb: Int = GP_ELEM_TPB,
+    solve_tpb: Int = CHOL_SOLVE_TPB,
+    unnorm: Bool = False,
+    y_std: Float32 = Float32(1.0),
+    y_mean: Float32 = Float32(0.0),
+) raises -> List[Float32]:
+    """`sample_y(X, n_samples, random_state)`, scikit-learn `_gpr.py`
+    `GaussianProcessRegressor.sample_y`: `n_star x n_samples` float32
+    row-major draws from the posterior at `x_star`, in the model's
+    normalized scale (the Python surface un-normalizes).
+
+    DEVIATION 2793 (`gaussian_process/checks/sample_y.mojo`) names every
+    step and its order: the cross-covariance, the mean and `V` exactly as
+    `gpr_predict_host` computes them; `V^T V` through the identical GEMM at
+    `OP_TN`; `K** = k(X, X)` with `is_self` true; `C` assembled and mirrored
+    on the host; the identical Cholesky of `C` at the pinned `2^-20` jitter
+    (a failed factor refused by name); the position-mapped normals `Z` on
+    the host; `L_C Z` through the identical GEMM at `OP_NN`; the mean added
+    on the host. `elem_tpb` and `solve_tpb` are scheduling only."""
+    gp_sample_y_validate(model.info, n_star, n_samples)
+    gp_validate_data(x_star, n_star, model.n_features, String("X_star"))
+
+    var n_train = model.n_train
+    var d = model.n_features
+    var trace = _trace_for("", False)
+    trace.header(
+        "gaussian_process sample_y: profile="
+        + GP_PROFILE
+        + " n_train="
+        + String(n_train)
+        + " n_star="
+        + String(n_star)
+        + " n_samples="
+        + String(n_samples)
+        + " d="
+        + String(d)
+        + " kernel="
+        + gp_kernel_name(model.kernel)
+        + " seed="
+        + String(seed)
+    )
+
+    # --- the mean, V, V^T V and K** on the device --------------------------
+    var ctx = _family_ctx()
+    var dx = _upload(ctx, model.x_train)
+    var dxs = _upload(ctx, x_star)
+    var dls = _upload(ctx, _length_scale_table(model.kernel))
+    var ddual = _upload(ctx, model.dual_coef)
+    var dl = _upload(ctx, model.l)
+    var dkcross = ctx.enqueue_create_buffer[DType.float32](n_train * n_star)
+    var dstack = ctx.enqueue_create_buffer[DType.float32](
+        gp_kernel_stack_floats(n_train, n_star)
+    )
+    var dmean = ctx.enqueue_create_buffer[DType.float32](n_star)
+    var dws = ctx.enqueue_create_buffer[DType.float32](
+        identical_gemm_workspace_max_floats(n_star, 1, n_train)
+    )
+    ctx.synchronize()
+    gp_kernel_matrix(
+        ctx,
+        dkcross,
+        dx,
+        dxs,
+        dls,
+        dstack,
+        n_train,
+        n_star,
+        d,
+        model.kernel,
+        False,
+        trace,
+        "gp.sample_y.kcross",
+        elem_tpb,
+    )
+    identical_gemm_into(
+        ctx, dmean, dkcross, ddual, dws, n_star, 1, n_train, OP_TN
+    )
+    trsm_lower(
+        ctx, dl, dkcross, n_train, n_star, trace, "gp.sample_y.v", solve_tpb
+    )
+    # GEMM takes two mutable operands, so V is copied once more as B, on
+    # the device (lane/cgr-kernel; it crossed to the host and back)
+    var dv2 = ctx.enqueue_create_buffer[DType.float32](n_train * n_star)
+    ctx.enqueue_copy(dst_buf=dv2, src_buf=dkcross)
+    var dvtv = ctx.enqueue_create_buffer[DType.float32](n_star * n_star)
+    var dws2 = ctx.enqueue_create_buffer[DType.float32](
+        identical_gemm_workspace_max_floats(n_star, n_star, n_train)
+    )
+    var dkss = ctx.enqueue_create_buffer[DType.float32](n_star * n_star)
+    var dstack2 = ctx.enqueue_create_buffer[DType.float32](
+        gp_kernel_stack_floats(n_star, n_star)
+    )
+    ctx.synchronize()
+    identical_gemm_into(
+        ctx, dvtv, dkcross, dv2, dws2, n_star, n_star, n_train, OP_TN
+    )
+    gp_kernel_matrix(
+        ctx,
+        dkss,
+        dxs,
+        dxs,
+        dls,
+        dstack2,
+        n_star,
+        n_star,
+        d,
+        model.kernel,
+        True,
+        trace,
+        "gp.sample_y.kss",
+        elem_tpb,
+    )
+
+    # --- C, its identical Cholesky, Z, L_C Z and the mean, RESIDENT -------
+    # (lane/cgr-kernel) C was formed on the host from downloaded K** and
+    # V^T V, factored through a host round trip, Z drawn on the host and
+    # the mean added on the host; the same statements now run one thread
+    # per cell (gaussian_process/checks/sample_y.mojo's items)
+    var nn = n_star * n_star
+    var dcov = ctx.enqueue_create_buffer[DType.float32](nn)
+    ctx.enqueue_function[gp_cov_kernel](
+        _gp(dcov), _gp(dkss), _gp(dvtv), Int32(n_star),
+        grid_dim=(nn + GP_YDOT_TPB - 1) // GP_YDOT_TPB, block_dim=GP_YDOT_TPB,
+    )
+    var jit = chol_jitter_pinned()
+    chol_validate_jitter(jit)
+    var nb_pin = chol_nb_for(n_star, CHOL_NB_PINNED)
+    var cws = ctx.enqueue_create_buffer[DType.float32](chol_workspace_floats(n_star, nb_pin))
+    ctx.synchronize()
+    var ctrace = IdentityTrace()
+    add_jitter(ctx, dcov, n_star, jit, CHOL_ELEM_TPB)
+    var run = potrf_lower(ctx, dcov, cws, n_star, ctrace, chol_default_nb_hint(), CHOL_PANEL_TPB, CHOL_ELEM_TPB)
+    gp_sample_y_check_factor(run.info, n_star)
+    var key = gp_sample_y_key(seed)
+    var nz = n_star * n_samples
+    var dz = ctx.enqueue_create_buffer[DType.float32](nz)
+    ctx.enqueue_function[gp_normals_kernel](
+        _gp(dz), Int32(n_star), Int32(n_samples), key[0], key[1],
+        grid_dim=(nz + GP_YDOT_TPB - 1) // GP_YDOT_TPB, block_dim=GP_YDOT_TPB,
+    )
+    var dlz = ctx.enqueue_create_buffer[DType.float32](nz)
+    var dws3 = ctx.enqueue_create_buffer[DType.float32](
+        identical_gemm_workspace_max_floats(n_star, n_samples, n_star)
+    )
+    ctx.synchronize()
+    identical_gemm_into(
+        ctx, dlz, dcov, dz, dws3, n_star, n_samples, n_star, OP_NN
+    )
+    trace.record_device(ctx, "gp.sample_y.lz", dlz, nz)
+    var dyo = ctx.enqueue_create_buffer[DType.float32](nz)
+    ctx.enqueue_function[gp_add_mean_kernel](
+        _gp(dyo), _gp(dmean), _gp(dlz), Int32(n_star), Int32(n_samples),
+        grid_dim=(nz + GP_YDOT_TPB - 1) // GP_YDOT_TPB, block_dim=GP_YDOT_TPB,
+    )
+    if unnorm:
+        # every draw un-normalized as the mean, on the device
+        _gp_unnorm(ctx, dyo, dyo, nz, y_std, y_mean, GP_UNNORM_MEAN)
+    var out = _download(ctx, dyo, nz)
+    _ = dx^
+    _ = dxs^
+    _ = dls^
+    _ = ddual^
+    _ = dl^
+    _ = dkcross^
+    _ = dstack^
+    _ = dmean^
+    _ = dws^
+    _ = dv2^
+    _ = dvtv^
+    _ = dws2^
+    _ = dkss^
+    _ = dstack2^
+    _ = dcov^
+    _ = cws^
+    _ = dz^
+    _ = dlz^
+    _ = dws3^
+    _ = dyo^
+    # DEVIATION 1946: the context dies LAST, after every value built on it.
+    _ = ctx^
+    return out^

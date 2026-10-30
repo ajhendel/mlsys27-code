@@ -1,0 +1,828 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 the authors. Part of anonlib, DOI-WITHHELD
+"""The verdict steps of .github/workflows/cpu-identity-gate.yml (the CPU
+training lane, 2026-09-13), as a tool that runs on a laptop too.
+
+  readback   import the checkout's package on this CPU-only box and read
+             every host binding under anonlib/host/ back: vendor() must be
+             cpu, and each binding's <prefix>_column() must be "cpu" (the
+             kernel matrix's CPU column, the comptime assert's witness).
+             Exit 2 when a named binding is not built.
+  column     judge a tools/identity_break.py JSON written on a CPU-only box:
+             vendor starts with cpu-, commit equals --commit, host.column is
+             cpu, every named host binding is in host.families with column
+             cpu, at least one cell exists, every cell of a lane in --covered
+             is STABLE, and every other cell is REFUSED with the by-name
+             sentence "no CPU implementation of". A JSON with no cell, or a
+             cell of the wrong kind, fails: a step that was supposed to
+             produce a cell and produced none is a failure, never a pass.
+             With --sabotage --production PROD, a covered cell the sabotage
+             build makes the lane itself refuse, on a cell PROD hashes
+             STABLE, counts as caught (caught_refusals); without --sabotage
+             every refusal of a covered cell stays a failure.
+  run-column run tools/identity_break.py over --lanes as SHARDS in parallel
+             processes and join the parts with identity_break --merge into
+             --json (2026-09-15, lane/cpu-training-gate-budget). The gate's
+             covered lanes outgrew one process on a hosted runner: at
+             2cf5562b1 two runners hit the job's 60-minute limit (run
+             34956243867). Every lane still runs every fixture and every
+             repeat, in a process of its own shard; the merge refuses parts
+             that ran a different machine, commit, fixture or binding bytes.
+             Exit non-zero if any shard exits non-zero (a MOVED cell, a
+             refusal of the lane list, a crash) or the merge refuses.
+  owed       the sabotage arm of the OWED cell parts (2026-09-15,
+             lane/cpu-gate-owed-cells). `identity_break --diff
+             --require-columns 4 --owed-json owed_cells.json` admits a cell
+             part that no committed GPU record hashes yet (absent, n/a, or a
+             lane not in the record) as OWED when the CPU column hashes it
+             STABLE and every column that has it agrees; this check then
+             requires every listed part to MOVE between the production CPU
+             column and the ANONLIB_HOST_SABOTAGE column. Exit 1 on a part
+             that did not move or is absent under sabotage, or is refused by
+             anything but the lane's own computation (caught_refusals).
+             The parts in SABOTAGE_EXEMPT_ENTRIES (2026-09-22) are the
+             exception: the host sabotage does not reach them, so they are
+             counted as exempt when unmoved and FAIL when they move (the
+             entry is stale). docs/VERIFY.md lists them and why.
+  build-list the host binding lists the gate builds, read back and builds
+             again for the sabotage set, against the manifest
+             (python/anonlib/host_surface.py, 2026-09-15). Every family the
+             manifest declares (the full verification) or every family whose
+             binding ships in the wheel (routine) must be in --families and in
+             --sabotage-families. Since 2026-09-16 those are the same
+             thirty-two families, because every family ships
+             (lane/ship-cpu-host-families); the two scopes are kept apart so
+             that holding a family back again narrows routine without an edit
+             here. Each must have its build shim, and
+             --readback must name exactly the --families bindings. Exit 1
+             names each binding left out: on 2026-09-15 the workflow built
+             byte_lm, forest, tokenizer and the routed families only and
+             missed seven shipped bindings.
+
+Exit 0: every check holds. 1: a check failed. 2: the tool could not run.
+"""
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+
+REFUSAL = "no CPU implementation of"
+
+
+#: Exception names whose refusal says nothing about the lane's arithmetic:
+#: the package or a binding did not load, the box ran out of memory or time.
+#: A sabotage refusal of one of these kinds is never a catch.
+_ENVIRONMENT_ERRORS = ("ImportError", "ModuleNotFoundError", "OSError", "FileNotFoundError",
+                       "PermissionError", "MemoryError", "TimeoutError", "KeyboardInterrupt",
+                       "SystemExit", "RecursionError")
+#: The loader's sentence for a sabotage binary loaded without the gate's
+#: permission (python/anonlib/_backend.py): the arm did not run at all.
+_SABOTAGE_LOAD_REFUSAL = "refused outside the gate"
+
+
+def _host_sabotaged(record):
+    return any(f.get("sabotage") is True for f in ((record.get("host") or {}).get("families") or {}).values())
+
+
+def caught_refusals(record, production):
+    """The sabotage column's cells REFUSED because the sabotage build broke
+    the lane's own computation, so the column MOVED there (2026-09-21).
+
+    Gate run 35636551982 (8fbcd2514): under the sabotage host set the
+    helpers' deliberate faults made rf-score-weighted's weighted score
+    refuse its own weights (the sabotaged max read the minimum, zero) and
+    spectral-precomputed's k-means reach a row with no nearest centroid.
+    Those are the sabotage caught, but the recorder writes them as REFUSED,
+    and a refusal was never evidence, so both shards failed the step.
+
+    A refused cell counts as caught ONLY when all of these hold:
+      - `record` is a CPU column whose host families read back sabotage and
+        `production` is a CPU column of the same commit, fixtures and CPU
+        whose families read back production (no sabotage);
+      - the production column hashes the same cell STABLE over at least two
+        repeats with no refusal of any part: the only difference between the
+        two runs is the sabotage build, so the refusal is the sabotage's;
+      - the refusal is not the routing refusal ("no CPU implementation of"),
+        not the loader's refusal of a sabotage binary, and not an
+        environment failure (_ENVIRONMENT_ERRORS).
+    Never used for a production column: a refusal there stays a failure."""
+    if not _comparable(record, production):
+        return set()
+    caught = set()
+    pcells = production.get("cells") or {}
+    for key, cell in (record.get("cells") or {}).items():
+        if cell.get("verdict") != "REFUSED":
+            continue
+        if not _own_computation_refusal(cell.get("error")):
+            continue
+        if not _production_stable(pcells.get(key)):
+            continue
+        caught.add(key)
+    return caught
+
+
+def _comparable(record, production):
+    """`record` is a sabotage CPU column and `production` a production CPU
+    column of the same commit, CPU, fixtures and mode."""
+    if not production or not _host_sabotaged(record) or _host_sabotaged(production):
+        return False
+    host, phost = record.get("host") or {}, production.get("host") or {}
+    return not (host.get("column") != "cpu" or phost.get("column") != "cpu"
+                or record.get("commit") != production.get("commit")
+                or host.get("cpu_model") != phost.get("cpu_model")
+                or set(record.get("fixtures") or {}) != set(production.get("fixtures") or {})
+                or record.get("mode") != production.get("mode"))
+
+
+def _own_computation_refusal(error):
+    """The refusal text names the lane's own computation: not empty, not the
+    routing refusal, not the loader's refusal of a sabotage binary, not an
+    environment failure. A probe refusal carries its stage first
+    ("infer: ValueError: ..."), which is dropped before the kind is read."""
+    error = str(error or "")
+    if not error or REFUSAL in error or _SABOTAGE_LOAD_REFUSAL in error:
+        return False
+    head, _, rest = error.partition(":")
+    if head.strip() in _PROBE_STAGES and rest.strip():
+        error = rest.strip()
+    kind = error.split(":", 1)[0].strip()
+    return not any(kind == e or kind.endswith("." + e) for e in _ENVIRONMENT_ERRORS)
+
+
+def _production_stable(p, parts=()):
+    """The production cell hashes STABLE over at least two repeats with no
+    error of any part, and each of `parts` (a `<part>_verdict` field) reads
+    STABLE."""
+    p = p or {}
+    hashes = p.get("hashes") or []
+    return not (p.get("verdict") != "STABLE" or not isinstance(hashes, list) or len(hashes) < 2
+                or not all(isinstance(h, str) and h for h in hashes) or len(set(hashes)) != 1
+                or any(v for f, v in p.items() if f == "error" or f.endswith("_error"))
+                or any(p.get(f) != "STABLE" for f in parts))
+
+
+#: The stages whose failure identity_break records as the cell's
+#: `probe_error` and whose column then reads REFUSED.
+_PROBE_STAGES = ("infer", "model")
+
+
+def caught_part_refusals(record, production):
+    """The sabotage column's cells whose TRAINING hashed STABLE but whose
+    infer or model part the lane's own self-check refused, on a cell the
+    production column hashes STABLE with those parts STABLE (2026-09-22).
+
+    Gate run 35662090487 (e28efd4a5): under the sabotage host set the
+    holtwinters lanes trained to stable bytes that differ from production,
+    then their infer probe compared forecast(h) with forecast(h, index=0)
+    (and forecast_exponential_smoothing with ExponentialSmoothing.forecast)
+    and refused because the sabotaged kernel made them differ. identity_break
+    records that as probe_error with infer_verdict and model_verdict REFUSED;
+    the cell's own verdict stays STABLE, so `caught_refusals` never saw it and
+    shard 1 failed the step on every runner.
+
+    Returns {cell key: frozenset of the REFUSED `<part>_verdict` fields}. A
+    cell is admitted only when `caught_refusals`' column conditions hold, the
+    cell reads STABLE, probe_error names the lane's own computation
+    (`_own_computation_refusal`), the REFUSED fields are only infer_verdict
+    and model_verdict and every repeat of each is None, and the production
+    cell reads those parts STABLE. Every other part and error of the cell is
+    still judged as before."""
+    if not _comparable(record, production):
+        return {}
+    pcells = production.get("cells") or {}
+    caught = {}
+    for key, cell in (record.get("cells") or {}).items():
+        if cell.get("verdict") != "STABLE" or not cell.get("probe_error"):
+            continue
+        error = str(cell.get("probe_error"))
+        if error.partition(":")[0].strip() not in _PROBE_STAGES or not _own_computation_refusal(error):
+            continue
+        refused = {f for f, v in cell.items() if f.endswith("_verdict") and v == "REFUSED"}
+        if not refused or not refused <= {f"{s}_verdict" for s in _PROBE_STAGES}:
+            continue
+        if any(not isinstance(cell.get(f[:-len("_verdict")]), list)
+               or any(v is not None for v in cell.get(f[:-len("_verdict")]))
+               for f in refused):
+            continue
+        if not _production_stable(pcells.get(key), sorted(refused)):
+            continue
+        caught[key] = frozenset(refused)
+    return caught
+
+
+def recorded_native_oracle_failure(record, caught=frozenset(), caught_parts=None):
+    """A deliberate native fault returned repeated bytes and failed its oracle.
+
+    This permits the recorder's exit one only in the explicit sabotage arm.
+    It never turns a refusal, unstable result or incomplete shard into
+    evidence, except the cells in `caught` (`caught_refusals`, a refusal the
+    production column shows the sabotage build caused), which are skipped
+    here and count as observed, and the part refusals in `caught_parts`
+    (`caught_part_refusals`), whose probe_error and REFUSED infer/model
+    columns count as observed while the rest of the cell is judged as usual.
+    """
+    from verify_cpu_batch import expected_oracle_failure
+    host = record.get("host") or {}
+    repeats = record.get("repeats", 0)
+    if (not record.get("complete") or record.get("mode") != "identical"
+            or not isinstance(repeats, int) or repeats < 2
+            or host.get("column") != "cpu"
+            or not any(f.get("sabotage") is True for f in (host.get("families") or {}).values())):
+        return False
+    cells = record.get("cells") or {}
+    for key, cell in cells.items():
+        if key in caught:
+            continue
+        hashes = cell.get("hashes") or []
+        if (not isinstance(hashes, list) or len(hashes) != repeats
+                or not all(isinstance(h, str) and h for h in hashes) or len(set(hashes)) != 1):
+            return False
+    return expected_oracle_failure(record, caught=caught, caught_parts=caught_parts)
+
+
+def _load_production(path):
+    """The production CPU column a sabotage verdict is read against, or None.
+    An unreadable one admits no refusal as caught (the verdict is then the
+    strict one) and is said so; it is not itself a failure of this arm."""
+    if not path:
+        return None
+    try:
+        with open(path) as fh:
+            return json.load(fh)
+    except (OSError, ValueError) as exc:
+        print(f"note: cannot read the production column {path} ({exc}); no sabotage refusal counts as caught",
+              flush=True)
+        return None
+
+
+def do_readback(args):
+    sys.path.insert(0, os.path.abspath(args.package_root))
+    try:
+        import anonlib
+        from anonlib import _backend
+    except Exception as exc:
+        print(f"readback: import failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 2
+    vendor = anonlib.vendor()
+    print(f"readback vendor() = {vendor}")
+    print(f"readback vendor_how() = {_backend.vendor_how()}")
+    built = _backend.host_families_built()
+    print(f"readback host_families_built = {built}")
+    if vendor != "cpu":
+        print("readback FAIL: this package did not take the CPU-only path", file=sys.stderr)
+        return 1
+    missing = [b for b in args.binding if b not in built]
+    if missing:
+        print(f"readback: not built: {missing}", file=sys.stderr)
+        return 2
+    bad = 0
+    for basename in args.binding or built:
+        prefix = basename[len("_anonlib_"):]
+        try:
+            m = _backend.load_host_module(basename)
+        except Exception as exc:
+            print(f"readback FAIL {basename}: {type(exc).__name__}: {exc}", file=sys.stderr)
+            bad += 1
+            continue
+        column = str(getattr(m, prefix + "_column")())
+        detected = getattr(m, prefix + "_detected_column", None)
+        detected = str(detected()) if detected is not None else "(no read-back)"
+        numeric = int(getattr(m, prefix + "_numeric_mode")())
+        print(f"readback {basename}: column={column} detected_column={detected} "
+              f"numeric_mode={numeric} vendor={getattr(m, prefix + '_vendor')()}")
+        if column != "cpu":
+            print(f"readback FAIL {basename}: column {column!r} is not cpu", file=sys.stderr)
+            bad += 1
+    print(f"readback verdict {'OK' if not bad else 'FAIL'}")
+    return 1 if bad else 0
+
+
+def do_column(args):
+    try:
+        with open(args.json) as fh:
+            j = json.load(fh)
+    except (OSError, ValueError) as exc:
+        print(f"column: cannot read {args.json}: {exc}", file=sys.stderr)
+        return 2
+    covered = set(x for x in (args.covered or "").split(",") if x)
+    bindings = [x for x in (args.binding or "").split(",") if x]
+    failures = []
+
+    def need(cond, text):
+        if not cond:
+            failures.append(text)
+
+    vendor = str(j.get("vendor", ""))
+    need(vendor.startswith("cpu-") and len(vendor) > 4, f"vendor {vendor!r} does not start with cpu-")
+    need(bool(j.get("commit")), "commit is empty")
+    if args.commit:
+        need(j.get("commit") == args.commit, f"commit {j.get('commit')!r} is not {args.commit!r}")
+    host = j.get("host") or {}
+    need(bool(host), "no host object; the run was not on a CPU-only install")
+    need(host.get("column") == "cpu", f"host.column is {host.get('column')!r}, not cpu")
+    need(bool(host.get("cpu_model")), "host.cpu_model is empty")
+    families = host.get("families") or {}
+    for b in bindings:
+        need(b in families, f"host.families lacks {b}")
+        need(families.get(b, {}).get("column") == "cpu", f"host.families[{b}].column is not cpu")
+    cells = j.get("cells") or {}
+    sabotage = bool(getattr(args, "sabotage", False))
+    production = _load_production(getattr(args, "production", None)) if sabotage else None
+    caught = caught_refusals(j, production) if sabotage else set()
+    caught_parts = caught_part_refusals(j, production) if sabotage else {}
+    oracle_control = bool(sabotage and recorded_native_oracle_failure(j, caught, caught_parts))
+    need(len(cells) > 0, "the JSON carries NO cell; a run that was supposed to produce cells produced none")
+    need(j.get("complete", False), "the JSON is INCOMPLETE (the run was killed)")
+    fixtures = j.get("fixtures") or {}
+    need(bool(fixtures), "no fixture manifest")
+    for lane in sorted(covered):
+        for fixture in fixtures:
+            need(f"{lane}/{fixture}" in cells, f"covered cell {lane}/{fixture} is missing")
+    seen = set()
+    for key, cell in cells.items():
+        lane = key.split("/")[0]
+        seen.add(lane)
+        verdict = cell.get("verdict")
+        if lane in covered and key in caught and oracle_control:
+            print(f"column {key}: REFUSED under sabotage, STABLE in production: caught "
+                  f"({str(cell.get('error', ''))[:160]})")
+            continue
+        if lane in covered:
+            need(verdict == "STABLE" or (oracle_control and verdict == "DIVERGENT"),
+                 f"{key}: covered lane reads {verdict}, not STABLE" + (f" ({cell.get('error', '')[:160]})" if verdict == "REFUSED" else ""))
+            # A stable training hash cannot certify a failed inference or
+            # metamorphic comparison. Only explicitly inapplicable/skipped
+            # parts may be N/A; every reported failure stays a failure.
+            if oracle_control and key in caught_parts:
+                print(f"column {key}: {', '.join(sorted(caught_parts[key]))} REFUSED under sabotage by the "
+                      f"lane's own check, STABLE in production: caught ({str(cell.get('probe_error', ''))[:160]})")
+            for field, part_verdict in cell.items():
+                if oracle_control and field in caught_parts.get(key, ()):
+                    continue
+                if field.endswith("_verdict"):
+                    need(part_verdict in ("STABLE", "N/A") or
+                         (oracle_control and part_verdict in ("BATCH_MOVED", "RLPAIR_MOVED")),
+                         f"{key}: {field} is {part_verdict}, not STABLE or N/A")
+        else:
+            # N/A is identity_break's by-design `par-*` refusal (CPU_BY_DESIGN_NA),
+            # its sentence kept in `error`: still no hash, still by name
+            need(verdict == "REFUSED" or (verdict == "N/A" and lane.startswith("par-")),
+                 f"{key}: uncovered lane reads {verdict}, not REFUSED; a hash from a lane with no CPU implementation is a routing bug")
+            need(REFUSAL in str(cell.get("error", "")),
+                 f"{key}: refused, but not by name ({str(cell.get('error', ''))[:160]!r})")
+    for lane in sorted(covered - seen):
+        need(False, f"covered lane {lane} has no cell in the JSON")
+    print(f"column {os.path.basename(args.json)}: vendor={vendor} commit={j.get('commit')} "
+          f"host.column={host.get('column')} cpu_model={host.get('cpu_model')!r} "
+          f"families={sorted(families)} cells={len(cells)} lanes={sorted(seen)} covered={sorted(covered)}")
+    for f in failures:
+        print(f"column FAIL: {f}")
+    print(f"column verdict {'OK' if not failures else 'FAIL'} ({len(failures)} failure(s))")
+    return 1 if failures else 0
+
+
+def _oracle_diverged(cell):
+    """A cell whose training failed its oracle on every repeat with the same
+    bytes: DIVERGENT, one non-empty oracle error per repeated hash."""
+    hashes = cell.get("hashes") or []
+    errors = cell.get("oracle_errors") or []
+    return (cell.get("verdict") == "DIVERGENT" and isinstance(hashes, list) and len(hashes) >= 2
+            and all(isinstance(h, str) and h for h in hashes) and len(set(hashes)) == 1
+            and len(errors) == len(hashes) and all(errors))
+
+
+def _part_values(cell, part):
+    """The per-repeat values of one part of a cell: the train hashes, or the
+    `infer`, `model`, `batch` (and opt-in part) lists. None when the cell or
+    the part is absent or the cell was refused."""
+    if cell is None or cell.get("verdict") == "REFUSED":
+        return None
+    values = cell.get("hashes") if part == "train" else cell.get(part)
+    return list(values) if values else None
+
+
+#: Every fixture identity_break runs (tools/identity_break.py FIXTURES).
+_ALL_FIXTURES = ("base", "ties", "hashed", "wide", "denormal", "denormal_ftz", "dupes", "odd", "negative")
+
+#: OWED cell parts the ANONLIB_HOST_SABOTAGE build does not move, EXEMPT
+#: from the owed check's "must move" rule (2026-09-22). Each entry is
+#: (lane, part, fixtures, reason) and stands for one (lane, fixture, part)
+#: per fixture. Measured on CPU identity gate run 35728134044 (99f10a932):
+#: the same 92 parts, and only those, did not move on x86-a, arm64 and
+#: macos15. THESE PARTS HAVE NO NEGATIVE CONTROL: the owed check admits them
+#: on the production CPU hash and cross-column agreement alone. An exempted
+#: part that DOES move fails the check (`do_owed`), so the list can only
+#: shrink: remove the entry, which puts the part back under the sabotage
+#: control. To take a part off this list for good, add a fault the sabotage
+#: build reaches it with (docs/VERIFY.md, "Owed parts the host sabotage
+#: cannot move").
+SABOTAGE_EXEMPT_ENTRIES = (
+    ("radius", "model", _ALL_FIXTURES,
+     "RadiusNeighbors.save writes the fitted index (the training rows as given), radius, metric, p and "
+     "algorithm; fit computes nothing, the ball cover is built per query, so no host kernel produces "
+     "a saved byte (train, infer and batch move)"),
+    ("radius-manhattan", "model", _ALL_FIXTURES, "as radius: the saved file is the training rows and the knobs"),
+    ("radius-chebyshev", "model", _ALL_FIXTURES, "as radius: the saved file is the training rows and the knobs"),
+    ("radius-minkowski-p3", "model", _ALL_FIXTURES, "as radius: the saved file is the training rows and the knobs"),
+    ("iforest", "model", _ALL_FIXTURES,
+     "IsolationForest.save writes the training matrix, the resolved knobs and offset_ (the constant "
+     "-0.5 at contamination='auto'); the forest is rebuilt on every scoring call and never saved "
+     "(DEVIATION 874), so the sabotaged scoring path writes no saved byte (train, infer and batch move)"),
+    ("rbf-sampler", "model", _ALL_FIXTURES,
+     "RBFSampler.save writes the Philox weights and offsets, sigma and scale; the fit reads only "
+     "n_features (the model hash is the same on all nine fixtures) and the sabotaged GEMM is in "
+     "transform, which is not saved (train, infer and batch move)"),
+    ("kernel-ridge-poly", "model", tuple(f for f in _ALL_FIXTURES if f != "negative"),
+     "reached but inert: KernelRidge.save writes X_fit_ and dual_coef_; the GEMM value flip moves the "
+     "48x48 poly kernel by one ulp, but at alpha=64 on inputs scaled by 1/8 the solved dual rounds to "
+     "the same float32 on these eight fixtures (it moves on negative, whose larger kernel carries the "
+     "ulp through); train, infer and batch move on all nine"),
+    ("standard-scaler-no-std", "model", ("ties",),
+     "reached but inert: with_std=False saves mean_ only, and ties is integer valued (0 to 5 over "
+     "20000 rows), so every partial sum is exact in float32 and the reordered fold returns the same "
+     "mean (it moves on the other eight fixtures; train, infer and batch move on ties)"),
+    ("optim-sgd", "batch", _ALL_FIXTURES,
+     "the batch arms run SGD step without max_norm: momentum, Nesterov, dampening and weight decay are "
+     "elementwise per parameter and no host kernel the sabotage flips runs; the train part, whose "
+     "clip norm is a reduction the training host sabotage moves, moves"),
+    ("select-d", "train", _ALL_FIXTURES,
+     "select_d returns an integer differencing order chosen by the KPSS p-value against 0.05; the host "
+     "sabotage reorders the KPSS statistic's fold (kpss_oracle KPSS_ORACLE_HOST_SABOTAGE) by an ulp, "
+     "which crosses no threshold on these series, and the decision arm ANONLIB_KPSS_DECISION_SABOTAGE "
+     "is not in the gate's tsa sabotage build; NO part of this lane moves"),
+    ("select-d", "batch", _ALL_FIXTURES, "as select-d train: the batch part is the same integer order per series"),
+    ("agglomerative", "batch", ("denormal", "denormal_ftz"),
+     "reached but inert: the 64 held-out rows the batch part asks predict for get the same labels with "
+     "and without the fault on these two fixtures (the hash the sabotage build gives on every "
+     "fixture); the 256-row infer part and the model part move on both"),
+)
+
+
+def exempt_set(entries=None):
+    """{(lane, fixture, part): reason} expanded from SABOTAGE_EXEMPT_ENTRIES."""
+    out = {}
+    for lane, part, fixtures, reason in (SABOTAGE_EXEMPT_ENTRIES if entries is None else entries):
+        for f in fixtures:
+            out[(lane, f, part)] = reason
+    return out
+
+
+def do_owed(args):
+    """The OWED cell parts' sabotage arm (lane/cpu-gate-owed-cells,
+    2026-09-15). identity_break --diff --owed-json admits a cell part no GPU
+    record hashes yet only when the CPU column hashes it STABLE and every
+    column that has it agrees. That alone cannot fail on a CPU fold that
+    does nothing, so every owed part must also MOVE under the sabotage host
+    set: its sabotage value must exist, must not be n/a, and must differ from
+    the production CPU hash (a BATCH_MOVED string differs from every hash).
+    An absent sabotage cell is not a catch; a refused one is only when
+    `caught_refusals` admits it (the lane's own computation refused under
+    the sabotage build on a cell production hashes STABLE), and a cell whose
+    training failed its own oracle on every repeat is (`_oracle_diverged`),
+    as the column verdict admits it. The parts in SABOTAGE_EXEMPT_ENTRIES
+    are the exception (see there)."""
+    try:
+        with open(args.owed_json) as fh:
+            owed = json.load(fh)
+        with open(args.production) as fh:
+            prod = json.load(fh)
+        with open(args.sabotage) as fh:
+            sab = json.load(fh)
+    except (OSError, ValueError) as exc:
+        print(f"owed: cannot read an input: {exc}", file=sys.stderr)
+        return 2
+    failures = []
+    if not prod.get("host") or not sab.get("host"):
+        failures.append("the production and sabotage JSONs must both be CPU columns (a host object)")
+    entries = owed.get("owed")
+    if not isinstance(entries, list):
+        print(f"owed: {args.owed_json} carries no owed list", file=sys.stderr)
+        return 2
+    moved = 0
+    caught = caught_refusals(sab, prod)
+    caught_parts = caught_part_refusals(sab, prod)
+    # A sabotage cell whose training failed its own oracle on every repeat
+    # records no further part (gate run 35636551982: the par-* lanes); the
+    # column verdict already admits it as the sabotage caught, so an owed
+    # part of it moved too.
+    oracle_caught = {k for k, c in (sab.get("cells") or {}).items()
+                     if _host_sabotaged(sab) and _oracle_diverged(c)}
+
+    def judge(key, part):
+        """("moved", line), ("unmoved", text) or ("fail", text) for one part."""
+        p = _part_values(prod["cells"].get(key), part)
+        s = _part_values(sab["cells"].get(key), part)
+        if not p or len(set(p)) != 1 or str(p[0]).startswith("n/a"):
+            return "fail", f"{key} {part}: the production CPU column does not hash it STABLE ({p})"
+        if not s and key in oracle_caught:
+            return "moved", (f"owed {key} {part}: production {p[0]} sabotage DIVERGENT from its own oracle "
+                             f"({str((sab['cells'][key].get('oracle_errors') or [''])[0])[:120]}) MOVED")
+        if not s and key in caught:
+            return "moved", (f"owed {key} {part}: production {p[0]} sabotage REFUSED by the lane's own computation "
+                             f"({str(sab['cells'][key].get('error', ''))[:120]}) MOVED")
+        if s and all(v is None for v in s) and f"{part}_verdict" in caught_parts.get(key, ()):
+            return "moved", (f"owed {key} {part}: production {p[0]} sabotage REFUSED by the lane's own check "
+                             f"({str(sab['cells'][key].get('probe_error', ''))[:120]}) MOVED")
+        if not s or any(v is None for v in s):
+            return "fail", (f"{key} {part}: the sabotage column has no value (absent, or REFUSED by routing, "
+                            "loading or the environment); such a refusal is not a catch")
+        if str(s[0]).startswith("n/a"):
+            return "fail", f"{key} {part}: the sabotage column reads {s[0]}"
+        if s[0] == p[0]:
+            return "unmoved", f"{key} {part}: DID NOT MOVE under the sabotage host set ({p[0]})"
+        return "moved", f"owed {key} {part}: production {p[0]} sabotage {str(s[0])[:60]} MOVED"
+
+    # The parts the host sabotage cannot move (SABOTAGE_EXEMPT_ENTRIES). An
+    # exempted part that stays put is counted, never silently passed; one
+    # that MOVES fails, because the exemption is then stale and the part can
+    # be covered again by removing it.
+    exempt = exempt_set(getattr(args, "exempt_entries", None))
+    exempted = 0
+    seen_exempt = set()
+    for o in entries:
+        key, part = f"{o['lane']}/{o['fixture']}", o["part"]
+        ekey = (o["lane"], o["fixture"], part)
+        kind, text = judge(key, part)
+        if ekey in exempt:
+            seen_exempt.add(ekey)
+            if kind == "unmoved":
+                exempted += 1
+                print(f"owed {text} EXEMPT ({exempt[ekey][:100]})")
+            elif kind == "moved":
+                failures.append(f"{key} {part}: EXEMPT but MOVED under the sabotage host set; the exemption is "
+                                "stale, remove its entry from SABOTAGE_EXEMPT_ENTRIES "
+                                "(tools/cpu_identity_gate_check.py) so the sabotage control covers it again")
+                print(text)
+            else:
+                failures.append(text)
+            continue
+        if kind == "moved":
+            moved += 1
+            print(text)
+        elif kind == "unmoved":
+            failures.append(f"{text}; an owed cell that sabotage cannot move rests on nothing")
+        else:
+            failures.append(text)
+    if not entries:
+        print("owed: no OWED cell part in the list; nothing to move")
+    absent = len(exempt) - len(seen_exempt)
+    if absent:
+        print(f"owed: {absent} exempt part(s) are not in this owed list (recorded by a GPU column, or another list)")
+    for f in failures:
+        print(f"owed FAIL: {f}")
+    print(f"owed verdict {'OK' if not failures else 'FAIL'} ({moved} of {len(entries)} owed cell part(s) moved, "
+          f"{exempted} exempt part(s) did not move as listed, {len(failures)} failure(s))")
+    return 1 if failures else 0
+
+
+#: Seconds per covered lane on a hosted runner, the mean over the seven
+#: runners of CPU identity gate run 34955435564 (b7e5a4287), read from the
+#: log timestamps of the lane rows; the 31 lanes measured again are the mean
+#: over the three runners of run 35628874036 (a503d5d6d, sum of each lane's
+#: DONE rows, lanes that finished all nine fixtures twice without an error).
+#: The Ordered GBDT lanes alone (1809 s and 1173 s) outweighed the whole
+#: old table, which had them at the 4 s default. A BALANCE HINT ONLY: a
+#: stale or missing entry moves wall time between shards and never changes
+#: a cell. A lane not
+#: listed weighs DEFAULT_LANE_SECONDS (the 60 lanes under 5 s averaged 1.5).
+LANE_SECONDS = {
+    "gbdt-ordered-bayesian-noise": 1809, "gbdt-ordered": 1173, "mamba2": 539, "byte-lm-host-infer": 314,
+    "gbdt-symmetric-eval": 275, "transformer": 124, "transformer-bf16w": 101, "iforest-tuned": 99,
+    "dbscan-weighted": 89, "iforest": 86, "mamba1-bf16w": 81, "gbdt-ordered-rmse": 78, "mamba1": 77,
+    "hdbscan": 69, "hdbscan-leaf": 69, "kmeans-random": 67, "byte-lm": 55, "gbdt-depthwise": 52,
+    "gbdt-symmetric": 51, "kmeans": 50, "gbdt-border-types": 47, "bootstrap": 46, "gbdt-lossguide": 42,
+    "kmeans-sqrt": 41, "rf-reg-gamma-ig": 41, "kmeans-weighted": 32, "spectral": 31, "kmeans-array": 25,
+    "gbdt-bfa-quantile": 23, "radius-minkowski-p3": 23, "rf-reg": 21, "agglomerative": 19,
+    "kmeans-classic-pp": 19, "knn": 17, "metrics-classification": 16, "permutation-test": 16,
+    "dbscan-brute-l1": 15, "kde-cosine-minkowski": 15, "gbdt-rmse": 14, "gpc-multiclass": 13, "svr": 13,
+    "knn-minkowski-p3": 12, "rf-clf-balanced-parallel": 12, "metrics": 10, "rf-clf-entropy-log2-noboot": 10,
+    "svr-linear": 10, "dbscan": 9, "et-reg": 9, "svc": 9, "cross-val": 8, "et-clf": 8, "rf-reg-poisson": 8,
+    "arima-seasonal-c": 7, "et-clf-entropy-bestfirst": 7, "knn-clf": 7, "knn-clf-distance": 7, "kde": 6,
+    "kde-linear-cosine": 6, "kde-weighted": 6, "logistic-elasticnet": 6, "logistic-l1": 6,
+    "et-reg-bootstrap-parallel": 5, "logistic-multiclass": 5, "umap": 5,
+}
+DEFAULT_LANE_SECONDS = 4
+
+
+def shard_lanes(lanes, shards):
+    """`lanes` split into at most `shards` lists, heaviest lane first onto
+    the lightest shard; each shard keeps the caller's lane order. Every lane
+    lands in exactly one shard."""
+    shards = max(1, min(shards, len(lanes)))
+    load = [0] * shards
+    owner = {}
+    for lane in sorted(lanes, key=lambda n: (-LANE_SECONDS.get(n, DEFAULT_LANE_SECONDS), lanes.index(n))):
+        k = load.index(min(load))
+        owner[lane] = k
+        load[k] += LANE_SECONDS.get(lane, DEFAULT_LANE_SECONDS)
+    out = [[n for n in lanes if owner[n] == k] for k in range(shards)]
+    assert sorted(sum(out, [])) == sorted(lanes)
+    return out, load
+
+
+def do_run_column(args):
+    resume = bool(getattr(args, 'resume', False))
+    if '--resume' in args.extra:
+        print('run-column: pass --resume before -- so checkpoints are preserved', file=sys.stderr)
+        return 2
+    lanes = [n for n in args.lanes.split(",") if n]
+    if not lanes:
+        print("run-column: --lanes is empty", file=sys.stderr)
+        return 2
+    if len(set(lanes)) != len(lanes):
+        print(f"run-column: --lanes repeats a lane: {sorted(n for n in set(lanes) if lanes.count(n) > 1)}", file=sys.stderr)
+        return 2
+    shards, load = shard_lanes(lanes, args.shards)
+    jobs = max(1, min(args.jobs, len(shards)))
+    stem = args.json[:-5] if args.json.endswith(".json") else args.json
+    tool = os.path.join(os.path.dirname(os.path.abspath(__file__)), "identity_break.py")
+    parts = [f"{stem}.part{k}.json" for k in range(len(shards))]
+    logs = [f"{stem}.part{k}.log" for k in range(len(shards))]
+    for path in ([args.json] if resume else parts + [args.json]):
+        if os.path.exists(path):
+            os.remove(path)             # a part left by an earlier run must not be merged
+    print(f"run-column: {len(lanes)} lanes in {len(shards)} shards, {jobs} at a time", flush=True)
+    for k, shard in enumerate(shards):
+        print(f"run-column: shard {k} weight {load[k]} s: {','.join(shard)}", flush=True)
+    t0 = time.time()
+    pending = list(range(len(shards)))
+    running = {}
+    codes = {}
+    last_beat = t0
+    while pending or running:
+        while pending and len(running) < jobs:
+            k = pending.pop(0)
+            cmd = [sys.executable, tool, "--lanes", ",".join(shards[k]), "--json", parts[k]] + args.extra
+            if resume and os.path.isfile(parts[k]):
+                # The harness validates source/binary bytes, environment,
+                # machine provenance and protocol before reusing any cell.
+                cmd.append('--resume')
+            fh = open(logs[k], "a" if resume else "w")
+            running[k] = (subprocess.Popen(cmd, stdout=fh, stderr=subprocess.STDOUT), fh, time.time())
+        for k in list(running):
+            proc, fh, started = running[k]
+            rc = proc.poll()
+            if rc is None:
+                continue
+            fh.close()
+            codes[k] = rc
+            del running[k]
+            print(f"run-column: shard {k} exited {rc} after {time.time() - started:.0f} s "
+                  f"({len(shards[k])} lanes, weight {load[k]} s)", flush=True)
+        now = time.time()
+        if running and now - last_beat >= args.heartbeat:
+            last_beat = now
+            for k, (proc, fh, started) in sorted(running.items()):
+                try:
+                    with open(logs[k]) as lf:
+                        tail = [ln for ln in lf.read().splitlines() if ln.startswith("| ")][-1:]
+                except OSError:
+                    tail = []
+                done = tail[0].split("|")[1].strip() if tail else "(no lane yet)"
+                print(f"run-column: {now - t0:.0f} s, shard {k} running, last row: {done}", flush=True)
+        time.sleep(0.5)
+    print(f"run-column: all shards done after {time.time() - t0:.0f} s", flush=True)
+    for k in range(len(shards)):
+        print(f"\n=== shard {k}: {','.join(shards[k])} (exit {codes[k]}) ===", flush=True)
+        with open(logs[k]) as lf:
+            sys.stdout.write(lf.read())
+        sys.stdout.flush()
+    production = _load_production(getattr(args, "production", None)) if getattr(args, "sabotage", False) else None
+    bad = []
+    for k in range(len(shards)):
+        if codes[k] == 0:
+            continue
+        expected_failure = False
+        if codes[k] == 1 and getattr(args, "sabotage", False):
+            try:
+                with open(parts[k]) as fh:
+                    record = json.load(fh)
+                expected_cells = {f"{lane}/{fixture}" for lane in shards[k]
+                                  for fixture in record.get("fixtures", {})}
+                expected_failure = (bool(expected_cells)
+                                    and set(record.get("cells", {})) == expected_cells
+                                    and recorded_native_oracle_failure(
+                                        record, caught_refusals(record, production),
+                                        caught_part_refusals(record, production)))
+            except (OSError, ValueError):
+                pass
+        if expected_failure:
+            print(f"run-column: shard {k} recorded an expected native oracle failure", flush=True)
+        else:
+            bad.append(k)
+    missing = [parts[k] for k in range(len(shards)) if not os.path.exists(parts[k])]
+    for k in bad:
+        print(f"run-column FAIL: shard {k} exited {codes[k]}", flush=True)
+    for m in missing:
+        print(f"run-column FAIL: {m} was not written", flush=True)
+    if missing:
+        return 1
+    merged = subprocess.run([sys.executable, tool, "--merge"] + parts + ["--json", args.json])
+    if merged.returncode != 0:
+        print(f"run-column FAIL: identity_break --merge exited {merged.returncode}", flush=True)
+        return 1
+    return 1 if bad else 0
+
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _split(text):
+    return [t for t in text.replace(",", " ").split() if t]
+
+
+def load_manifest(path=None):
+    """host_surface.py by path: the package cannot import before a binding
+    is built."""
+    import runpy
+    return runpy.run_path(path or os.path.join(ROOT, "python", "anonlib", "host_surface.py"))
+
+
+def build_list_errors(manifest, families, sabotage, readback, scope, root=ROOT):
+    """Every way the gate's build lists fall short of the manifest."""
+    declared = manifest["families"]()
+    binding = {f["family"]: f["binding"] for f in manifest["FAMILIES"]}
+    required = declared if scope == "full" else manifest["wheel_families"]()
+    errors = []
+    for name in families + sabotage:
+        if name not in binding:
+            errors.append(f"{name} is not a family the manifest declares")
+    for label, have in (("the production build", families), ("the sabotage build", sabotage)):
+        for name in required:
+            if name not in have:
+                errors.append(f"{label} leaves out {binding[name]} (family {name})")
+    for name in dict.fromkeys(families + sabotage):
+        if name in binding and not os.path.isfile(os.path.join(root, manifest["build_shim"](name))):
+            errors.append(f"family {name} has no build shim {manifest['build_shim'](name)}")
+    built = sorted(binding[n] for n in families if n in binding)
+    if sorted(readback) != built:
+        errors.append(f"the read-back list {sorted(readback)} is not the production build {built}")
+    return errors
+
+
+def do_build_list(args):
+    manifest = load_manifest(args.manifest)
+    families, sabotage, readback = _split(args.families), _split(args.sabotage_families), _split(args.readback)
+    errors = build_list_errors(manifest, families, sabotage, readback, args.scope)
+    for e in errors:
+        print(f"build-list FAIL: {e}")
+    print(f"build-list {'FAIL' if errors else 'OK'}: {len(families)} production, {len(sabotage)} sabotage "
+          f"families, scope {args.scope}")
+    return 1 if errors else 0
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    rb = sub.add_parser("readback", help="read every host binding back on this CPU-only box")
+    rb.add_argument("--package-root", default=os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "python"))
+    rb.add_argument("--binding", action="append", default=[], metavar="BASENAME",
+                    help="a host binding that must be built and read back as cpu (repeatable)")
+    col = sub.add_parser("column", help="judge an identity_break JSON written on a CPU-only box")
+    col.add_argument("json")
+    col.add_argument("--covered", default="", help="lanes that must be STABLE, comma separated; every other lane must be REFUSED by name")
+    col.add_argument("--commit", default="", help="the commit the JSON must carry")
+    col.add_argument("--binding", default="", help="host bindings that must appear in host.families with column cpu, comma separated")
+    col.add_argument("--sabotage", action="store_true", help="accept repeated explicit oracle failures with native sabotage readback")
+    col.add_argument("--production", default="", help="with --sabotage: the production CPU column; a covered cell it hashes "
+                     "STABLE that the sabotage build makes the lane refuse counts as caught")
+    ow = sub.add_parser("owed", help="every OWED cell part (identity_break --owed-json) must move under the sabotage host set")
+    ow.add_argument("owed_json")
+    ow.add_argument("--production", required=True, help="the production CPU column the owed list was diffed from")
+    ow.add_argument("--sabotage", required=True, help="the CPU column run on the ANONLIB_HOST_SABOTAGE host set")
+    rc = sub.add_parser("run-column", help="run identity_break over --lanes in parallel shards and merge the parts")
+    rc.add_argument("--lanes", required=True, help="the lanes to run, comma separated")
+    rc.add_argument("--json", required=True, help="the merged column; parts and logs are written beside it")
+    rc.add_argument("--shards", type=int, default=os.cpu_count() or 1, help="processes the lanes are split across")
+    rc.add_argument("--jobs", type=int, default=0, help="shards running at once (default: --shards)")
+    rc.add_argument("--heartbeat", type=float, default=120.0, help="seconds between progress lines")
+    rc.add_argument("--sabotage", action="store_true", help="accept exit one only for complete, repeated native oracle failures")
+    rc.add_argument("--production", default="", help="with --sabotage: the production CPU column; see column --production")
+    rc.add_argument("--resume", action="store_true", help="preserve shard checkpoints; the harness refuses incompatible source, binaries, environment or protocol")
+    rc.add_argument("extra", nargs="*", help="after --, arguments passed to every identity_break shard")
+    bl = sub.add_parser("build-list", help="the gate's build lists must cover every host binding the manifest declares")
+    bl.add_argument("--families", required=True, help="families built for the production set, space or comma separated")
+    bl.add_argument("--sabotage-families", required=True, help="families built for the sabotage set")
+    bl.add_argument("--readback", required=True, help="host binding basenames the read-back step names")
+    bl.add_argument("--scope", choices=("full", "routine"), required=True,
+                    help="full: every declared family; routine: every family that ships in the wheel")
+    bl.add_argument("--manifest", default=None, help="host_surface.py to read (default: this checkout's)")
+    args = ap.parse_args(argv)
+    if args.cmd == "build-list":
+        return do_build_list(args)
+    if args.cmd == "readback":
+        return do_readback(args)
+    if args.cmd == "owed":
+        return do_owed(args)
+    if args.cmd == "run-column":
+        if args.jobs <= 0:
+            args.jobs = args.shards
+        return do_run_column(args)
+    return do_column(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

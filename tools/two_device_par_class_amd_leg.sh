@@ -1,0 +1,406 @@
+#!/bin/sh
+# tools/two_device_par_class_amd_leg.sh: the on-box body (ANONLIB_GEMM_LEG_EXTRA
+# for tools/gemm_remote_leg.sh amd) of the ONE lease that can move the thirteen
+# `par-*` lanes tools/verification_matrix.py lists under "GPU column on fewer
+# than three classes", 2026-09-19.
+#
+#   ANONLIB_GEMM_LEG_GPU_COUNT=2 \
+#   ANONLIB_GEMM_LEG_EXTRA=tools/two_device_par_class_amd_leg.sh \
+#   sh tools/gemm_remote_leg.sh amd --rent --allow-concurrent \
+#      --local-card <an apple.card from a previous leg>
+#
+# ---------------------------------------------------------------------------
+# READ THIS BEFORE YOU BELIEVE A TWO-DEVICE COLUMN CLOSES A MATRIX GAP.
+#
+# It does not, and it cannot, and the refusal is three lines of code:
+#
+#   python/anonlib/_verify_reference.py:303
+#       if str(pkg.get("par_devices") or "0") != "0":
+#           return f"par_devices {pkg.get('par_devices')}"
+#
+# `tools/verification_matrix.py:262` builds its gpu coverage "from ADMITTED
+# clean columns" and skips every column `admit` returns a reason for. So a
+# column recorded with ANONLIB_PAR_DEVICES=0,1 is, BY CONSTRUCTION, invisible
+# to the count it would appear to answer. The thirteen lanes are not waiting on
+# a second GPU to be COUNTED. They are waiting on a second DEVICE CLASS.
+#
+# What each of the thirteen actually carries today, read out of the committed
+# columns rather than out of the prose:
+#
+#   eleven   nvidia ALONE, all from ONE column,
+#            bench/results/e1g/2026-09-17_203449-nvidia-refregen-par-lanes-b/
+#            remote/identity/identity_break.nvidia-...-4090-sm_89.json
+#            (par_devices=0, admitted). They need `amd` and `apple`.
+#   two      par-forest-pool and par-rbf-sampler: amd AND nvidia already, from
+#            bench/results/identity_break/2026-09-15_par-lanes-new/. The only
+#            class they lack is `apple`, and an Apple column is a Metal run on
+#            the one Mac. NOTHING ON A RENTED BOX CAN GIVE THEM A THIRD CLASS
+#            and this leg does not pretend otherwise.
+#
+# So the deliverable that MOVES THE MATRIX is PHASE ONE below: a ONE-device AMD
+# column, par_devices=0, admissible, over all thirteen. It takes the eleven
+# from one class to two. It takes NOTHING to three; three needs Apple, which
+# this leg cannot rent.
+#
+# WHY THE BOX IS STILL RENTED WITH TWO GPUs. Because the drivers' own claim --
+# `identity_break._par_devices`' docstring, "A two-device column ... must hash
+# equal, cell for cell, to the one-device column of the same commit; that
+# equality is the drivers' whole claim" -- is only STATEABLE on two devices,
+# and the pair is only worth anything when BOTH HALVES COME FROM THE SAME BUILD
+# ON THE SAME BOX AT THE SAME COMMIT. Two leases cannot give you that; one can.
+# PHASE TWO is that half, and PHASE DIFF holds them to each other ON THE BOX,
+# while a disagreement can still be re-run instead of reported.
+#
+# WHAT IS ALREADY DISCHARGED, so this leg does not buy it twice. On 2026-09-19
+# bench/results/identity_break/2026-09-19_hardware-gaps/ landed two-device
+# columns for eleven of the thirteen on BOTH vendors (nvidia-par-*.json and
+# amd-par-*-two.json). All 99 of their cells were checked here against the
+# one-device NVIDIA column above and every one is equal. What that set does NOT
+# contain is par-forest-pool or par-rbf-sampler at any recent commit, and it
+# contains no AMD ONE-device column for any of the thirteen -- which is exactly
+# the admissible thing the matrix is missing. Both gaps are what this leg buys.
+#
+# ---------------------------------------------------------------------------
+# THE DEFECT THAT KILLED TWO PODS TODAY, AND THE PROBE THAT COULD NOT CATCH IT.
+#
+# `import anonlib` fails on any freshly source-built Linux box with
+#
+#   OSError: python/anonlib/.libs/libAnonlibMath.so: cannot open shared
+#   object file: No such file or directory
+#
+# because `python/anonlib/_training_impl.py:1844` writes
+# `def kaiming_uniform(self, shape, fan_in, a=math.sqrt(5.0))`, and that
+# DEFAULT ARGUMENT is evaluated at class-definition time, so `_portable_math`
+# dlopens the library unconditionally on import. Nothing under `bindings/`
+# builds it and `python/anonlib/.libs/` is gitignored, so `git archive` ships
+# nothing. A developer Mac has the file from some past wheel build and never
+# notices. This body calls the tree's OWN recipe,
+# `packaging/portable_math/stage.py`'s build(), rather than copying its
+# compiler flags (-ffp-contract=off, -fno-fast-math, -nostdlib) -- those flags
+# ARE the arithmetic contract and a second copy of them is a second answer.
+#
+# AND THE PROBE IS PLACED WHERE IT CAN FAIL AND WHERE IT CAN PASS. Both of
+# today's legs put `import anonlib` BEFORE the bindings build, where it
+# ALWAYS fails -- `_backend.select()` raises "no identical binary exists under
+# .../identical" long before it could reach the math library. Measured:
+# ~/anonlib-evidence/e1g/2026-09-19_amd-gpu-class-gaps-run2/remote/
+# gpu-class-gaps/logs/import_probe.log, exit 1, while both columns that ran
+# after it came home clean. A check that cannot pass reports nothing. So there
+# are TWO probes here and each is at the only point it is informative:
+#   libm_probe   BEFORE the builds. ctypes.CDLL on the library alone, which
+#                needs no binding and therefore CAN pass -- it is the actual
+#                question ("did stage.build() produce a loadable .so?").
+#   import_probe AFTER the builds, where `import anonlib` is a real question,
+#                and it prints the vendor it selected.
+#
+# POSIX sh: the pod's /bin/sh is dash. `set -u` and deliberately NOT `set -e`:
+# a phase that fails is a FINDING and its log must come home.
+set -u
+cd /root/anonlib || exit 9
+OUT=/root/gemm_leg_out/two-device-par
+mkdir -p "$OUT/logs"
+G="$OUT/gate.txt"
+JOBS="${ANONLIB_COMPILE_JOBS:-8}"
+# rocminfo and rocm-smi live in /opt/rocm/bin, which the ROCm images do not
+# always put on a non-login shell's PATH.
+PATH="$PATH:/opt/rocm/bin"
+export PATH
+
+# THE THIRTEEN, and nothing else. Eleven are the matrix's nvidia-only par
+# lanes; par-forest-pool and par-rbf-sampler ride along because they are the
+# two whose two-device claim has NOT been restated since 2026-09-15 and they
+# cost about two minutes between them.
+LANES=par-boosting-clf,par-boosting-reg,par-cd-elasticnet,par-forest-et-clf,par-forest-pool,par-forest-reg,par-gram-ols,par-gram-pca,par-gram-tsvd,par-queries-nn,par-rbf-sampler,par-scaler-minmax,par-svm-svr
+
+# THE SHAPE IS THE DEFAULT ONE AND SMALL BY CONSTRUCTION. Every lane body above
+# fits in a few thousand rows (16 to 40 trees, 20 boosting rounds, 2000 SVM
+# rows, 64 query rows). This is an IDENTITY leg: no --n, no --fixtures cap, no
+# ANONLIB_IDENTITY_WIDE, because `admit` refuses a non-default fixture size
+# ("non-default fixture size or wide mode") and a capped column is not the
+# column the matrix reads. Measured cost of the eleven on a 4090, from the
+# column named above: 697 s for all nine fixtures at two repeats.
+
+T0=$(date +%s)
+# The runner's own work bound is MINUTES*60 - 600. 2900 s leaves it margin to
+# poll, fetch and terminate after this body writes its sentinel.
+BUDGET="${ANONLIB_PAR_LEG_BUDGET:-2900}"
+cap() {
+    _want=$1
+    _left=$(( T0 + BUDGET - $(date +%s) ))
+    [ "$_left" -lt 60 ] && _left=60
+    if [ "$_want" -gt "$_left" ]; then echo "$_left"; else echo "$_want"; fi
+}
+say() { echo "$@" >> "$G"; }
+run() {
+    _n=$1; shift
+    _t0=$(date +%s)
+    "$@" > "$OUT/logs/$_n.log" 2>&1
+    _e=$?
+    echo "$_n	$_e	$(( $(date +%s) - _t0 ))" >> "$OUT/status.tsv"
+    return "$_e"
+}
+say "started=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+say "budget_seconds=$BUDGET"
+say "lanes=$LANES"
+
+# THE COMMIT WITNESS, OR identity_break REFUSES TO WRITE A JSON. The box has no
+# .git (the runner ships `git archive` at a pinned sha) and the gemm payload
+# writes no commit.txt for the extra body. The runner DOES record the commit in
+# /root/gemm_leg_out/leg.txt. Take it from there, and NEVER TYPE A SHA.
+if [ ! -s /root/anonlib/commit.txt ]; then
+    _c=$(sed -n 's/^commit=//p' /root/gemm_leg_out/leg.txt 2>/dev/null | head -1 | awk '{print $1}')
+    case "$_c" in
+        [0-9a-f][0-9a-f]*) printf '%s\n' "$_c" > /root/anonlib/commit.txt ;;
+        *) say "NO COMMIT WITNESS: leg.txt gave '$_c'; every identity phase will refuse" ;;
+    esac
+fi
+say "commit=$(head -1 /root/anonlib/commit.txt 2>/dev/null)"
+
+# ------------------------------------------------------------ the box itself
+{ rocm-smi --showproductname; echo "-- driver --"; cat /sys/module/amdgpu/version 2>/dev/null;
+  echo "-- agents --"; rocminfo 2>/dev/null | grep -E 'Name:|gfx' | head -40; } > "$OUT/logs/device.txt" 2>&1
+say "device=$(rocm-smi --showproductname 2>/dev/null | tr '\n' ' ' | cut -c1-200)"
+say "amdgpu_driver=$(cat /sys/module/amdgpu/version 2>/dev/null)"
+# TWO DEVICES, COUNTED AND PRINTED, NOT ASSUMED. This is the entire reason the
+# pod costs twice what the single-device legs cost today. A box that came back
+# with one agent would run PHASE TWO as a second copy of PHASE ONE and the
+# "they agree" line would be a tautology -- the classic verification that
+# cannot fail. So the count is read here, recorded, and PHASE TWO is refused by
+# name if it is not 2.
+AGENTS=$(rocminfo 2>/dev/null | grep -c -E '^ *Name: *gfx')
+say "visible_agents=$AGENTS"
+if [ -z "${ANONLIB_GPU_ARCHS:-}" ]; then
+    ANONLIB_GPU_ARCHS=$(rocminfo 2>/dev/null | grep -m1 -oE 'gfx[0-9a-z]+')
+    export ANONLIB_GPU_ARCHS
+fi
+say "gpu_archs=${ANONLIB_GPU_ARCHS:-unset}"
+[ -n "${ANONLIB_GPU_ARCHS:-}" ] || say "NO ARCHITECTURE: every bindings/build*.sh refuses without one"
+_prod=$(rocm-smi --showproductname 2>/dev/null | sed -n 's/.*[Cc]ard [Ss]eries:[[:space:]]*//p' | head -1)
+[ -z "$_prod" ] && _prod=$(rocminfo 2>/dev/null | sed -n 's/^ *Marketing Name: *//p' | grep -i -m1 'instinct\|radeon')
+_prod=$(printf '%s' "$_prod" | tr 'A-Z ' 'a-z-' | tr -cd 'a-z0-9-' | cut -c1-24)
+[ -z "$_prod" ] && _prod=gpu
+# device_class() in python/anonlib/_verify_reference.py reads the class out of
+# this string and it must contain "amd", which it does, first. It must ALSO NOT
+# END IN "-two": admit() refuses such a column as a "two-device part" whatever
+# its par_devices says, and PHASE ONE must survive that check.
+LABEL="amd-$_prod-${ANONLIB_GPU_ARCHS:-gfx}"
+say "vendor_label=$LABEL"
+
+# ------------------------------------------------ THE R2 BINDING CACHE
+# WHY THIS AND NOT `sh bindings/X.sh`. This shape of leg spends TEN TO TWENTY
+# MINUTES COMPILING and then a few minutes doing identity work on fixtures
+# that are 20000 x 16 float32 -- 1.28 MB. Measured: 1010 s of builds against
+# 1006 s of identity run on 2026-09-14 (166 lanes, two GPUs), and 1204 s of
+# builds for 23 binding families on 2026-09-19. Three legs on 2026-09-19
+# rebuilt the SAME families at the SAME commit within hours of each other. On
+# a $4.78/h two-GPU box the compile is most of the bill.
+#
+# tools/bincache.py makes each build a content-addressed lookup in the R2
+# bucket that already holds the datasets: bincache/v1/<device arch>/<image
+# slug>/<key>.tar.gz. The key is the import closure of the entry .mojo, every
+# shell script the build execs, pixi.toml and pixi.lock, the pinned toolchain,
+# every ANONLIB_/MOJO_/MODULAR_ variable that can reach the compiler, the
+# numeric mode, the arch the box reports, the container image, the OS
+# (os-release, glibc, ld, cc), the host CPU on the machines where
+# bindings/build_*.sh does not pin --target-cpu, and the absolute repo path
+# (the rpath into .pixi is baked in). A hit is therefore
+# the binary THIS box would have produced, and the archive's manifest is
+# re-verified here against the key and the fields this box computed before a
+# single byte is placed.
+#
+# IT IS A PASS-THROUGH, NOT A DEPENDENCY. `bincache.py build X` runs `sh X`
+# unchanged when /root/.anonlib_bincache/urls.tsv is absent (the Mac did not
+# stage, because ANONLIB_BINCACHE was not 1), when ANONLIB_BINCACHE=0,
+# when the key cannot be computed, and on every miss or rejection. A cold
+# cache costs the key computation, seconds over the whole leg, and the leg
+# still builds everything from source. `command -v python3` is checked because
+# a box without one must build, not die.
+#
+# A SABOTAGE BUILD IS NEVER SERVED AS A PRODUCTION BINDING. bincache.py
+# refuses to look up or upload any build whose arguments or ANONLIB_*
+# environment mention SABOTAGE or FAULT_INJECT, unless the caller opts in with
+# ANONLIB_BINCACHE_NEGATIVE=1 -- and then the fields carry variant=sabotage,
+# so the key cannot equal a production key, and both the lookup and the upload
+# use the separate bincache/sabotage-v1/ prefix that a production build never
+# reads. THIS BODY SETS NO SABOTAGE DEFINE AND NEVER SETS THAT VARIABLE.
+BINCACHE="sh"
+if command -v python3 > /dev/null 2>&1 && [ -f tools/bincache.py ]; then
+    BINCACHE="python3 tools/bincache.py build"
+fi
+if [ -f /root/.anonlib_bincache/urls.tsv ]; then
+    _bcmap="staged entries=$(grep -c '^get' /root/.anonlib_bincache/urls.tsv)"
+else
+    _bcmap="absent (every build compiles from source)"
+fi
+say "bincache=$BINCACHE map=$_bcmap"
+
+# WHAT THE CACHE ACTUALLY DID, in the gate file, because a wiring change that
+# cannot be read back is not a fix. `hit` means no compiler ran for that
+# family; `refused:` and `miss` both compiled from source.
+bincache_report() {
+    _bcp="${ANONLIB_BINCACHE_OUT:-/root/gemm_leg_out/bincache}/provenance.tsv"
+    if [ -f "$_bcp" ]; then
+        say "bincache_outcomes=$(cut -f3 "$_bcp" | sort | uniq -c | tr '\n' ' ')"
+        say "bincache_build_seconds=$(awk -F'\t' '{s+=$5} END {printf "%.0f", s}' "$_bcp")"
+    else
+        say "bincache_outcomes=none (pass-through: no map, no python3, or ANONLIB_BINCACHE=0)"
+    fi
+}
+
+build() {
+    # shellcheck disable=SC2086  # $BINCACHE is one word or three, split on purpose
+    run "$1" timeout "$(cap 420)" env ANONLIB_NUMERIC_MODE=identical ANONLIB_SKIP_BUILD_GATE=1 \
+        ANONLIB_COMPILE_JOBS="$JOBS" $BINCACHE "bindings/$1.sh"
+}
+
+# ------------------------------------ THE HOST MATH LIBRARY, OR NOTHING IMPORTS
+run portable_math timeout "$(cap 300)" env PYTHONPATH=/root/anonlib/packaging/portable_math \
+    pixi run python -c "import pathlib, stage; stage.build(pathlib.Path('/root/anonlib/python/anonlib/.libs/libAnonlibMath.so'))"
+say "portable_math_exit=$(awk -F'	' '$1=="portable_math"{print $2}' "$OUT/status.tsv")"
+ls -l python/anonlib/.libs/ >> "$G" 2>&1
+# The probe that CAN pass here: load the library itself, by the path
+# _portable_math.py uses, with nothing else in the way.
+run libm_probe timeout "$(cap 120)" pixi run python -c \
+    "import ctypes; ctypes.CDLL('/root/anonlib/python/anonlib/.libs/libAnonlibMath.so'); print('LIBM_LOADS')"
+say "libm_probe=$(tail -1 "$OUT/logs/libm_probe.log" 2>/dev/null)"
+
+# ------------------------------------------------------------------- bindings
+# The ten that the NVIDIA column for eleven of these same lanes built and ran
+# green on 2026-09-17 (its extra_body.sh, same lane family), plus
+# build_kernel_methods for par-rbf-sampler, whose RBFSampler lives in
+# python/anonlib/kernel_methods.py and is in no other family.
+for b in build build_linalg build_estimators build_trees build_rf build_gbdt \
+         build_solver build_svm build_preprocessing build_metrics build_kernel_methods; do
+    build "$b"
+done
+say "builds_done=$(awk -F'	' '$1 ~ /^build/ && $2==0' "$OUT/status.tsv" | wc -l)"
+sha256sum python/anonlib/identical/*.so >> "$G" 2>/dev/null
+# NOW the import is a real question, and the answer is the backend this column
+# claims.
+run import_probe timeout "$(cap 180)" env ANONLIB_NUMERIC_MODE=identical PYTHONPATH=/root/anonlib/python \
+    pixi run python -c "import anonlib; print('IMPORT_OK', anonlib.vendor(), anonlib.__version__)"
+say "import_probe=$(tail -1 "$OUT/logs/import_probe.log" 2>/dev/null)"
+
+# ===================================================== PHASE ONE: THE DELIVERABLE
+# ANONLIB_PAR_DEVICES=0 -> package.par_devices="0" -> admit() returns None ->
+# tools/verification_matrix.py counts it. Default fixtures, default size, two
+# repeats in one process. No sabotage switch is set anywhere in this file.
+# It runs FIRST so that a lease that runs short still brings home the half that
+# the matrix can read.
+run column-one timeout "$(cap 1500)" env ANONLIB_NUMERIC_MODE=identical ANONLIB_PAR_DEVICES=0 \
+    PYTHONPATH=/root/anonlib/python \
+    pixi run python tools/identity_break.py --lanes "$LANES" --repeats 2 \
+    --vendor "$LABEL" --json "$OUT/$LABEL.par-one.json"
+say "column_one_exit=$(awk -F'	' '$1=="column-one"{print $2}' "$OUT/status.tsv")"
+grep -E '^cells=|^# CELL|MOVED|DIVERGENT|REFUSED|RELOAD' "$OUT/logs/column-one.log" | tail -60 >> "$G"
+say "elapsed_after_one=$(( $(date +%s) - T0 ))"
+
+# ===================================================== PHASE TWO: THE PAR CLAIM
+# ANONLIB_PAR_DEVICES=0,1 -> package.par_devices="0,1". This column is
+# INADMISSIBLE ON PURPOSE (admit: "par_devices 0,1") and is not evidence of
+# coverage; it is evidence of the drivers' equality claim, and it is worth
+# recording only because PHASE ONE above came off the same build on the same
+# box at the same commit.
+if [ "${AGENTS:-0}" -lt 2 ]; then
+    say "PHASE TWO REFUSED: rocminfo reports $AGENTS gfx agent(s); a two-device claim needs 2. Nothing was run."
+else
+    run column-two timeout "$(cap 1500)" env ANONLIB_NUMERIC_MODE=identical ANONLIB_PAR_DEVICES=0,1 \
+        PYTHONPATH=/root/anonlib/python \
+        pixi run python tools/identity_break.py --lanes "$LANES" --repeats 2 \
+        --vendor "$LABEL" --json "$OUT/$LABEL.par-two.json"
+    say "column_two_exit=$(awk -F'	' '$1=="column-two"{print $2}' "$OUT/status.tsv")"
+    grep -E '^cells=|^# CELL|MOVED|DIVERGENT|REFUSED|RELOAD' "$OUT/logs/column-two.log" | tail -60 >> "$G"
+fi
+say "elapsed_after_two=$(( $(date +%s) - T0 ))"
+
+# ============================================ PHASE DIFF: ON THE BOX, NOT AT HOME
+# The whole point of one lease. `--diff` exits non-zero on any DIVERGENT, MOVED
+# or RELOAD-MOVED cell, and it runs HERE, while the box that produced a
+# disagreement is still rented and a lane can be re-run SOLO to see whether the
+# disagreement survives being alone. Nothing else runs on this box at any point
+# in this file -- every phase is one process, in order -- so a cell that
+# disagrees here has already met that bar once.
+if [ -s "$OUT/$LABEL.par-one.json" ] && [ -s "$OUT/$LABEL.par-two.json" ]; then
+    run par_diff timeout "$(cap 300)" env ANONLIB_NUMERIC_MODE=identical PYTHONPATH=/root/anonlib/python \
+        pixi run python tools/identity_break.py --diff "$OUT/$LABEL.par-one.json" "$OUT/$LABEL.par-two.json"
+    say "par_diff_exit=$(awk -F'	' '$1=="par_diff"{print $2}' "$OUT/status.tsv")"
+    grep -E 'DIVERGENT|MOVED|REFUSED|ONE-COLUMN|NOT-COMPARED' "$OUT/logs/par_diff.log" | head -40 >> "$G"
+    # THE SOLO RE-RUN, and only for what disagreed. A lane named here is
+    # re-run one device at a time into files this leg does NOT commit; they
+    # exist so the divergence is reproduced before anyone reports it.
+    # Both diff tables put `lane/fixture` in the first pipe-delimited field;
+    # the lane is what is before the slash, and it is the unit --lanes takes.
+    #
+    # THE SELECTOR IS POSITIVE (2026-09-20). It used to be
+    # `grep -E 'DIVERGENT|MOVED'`, a list of the bad names, and that list
+    # cannot match ONE-COLUMN -- which is exactly the shape a refusing `par-*`
+    # arm produces and the shape `_verify_par.GATING` was extended to gate on
+    # after `par-queries-nn`'s batch part refused on two AMD devices for a day
+    # while every record read clean. A row is now selected unless its verdict
+    # is one of the CLEAN ones, so a verdict nobody has thought of yet is
+    # re-run rather than dropped. The verdict is the third pipe field in the
+    # train table and the fourth in the second table, which is told apart by
+    # the third field there being a lowercase part name.
+    _bad=$(awk -F'|' '
+        { lane = $2; sub(/^ +/, "", lane); sub(/ +$/, "", lane) }
+        lane !~ /^par-[a-z0-9_-]+\// { next }
+        {
+            v = $3; sub(/^ +/, "", v); sub(/ +$/, "", v)
+            if (v ~ /^[a-z]/) { v = $4; sub(/^ +/, "", v); sub(/ +$/, "", v) }
+            if (v ~ /^IDENTICAL x[0-9]+$/ || v == "N/A" || v == "NOT-COMPARED") next
+            sub(/\/.*/, "", lane); print lane
+        }' "$OUT/logs/par_diff.log" 2>/dev/null \
+        | sort -u | tr '\n' ',' | sed 's/,$//')
+    if [ -n "$_bad" ]; then
+        say "DISAGREEING LANES: $_bad -- re-running each arm SOLO before this is reported"
+        run solo_one timeout "$(cap 600)" env ANONLIB_NUMERIC_MODE=identical ANONLIB_PAR_DEVICES=0 \
+            PYTHONPATH=/root/anonlib/python pixi run python tools/identity_break.py \
+            --lanes "$_bad" --repeats 2 --vendor "$LABEL" --json "$OUT/solo-one-rerun.json"
+        run solo_two timeout "$(cap 600)" env ANONLIB_NUMERIC_MODE=identical ANONLIB_PAR_DEVICES=0,1 \
+            PYTHONPATH=/root/anonlib/python pixi run python tools/identity_break.py \
+            --lanes "$_bad" --repeats 2 --vendor "$LABEL" --json "$OUT/solo-two-rerun.json"
+        run solo_diff timeout "$(cap 300)" env ANONLIB_NUMERIC_MODE=identical PYTHONPATH=/root/anonlib/python \
+            pixi run python tools/identity_break.py --diff "$OUT/solo-one-rerun.json" "$OUT/solo-two-rerun.json"
+        say "solo_diff_exit=$(awk -F'	' '$1=="solo_diff"{print $2}' "$OUT/status.tsv")"
+    else
+        say "every compared par-* cell read IDENTICAL, N/A or NOT-COMPARED in the one-vs-two diff"
+    fi
+else
+    say "PHASE DIFF SKIPPED: one or both columns are missing or empty"
+fi
+
+# ========================== ADMISSIBILITY, WHILE THE BOX CAN STILL BE ASKED AGAIN
+# admit() is PATH SENSITIVE (_EXCLUDED_PATH_TOKENS, _EXCLUDED_BASENAME_TOKENS
+# and the quarantine prefix all read the path). Asking it here about the
+# ON-BOX path would answer a question nobody will ask again, so it is asked
+# about THE PATH THE COLUMN WILL BE COMMITTED AT. It is asked a SECOND time at
+# home, at the real path, because only that one is the claim.
+# ANONLIB_NUMERIC_MODE is set because `_verify_reference` lives INSIDE the
+# package, so reaching it runs `anonlib/__init__.py` and `_backend.select()`,
+# which refuses an unset mode on a box that has only identical bindings.
+run admit_check timeout "$(cap 120)" env ANONLIB_NUMERIC_MODE=identical \
+    PYTHONPATH=/root/anonlib/python pixi run python -c "
+import json, sys
+from anonlib import _verify_reference as vr
+base = 'bench/results/identity_break/2026-09-19_par-lane-amd-class/'
+for name, expect in (('$LABEL.par-one.json', 'ADMISSIBLE'), ('$LABEL.par-two.json', 'par_devices 0,1')):
+    try:
+        j = json.load(open('$OUT/' + name))
+    except Exception as exc:
+        print(name, 'UNREADABLE', exc); continue
+    why = vr.admit(j, base + name)
+    print(name, 'par_devices=' + str((j.get('package') or {}).get('par_devices')),
+          'cells=' + str(len(j.get('cells') or {})),
+          'admit=' + ('ADMISSIBLE' if why is None else why),
+          'EXPECTED ' + expect)
+"
+cat "$OUT/logs/admit_check.log" >> "$G" 2>/dev/null
+
+# --------------------------------------------------------------- bring it home
+cp "$OUT/logs/column-one.log" "$OUT/column-one.log" 2>/dev/null
+cp "$OUT/logs/column-two.log" "$OUT/column-two.log" 2>/dev/null
+cp "$OUT/logs/par_diff.log" "$OUT/par_diff.log" 2>/dev/null
+cat "$OUT/status.tsv" >> "$G" 2>/dev/null
+ls -l "$OUT" >> "$G" 2>/dev/null
+bincache_report
+say "finished=$(date -u +%Y-%m-%dT%H:%M:%SZ)"

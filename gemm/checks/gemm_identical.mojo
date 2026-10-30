@@ -1,0 +1,10026 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 the authors. Part of anonlib, DOI-WITHHELD
+"""The device GEMM of profile `anonlib.identical.gemm.fp32.v1`.
+
+Phase 2b of `archive/plans/IDENTICAL_GEMM_PLAN.md`'s lane charter. The contract is
+`gemm/IDENTICAL_FP32_CONTRACT.md`; the answer is
+`gemm/checks/gemm_oracle.mojo::gemm_oracle`, bit for bit, for `OP_NN`,
+`OP_NT` and `OP_TN`.
+
+**NO REFERENCE FILE.** RAFT's standalone matrix product is cuBLASLt, a closed
+library (`gemm_oracle.mojo`'s header carries the citation). What IS mirrored
+is the STRUCTURE: RAFT's `pairwise_distance_base.cuh:139-149` gives one
+thread block the entire `k` range of its output tile and walks `kidx`
+ascending, with no split-K and no cross-block combination anywhere. Plans
+`TILE_*` below are that structure with the contract's leaf partition and fold
+named on top of it.
+
+THE SEPARATION THIS FILE EXISTS TO MAKE STRUCTURAL
+---------------------------------------------------
+The charter splits the NUMERICAL PLAN (logical k leaves, product order in a
+leaf, the fold tree, FMA policy, denormal policy, accumulator precision) from
+the EXECUTION PLAN (output tiles, block and thread counts, staging,
+vectorization, the order blocks compute logical nodes in). The first may not
+vary by vendor or by launch; the second may vary freely.
+
+Here that separation is three structural facts, not three promises:
+
+1. **`_contract_partition` is the ONLY producer of `(L, P)` in this file**,
+   and it takes `k`. Not `m`, not `n`, not `ctx`, not a plan, not a block
+   size. Every kernel receives `L` and `P` as arguments and has no other way
+   to learn a leaf boundary: the words `m`, `n`, `block_dim`, `grid_dim`,
+   `block_idx` and `thread_idx` do not appear in any expression that reaches
+   `leaf_begin` / `leaf_end` or a tree level. Contract section 6.
+2. **No float ever crosses a thread boundary in the TILE_* and FLAT plans.**
+   One thread owns cell `(i, j)` and computes every one of its `k` products
+   and every one of its `P - 1` fold additions in its own registers. Shared
+   memory carries OPERANDS (a bit-exact copy of `A` and `B`), never partial
+   sums. So there is no cross-thread combination for a block size to
+   reorder, and batch invariance is a property of the shape of the kernel
+   rather than of a check that happens to pass.
+3. **The fold is a thread-private stack whose merge rule is a pure function of the
+   leaf index.** `_fold_push` merges when the level is occupied, which
+   happens exactly when the contract's tree pairs. Proven equal to
+   `fold_balanced_tree` for every `P` in `1 .. 2049` by
+   `check_stack_fold_is_the_contract_tree` in `gemm_device_check.mojo`, and
+   the argument is in `_fold_push`'s docstring. Contract section 7.2.
+   This is a source-level storage description, not a register-residency
+   guarantee: the current H100 tuned specialization has compiler local
+   storage and spills (see the September 10 GEMM resource capture).
+
+THE WORKSPACE QUESTION, CONTRACT 13.5
+--------------------------------------
+A split-K arm materializes `m * n * P` floats: 2 GB at `m = n = 4096,
+k = 4096`, 64 GB at `k = 4,000,000`. Section 6.1 forbids fixing that by
+letting `L` depend on `m` or `n`, because `m` is the batch dimension.
+
+**The DEFAULT arm here is 13.5's second escape: one block owns an output tile
+and ALL of its `k` leaves, folding in thread-private storage. It allocates no
+explicit global workspace, and `identical_gemm_workspace_floats` returns 0
+for it.** Compiler local memory is separate from that workspace budget.
+That is the right arm wherever `m * n` is large enough to fill the machine on
+its own, which is every transformer row in `bench/gemm_shapes.mojo`.
+
+The SPLITK plans are kept for the opposite shape -- small `m n`, enormous
+`k`, which is the shipped Gram aspect (`32 x 32 x 1,000,000`) -- where a
+fused arm has only `m * n` threads of parallelism and `m * n * P` is small
+precisely because `m n` is. Choosing between the arms on `m`, `n` and the
+device is legal and expected (13.5); choosing the NUMERICAL TREE on them is
+not, and nothing here does.
+
+`PLAN_SPLITK_STAGED` is a third realization and the DISPATCHER NEVER PICKS
+IT. It materializes every node of the tree and runs `D` separate fold
+launches, which is contract 13.4's "fully staged" implementation -- the one
+13.4 argues is never necessary and 13.6.2 requires to be PRICED against the
+fused one. It is in the source for that measurement and because it is the
+most distant realization of the arithmetic DAG available: no register stack,
+no threadgroup memory, every intermediate node round-tripped through DRAM.
+`check_device_is_launch_invariant` requiring it to equal `PLAN_FLAT` bit for
+bit is the strongest form of the claim this file makes.
+
+WHAT `NUMERIC_FAST` DOES HERE
+------------------------------
+Everything, with the two pins compiled away. `identical_mul_add` becomes
+`a*b + c` and `ftz` becomes the identity, so the leaf loop rounds however the
+backend's codegen decides and a denormal survives or does not according to
+the hardware. The partition, the tree, the addressing, the tiling and every
+launch are UNCHANGED -- so FAST is a correct GEMM, it is the same code on the
+same path (not dead code, and not a separate kernel), and it makes no
+identity claim. `check_device_is_launch_invariant` and
+`check_device_is_batch_invariant` are asserted in BOTH modes, because they
+are properties of the kernel's shape rather than of the arithmetic pins;
+`check_device_matches_oracle` asserts under IDENTICAL and reports under FAST,
+for the reason `core/gemm_identity_check.mojo` gives at the same seam.
+
+THE TUNED PLANS (2026-09-09)
+----------------------------
+`PLAN_TUNED_32_2X2`, `PLAN_TUNED_64_4X4` and `PLAN_TUNED_128_8X8` are the
+TILE_* arrangement with four things changed and nothing else: a thread owns
+`RPT x CPT` cells (one accumulator each, contract 7.1 per cell), operands
+are staged `VEC`-wide through two shared pages with one barrier per window,
+the operand flushes 5a/5b are applied once per staged value, and the fold
+stack lives in thread-local memory (`_fold_push_local`, touched once per
+leaf). On the NVIDIA column the per-step seam `ftz(fma(a, b, acc))` is the
+explicit NVIDIA FMA path selected by `lib_hardware_ftz_fma_for`. Its
+round-then-flush rule includes the smallest-normal rounding boundary;
+a bare `fma.rn.ftz.f32` is insufficient. `choose_gemm_plan` picks them for outputs of 128 K cells and
+up; `choose_gemm_plan_untuned` is the dispatcher as it stood before.
+
+DEVIATIONS 530 (the register-stack realization of the contract's fold tree),
+531 (the fused one-block-owns-all-k arm as the default, and the workspace
+escape it is), 532 (the SPLITK arm and its level-wise threadgroup fold over
+the normative `(d, q)` addressing).
+
+`[[mojo-buffer-freed-at-last-use]]`: every launcher here takes buffers the
+CALLER owns and the caller keeps alive past `ctx.synchronize()`.
+"""
+
+from std.gpu import block_dim, block_idx, grid_dim, thread_idx, MAX_THREADS_PER_BLOCK_METADATA, WARP_SIZE
+from std.gpu.primitives.warp import shuffle_xor
+from std.utils import StaticTuple
+from std.memory import bitcast, stack_allocation
+from std.os import getenv
+from max.gpu.host import DeviceBuffer, DeviceContext
+# DEVIATION 2630: the step phase timers and counters (core/step_phase.mojo;
+# compiled only under -D ANONLIB_STEP_PHASE_TIMERS=1).
+from core.step_phase import (
+    step_count_device_alloc,
+    step_count_launch,
+    step_count_sync,
+)
+from max.gpu.memory import AddressSpace
+from max.gpu.sync import barrier
+from std.sys import llvm_intrinsic
+from std.sys.compile import is_defined
+from experiments.apple_fast.gemm.scoped_dispatch import try_scoped_gemm
+from std.sys.defines import get_defined_int
+from std.sys.info import is_amd_gpu
+from core.apple_air import simdgroup_load_legacy_air
+from gemm.afn_apple_fast import AFN_GEMM_FP32_MMA, afn_gemm_fp32_into, afn_gemm_fp32_ragged_k_ptr_into
+from std.ffi import _Global, external_call
+from std.time import perf_counter_ns
+
+from gemm.contract import (
+    CONTRACT_MAX_LEAVES,
+    OP_NN,
+    OP_NT,
+    OP_TN,
+    contract_leaf_count,
+    contract_leaf_size,
+    fold_level_base,
+    fold_level_count,
+    fold_level_width,
+    fold_node_total,
+)
+from checks.numerics import GLOBAL_NUMERIC_MODE, NUMERIC_IDENTICAL, ftz, identical_mul_add, identical_mul_add_simd
+from checks.rtf_seam import RTF_REPAIR, rtf_mul_add
+from checks.kernel_matrix import (
+    K_LIB_GEMM_CONTRACTION,
+    COLUMN_AMD,
+    COLUMN_APPLE,
+    COLUMN_NVIDIA,
+    PINNED_ACC_COLS_PER_TH,
+    PINNED_ACC_ROWS_PER_TH,
+    PINNED_KBLK,
+    PINNED_VECLEN,
+    TARGET_COLUMN,
+    lib_block_size_for,
+    lib_hardware_ftz_fma_for,
+    lib_lane_width_for,
+    lib_smem_page_fits_for,
+    lib_smem_pages_for,
+)
+from checks.kernel_matrix_gemm import (
+    lib_gemm_stage_ftz_for,
+    lib_postround_class_flush_for,
+    lib_gemm_detect_seam_for,
+    lib_gemm_leaf_split_for,
+    lib_gemm_mfma_for,
+    lib_gemm_window_admit_for,
+    lib_gemm_kpack_narrow_for,
+    gemm_wide_split_for,
+    lib_gemm_block_parallelism_for,
+    lib_gemm_kernel_body_for,
+    lib_gemm_block_parallelism_trial_for,
+)
+
+# DEVIATION 1876 -- THE FAST ARM REACHES THE VENDOR KERNEL. See
+# `_fast_vendor_gemm` below for why these three imports are here at all.
+from layout import TileTensor
+from layout.tile_layout import row_major
+from linalg.matmul import matmul
+from linalg.gemv import gemv_gpu
+
+
+# ===========================================================================
+# THE SABOTAGE SWITCHES
+# ===========================================================================
+# OFF in every build that does not name them. Each one is a specific way to
+# break the contract that a plausible implementation could reach by accident,
+# and each exists so that the checks in `gemm_device_check.mojo` can be shown
+# to FAIL -- "a check that has never failed is a check nobody has tested".
+#
+# Build with, e.g.:
+#     tools/with_identical_mode.sh pixi run mojo run \
+#         -D ANONLIB_GEMM_SABOTAGE_LEAF_READS_LAUNCH=1 \
+#         -I . gemm/checks/gemm_device_check.mojo
+#
+#: The leaf boundary reads the LAUNCH instead of `k`: `L` is scaled by the
+#: block size. Contract section 6's first sentence, violated.
+comptime SAB_LEAF_READS_LAUNCH = is_defined[
+    "ANONLIB_GEMM_SABOTAGE_LEAF_READS_LAUNCH"
+]()
+#: The fold pairs by STRIDE (`red[t] += red[t + step]`) instead of by
+#: adjacent logical leaves. `core/pinned_reduce.mojo::pinned_block_sum`'s
+#: shape, and the one a Phase 2b kernel gets for free by letting a thread
+#: index stand in for a logical leaf index. Contract 7.2 clause 1, fixture F8.
+comptime SAB_FOLD_STRIDE = is_defined["ANONLIB_GEMM_SABOTAGE_FOLD_STRIDE"]()
+#: The odd tail is PADDED with `+0.0` instead of carried bit for bit.
+#: Contract 7.2 clause 3 and 4, fixture F7.
+comptime SAB_PAD_PLUS_ZERO = is_defined[
+    "ANONLIB_GEMM_SABOTAGE_PAD_PLUS_ZERO"
+]()
+#: The fold is SERIAL ascending over the partials -- the SUPERSEDED rule, and
+#: `core/gram_splitk.mojo::gram_splitk_reduce_kernel`'s shipped spelling.
+#: Contract 7.2, fixture F5.
+comptime SAB_FOLD_SERIAL = is_defined["ANONLIB_GEMM_SABOTAGE_FOLD_SERIAL"]()
+#: A NODE IS COMPUTED IN THE WRONG ORDER: the SPLITK leaf kernel writes its
+#: partial at the address its BLOCK arrived in rather than at its logical
+#: leaf index, so the fold pairs the wrong leaves. Contract 7.2.2 -- "the
+#: pairing is over logical leaf indices, never over physical block, warp or
+#: thread indices" -- and 7.2 clause 2.
+comptime SAB_NODE_ORDER = is_defined["ANONLIB_GEMM_SABOTAGE_NODE_ORDER"]()
+#: THE LEAF START IS ROTATED BY THE BLOCK INDEX: position `t` of the fold
+#: visits logical leaf `(t + block_idx.x) mod P` instead of leaf `t`, in every
+#: plan. The leaf ARITHMETIC and the tree are both untouched -- only WHICH
+#: leaf stands at which tree position depends on the physical block, so the
+#: same `(i, j, k)` cell folds in a different order whenever the launch puts
+#: it in a different block. That is exactly what a change of batch
+#: composition does, and it is the defect `check_device_is_batch_invariant`'s
+#: `n: 4 vs 4096` and shared-workspace arms exist to see. Contract 7.2.2 and
+#: the charter's "never of batch composition". Added 2026-08-23 for the
+#: batch-composition arms; a NO-OP in every build that does not name it.
+comptime SAB_LEAF_ROTATE = is_defined["ANONLIB_GEMM_SABOTAGE_LEAF_ROTATE"]()
+
+comptime ANY_SABOTAGE = (
+    SAB_LEAF_READS_LAUNCH
+    or SAB_FOLD_STRIDE
+    or SAB_PAD_PLUS_ZERO
+    or SAB_FOLD_SERIAL
+    or SAB_NODE_ORDER
+    or SAB_LEAF_ROTATE
+)
+
+
+def gemm_sabotage_name() -> String:
+    """Which sabotage this binary compiled with, for the check's banner."""
+    comptime if SAB_LEAF_READS_LAUNCH:
+        return String("LEAF_READS_LAUNCH")
+    comptime if SAB_FOLD_STRIDE:
+        return String("FOLD_STRIDE")
+    comptime if SAB_PAD_PLUS_ZERO:
+        return String("PAD_PLUS_ZERO")
+    comptime if SAB_FOLD_SERIAL:
+        return String("FOLD_SERIAL")
+    comptime if SAB_NODE_ORDER:
+        return String("NODE_ORDER")
+    comptime if SAB_LEAF_ROTATE:
+        return String("LEAF_ROTATE")
+    return String("none")
+
+
+# ===========================================================================
+# THE NUMERICAL PLAN'S ONE DOOR (contract section 6)
+# ===========================================================================
+
+
+#: `ceil(log2(MAX_LEAVES)) + 1` levels, plus headroom, is the depth of the
+#: register fold stack. `D = 10` at the profile cap `P = 1024`, so 12 is two
+#: spare; `check_fold_stack_depth_covers_the_profile` asserts it against
+#: `CONTRACT_MAX_LEAVES` rather than against this comment.
+comptime GEMM_FOLD_LEVELS = 12
+
+#: The width of the SIMD register the fold stack lives in. Must be >=
+#: `GEMM_FOLD_LEVELS` and a power of two.
+comptime GEMM_FOLD_SLOTS = 16
+
+# NI01/NI02/NI06 source-only arms, all default OFF. No compilation,
+# identity, quality or timing evidence was collected for this source.
+comptime _NI_GEMM_ENABLED = GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL and not is_defined["ANONLIB_IDN_ALL_OFF"]()
+comptime NI01_GEOMETRIC_WORKSPACE = _NI_GEMM_ENABLED and is_defined["ANONLIB_NI01_GEMM_GEOMETRIC_WORKSPACE"]()
+# Tried 2026-10-08 (NI02, ANONLIB_IDN_NEURAL_GEMM_SCHEDULE=3 stream_all: bounded 16-leaf partial windows for every
+# GEMM caller, run ge123e6f9): NV/AMD gemm gaussian 2.07x/1.78x, lm-train-step 1.11x/1.07x SLOWER (quality not
+# judged). Deleted (kernels, dispatch, workspace sizing, the CNN pre-check) and =3 refused; recoverable at main bc10b8b56.
+comptime NI06_ONE_PAGE = _NI_GEMM_ENABLED and is_defined["ANONLIB_NI06_GEMM_ONE_PAGE"]()
+
+
+def contract_partition(k: Int) -> Tuple[Int, Int]:
+    """**THE ONLY PLACE `(L, P)` IS PRODUCED IN THIS FILE.** Contract 6.
+
+    It takes `k`. There is no overload that takes `m`, `n`, a plan, a block
+    size, a `DeviceContext` or a device, and every launcher below calls this
+    and passes the two results through as kernel arguments. That is what
+    makes "launch geometry cannot reach the arithmetic" a property of the
+    call graph instead of a claim in a comment: to move a leaf boundary you
+    would have to add an argument to this function, and there is exactly one
+    line to look at.
+
+    Both values come from `gemm_oracle`'s own functions -- imported, not
+    re-derived -- so the kernel and the oracle cannot hold two opinions
+    about the partition. A second spelling of the leaf rule would be a
+    second thing that can be wrong, and the shape table already shipped one
+    such re-spelling and got it wrong (`bench/gemm_shapes.mojo`'s header).
+    """
+    return (contract_leaf_size(k), contract_leaf_count(k))
+
+
+def gemm_operand_strides(op: Int, m: Int, n: Int, k: Int) -> Tuple[Int, Int, Int, Int]:
+    """`(a_si, a_sp, b_sp, b_sj)`: contract section 3's four lines, as strides.
+
+        A_eff[i, p] = a[i * a_si + p * a_sp]
+        B_eff[p, j] = b[p * b_sp + j * b_sj]
+
+    and the contract's four cases are exactly
+
+        OP_NN, OP_NT :  A is m x k row-major  ->  (a_si, a_sp) = (k, 1)
+        OP_TN        :  A is k x m row-major  ->  (a_si, a_sp) = (1, m)
+        OP_NN, OP_TN :  B is k x n row-major  ->  (b_sp, b_sj) = (n, 1)
+        OP_NT        :  B is n x k row-major  ->  (b_sp, b_sj) = (1, k)
+
+    **Strides rather than a branch inside the k loop, and it is the same
+    arithmetic.** Contract section 3 requires the three orientations to be
+    ONE numerical implementation differing only in the two index
+    expressions; a stride pair IS that index expression with the `if` lifted
+    to the host, so the inner loop is character for character identical
+    across the three ops and cannot round differently.
+    `check_strides_match_the_contract_addressing` asserts the four lines
+    element by element against the contract's own spelling.
+    """
+    var a_si = k
+    var a_sp = 1
+    if op == OP_TN:
+        a_si = 1
+        a_sp = m
+    var b_sp = n
+    var b_sj = 1
+    if op == OP_NT:
+        b_sp = 1
+        b_sj = k
+    return (a_si, a_sp, b_sp, b_sj)
+
+
+# ===========================================================================
+# THE FOLD, IN REGISTERS (contract section 7.2)
+# ===========================================================================
+
+
+def _fold_push(
+    mut stack: SIMD[DType.float32, GEMM_FOLD_SLOTS],
+    mut occ: Int,
+    value: Float32,
+) -> Bool:
+    """Push leaf partial `t` into the balanced tree. Returns False on overflow.
+
+    **THIS IS THE CONTRACT'S TREE, NOT AN APPROXIMATION OF IT**, and the
+    argument is short enough to check.
+
+    `occ` is a bitmask: bit `d` set means slot `d` holds a completed node of
+    level `d`, which by construction covers a FULL block of `2^d` consecutive
+    leaves ending just before the leaf about to be pushed. Pushing merges
+    upward while the level is occupied. So a merge at level `d` combines the
+    node covering `[q*2^d, (q+1)*2^d)` with the node covering
+    `[(q+1)*2^d, (q+2)*2^d)` -- adjacent, ascending, in logical leaf order,
+    which is `node(d+1, q/2) = node(d, 2q') + node(d, 2q'+1)`.
+
+    An UNPAIRED leaf never merges: it sits in its slot and is combined only
+    at drain time. That is the contract's CARRY -- a bit-for-bit copy with no
+    arithmetic -- realized as "no instruction at all", which is the strongest
+    form of it. There is no padding anywhere in this function and no `+0.0`
+    is ever added.
+
+    THE TREE IS THEREFORE A PURE FUNCTION OF `t` AND `P`, and `P` is a pure
+    function of `k` (contract section 6). Nothing here reads a block size, a
+    thread index, a lane width or a vendor, and there is nothing in scope
+    that could.
+
+    Proven, not argued: `check_stack_fold_is_the_contract_tree` runs this
+    spelling against `gemm_oracle.fold_balanced_tree` for every `P` in
+    `1 .. 2049` on hashed partials and requires bit equality at every one.
+
+    Contract sections 5 (rows 5e, 5f), 7.2 and 7.3.
+    """
+    var val = value
+    var placed = False
+    comptime for d in range(GEMM_FOLD_LEVELS):
+        if not placed:
+            if ((occ >> d) & 1) == 1:
+                comptime if SAB_FOLD_STRIDE:
+                    # SABOTAGE: pair the far end of the level instead of the
+                    # adjacent node -- `pinned_block_sum`'s stride shape.
+                    val = ftz(ftz(val) + ftz(stack[GEMM_FOLD_LEVELS - 1 - d]))
+                else:
+                    # THE ARITHMETIC NODE. Contract 5e (both children
+                    # flushed as read) and 5f (the node's own result
+                    # flushed). The occupied slot holds the EARLIER leaves,
+                    # so it is the left operand.
+                    val = ftz(ftz(stack[d]) + ftz(val))
+                occ = occ - (1 << d)
+            else:
+                stack[d] = val
+                occ = occ + (1 << d)
+                placed = True
+    return placed
+
+
+def _fold_drain(
+    stack: SIMD[DType.float32, GEMM_FOLD_SLOTS], occ: Int
+) -> Float32:
+    """Combine the leftover slots into the root, LOWEST LEVEL FIRST.
+
+    At the end of the push sequence the occupied slots are the set bits of
+    `P`, and slot `d` holds the pairwise sum of a full `2^d` block. The
+    contract's root is `node(D, 0)`, which unrolls as
+    `full_block(d_max) + (the same construction on the remainder)` -- so the
+    remainder is accumulated first and each larger block joins on its left.
+    That is this loop, ascending `d`.
+
+    **`P == 1` performs NO addition** (contract 7.3): one slot is occupied,
+    `have` is False on the only iteration that fires, and the value is
+    returned unchanged. The `-0.0` of section 9.2(b) survives, and this is
+    the case where the rule and the "optimization" coincide, so there is
+    nothing to get wrong.
+
+    `P == 0` (`k == 0`) returns `+0.0` and the caller STORES it -- contract
+    section 8 requires the value to be written, not the store to be skipped.
+    """
+    var have = False
+    var acc = Float32(0.0)
+    comptime for d in range(GEMM_FOLD_LEVELS):
+        if ((occ >> d) & 1) == 1:
+            if have:
+                acc = ftz(ftz(stack[d]) + ftz(acc))
+            else:
+                acc = stack[d]
+                have = True
+    return acc
+
+
+# ===========================================================================
+# PLAN NAMES (EXECUTION PLAN ONLY -- none of these can move a bit)
+# ===========================================================================
+# Every plan below computes `gemm_oracle`. They differ in which thread owns
+# which cell, how many threads a block has, what the grid looks like, whether
+# operands are staged through threadgroup memory, what order blocks take
+# tiles in, and whether the fold runs in registers, in one threadgroup
+# launch, or in `D` separate global launches.
+# `check_device_is_launch_invariant` requires all eight to produce the same
+# bits, and that check is the reason the profile exists.
+
+comptime PLAN_FLAT = 0
+comptime PLAN_TILE_16_16_32 = 1
+comptime PLAN_TILE_8_32_32 = 2
+comptime PLAN_TILE_32_8_16 = 3
+comptime PLAN_TILE_16_16_8_REV = 4
+comptime PLAN_TILE_4_4_32_TSP = 5
+comptime PLAN_SPLITK = 6
+comptime PLAN_SPLITK_STAGED = 7
+#: The register-blocked plans (2026-09-09): one block owns a BM x BN tile,
+#: each thread RPT x CPT cells, operands staged VEC-wide through two shared
+#: pages, the fold stack in thread-local memory. Same partition, same tree,
+#: same seams as TILE_*; `check_device_is_launch_invariant` holds them to
+#: FLAT's bits. TOTAL at every shape (masking, k == 0, P up to the cap).
+comptime PLAN_TUNED_32_2X2 = 8
+comptime PLAN_TUNED_64_4X4 = 9
+comptime PLAN_TUNED_128_8X8 = 10
+#: The SPLIT plans (2026-09-09, the split-K lane): the SAME tuned kernel with
+#: the grid's y axis over the `P` logical leaves. One block owns a `BM x BN`
+#: tile of ONE leaf, stages that leaf's windows through shared memory exactly
+#: as the tuned plans do, and writes the leaf partial `ftz(acc)` (5d) to the
+#: workspace at `[t * m * n + cell]`; `identical_gemm_fold_stack_kernel`
+#: then folds each cell's `P` partials through `_fold_push`, the register
+#: stack the FLAT plan uses. Contract 13.5's first escape ("tile the OUTPUT
+#: and run one tile's split-K"), with the leaf stage of the tuned plans and
+#: the fold of the FLAT plan: no new arithmetic anywhere. They exist for the
+#: shapes whose output cannot fill the machine (small `m n`, and the decode
+#: rows `m <= 8`), where `PLAN_SPLITK`'s leaf kernel reads every operand
+#: uncoalesced (50 ms at `gram.32x32x1M` on an H100 against cuBLAS's 0.24).
+comptime PLAN_SPLIT_32_2X2 = 11
+comptime PLAN_SPLIT_16_1X1 = 12
+comptime PLAN_SPLIT_1X256 = 13
+comptime PLAN_SPLIT_8X64 = 14
+#: 64x64 reg4x4 split tile for the 64 <= m, n outputs under the tuned floor
+#: (gram.128sq: 4 tiles x 782 leaves instead of 16 x 782 on 32x32).
+comptime PLAN_SPLIT_64_4X4 = 15
+#: The task-4 probes: the two wide tuned plans at KS = 32 (RAFT's Kblk).
+#: Two pages of a 64x64 pair is 37 KB (fits NVIDIA and AMD, one page on
+#: Apple); a 128x128 pair is 37 KB a page, one page on NVIDIA and AMD and
+#: none under 32 KB, where the probe resolves to KS = 16 (`TUNED_128_KS`).
+#: `choose_gemm_plan` does not pick them; the forced-plan sweep times them.
+comptime PLAN_TUNED_64_4X4_K32 = 16
+comptime PLAN_TUNED_128_8X8_K32 = 17
+#: Wider split tile, retaining each leaf's ascending arithmetic and fold.
+#: KS=16 keeps its shared page within every column's memory limit.
+comptime PLAN_SPLIT_128_8X8 = 18
+#: Forced-only tile-visitation experiment; same kernel and arithmetic as plan 10.
+comptime PLAN_TUNED_128_8X8_TSP = 19
+#: Apple only: admitted windows on the simdgroup matrix path (`APPLE_MMA`).
+comptime PLAN_APPLE_MMA = 20
+#: Apple only (lane/cnn-apple2): `PLAN_APPLE_MMA`'s kernel over aligned
+#: power-of-two leaf groups on grid.y, the nodes folded by the SPLIT fold.
+#: Forced only (x_cnn's measured weight-gradient plan); outside the
+#: `range(GEMM_PLAN_COUNT)` sweeps like plan 20.
+comptime PLAN_APPLE_MMA_SPLIT = 21
+#: The same over the default (64x64) tile: twice the arithmetic per staged
+#: word, for outputs with enough tiles.
+comptime PLAN_APPLE_MMA_SPLIT_BIG = 22
+comptime GEMM_PLAN_COUNT = 20
+
+#: Threads per block for `PLAN_FLAT`. SCHEDULING: each thread owns a whole
+#: output cell, so this moves WHICH thread computes a cell and never the
+#: order any cell is accumulated in.
+comptime FLAT_TPB = 256
+#: Threads per block for the SPLITK leaf-partial kernel. Same argument.
+comptime SPLITK_LEAF_TPB = 128
+#: Apple only (lane/linear-apple2): the SPLITK leaf loads its operands
+#: LEAF_PREFETCH steps ahead of the chain (SCHEDULING: the chain's steps and
+#: their order are unchanged). -D ANONLIB_APPLE_LEAF_PREFETCH_OFF=1 restores
+#: the one-load-per-step loop.
+comptime APPLE_LEAF_PREFETCH = (
+    TARGET_COLUMN == COLUMN_APPLE
+    and not is_defined["ANONLIB_APPLE_LEAF_PREFETCH_OFF"]()
+)
+comptime LEAF_PREFETCH = 16
+#: The SPLITK leaf launch's block size: 32 on Apple (lane/linear-apple2), so a
+#: 1 x 1 x 1M dot's 1024 leaf chains spread over 32 GPU cores instead of 8.
+#: SCHEDULING only (the leaf index comes from the flat work index).
+comptime SPLITK_LEAF_LAUNCH_TPB = 32 if APPLE_LEAF_PREFETCH else SPLITK_LEAF_TPB
+#: Threads per block for the SPLITK fold kernel: one BLOCK per output cell,
+#: cooperating over the nodes of one tree level. The level WIDTHS come from
+#: `P` alone (contract 7.2.2); this number only decides how the nodes of a
+#: level are handed out.
+comptime SPLITK_FOLD_TPB = 256
+
+#: Tile order permutations. Each is an exact bijection on `[0, n_tiles)`, so
+#: every tile is computed exactly once whichever is chosen; which BLOCK
+#: computes which tile is the "order blocks compute logical nodes in" that
+#: the charter puts on the execution-plan side of the table.
+comptime SWIZZLE_NONE = 0
+comptime SWIZZLE_REVERSE = 1
+comptime SWIZZLE_TRANSPOSE = 2
+
+
+def gemm_plan_name(plan: Int) -> String:
+    if plan == PLAN_FLAT:
+        return String("FLAT(1 thread/cell, tpb=256, 1-D grid)")
+    if plan == PLAN_TILE_16_16_32:
+        return String("TILE 16x16 KS=32 (256 thr, 1-D grid, no swizzle)")
+    if plan == PLAN_TILE_8_32_32:
+        return String("TILE 8x32 KS=32 (256 thr, 2-D grid, no swizzle)")
+    if plan == PLAN_TILE_32_8_16:
+        return String("TILE 32x8 KS=16 (256 thr, 1-D grid, reversed tiles)")
+    if plan == PLAN_TILE_16_16_8_REV:
+        return String("TILE 16x16 KS=8 (256 thr, 2-D grid, transposed tiles)")
+    if plan == PLAN_TILE_4_4_32_TSP:
+        return String("TILE 4x4 KS=32 (16 thr, 1-D grid, transposed tiles)")
+    if plan == PLAN_SPLITK:
+        return String("SPLITK(leaf kernel -> global workspace -> level-wise threadgroup fold)")
+    if plan == PLAN_SPLITK_STAGED:
+        return String("SPLITK_STAGED(leaf kernel -> D separate global fold-level launches -> emit)")
+    if plan == PLAN_TUNED_32_2X2:
+        return _tuned_plan_name(TUNED_RPT // 2, TUNED_CPT // 2, 16)
+    if plan == PLAN_TUNED_64_4X4:
+        return _tuned_plan_name(TUNED_RPT, TUNED_CPT, TUNED_64_KS)
+    if plan == PLAN_TUNED_128_8X8:
+        return _tuned_plan_name(TUNED_RPT * 2, TUNED_CPT * 2, 16)
+    if plan == PLAN_TUNED_64_4X4_K32:
+        return _tuned_plan_name(TUNED_RPT, TUNED_CPT, TUNED_KBLK)
+    if plan == PLAN_TUNED_128_8X8_TSP:
+        return _tuned_plan_name(TUNED_RPT * 2, TUNED_CPT * 2, 16, True)
+    if plan == PLAN_APPLE_MMA_SPLIT:
+        return String("APPLE_MMA_SPLIT ") + String(_AMMA_SPLIT_BM) + "x" + String(_AMMA_SPLIT_BN) + " KB=" + String(APPLE_MMA_KB) + " (leaf groups on grid.y -> workspace -> fold)"
+    if plan == PLAN_APPLE_MMA_SPLIT_BIG:
+        return String("APPLE_MMA_SPLIT ") + String(APPLE_MMA_BM) + "x" + String(APPLE_MMA_BN) + " KB=" + String(APPLE_MMA_KB) + " (leaf groups on grid.y -> workspace -> fold)"
+    if plan == PLAN_APPLE_MMA:
+        return String("APPLE_MMA ") + String(APPLE_MMA_BM) + "x" + String(APPLE_MMA_BN) + " KB=" + String(APPLE_MMA_KB) + " (simdgroup matrix on admitted windows, rtf elsewhere)"
+    if plan == PLAN_TUNED_128_8X8_K32:
+        return _tuned_plan_name(TUNED_RPT * 2, TUNED_CPT * 2, TUNED_128_KS)
+    if plan == PLAN_SPLIT_128_8X8:
+        return _split_plan_name(TUNED_RPT * 2, TUNED_CPT * 2, TUNED_TC, 16)
+    if plan == PLAN_SPLIT_64_4X4:
+        return _split_plan_name(TUNED_RPT, TUNED_CPT, TUNED_TC, TUNED_KBLK)
+    if plan == PLAN_SPLIT_32_2X2:
+        return _split_plan_name(TUNED_RPT // 2, TUNED_CPT // 2, TUNED_TC, TUNED_KBLK)
+    if plan == PLAN_SPLIT_16_1X1:
+        return _split_plan_name(1, 1, TUNED_TC, TUNED_KBLK)
+    if plan == PLAN_SPLIT_1X256:
+        return _split_plan_name(1, 1, TUNED_TPB, 16)
+    if plan == PLAN_SPLIT_8X64:
+        return _split_plan_name(1, 2, TUNED_TPB // 8, 16)
+    return String("PLAN?")
+
+
+def _split_plan_name(rpt: Int, cpt: Int, tc: Int, ks: Int) -> String:
+    """Built from the resolved constants, never a literal."""
+    var name = String("SPLIT ") + String(rpt * (TUNED_TPB // tc))
+    name += "x" + String(cpt * tc)
+    name += " reg" + String(rpt) + "x" + String(cpt)
+    name += " KS=" + String(ks)
+    name += " leaves on grid.y -> workspace -> fold (block per cell <= "
+    name += String(SPLIT_BLOCK_FOLD_MAX_CELLS) + ", else register stack)"
+    name += " tpb=" + String(TUNED_TPB)
+    name += " hwftz=" + String(TUNED_HW_FTZ_FMA)
+    return name + " (256 thr, 2-D grid, no swizzle)"
+
+
+def _tuned_plan_name(rpt: Int, cpt: Int, ks: Int, transpose: Bool = False) -> String:
+    """Built from the resolved kernel-matrix constants, never a literal."""
+    var name = String("TUNED ") + String(rpt * TUNED_TR)
+    name += "x" + String(cpt * TUNED_TC)
+    name += " reg" + String(rpt) + "x" + String(cpt)
+    name += " KS=" + String(ks) + " fold=" + String(TUNED_FOLD_SLOTS) + " local"
+    name += " tpb=" + String(TUNED_TPB)
+    name += " hwftz=" + String(TUNED_HW_FTZ_FMA)
+    return name + (" (1-D grid, transposed tiles)" if transpose else " (1-D grid, no swizzle)")
+
+
+# ===========================================================================
+# THE LEAF LOOP (contract sections 4, 5, 7.1)
+# ===========================================================================
+
+
+def _leaf_bounds(t: Int, leaf: Int, k: Int) -> Tuple[Int, Int]:
+    """Leaf `t` covers `[t*L, min((t+1)*L, k))`. Contract sections 6 and 8.
+
+    Only the LAST leaf is ever short and by section 6.2 none is ever empty.
+    NO PADDING: the ragged leaf is masked by `pe`, never extended with zeros
+    (section 8 forbids a padded operand because `0.0 * 0.0` is not inert for
+    the signed-zero and NaN cases of section 9).
+
+    `leaf` and `k` are the only inputs. That is the clause.
+    """
+    var pb = t * leaf
+    var pe = pb + leaf
+    if pe > k:
+        pe = k
+    return (pb, pe)
+
+
+def _leaf_at(t: Int, p_count: Int) -> Int:
+    """The logical leaf that stands at fold position `t`. **The identity**,
+    and it exists only so that `SAB_LEAF_ROTATE` has one place to break it
+    in every plan: under the sabotage it is `(t + block_idx.x) mod P`, and
+    the block a cell was scheduled in decides its summation order."""
+    comptime if SAB_LEAF_ROTATE:
+        if p_count > 0:
+            return (t + Int(block_idx.x)) % p_count
+    return t
+
+
+# ===========================================================================
+# PLAN FLAT: one thread per output cell, its whole k range, no staging
+# ===========================================================================
+
+
+@always_inline
+def _flat_cell_body(
+    c: MutPointer[Float32, MutAnyOrigin],
+    a: MutPointer[Float32, MutAnyOrigin],
+    b: MutPointer[Float32, MutAnyOrigin],
+    m_in: Int32,
+    n_in: Int32,
+    k_in: Int32,
+    leaf_in: Int32,
+    p_in: Int32,
+    a_si_in: Int32,
+    a_sp_in: Int32,
+    b_sp_in: Int32,
+    b_sj_in: Int32,
+    cell_in: Int32,
+):
+    """`C[i, j]` for one thread: every leaf, then the tree, all in registers.
+
+    The simplest realization of the profile and the reference the tiled plans
+    are checked against. No shared memory, no cross-thread anything: the
+    launch decides only which linear index this thread holds.
+
+    `leaf_in` and `p_in` come from `contract_partition(k)` and from nowhere
+    else. This kernel cannot compute a leaf boundary from anything but them.
+    """
+    var m = Int(m_in)
+    var n = Int(n_in)
+    var k = Int(k_in)
+    var leaf = Int(leaf_in)
+    var p_count = Int(p_in)
+    var a_si = Int(a_si_in)
+    var a_sp = Int(a_sp_in)
+    var b_sp = Int(b_sp_in)
+    var b_sj = Int(b_sj_in)
+
+    comptime if SAB_LEAF_READS_LAUNCH:
+        # SABOTAGE: the leaf boundary reads the LAUNCH. Contract section 6's
+        # first sentence forbids exactly this.
+        leaf = leaf * Int(block_dim.x) // 64
+        if leaf < 1:
+            leaf = 1
+        p_count = (k + leaf - 1) // leaf
+        if k <= 0:
+            p_count = 0
+
+    var cell = Int(cell_in)
+    if cell >= m * n:
+        return
+    var i = cell // n
+    var j = cell - i * n
+
+    var stack = SIMD[DType.float32, GEMM_FOLD_SLOTS](0.0)
+    var occ = 0
+    var serial = Float32(0.0)
+    var a_row = i * a_si
+    var b_col = j * b_sj
+    for t in range(p_count):
+        var bounds = _leaf_bounds(_leaf_at(t, p_count), leaf, k)
+        var acc = Float32(0.0)
+        for p in range(bounds[0], bounds[1]):
+            # Contract 7.1: ascending `p`, one `identical_mul_add` per step,
+            # operands flushed as loaded (5a, 5b) and the accumulator flushed
+            # after every step (5c). No sub-partition of a leaf -- section
+            # 7.1's clause about register tiling and vectorization.
+            acc = rtf_mul_add(
+                ftz(a.unsafe_load(a_row + p * a_sp)),
+                ftz(b.unsafe_load(p * b_sp + b_col)),
+                acc,
+            )
+        # 5d: the leaf partial as written.
+        var part = ftz(acc)
+        comptime if SAB_FOLD_SERIAL:
+            # SABOTAGE: the SUPERSEDED serial ascending fold.
+            serial = ftz(ftz(serial) + ftz(part))
+        else:
+            _ = _fold_push(stack, occ, part)
+    comptime if SAB_PAD_PLUS_ZERO:
+        # SABOTAGE: pad the level-0 width up to the next power of two with
+        # `+0.0` instead of carrying the odd tail. Contract 7.2 clause 4.
+        var padded = 1
+        while padded < p_count:
+            padded = padded * 2
+        for _pad in range(p_count, padded):
+            _ = _fold_push(stack, occ, Float32(0.0))
+    var out = _fold_drain(stack, occ)
+    comptime if SAB_FOLD_SERIAL:
+        out = serial
+    # 5g: the output cell as stored. At `P == 1` this is the ONLY operation
+    # between the leaf partial and memory (contract 7.3); at `P == 0` it
+    # stores the `+0.0` section 8 requires to be written rather than skipped.
+    c.unsafe_store(cell, ftz(out))
+
+
+def identical_gemm_flat_kernel(
+    c: MutPointer[Float32, MutAnyOrigin],
+    a: MutPointer[Float32, MutAnyOrigin],
+    b: MutPointer[Float32, MutAnyOrigin],
+    m_in: Int32,
+    n_in: Int32,
+    k_in: Int32,
+    leaf_in: Int32,
+    p_in: Int32,
+    a_si_in: Int32,
+    a_sp_in: Int32,
+    b_sp_in: Int32,
+    b_sj_in: Int32,
+):
+    # Shared per-cell arithmetic; grid changes only select a cell/job.
+    var cell = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    _flat_cell_body(c,a,b,m_in,n_in,k_in,leaf_in,p_in,a_si_in,a_sp_in,
+                    b_sp_in,b_sj_in,Int32(cell))
+
+
+# ===========================================================================
+# PLAN TILE_*: one block owns a TM x TN output tile and ALL of its k leaves
+# ===========================================================================
+
+
+def identical_gemm_tiled_kernel[
+    TM: Int, TN: Int, KS: Int
+](
+    c: MutPointer[Float32, MutAnyOrigin],
+    a: MutPointer[Float32, MutAnyOrigin],
+    b: MutPointer[Float32, MutAnyOrigin],
+    m_in: Int32,
+    n_in: Int32,
+    k_in: Int32,
+    leaf_in: Int32,
+    p_in: Int32,
+    a_si_in: Int32,
+    a_sp_in: Int32,
+    b_sp_in: Int32,
+    b_sj_in: Int32,
+    swizzle_in: Int32,
+):
+    """RAFT's structure: one block owns a `TM x TN` output tile and the whole
+    `k` range of it. Contract 13.5's second workspace escape -- NO GLOBAL
+    SCRATCH AT ANY SHAPE.
+
+    Operands are staged through threadgroup memory in `KS`-wide k windows.
+    **Threadgroup memory carries OPERANDS, never partial sums**, and a
+    staging copy is bit-exact, so the value this thread flushes and
+    multiplies is the same float `A_eff[i, p]` the FLAT plan loads straight
+    from DRAM. `TM`, `TN` and `KS` are therefore pure execution plan: they
+    change which thread owns a cell and how many DRAM transactions serve it,
+    and they cannot change the sequence of values accumulated into it.
+
+    THE STAGING WINDOW IS NOT A LEAF, and the loop nest is written to make
+    that impossible to confuse: the OUTER loop is over logical leaves `t`
+    (from `leaf` and `k` alone) and the staging window is the INNER loop,
+    clamped to the leaf's end. So a `KS` of 8 and a `KS` of 32 walk the same
+    leaf in a different number of windows and accumulate into the same
+    register in the same order. `check_device_is_launch_invariant` runs both.
+
+    Every thread of the block reaches every `barrier()`: the loop bounds are
+    functions of `t`, `leaf`, `k` and `KS`, which are block-uniform, and a
+    thread whose cell is out of range still stages and still barriers, and
+    only its final STORE is masked. `[[metal-hardware-gaps]]`: no block
+    reduction primitive is used anywhere, so nothing here carries the
+    `Block size must be greater than warp size` constraint.
+    """
+    var m = Int(m_in)
+    var n = Int(n_in)
+    var k = Int(k_in)
+    var leaf = Int(leaf_in)
+    var p_count = Int(p_in)
+    var a_si = Int(a_si_in)
+    var a_sp = Int(a_sp_in)
+    var b_sp = Int(b_sp_in)
+    var b_sj = Int(b_sj_in)
+    var swizzle = Int(swizzle_in)
+
+    comptime if SAB_LEAF_READS_LAUNCH:
+        leaf = leaf * Int(block_dim.x) // 64
+        if leaf < 1:
+            leaf = 1
+        p_count = (k + leaf - 1) // leaf
+        if k <= 0:
+            p_count = 0
+
+    comptime NTH = TM * TN
+    var as_ = stack_allocation[
+        TM * KS, Scalar[DType.float32], address_space = AddressSpace.SHARED
+    ]()
+    var bs_ = stack_allocation[
+        KS * TN, Scalar[DType.float32], address_space = AddressSpace.SHARED
+    ]()
+
+    var tiles_i = (m + TM - 1) // TM
+    var tiles_j = (n + TN - 1) // TN
+    var n_tiles = tiles_i * tiles_j
+    var raw = Int(block_idx.y) * Int(grid_dim.x) + Int(block_idx.x)
+    if raw >= n_tiles:
+        return
+    # The tile permutation: an EXACT bijection, so every tile runs once.
+    var tile = raw
+    if swizzle == SWIZZLE_REVERSE:
+        tile = n_tiles - 1 - raw
+    elif swizzle == SWIZZLE_TRANSPOSE:
+        tile = (raw % tiles_i) * tiles_j + (raw // tiles_i)
+    var ti = tile // tiles_j
+    var tj = tile - ti * tiles_j
+    var i0 = ti * TM
+    var j0 = tj * TN
+
+    var tid = Int(thread_idx.x)
+    var r = tid // TN
+    var s = tid - r * TN
+    var gi = i0 + r
+    var gj = j0 + s
+
+    var stack = SIMD[DType.float32, GEMM_FOLD_SLOTS](0.0)
+    var occ = 0
+    var serial = Float32(0.0)
+
+    for t in range(p_count):
+        var bounds = _leaf_bounds(_leaf_at(t, p_count), leaf, k)
+        var pe = bounds[1]
+        var acc = Float32(0.0)
+        var p = bounds[0]
+        while p < pe:
+            var chunk = pe - p
+            if chunk > KS:
+                chunk = KS
+            # Stage A_eff[i0 .. i0+TM, p .. p+chunk). `KS` is comptime, so
+            # `idx // KS` is a shift; slots past `chunk` are written zero and
+            # never read, which is staging hygiene and NOT operand padding --
+            # the accumulation loop below runs `chunk` steps, not `KS`.
+            var ia = tid
+            while ia < TM * KS:
+                var rr = ia // KS
+                var cc = ia - rr * KS
+                var v = Float32(0.0)
+                if i0 + rr < m and cc < chunk:
+                    v = a.unsafe_load((i0 + rr) * a_si + (p + cc) * a_sp)
+                as_[unsafe_offset=ia] = v
+                ia += NTH
+            var ib = tid
+            while ib < KS * TN:
+                var cc2 = ib // TN
+                var ss = ib - cc2 * TN
+                var v2 = Float32(0.0)
+                if j0 + ss < n and cc2 < chunk:
+                    v2 = b.unsafe_load((p + cc2) * b_sp + (j0 + ss) * b_sj)
+                bs_[unsafe_offset=ib] = v2
+                ib += NTH
+            barrier()
+            for cc3 in range(chunk):
+                # Contract 7.1 again, character for character the FLAT
+                # plan's step with the two loads served from threadgroup
+                # memory. Seams 5a, 5b, 5c.
+                acc = rtf_mul_add(
+                    ftz(as_[unsafe_offset = r * KS + cc3]),
+                    ftz(bs_[unsafe_offset = cc3 * TN + s]),
+                    acc,
+                )
+            barrier()
+            p += chunk
+        var part = ftz(acc)
+        comptime if SAB_FOLD_SERIAL:
+            serial = ftz(ftz(serial) + ftz(part))
+        else:
+            _ = _fold_push(stack, occ, part)
+
+    comptime if SAB_PAD_PLUS_ZERO:
+        var padded = 1
+        while padded < p_count:
+            padded = padded * 2
+        for _pad in range(p_count, padded):
+            _ = _fold_push(stack, occ, Float32(0.0))
+
+    var out = _fold_drain(stack, occ)
+    comptime if SAB_FOLD_SERIAL:
+        out = serial
+    if gi < m and gj < n:
+        c.unsafe_store(gi * n + gj, ftz(out))
+
+
+# ===========================================================================
+# PLAN SPLITK: named partials into a predetermined workspace, then a fold
+# ===========================================================================
+# `core/gram_splitk.mojo`'s architecture, with v1's numerical policy instead
+# of that file's (which pins a chunk COUNT and folds SERIALLY, and stays that
+# way as its own profile -- archive/plans/IDENTICAL_GEMM_PLAN.md's LANE BOUNDARY item 2).
+
+
+def identical_gemm_leaf_kernel(
+    ws: MutPointer[Float32, MutAnyOrigin],
+    a: MutPointer[Float32, MutAnyOrigin],
+    b: MutPointer[Float32, MutAnyOrigin],
+    m_in: Int32,
+    n_in: Int32,
+    k_in: Int32,
+    leaf_in: Int32,
+    p_in: Int32,
+    a_si_in: Int32,
+    a_sp_in: Int32,
+    b_sp_in: Int32,
+    b_sj_in: Int32,
+    stride_in: Int32,
+):
+    """Level 0 of the tree: every `(cell, leaf)` partial, at its PREDETERMINED
+    address `ws[cell * stride + t]`. Contract 7.2.2.
+
+    `stride` is the per-cell block of the workspace: `P` when only level 0 is
+    materialized (`PLAN_SPLITK`, whose fold keeps the upper levels in
+    threadgroup memory) and `fold_node_total(P)` when EVERY level is
+    materialized (`PLAN_SPLITK_STAGED`). It is a LAYOUT number and the only
+    thing it changes is where a node lives, never which node is added to
+    which -- contract 7.2.2's "the (d, q) pair is the normative address; the
+    flat integer is one legal layout of it".
+
+    `t` is the LOGICAL leaf index, derived from the flat work index and never
+    from `block_idx`. That distinction is the whole of contract 7.2 clause 2,
+    and `SAB_NODE_ORDER` is the version that gets it wrong.
+
+    Blocks may run in any order and any number of them may be resident: each
+    partial has one writer and one address, so the workspace after the launch
+    is the same array of floats whatever the schedule was.
+    """
+    var m = Int(m_in)
+    var n = Int(n_in)
+    var k = Int(k_in)
+    var leaf = Int(leaf_in)
+    var p_count = Int(p_in)
+    var a_si = Int(a_si_in)
+    var a_sp = Int(a_sp_in)
+    var b_sp = Int(b_sp_in)
+    var b_sj = Int(b_sj_in)
+    var stride = Int(stride_in)
+
+    comptime if SAB_LEAF_READS_LAUNCH:
+        leaf = leaf * Int(block_dim.x) // 64
+        if leaf < 1:
+            leaf = 1
+        p_count = (k + leaf - 1) // leaf
+        if k <= 0:
+            p_count = 0
+
+    var total = m * n * p_count
+    var gid = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if gid >= total:
+        return
+    var cell = gid // p_count
+    var t = gid - cell * p_count
+    var i = cell // n
+    var j = cell - i * n
+
+    var bounds = _leaf_bounds(_leaf_at(t, p_count), leaf, k)
+    var acc = Float32(0.0)
+    var a_row = i * a_si
+    var b_col = j * b_sj
+    comptime if APPLE_LEAF_PREFETCH:
+        # lane/linear-apple2: the chain's operands are loaded LEAF_PREFETCH at
+        # a time before the chain consumes them, so the loads overlap instead
+        # of each step waiting on its own. The steps are the same
+        # rtf_mul_add calls on the same words in the same order.
+        var p = bounds[0]
+        var pe = bounds[1]
+        while p + LEAF_PREFETCH <= pe:
+            var av = InlineArray[Float32, LEAF_PREFETCH](fill=Float32(0))
+            var bv = InlineArray[Float32, LEAF_PREFETCH](fill=Float32(0))
+            comptime for u in range(LEAF_PREFETCH):
+                av[u] = a.unsafe_load(a_row + (p + u) * a_sp)
+                bv[u] = b.unsafe_load((p + u) * b_sp + b_col)
+            comptime for u in range(LEAF_PREFETCH):
+                acc = rtf_mul_add(ftz(av[u]), ftz(bv[u]), acc)
+            p += LEAF_PREFETCH
+        while p < pe:
+            acc = rtf_mul_add(
+                ftz(a.unsafe_load(a_row + p * a_sp)),
+                ftz(b.unsafe_load(p * b_sp + b_col)),
+                acc,
+            )
+            p += 1
+    else:
+        for p in range(bounds[0], bounds[1]):
+            acc = rtf_mul_add(
+                ftz(a.unsafe_load(a_row + p * a_sp)),
+                ftz(b.unsafe_load(p * b_sp + b_col)),
+                acc,
+            )
+    var slot = t
+    comptime if SAB_NODE_ORDER:
+        # SABOTAGE: address the partial by the PHYSICAL BLOCK that produced
+        # it rather than by its logical leaf index, so the fold below pairs
+        # whichever leaves happened to share a block. Contract 7.2.2.
+        slot = (t + Int(block_idx.x)) % p_count
+    ws.unsafe_store(cell * stride + slot, ftz(acc))
+
+
+def identical_gemm_fold_kernel[
+    LEAF_MAJOR: Bool = False
+](
+    c: MutPointer[Float32, MutAnyOrigin],
+    ws: MutPointer[Float32, MutAnyOrigin],
+    mn_in: Int32,
+    p_in: Int32,
+    stride_in: Int32,
+):
+    """One BLOCK per output cell folds that cell's tree LEVEL BY LEVEL in
+    threadgroup memory.
+
+    `LEAF_MAJOR` (the SPLIT plans, 2026-09-09): level 0 is laid out
+    `ws[t * mn + cell]` instead of `ws[cell * stride + t]`. Which address a
+    partial lives at is contract 7.2.2's "one legal layout"; the pairing
+    below reads `q` and nothing else, so the layout parameter cannot reach
+    a node. Contract 7.2.2's normative `(d, q)` addressing, run
+    as the addressing rather than as a comment about it.
+
+    Contract 13.4's design: `MAX_LEAVES = 1024` caps `P`, so 1024 partials is
+    4 KB and ONE threadgroup folds all `D <= 10` levels with a barrier
+    between them, in ONE launch, executing exactly the pairings of section
+    7.2.
+
+    THE LEVEL WIDTHS COME FROM `P` ALONE. `w` starts at `P` and halves with a
+    CEILING; the block size decides only how the `pairs` nodes of a level are
+    handed out to threads (`q` strides by `block_dim.x`), which is the
+    charter's "scheduling of logical work". A thread index is never a leaf
+    index here: `q` addresses the node, and node `q` reads children `2q` and
+    `2q + 1` whichever thread computes it.
+
+    Ping-pong buffers rather than in-place: at level `d`, node `q` writes
+    slot `q` while node `q/2`'s children live at `2q` and `2q + 1`, and
+    `q <= 2q`, so an in-place level would race a reader against a writer.
+    That is a correctness bug a small `P` would hide, because at `P <= 2`
+    there is one node per level.
+
+    `[[metal-hardware-gaps]]`: hand-written, no `max.gpu.primitives.block.*`
+    reduction, so no `Block size must be greater than warp size` constraint
+    and this compiles at any block size on a 64-wide wavefront.
+    """
+    var mn = Int(mn_in)
+    var p_count = Int(p_in)
+    var stride = Int(stride_in)
+    var cell = Int(block_idx.x)
+    if cell >= mn:
+        return
+    var tid = Int(thread_idx.x)
+    var nth = Int(block_dim.x)
+
+    var buf = stack_allocation[
+        2 * CONTRACT_MAX_LEAVES,
+        Scalar[DType.float32],
+        address_space = AddressSpace.SHARED,
+    ]()
+    var cur = 0
+    var nxt = CONTRACT_MAX_LEAVES
+
+    var q0 = tid
+    while q0 < p_count:
+        comptime if LEAF_MAJOR:
+            buf[unsafe_offset = cur + q0] = ws.unsafe_load(q0 * mn + cell)
+        else:
+            buf[unsafe_offset = cur + q0] = ws.unsafe_load(cell * stride + q0)
+        q0 += nth
+    barrier()
+
+    var w = p_count
+    comptime if SAB_FOLD_SERIAL:
+        # SABOTAGE: the SUPERSEDED serial ascending fold, one thread.
+        if tid == 0:
+            var acc = Float32(0.0)
+            for t in range(p_count):
+                acc = ftz(ftz(acc) + ftz(buf[unsafe_offset = cur + t]))
+            c.unsafe_store(cell, ftz(acc))
+        return
+    while w > 1:
+        var pairs = w // 2
+        var q = tid
+        while q < pairs:
+            comptime if SAB_FOLD_STRIDE:
+                # SABOTAGE: `red[q] += red[q + step]`, `pinned_block_sum`'s
+                # stride pairing. Same depth, different pairs, different
+                # answer. Contract 7.2 clause 1, fixture F8.
+                buf[unsafe_offset = nxt + q] = ftz(
+                    ftz(buf[unsafe_offset = cur + q])
+                    + ftz(buf[unsafe_offset = cur + q + pairs])
+                )
+            else:
+                # THE ARITHMETIC NODE, contract 7.2.2: adjacent children,
+                # ascending logical order, both flushed as read (5e), the
+                # result flushed (5f).
+                buf[unsafe_offset = nxt + q] = ftz(
+                    ftz(buf[unsafe_offset = cur + 2 * q])
+                    + ftz(buf[unsafe_offset = cur + 2 * q + 1])
+                )
+            q += nth
+        var w_next = pairs
+        if w % 2 == 1:
+            comptime if SAB_PAD_PLUS_ZERO:
+                # SABOTAGE: pad with `+0.0` instead of carrying. `x + (+0.0)`
+                # is not the identity at `x = -0.0`. Contract 7.2 clause 4,
+                # fixture F7.
+                if tid == 0:
+                    buf[unsafe_offset = nxt + pairs] = ftz(
+                        ftz(buf[unsafe_offset = cur + w - 1]) + Float32(0.0)
+                    )
+            else:
+                # THE CARRY NODE, contract 7.2.2: a BIT-FOR-BIT copy. No
+                # arithmetic, no flush of its own -- it inherits the flush
+                # its source already carries (contract section 5's note that
+                # a carry needs no seam).
+                if tid == 0:
+                    buf[unsafe_offset = nxt + pairs] = buf[
+                        unsafe_offset = cur + w - 1
+                    ]
+            w_next = pairs + 1
+        barrier()
+        var swap = cur
+        cur = nxt
+        nxt = swap
+        w = w_next
+    if tid == 0:
+        # 5g, and contract section 8's `k == 0` case: `p_count == 0` skips
+        # the loop entirely and `+0.0` is STORED rather than the store being
+        # skipped.
+        var root = Float32(0.0)
+        if p_count > 0:
+            root = buf[unsafe_offset=cur]
+        c.unsafe_store(cell, ftz(root))
+
+
+def identical_gemm_fold_level_kernel(
+    ws: MutPointer[Float32, MutAnyOrigin],
+    mn_in: Int32,
+    stride_in: Int32,
+    src_base_in: Int32,
+    dst_base_in: Int32,
+    w_prev_in: Int32,
+    w_next_in: Int32,
+):
+    """ONE LOGICAL LEVEL of the tree, as ONE LAUNCH. Contract 7.2.2's flat
+    address space, used literally.
+
+    `src_base` is `fold_level_base(P, d-1)` and `dst_base` is
+    `fold_level_base(P, d)`, both computed ON THE HOST by `gemm_oracle`'s own
+    functions, so the device never re-derives the topology and cannot hold a
+    second opinion about it.
+
+        q <  pairs   ARITHMETIC:  ftz( ftz(node(d-1, 2q)) + ftz(node(d-1, 2q+1)) )
+        q == pairs   CARRY:       node(d-1, w_prev - 1), BIT FOR BIT
+
+    This is the FULLY STAGED realization contract 13.4 says is not required
+    and 13.6.2 says must be priced against the fused one. It is here for two
+    reasons and the first is not performance: it is an eighth EXECUTION PLAN
+    whose fold runs in `D` separate global-memory launches with no
+    threadgroup memory and no register stack anywhere, so
+    `check_device_is_launch_invariant` comparing it against `PLAN_FLAT` is
+    about as far apart as two realizations of one arithmetic DAG can get.
+    """
+    var mn = Int(mn_in)
+    var stride = Int(stride_in)
+    var src_base = Int(src_base_in)
+    var dst_base = Int(dst_base_in)
+    var w_prev = Int(w_prev_in)
+    var w_next = Int(w_next_in)
+    var gid = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if gid >= mn * w_next:
+        return
+    var cell = gid // w_next
+    var q = gid - cell * w_next
+    var base = cell * stride
+    var pairs = w_prev // 2
+    if q < pairs:
+        comptime if SAB_FOLD_STRIDE:
+            ws.unsafe_store(
+                base + dst_base + q,
+                ftz(
+                    ftz(ws.unsafe_load(base + src_base + q))
+                    + ftz(ws.unsafe_load(base + src_base + q + pairs))
+                ),
+            )
+        else:
+            ws.unsafe_store(
+                base + dst_base + q,
+                ftz(
+                    ftz(ws.unsafe_load(base + src_base + 2 * q))
+                    + ftz(ws.unsafe_load(base + src_base + 2 * q + 1))
+                ),
+            )
+        return
+    # THE CARRY. `q == pairs` can only be reached when `w_prev` is odd.
+    comptime if SAB_PAD_PLUS_ZERO:
+        ws.unsafe_store(
+            base + dst_base + q,
+            ftz(ftz(ws.unsafe_load(base + src_base + w_prev - 1)) + Float32(0.0)),
+        )
+    else:
+        ws.unsafe_store(
+            base + dst_base + q, ws.unsafe_load(base + src_base + w_prev - 1)
+        )
+
+
+def identical_gemm_emit_kernel(
+    c: MutPointer[Float32, MutAnyOrigin],
+    ws: MutPointer[Float32, MutAnyOrigin],
+    mn_in: Int32,
+    stride_in: Int32,
+    root_base_in: Int32,
+    p_in: Int32,
+):
+    """The output seam (contract 5g) for the staged plan: `C[cell] =
+    ftz(node(D, 0))`.
+
+    `p_count == 0` (`k == 0`) stores `+0.0` -- contract section 8 requires the
+    value to be WRITTEN, not the store skipped.
+    """
+    var mn = Int(mn_in)
+    var stride = Int(stride_in)
+    var root_base = Int(root_base_in)
+    var p_count = Int(p_in)
+    var cell = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if cell >= mn:
+        return
+    var v = Float32(0.0)
+    if p_count > 0:
+        comptime if SAB_FOLD_SERIAL:
+            # SABOTAGE: ignore the tree in the workspace and fold level 0
+            # SERIALLY -- the superseded rule, and gram_splitk's spelling.
+            var acc = Float32(0.0)
+            for t in range(p_count):
+                acc = ftz(ftz(acc) + ftz(ws.unsafe_load(cell * stride + t)))
+            v = acc
+        else:
+            v = ws.unsafe_load(cell * stride + root_base)
+    c.unsafe_store(cell, ftz(v))
+
+
+
+# ===========================================================================
+# THE TUNED PLANS: register-blocked tiles, the same arithmetic
+# ===========================================================================
+
+#: NVIDIA RN FMA followed by the post-round hardware FTZ multiply, where
+#: the matrix exposes those intrinsics (`lib_hardware_ftz_fma_for`). Software seam
+#: everywhere else and in every non-IDENTICAL build.
+comptime TUNED_HW_FTZ_FMA = (
+    GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL
+    and lib_hardware_ftz_fma_for[TARGET_COLUMN]()
+)
+
+
+# Apply operand seams before shared staging on qualified NVIDIA/AMD paths.
+# Consumers read the same flushed words without repeating their tests.
+# Explicit opt-in qualifies other columns; the legacy flag supplies A/B control.
+comptime TUNED_STAGE_FTZ = (
+    GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL
+    and not is_defined["ANONLIB_GEMM_LEGACY_STAGE_FTZ"]()
+    and (lib_gemm_stage_ftz_for[TARGET_COLUMN]() or is_defined["ANONLIB_GEMM_STAGE_FTZ"]())
+)
+
+
+@always_inline
+def _tuned_loaded_operand(v: Float32) -> Float32:
+    comptime if TUNED_STAGE_FTZ:
+        return v
+    return ftz(v)
+
+
+comptime TUNED_CLASS_FLUSH = (
+    GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL
+    and lib_postround_class_flush_for[TARGET_COLUMN]()
+    and not is_defined["ANONLIB_GEMM_LEGACY_CLASS_FLUSH"]()
+)
+
+
+@always_inline
+def _ftz_class(x: Float32) -> Float32:
+    # Class 0x90 selects negative/positive subnormals, after FMA rounding.
+    comptime if lib_postround_class_flush_for[TARGET_COLUMN]():
+        var subnormal = llvm_intrinsic[
+            "llvm.amdgcn.class.f32", Bool, has_side_effect=False
+        ](x, Int32(0x90))
+        var zero = bitcast[DType.float32](bitcast[DType.uint32](x) & UInt32(0x80000000))
+        return zero if subnormal else x
+    return ftz(x)
+
+
+@always_inline
+def _tuned_step(a: Float32, b: Float32, acc: Float32) -> Float32:
+    """Contract sections 4 and 5c for one `p`: `ftz(fma(a, b, acc))`, with
+    `a` and `b` already flushed as loaded (5a, 5b) and `acc` already flushed
+    by the previous step or seeded `+0.0`.
+
+    NVIDIA first rounds the FMA without FTZ, then flushes the rounded
+    value with hardware multiply-by-one. A single hardware FTZ FMA can
+    flush before rounding at the smallest-normal boundary, unlike this
+    two-instruction sequence. Inputs here are already flushed by callers.
+    AMD classifies the rounded FMA result and flushes only subnormals,
+    preserving their sign. This matches the software post-round flush.
+    Other columns' underlying FMA
+    rounding at underflow boundaries remains a separate numerical audit.
+    """
+    comptime if TUNED_HW_FTZ_FMA:
+        var rounded = llvm_intrinsic[
+            "llvm.nvvm.fma.rn.f", Float32, has_side_effect=False
+        ](a, b, acc)
+        return llvm_intrinsic[
+            "llvm.nvvm.mul.rn.ftz.f", Float32, has_side_effect=False
+        ](rounded, Float32(1.0))
+    comptime if TUNED_CLASS_FLUSH:
+        return _ftz_class(identical_mul_add(a, b, acc))
+    # Apple (lane/apple-seam-repair): the native FMA flushes before rounding;
+    # `rtf_mul_add` repairs the signed-zero boundary case exactly and is the
+    # plain `ftz(identical_mul_add(...))` on every other column.
+    return rtf_mul_add(a, b, acc)
+
+
+#: lane/apple-seam-repair, 2026-09-18. The per-step repair inlined into the
+#: tuned kernel's 64-cell register tile made the Apple metallib 10x larger and
+#: the Apple GEMM sum ~2.4x slower. The
+#: tuned kernel therefore takes an EXACT block admission instead: while
+#: staging, each thread keeps the minimum biased exponent of the NONZERO
+#: operand words it loaded (A and B separately); the block reduces them once
+#: after the last window. If `minA + minB >= 151` (in exponent-field units),
+#: every product of two nonzero flushed operands this block can form has its
+#: lowest bit at or above 2^-149, every flushed accumulator is a multiple of
+#: 2^-149, so every exact step result is a multiple of 2^-149 and none lies in
+#: the window [2^-126 - 2^-150, 2^-126): the fast step's bits ARE rtf. Blocks
+#: that fail admission recompute each of their cells with the exact repaired
+#: step (`rtf_mul_add`) in the contract's order and fold. Price arm
+#: `-D ANONLIB_GEMM_INLINE_ZERO_FMA_REPAIR` keeps the per-step repair.
+comptime TUNED_BLOCK_ADMIT = (
+    RTF_REPAIR and not is_defined["ANONLIB_GEMM_INLINE_ZERO_FMA_REPAIR"]()
+)
+
+comptime _EXP_NONE = UInt32(0x7F800000)
+
+
+#: lane/amd-step-time (2026-09-24): the DETECT seam, `lib_gemm_detect_seam_for`.
+#: Where it is compiled in, the tuned and kpack kernels' full-window
+#: accumulate runs BARE packed FMAs (`identical_mul_add_simd`, one rounding
+#: each, the same operands in the same ascending `p` order per cell) and each
+#: thread records whether ANY step result of its cells was subnormal (one class
+#: test per result, OR-ed into a per-thread flag; no select, no mask, no
+#: store). A bare chain differs from the contract's `ftz(fma(...))` chain only
+#: after a subnormal step result, so a thread whose flag stayed clear stored
+#: the contract's bits; a thread whose flag is set recomputes every cell it
+#: owns with the exact step (`_rtf_cell`, `_rtf_group_node`) and overwrites
+#: them. Never on a column with the block admission (Apple), never in a
+#: non-IDENTICAL build.
+comptime GEMM_DETECT_SEAM = (
+    GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL
+    and lib_gemm_detect_seam_for[TARGET_COLUMN]()
+    and not TUNED_BLOCK_ADMIT
+)
+
+
+#: lane/nvidia-step-time (2026-09-25): the WINDOW ADMISSION,
+#: `lib_gemm_window_admit_for` (the argument is in that row's docstring). The
+#: kpack kernel's full windows run the bare `fma.rn` where the block proved
+#: the flush is the identity on every step result, the exact step elsewhere.
+comptime GEMM_WINDOW_ADMIT = (
+    GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL
+    and TUNED_HW_FTZ_FMA
+    and TUNED_STAGE_FTZ
+    and lib_gemm_window_admit_for[TARGET_COLUMN]()
+    and not GEMM_DETECT_SEAM
+    and not TUNED_BLOCK_ADMIT
+)
+#: The admission bound on `Ea + Eb` (biased exponent fields): 174 puts the
+#: products' common grain at 2^-126. The sabotage arm admits every window.
+comptime GEMM_ADMIT_EXP_SUM = 0 if is_defined["ANONLIB_GEMM_SABOTAGE_ADMIT_ALWAYS"]() else 174
+#: The bound for Apple's simdgroup matrix windows (`PLAN_APPLE_MMA`, the
+#: Cholesky left-looking update). Those windows need a weaker fact than
+#: 174's: the matrix unit returns exactly the chain of Apple FMAs
+#: (flush-before-round, `apple_simdgroup_probe`, 0 mismatches in every kind
+#: including subnormal results), and flush-before-round differs from the
+#: contract's round-then-flush ONLY where an exact step result lies in
+#: [2^-126 - 2^-150, 2^-126) (`checks/rtf_seam.mojo`). With `Ea + Eb >= 151`
+#: every product's lowest bit is at or above 2^-149, every float32
+#: accumulator is a multiple of 2^-149, so no exact step result lies in that
+#: window: the same bound `TUNED_BLOCK_ADMIT` and `rtf_fix`'s filter use.
+comptime APPLE_MMA_ADMIT_EXP_SUM = 0 if is_defined["ANONLIB_GEMM_SABOTAGE_ADMIT_ALWAYS"]() else (
+    174 if is_defined["ANONLIB_APPLE_MMA_ADMIT_174"]() else 151
+)
+
+
+#: lane/apple-identical-gemm (2026-09-25): the WINDOW ADMISSION on the Apple
+#: tuned kernel (`lib_gemm_window_admit_for`, the same argument as NVIDIA's
+#: kpack window). The tuned kernel's step on Apple is
+#: `ftz(identical_mul_add(a, b, acc))` under the block admission
+#: (`TUNED_BLOCK_ADMIT`). On a full window whose staged operand words prove
+#: `Ea + Eb >= 174` (nonzero words of the flushed operands; a word with a zero
+#: exponent field flushes to zero and constrains nothing) and whose entering
+#: accumulators are multiples of 2^-126 (a leaf start, or only admitted windows
+#: since), every exact step result is zero or at least 2^-126 in magnitude, so
+#: the device FMA returns a normal or a zero under either rounding model
+#: (round then flush, or Apple's flush before round) and `ftz` is the identity:
+#: the bare FMA returns the same word the shipped step returns. Every other
+#: window, and every later window of its leaf, runs the shipped step. The block
+#: admission and its exact recompute are untouched. The decision is block
+#: uniform (warp minima published in shared memory before the staging barrier).
+comptime TUNED_WINDOW_ADMIT = (
+    TUNED_BLOCK_ADMIT
+    and lib_gemm_window_admit_for[TARGET_COLUMN]()
+)
+
+
+@always_inline
+def _tuned_admit_step(a: Float32, b: Float32, acc: Float32) -> Float32:
+    """The tuned kernel's step on an ADMITTED window: the shipped step without
+    its flush, which the window proved is the identity. The sabotage arm
+    `ANONLIB_GEMM_SABOTAGE_WINDOW_ADMIT_STEP` perturbs it so a check can
+    show that it reaches admitted windows (it must FAIL the ordinary fixtures)."""
+    comptime if is_defined["ANONLIB_GEMM_SABOTAGE_WINDOW_ADMIT_STEP"]():
+        return identical_mul_add(a, b, acc) * Float32(1.0000001)
+    return identical_mul_add(a, b, acc)
+
+
+@always_inline
+def _admit_exp_min[W: Int](v: SIMD[DType.float32, W]) -> UInt32:
+    """Minimum biased exponent field over the NONZERO words of `v` (flushed
+    operands: a zero field is a zero word and constrains nothing, so it reads
+    255, as Inf and NaN do)."""
+    var e = (bitcast[DType.uint32](v) >> SIMD[DType.uint32, W](23)) & SIMD[DType.uint32, W](0xFF)
+    var ez = e.eq(SIMD[DType.uint32, W](0)).select(SIMD[DType.uint32, W](0xFF), e)
+    return ez.reduce_min()
+
+
+@always_inline
+def _admit_warp_min(v: UInt32) -> UInt32:
+    """The minimum over the warp, in every lane (an integer butterfly: the
+    order of an integer minimum cannot matter)."""
+    var m = v
+    comptime for _s in range(8):
+        comptime if (1 << _s) < WARP_SIZE:
+            var o = shuffle_xor(m, UInt32(1 << _s))
+            m = o if o < m else m
+    return m
+
+
+@always_inline
+def _admit_step(a: Float32, b: Float32, acc: Float32) -> Float32:
+    """The contract step on an ADMITTED window: `fma.rn`, the first of
+    `_tuned_step`'s two instructions; its flush is proven the identity."""
+    return llvm_intrinsic["llvm.nvvm.fma.rn.f", Float32, has_side_effect=False](a, b, acc)
+
+
+@always_inline
+def _is_subnormal(x: Float32) -> Bool:
+    """True exactly when `x` is a nonzero subnormal (either sign): one
+    `v_cmp_class_f32` (mask 0x90) on AMD, the exponent/mantissa test
+    elsewhere. Reads `x`; computes nothing that reaches a stored value."""
+    comptime if is_amd_gpu():
+        return llvm_intrinsic["llvm.amdgcn.class.f32", Bool, has_side_effect=False](x, Int32(0x90))
+    var b = bitcast[DType.uint32](x)
+    return (b & UInt32(0x7F800000)) == UInt32(0) and (b & UInt32(0x007FFFFF)) != UInt32(0)
+
+
+@always_inline
+def _detect_recompute(seen: Bool) -> Bool:
+    """Whether this thread takes the exact recompute. The two test arms:
+    `ANONLIB_GEMM_DETECT_ALWAYS_EXACT` (every thread recomputes: the exact
+    path's own bits, and its price) and `ANONLIB_GEMM_SABOTAGE_DETECT_NEVER`
+    (the detector ignored: must FAIL the subnormal fixtures)."""
+    comptime if is_defined["ANONLIB_GEMM_DETECT_ALWAYS_EXACT"]():
+        return True
+    comptime if is_defined["ANONLIB_GEMM_SABOTAGE_DETECT_NEVER"]():
+        return False
+    return seen
+
+
+@always_inline
+def _fast_rows[
+    NR: Int, CPT: Int, NCELL: Int, RW: Int, RS: Int, RO: Int
+](
+    mut acc: SIMD[DType.float32, NCELL],
+    ra: SIMD[DType.float32, RW],
+    rb: SIMD[DType.float32, CPT],
+    mut seen: Bool,
+):
+    """One `p` step of the DETECT seam for a thread's `NR x CPT` register tile:
+    row `u` gets `fma(ra[u * RS + RO], rb[v], acc[u, v])` for every
+    `v`, as one `CPT`-wide FMA (packed on gfx942), and `seen` set when any of
+    the new values is subnormal. Per cell exactly one FMA of the same operands
+    as `_tuned_step`'s, without its flush."""
+    comptime for u in range(NR):
+        var row = SIMD[DType.float32, CPT](0.0)
+        comptime for v in range(CPT):
+            row[v] = acc[u * CPT + v]
+        row = identical_mul_add_simd[CPT](SIMD[DType.float32, CPT](ra[u * RS + RO]), rb, row)
+        comptime for v2 in range(CPT):
+            acc[u * CPT + v2] = row[v2]
+            seen = seen | _is_subnormal(row[v2])  # bitwise: no short-circuit branch
+
+
+@always_inline
+def _tuned_step_admitted(a: Float32, b: Float32, acc: Float32) -> Float32:
+    """The tuned kernel's step: without the inline repair when the block
+    admission is compiled in (it then proves or repairs the block)."""
+    comptime if TUNED_BLOCK_ADMIT:
+        return ftz(identical_mul_add(a, b, acc))
+    return _tuned_step(a, b, acc)
+
+
+@always_inline
+def _nz_exp_min[W: Int](v: SIMD[DType.float32, W], cur: UInt32) -> UInt32:
+    """Minimum exponent field over the words of `v` that flush to a NONZERO
+    value (exponent field nonzero); zeros and subnormals flush to zero and
+    constrain nothing. Inf/NaN read 0x7F800000, the no-constraint value."""
+    var e = bitcast[DType.uint32](v) & SIMD[DType.uint32, W](0x7F800000)
+    var z = e.eq(SIMD[DType.uint32, W](0))
+    var ez = z.select(SIMD[DType.uint32, W](0x7F800000), e)
+    return min(cur, ez.reduce_min())
+
+
+@always_inline
+def _admit_track[
+    WA: Int, WB: Int
+](
+    pa: SIMD[DType.float32, WA],
+    pb: SIMD[DType.float32, WB],
+    mut emin_a: UInt32,
+    mut emin_b: UInt32,
+):
+    comptime if TUNED_BLOCK_ADMIT:
+        emin_a = _nz_exp_min(pa, emin_a)
+        emin_b = _nz_exp_min(pb, emin_b)
+
+
+@always_inline
+def _admission_holds(emin_a: UInt32, emin_b: UInt32) -> Bool:
+    if emin_a == _EXP_NONE or emin_b == _EXP_NONE:
+        return True
+    return emin_a + emin_b >= UInt32(151 << 23)
+
+
+@always_inline
+def _rtf_leaf_partial(
+    a: MutPointer[Float32, MutAnyOrigin],
+    b: MutPointer[Float32, MutAnyOrigin],
+    i: Int, j: Int, t: Int, p_count: Int, leaf: Int, k: Int,
+    a_si: Int, a_sp: Int, b_sp: Int, b_sj: Int,
+) -> Float32:
+    """One logical leaf of cell (i, j), the exact rtf step, contract 7.1."""
+    var bounds = _leaf_bounds(_leaf_at(t, p_count), leaf, k)
+    var acc = Float32(0.0)
+    for p in range(bounds[0], bounds[1]):
+        acc = rtf_mul_add(
+            ftz(a.unsafe_load(i * a_si + p * a_sp)),
+            ftz(b.unsafe_load(p * b_sp + j * b_sj)),
+            acc,
+        )
+    return ftz(acc)
+
+
+@always_inline
+def _rtf_cell(
+    a: MutPointer[Float32, MutAnyOrigin],
+    b: MutPointer[Float32, MutAnyOrigin],
+    i: Int, j: Int, p_count: Int, leaf: Int, k: Int,
+    a_si: Int, a_sp: Int, b_sp: Int, b_sj: Int,
+) -> Float32:
+    """Cell (i, j) exactly as `identical_gemm_flat_kernel` computes it (every
+    leaf, then the contract's fold tree), with the exact rtf step."""
+    var stack = SIMD[DType.float32, GEMM_FOLD_SLOTS](0.0)
+    var occ = 0
+    for t in range(p_count):
+        var part = _rtf_leaf_partial(
+            a, b, i, j, t, p_count, leaf, k, a_si, a_sp, b_sp, b_sj
+        )
+        _ = _fold_push(stack, occ, part)
+    return ftz(_fold_drain(stack, occ))
+
+
+# Tried 2026-10-08 (NI02, ANONLIB_IDN_NEURAL_GEMM_SCHEDULE=3 stream_all: bounded 16-leaf partial windows for every
+# GEMM caller, run ge123e6f9): NV/AMD gemm gaussian 2.07x/1.78x, lm-train-step 1.11x/1.07x SLOWER (quality not
+# judged). Deleted (kernels, dispatch, workspace sizing, the CNN pre-check) and =3 refused; recoverable at main bc10b8b56.
+
+
+@always_inline
+def _rtf_group_node(
+    a: MutPointer[Float32, MutAnyOrigin],
+    b: MutPointer[Float32, MutAnyOrigin],
+    i: Int, j: Int, lbeg: Int, lend: Int, p_count: Int, leaf: Int, k: Int,
+    a_si: Int, a_sp: Int, b_sp: Int, b_sj: Int,
+) -> Float32:
+    """The ksplit/kpack GROUP node of cell (i, j) over fold positions
+    `[lbeg, lend)`, exactly as `identical_gemm_kpack_kernel[GROUP=True]`
+    stores it: each leaf partial with the exact step, pushed in ascending
+    position into the contract's tree, drained, and returned UNFLUSHED (the
+    fold kernels flush on read). The DETECT seam's recompute (lane/amd-step-time)."""
+    var stack = SIMD[DType.float32, GEMM_FOLD_SLOTS](0.0)
+    var occ = 0
+    for t in range(lbeg, lend):
+        var part = _rtf_leaf_partial(
+            a, b, i, j, t, p_count, leaf, k, a_si, a_sp, b_sp, b_sj
+        )
+        _ = _fold_push(stack, occ, part)
+    return _fold_drain(stack, occ)
+
+
+
+# ===========================================================================
+# THE SCHEDULING CONSTANTS, ALL FROM `checks/kernel_matrix.mojo`
+# ===========================================================================
+# DEVIATION 1260. Every number below is a kernel-matrix ROW read through a
+# comptime accessor, not a constant chosen in this file, with the single
+# exception of `TUNED_TC` -- which says so in its own docstring and which
+# `archive/plans/gemm/TUNING_PLAN.md` OWED item 10 asks to be moved into the matrix.
+#
+# `[[ALWAYS GPU-agnostic]]`: one source for Metal, CUDA and HIP, and vendor
+# divergence is a kernel-matrix ROW and never an inline `if apple`. There is
+# no vendor branch anywhere in this file. `PAGES` differs between Apple and
+# the other two columns at `KS = 32` and it differs because
+# `lib_smem_pages_for` reads `column_shared_limit`, one directory over.
+
+
+#: Threads per block. `lib_block_size_for[K_LIB_GEMM_CONTRACTION, ...]`,
+#: which is RAFT's `Policy4x4` "AccThRows * AccThCols threads cover one
+#: tile" and resolves to 256 on every column today. It is NOT one of the
+#: rows `lib_block_bounds_a_float_fold` names, so IDENTICAL does not remap
+#: it to the identity floor -- correctly, because in THIS kernel the block
+#: size bounds no float fold at all: one thread owns each cell for its whole
+#: `k` range and no partial sum crosses a thread boundary.
+comptime TUNED_TPB = lib_block_size_for[K_LIB_GEMM_CONTRACTION, TARGET_COLUMN]()
+
+#: lane/amd-step-time (2026-09-24): the launch bound the two step GEMM kernels
+#: declare (`MAX_THREADS_PER_BLOCK_METADATA`), which is their real launch size.
+#: Without it the gfx942 backend assumes 1,024 threads a block, budgets 128
+#: VGPRs a lane and SPILLED the 128x128 register tile: 630 VGPR spills in the
+#: tuned kernel and 396 in the kpack body (`.vgpr_spill_count`, bench/results/
+#: amd_step_time_2026-09-24). At 256 both read 0. Register allocation only; no
+#: operation, operand or order changes. `-D ANONLIB_GEMM_NO_LAUNCH_BOUND=1`
+#: restores the old 1,024 (the A/B arm).
+#: lane/nvidia-step-time (2026-09-25): `-D ANONLIB_GEMM_LB512=1` (trial) declares
+#: 512 on a 256-thread launch, which on NVIDIA budgets 128 registers a thread
+#: (65,536 / 512) so two blocks fit an SM. Register allocation only.
+comptime GEMM_LAUNCH_BOUND = 1024 if is_defined["ANONLIB_GEMM_NO_LAUNCH_BOUND"]() else (
+    2 * TUNED_TPB if is_defined["ANONLIB_GEMM_LB512"]() else (
+        3 * TUNED_TPB if is_defined["ANONLIB_GEMM_LB768"]() else TUNED_TPB
+    )
+)
+#: lane/nvidia-step-time trial: the kpack gather of the next window issued
+#: before the staging barrier instead of after it.
+comptime GEMM_PREFETCH_EARLY = is_defined["ANONLIB_GEMM_PREFETCH_EARLY"]()
+
+#: The width of a staged copy, in floats. `PINNED_VECLEN`, RAFT's own
+#: `Veclen = 4`.
+#:
+#: **THE MATRIX LABELS THIS ROW NUMERIC AND IN THIS FILE IT IS SCHEDULING,
+#: AND THAT DIFFERENCE IS WORTH ONE PARAGRAPH.** In
+#: `simt_kernel.mojo` the value is numeric because RAFT accumulates a
+#: `Veclen` chunk per accumulator and the chunk width therefore decides a
+#: summation order. Here it decides only how many floats one load
+#: instruction moves: contract 7.1 fixes the accumulation to ONE accumulator
+#: per cell walking `p` ascending, the inner `comptime for e in range(VEC)`
+#: walks that chunk ascending into that one accumulator, and a `VEC` of 1, 2
+#: or 4 accumulates the same terms in the same order. Read from the matrix
+#: rather than respelled so a vendor measurement lands in one place.
+comptime TUNED_VECLEN = PINNED_VECLEN
+
+#: Thread columns per block: `AccThCols`. RAFT's `Policy4x4` is 16 at
+#: `Nthreads = 256` and `simt_kernel.mojo` inherits it.
+#:
+#: **THIS IS THE ONE SCHEDULING NUMBER THIS FILE NAMES ITSELF AND THAT IS A
+#: DEFECT, NOT A DESIGN.** The matrix pins the per-thread tile
+#: (`PINNED_ACC_ROWS_PER_TH`, `PINNED_ACC_COLS_PER_TH`) and the block size,
+#: but has no row for the THREAD GRID that connects them, so there is
+#: nowhere for a vendor measurement of it to land. `archive/plans/gemm/TUNING_PLAN.md`
+#: OWED item 6 asks for a `lib_acc_th_cols` row; until it exists this line
+#: is a constant in a kernel, which is what the matrix's own header calls
+#: the failure it was built to prevent.
+comptime TUNED_TC = 16
+
+#: The default `KS`. `PINNED_KBLK`, RAFT's `Kblk = 32`. Used by the `K32`
+#: plans; the dispatcher's default plans use 16, because 16 is what lets
+#: `lib_smem_pages_for` return 2 on Apple. Which of the two wins is a
+#: MEASUREMENT and `archive/plans/gemm/TUNING_PLAN.md` section 5 predicts neither.
+comptime TUNED_KBLK = PINNED_KBLK
+
+#: The per-thread register tile of the WIDE plans. `PINNED_ACC_ROWS_PER_TH`
+#: and `PINNED_ACC_COLS_PER_TH`, RAFT's `Policy4x4` 4x4. Same paragraph as
+#: `TUNED_VECLEN`: the matrix labels these rows NUMERIC because in
+#: `simt_kernel.mojo` they decide an accumulation geometry, and in THIS file
+#: they decide only which cells a thread owns. Contract 7.1 fixes one
+#: accumulator per cell walking `p` ascending, so a 4x4 tile and a 2x2 tile
+#: accumulate the same terms into the same accumulator in the same order.
+comptime TUNED_RPT = PINNED_ACC_ROWS_PER_TH
+comptime TUNED_CPT = PINNED_ACC_COLS_PER_TH
+
+#: The resolved output tiles, DERIVED and never written down twice. The
+#: dispatcher compares `m` and `n` against these rather than against a
+#: literal 64, so a column that resolves a different block size moves the
+#: kernel and the dispatch threshold together. A tile constant that appears
+#: in two places is a tile constant that drifts.
+comptime TUNED_TR = TUNED_TPB // TUNED_TC
+comptime TUNED_BM_WIDE = TUNED_RPT * TUNED_TR
+comptime TUNED_BN_WIDE = TUNED_CPT * TUNED_TC
+comptime TUNED_BM_NARROW = (TUNED_RPT // 2) * TUNED_TR
+comptime TUNED_BN_NARROW = (TUNED_CPT // 2) * TUNED_TC
+
+#: The 64x64 tuned plan's K step (2026-09-09, the split-K lane's task-4
+#: probe). RAFT's `Kblk = 32` where TWO pages of the 64x64 operand pair
+#: (37 KB) fit under the column's shared limit, else 16. Measured on an
+#: H100 (`bench/results/e1g/2026-09-09_140650-nvidia-h100-identical-splitk3`,
+#: forced plan 16 against plan 9): 4% to 7% faster at every row the
+#: dispatcher sends to this tile, bits equal by the launch-invariance gate.
+#: The 128x128 pair is 37 KB a PAGE (36,864 bytes): one page on NVIDIA and
+#: AMD, and NOT EVEN ONE under a 32 KB column (Metal refuses the pipeline;
+#: found by the Apple RUN OWED 2026-09-09), so the KS = 32 probe of that
+#: tile resolves to 16 wherever one page does not fit (`TUNED_128_KS`,
+#: through `lib_smem_page_fits_for`); at KS = 32 it LOST 17% on the H100
+#: (plan 17 against plan 10), so the shipped 128x128 plan stays at 16
+#: everywhere. Read through the matrix so Apple (32 KB) keeps its two
+#: 64x64 pages at 16 and no vendor is named here.
+comptime TUNED_64_PAGE_BYTES_K32 = (
+    (TUNED_BM_WIDE + TUNED_BN_WIDE) * (TUNED_KBLK + TUNED_VECLEN) * 4
+)
+comptime TUNED_64_KS = (
+    TUNED_KBLK
+    if lib_smem_pages_for[TARGET_COLUMN, TUNED_64_PAGE_BYTES_K32]() == 2
+    else 16
+)
+comptime TUNED_128_PAGE_BYTES_K32 = (
+    (2 * TUNED_BM_WIDE + 2 * TUNED_BN_WIDE) * (TUNED_KBLK + TUNED_VECLEN) * 4
+)
+comptime TUNED_128_KS = (
+    TUNED_KBLK
+    if lib_smem_page_fits_for[TARGET_COLUMN, TUNED_128_PAGE_BYTES_K32]()
+    else 16
+)
+
+#: The fold stack depth of every tuned plan: `P <= 2^16 - 1` covers the
+#: profile cap (`CONTRACT_MAX_LEAVES = 1024`) with room, and because the
+#: stack lives in thread-local memory (`_fold_push_local`) its depth costs
+#: no register, so there is one depth rather than a dispatch on `P`.
+comptime TUNED_FOLD_SLOTS = 16
+
+
+
+@always_inline
+def _fold_flush[HW: Bool](x: Float32) -> Float32:
+    """DEVIATION 2706: the flush at the fold, `ftz(x)`. `HW = True` on the
+    NVIDIA column spells it as the hardware `mul.rn.ftz` by one that the
+    step seam already uses (`_tuned_step`): a stored binary32 times one is
+    exact, so the only effect is the flush of a subnormal to its signed
+    zero, which is `ftz`'s definition; measured equal on the 262,144 words of
+    the boundary gate (2026-09-09). One instruction where the software
+    spelling is six. Every other column, and every caller that does not ask,
+    keeps the software `ftz`, so no bit can move anywhere."""
+    comptime if HW and TUNED_HW_FTZ_FMA:
+        return llvm_intrinsic[
+            "llvm.nvvm.mul.rn.ftz.f", Float32, has_side_effect=False
+        ](x, Float32(1.0))
+    return ftz(x)
+
+
+def _fold_push_local[
+    NC: Int, FS: Int, HW: Bool = False
+](
+    stack: MutPointer[Float32, MutUntrackedOrigin],
+    mut occ: Int,
+    value: SIMD[DType.float32, NC],
+) -> Bool:
+    """`_fold_push_tile`, with the stack in THREAD-LOCAL MEMORY instead of a
+    SIMD register: `stack[d * NC + e]` is slot `d` of cell `e`.
+
+    Same merge expression, same `occ` arithmetic, same carry-by-silence.
+    The push fires once per LEAF (every `L >= 128` steps of `p`), so the
+    local-memory traffic is a rounding error, and what it buys is that the
+    register tile no longer pays `FS * NC` registers for a stack it touches
+    once per leaf (DEVIATION 1253's bound). The loop over `d` is a runtime
+    loop with an early return, which is what makes the stack a memory
+    object rather than a register file.
+    """
+    var val = value
+    for d in range(FS):
+        if ((occ >> d) & 1) == 1:
+            comptime if SAB_FOLD_STRIDE:
+                comptime for e in range(NC):
+                    val[e] = _fold_flush[HW](
+                        _fold_flush[HW](val[e]) + _fold_flush[HW](stack.unsafe_load((FS - 1 - d) * NC + e))
+                    )
+            else:
+                comptime for e in range(NC):
+                    val[e] = _fold_flush[HW](_fold_flush[HW](stack.unsafe_load(d * NC + e)) + _fold_flush[HW](val[e]))
+            occ = occ - (1 << d)
+        else:
+            comptime for e in range(NC):
+                stack.unsafe_store(d * NC + e, val[e])
+            occ = occ + (1 << d)
+            return True
+    return False
+
+
+def _fold_drain_local[
+    NC: Int, FS: Int, HW: Bool = False
+](stack: MutPointer[Float32, MutUntrackedOrigin], occ: Int) -> SIMD[DType.float32, NC]:
+    """`_fold_drain_tile` over the thread-local stack: lowest level first,
+    no addition at `P == 1`."""
+    var have = False
+    var acc = SIMD[DType.float32, NC](0.0)
+    for d in range(FS):
+        if ((occ >> d) & 1) == 1:
+            if have:
+                comptime for e in range(NC):
+                    acc[e] = _fold_flush[HW](_fold_flush[HW](stack.unsafe_load(d * NC + e)) + _fold_flush[HW](acc[e]))
+            else:
+                comptime for e in range(NC):
+                    acc[e] = stack.unsafe_load(d * NC + e)
+                have = True
+    return acc
+
+
+
+# ===========================================================================
+# THE WINDOW SEQUENCE (DEVIATION 1255)
+# ===========================================================================
+
+
+@always_inline
+def _udiv[D: Int](x: Int) -> Int:
+    """`x // D` for `x >= 0`, unsigned. The staging and ownership index math
+    divides by comptime tile sizes; the signed forms leave a sign fix-up and
+    a division/remainder pair that Mojo 1.0.0's optimizer associated
+    differently from one cold compile to the next (see `_tuned_window_at`).
+    Unsigned by a power of two this is a shift, and it has no fix-up."""
+    return Int(UInt(x) // UInt(D))
+
+
+@always_inline
+def _urem[D: Int](x: Int) -> Int:
+    """`x % D` (equivalently `x - (x // D) * D`) for `x >= 0`, unsigned."""
+    return Int(UInt(x) % UInt(D))
+
+
+def _tuned_windows_per_leaf[KS: Int](leaf: Int) -> Int:
+    """`ceil(L / KS)`, at least 1. Block-uniform, and a pure function of `L`
+    and the comptime `KS`."""
+    var w = (leaf + KS - 1) // KS
+    if w < 1:
+        return 1
+    return w
+
+
+def _tuned_window[
+    KS: Int
+](w: Int, wpl: Int, leaf: Int, k: Int, p_count: Int) -> Tuple[Int, Int, Int]:
+    """`(p0, chunk, is_last_window_of_its_leaf)` for flat window `w`.
+
+    Window `w` belongs to fold POSITION `t = w // wpl` and sits at offset
+    `(w % wpl) * KS` inside that position's leaf. `_leaf_at` maps the
+    position to the logical leaf -- the identity, and rotated only under
+    `SAB_LEAF_ROTATE` -- and `_leaf_bounds` is the IMPORTED clamp, so the
+    only inputs to a leaf boundary here are `leaf` and `k`, which is
+    contract section 6's clause.
+
+    **`chunk` may be 0.** Every position gets `wpl` windows whether or not
+    its leaf needs them, so the trip count is block-uniform and independent
+    of how ragged the last leaf is; the short last leaf simply ends with
+    empty windows that stage zeros and accumulate nothing. That costs at
+    most `wpl - 1` empty windows per tile per launch, and it buys a
+    `barrier()` sequence that every thread provably reaches.
+
+    The third element is 1 exactly at `w % wpl == wpl - 1`, so the fold push
+    fires exactly once per leaf whatever the raggedness.
+    """
+    var t = w // wpl
+    return _tuned_window_at[KS](t, w - t * wpl, wpl, leaf, k, p_count)
+
+
+@always_inline
+def _tuned_window_at[
+    KS: Int
+](t: Int, ww: Int, wpl: Int, leaf: Int, k: Int, p_count: Int) -> Tuple[Int, Int, Int]:
+    """`_tuned_window` of the window at fold position `t`, offset `ww`
+    (`w = t * wpl + ww`, `0 <= ww < wpl`), with no division.
+
+    THE KERNELS CARRY `(t, ww)` AS COUNTERS (2026-09-22). Recomputing
+    `w // wpl` and `w - (w // wpl) * wpl` at the three call sites per window
+    left several division/remainder pairs in one function, and Mojo 1.0.0's
+    optimization pipeline then associated the integer adds around them
+    differently from one cold compile to the next: the gfx942 code objects
+    of every tuned GEMM instantiation differed in integer index code
+    (tools/amd_codegen/probe_gemm.mojo; the minimal reproducer with no
+    anonlib code is tools/amd_codegen/repro_floormod.mojo). Same values,
+    one less thing for the optimizer to order."""
+    var lb = _leaf_bounds(_leaf_at(t, p_count), leaf, k)
+    var p0 = lb[0] + ww * KS
+    var chunk = lb[1] - p0
+    if chunk > KS:
+        chunk = KS
+    if chunk < 0:
+        chunk = 0
+    var last = 0
+    if ww == wpl - 1:
+        last = 1
+    return (p0, chunk, last)
+
+
+@always_inline
+def _tuned_window_next[
+    KS: Int
+](t: Int, ww: Int, wpl: Int, leaf: Int, k: Int, p_count: Int) -> Tuple[Int, Int, Int]:
+    """`_tuned_window_at` of the window after `(t, ww)`: `_tuned_window[KS](w + 1, ...)`."""
+    if ww + 1 == wpl:
+        return _tuned_window_at[KS](t + 1, 0, wpl, leaf, k, p_count)
+    return _tuned_window_at[KS](t, ww + 1, wpl, leaf, k, p_count)
+
+
+# ===========================================================================
+# THE GLOBAL -> REGISTER STAGE (DEVIATION 1257)
+# ===========================================================================
+
+
+def _tuned_g2r[
+    SLOTS: Int, VEC: Int, KV: Int, ROWS: Int, NTH: Int
+](
+    src: MutPointer[Float32, MutAnyOrigin],
+    outer_stride: Int,
+    k_stride: Int,
+    base_outer: Int,
+    outer_limit: Int,
+    p0: Int,
+    chunk: Int,
+    tid: Int,
+) -> SIMD[DType.float32, SLOTS * VEC]:
+    """One window of one operand, DRAM to registers. ONE function for A and
+    for B, because contract section 3 already made them one.
+
+        A_eff[i, p] = a[i * a_si + p * a_sp]     outer = i, outer_stride = a_si
+        B_eff[p, j] = b[j * b_sj + p * b_sp]     outer = j, outer_stride = b_sj
+
+    `gemm_operand_strides` is what turns the three orientations into those
+    two lines, and it is imported. There is no `if op ==` in this file.
+
+    THE VECTOR GUARD. One `unsafe_load[width=VEC]` serves `VEC` elements
+    when the operand is contiguous along `p` (`k_stride == 1`) and the whole
+    vector lies inside the window and inside the matrix; otherwise `VEC`
+    scalar loads with the stride, masked. **The two paths write the same
+    floats into the same slots.** A machine or an orientation on which the
+    guard never fires is slower here and never different, so this technique
+    cannot move a bit and can only fail to help. Contract sections 2 and 3.
+
+    Slots past the window are left `+0.0`. They are NEVER READ: the
+    accumulation loop below runs `chunk` steps and never `KS`, which is
+    `identical_gemm_tiled_kernel`'s own staging-hygiene distinction and
+    contract section 8's ban on operand padding.
+
+    `[[Mojo int widening sign-extends]]` does not bite here: every index is
+    `Int` throughout and nothing is narrowed.
+    """
+    comptime NSLOT = SLOTS
+    comptime NV = VEC
+    var out = SIMD[DType.float32, SLOTS * VEC](0.0)
+    if k_stride != 1 and outer_stride == 1:
+        # THE OUTER-CONTIGUOUS MAPPING (2026-09-09): `OP_TN`'s A (`k x m`)
+        # and `OP_NN`'s B (`k x n`) are contiguous along the OUTER index, so
+        # here consecutive threads take consecutive outer rows at one `p`
+        # and the warp's load is one contiguous line instead of `NTH`
+        # scattered words. Element `e` of slot `s` is flat index
+        # `tid + (s * VEC + e) * NTH`, row `idx % ROWS`, window column
+        # `idx // ROWS`; the kernel's register-to-shared copy uses the SAME
+        # expression, so the staged page holds the same floats in the same
+        # slots as the `p`-contiguous mapping below. Which mapping ran is
+        # a property of two strides and can move no bit.
+        comptime for s0 in range(NSLOT):
+            comptime for e0 in range(NV):
+                var idx0 = tid + (s0 * VEC + e0) * NTH
+                if idx0 < ROWS * KV * VEC:
+                    var rr0 = _urem[ROWS](idx0)
+                    var cc0 = _udiv[ROWS](idx0)
+                    var oi0 = base_outer + rr0
+                    if oi0 < outer_limit and cc0 < chunk:
+                        out[s0 * VEC + e0] = src.unsafe_load(
+                            oi0 * outer_stride + (p0 + cc0) * k_stride
+                        )
+        comptime if TUNED_STAGE_FTZ and not is_defined["ANONLIB_GEMM_SABOTAGE_TUNED_STAGE_FTZ"]():
+            comptime for f in range(SLOTS * VEC):
+                out[f] = ftz(out[f])
+        return out
+    comptime for s in range(NSLOT):
+        var idx = tid + s * NTH
+        if idx < ROWS * KV:
+            var rr = _udiv[KV](idx)
+            var cc = _urem[KV](idx) * VEC
+            var oi = base_outer + rr
+            if oi < outer_limit:
+                if k_stride == 1 and cc + VEC <= chunk:
+                    var vv = src.unsafe_load[width=VEC](
+                        oi * outer_stride + p0 + cc
+                    )
+                    comptime for e in range(NV):
+                        out[s * VEC + e] = vv[e]
+                else:
+                    comptime for e in range(NV):
+                        if cc + e < chunk:
+                            out[s * VEC + e] = src.unsafe_load(
+                                oi * outer_stride + (p0 + cc + e) * k_stride
+                            )
+    comptime if TUNED_STAGE_FTZ and not is_defined["ANONLIB_GEMM_SABOTAGE_TUNED_STAGE_FTZ"]():
+        comptime for f in range(SLOTS * VEC):
+            out[f] = ftz(out[f])
+    return out
+
+
+
+# ===========================================================================
+# THE TUNED TILED KERNEL
+# ===========================================================================
+
+
+@__llvm_metadata(MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(GEMM_LAUNCH_BOUND)))
+def identical_gemm_tuned_kernel[
+    RPT: Int, CPT: Int, TC: Int, KS: Int, FS: Int, PAGES: Int, SPLIT: Bool = False
+](
+    c: MutPointer[Float32, MutAnyOrigin],
+    a: MutPointer[Float32, MutAnyOrigin],
+    b: MutPointer[Float32, MutAnyOrigin],
+    m_in: Int32,
+    n_in: Int32,
+    k_in: Int32,
+    leaf_in: Int32,
+    p_in: Int32,
+    a_si_in: Int32,
+    a_sp_in: Int32,
+    b_sp_in: Int32,
+    b_sj_in: Int32,
+    swizzle_in: Int32,
+):
+    """One block owns a `BM x BN` output tile and ALL of its `k` leaves.
+
+    **`SPLIT = True` (the SPLIT plans):** one block owns a `BM x BN` tile of
+    ONE logical leaf, `t = block_idx.y`, walks that leaf's `wpl` windows and
+    nothing else, and at the leaf boundary writes the partial `ftz(acc)`
+    (5d) to `c[t * m * n + cell]` -- `c` is then the WORKSPACE, and
+    `identical_gemm_fold_stack_kernel` folds the `P` partials of each cell.
+    The leaf stage is the same code; the push into the local stack is
+    replaced by a store, and the tile/leaf pair comes from the grid.
+
+    RAFT's structure (`pairwise_distance_base.cuh:139-149`), contract 13.5's
+    second workspace escape -- NO GLOBAL SCRATCH AT ANY SHAPE -- and
+    `identical_gemm_tiled_kernel`'s arrangement with four things changed and
+    nothing else:
+
+        identical_gemm_tiled_kernel        this kernel
+        1 cell per thread                  RPT x CPT cells per thread
+        1 shared page, 2 barriers/window   PAGES pages, 1 barrier at PAGES=2
+        scalar global->shared copies       VEC-wide, guarded, same floats
+        ftz(operand) at every use          ftz(operand) once per staged load
+
+    **THE ARITHMETIC IS UNCHANGED AND THE ARGUMENT IS THREE LINES.** Every
+    output cell has exactly one accumulator. That accumulator is seeded
+    `+0.0` at the start of each logical leaf, takes one `identical_mul_add`
+    per `p` ASCENDING, is flushed after every step (5c), is flushed again as
+    the leaf partial (5d) and enters the same `_fold_push` tree the shipped
+    kernel uses. `RPT`, `CPT`, `TC`, `KS` and `PAGES` decide which thread
+    owns which cell, how many DRAM and shared transactions serve it and how
+    many barriers separate them. None of them appears in any expression that
+    reaches `leaf_begin`, `leaf_end` or a tree level, and `leaf_in` and
+    `p_in` arrive from `contract_partition(k)` and from nowhere else.
+
+    Every thread of the block reaches every `barrier()`. `w_total`, `wpl`,
+    `chunk` and `last` are functions of `leaf`, `k`, `p_count` and the
+    comptime `KS`, all block-uniform; a thread whose cell is out of range
+    still stages, still barriers, and only its final STORE is masked; and
+    the one early `return` (`raw >= n_tiles`) is block-uniform and happens
+    before any barrier. `[[metal-hardware-gaps]]`: no block reduction
+    primitive is used anywhere, so nothing here carries the "Block size must
+    be greater than warp size" constraint.
+    """
+    comptime NTH = TUNED_TPB
+    comptime FASTK = GEMM_DETECT_SEAM and TUNED_STAGE_FTZ and not SPLIT
+    comptime TR = NTH // TC
+    comptime BM = RPT * TR
+    comptime BN = CPT * TC
+    comptime VEC = TUNED_VECLEN
+    comptime KV = KS // VEC
+    comptime SSTRIDE = KS + VEC
+    comptime APAGE = BM * SSTRIDE
+    comptime BPAGE = BN * SSTRIDE
+    comptime NCELL = RPT * CPT
+    comptime NR = RPT
+    comptime NCOL = CPT
+    comptime ASLOTS = (BM * KV + NTH - 1) // NTH
+    comptime BSLOTS = (BN * KV + NTH - 1) // NTH
+
+    comptime assert KS % VEC == 0, (
+        "identical_gemm_tuned_kernel: KS must be a VEC multiple, so a staged"
+        " window is a whole number of vector slots"
+    )
+    comptime assert NTH % TC == 0, (
+        "identical_gemm_tuned_kernel: TC must divide the block size"
+    )
+    comptime assert FS >= 1 and (FS & (FS - 1)) == 0, (
+        "identical_gemm_tuned_kernel: FS must be a power of two, because the"
+        " fold stack is one SIMD register of FS * NCELL lanes"
+    )
+    comptime assert (NCELL & (NCELL - 1)) == 0, (
+        "identical_gemm_tuned_kernel: RPT * CPT must be a power of two, same"
+        " reason"
+    )
+    comptime assert PAGES == 1 or PAGES == 2, (
+        "identical_gemm_tuned_kernel: PAGES comes from lib_smem_pages_for and"
+        " that row returns 1 or 2"
+    )
+
+    var m = Int(m_in)
+    var n = Int(n_in)
+    var k = Int(k_in)
+    var leaf = Int(leaf_in)
+    var p_count = Int(p_in)
+    var a_si = Int(a_si_in)
+    var a_sp = Int(a_sp_in)
+    var b_sp = Int(b_sp_in)
+    var b_sj = Int(b_sj_in)
+    var swizzle = Int(swizzle_in)
+    # Block-uniform: which staging mapping each operand takes (`_tuned_g2r`).
+    var a_outer_fast = a_sp != 1 and a_si == 1
+    var b_outer_fast = b_sp != 1 and b_sj == 1
+
+    comptime if SAB_LEAF_READS_LAUNCH:
+        # SABOTAGE: the leaf boundary reads the LAUNCH. Contract section 6's
+        # first sentence forbids exactly this. Same arithmetic as the
+        # shipped kernel's arm so the two fail the same fixture.
+        leaf = leaf * Int(block_dim.x) // 64
+        if leaf < 1:
+            leaf = 1
+        p_count = (k + leaf - 1) // leaf
+        if k <= 0:
+            p_count = 0
+
+    var as_ = stack_allocation[
+        PAGES * APAGE,
+        Scalar[DType.float32],
+        address_space = AddressSpace.SHARED,
+    ]()
+    var bs_ = stack_allocation[
+        PAGES * BPAGE,
+        Scalar[DType.float32],
+        address_space = AddressSpace.SHARED,
+    ]()
+    # `TUNED_WINDOW_ADMIT`: per page, NWA warp minima of the staged A words'
+    # exponent fields, then NWA of B's.
+    comptime NWA = NTH // WARP_SIZE
+    var wadm_s = stack_allocation[
+        2 * PAGES * NWA if TUNED_WINDOW_ADMIT else 1,
+        Scalar[DType.uint32],
+        address_space = AddressSpace.SHARED,
+    ]()
+    var wadm_exact = True  # every accumulator of this leaf is a multiple of 2^-126
+
+    var tiles_i = (m + BM - 1) // BM
+    var tiles_j = (n + BN - 1) // BN
+    var n_tiles = tiles_i * tiles_j
+    var raw = Int(block_idx.y) * Int(grid_dim.x) + Int(block_idx.x)
+    var t_pos = 0
+    comptime if SPLIT:
+        # Tiles on x, the fold POSITION on y. `_tuned_window` maps the
+        # position to its logical leaf through `_leaf_at`, as every plan does.
+        raw = Int(block_idx.x)
+        t_pos = Int(block_idx.y)
+    if raw >= n_tiles:
+        return
+    # The tile permutation: an EXACT bijection, so every tile runs once.
+    var tile = raw
+    if swizzle == SWIZZLE_REVERSE:
+        tile = n_tiles - 1 - raw
+    elif swizzle == SWIZZLE_TRANSPOSE:
+        tile = (raw % tiles_i) * tiles_j + (raw // tiles_i)
+    # Unsigned: `tile >= 0` and `tiles_j > 0` here, and a signed floor division
+    # is one more sign fix-up for the optimizer to associate (`_tuned_window_at`).
+    var ti = Int(UInt(tile) // UInt(tiles_j))
+    var tj = tile - ti * tiles_j
+    var i0 = ti * BM
+    var j0 = tj * BN
+
+    var tid = Int(thread_idx.x)
+    # RAFT's accumulation assignment (`contractions.cuh:96-102`): thread
+    # `tid` owns rows `accrow + u * TR` and columns `acccol + v * TC`. The
+    # ownership is STRIDED rather than contiguous, so consecutive threads
+    # write consecutive columns of `C` and the store coalesces.
+    var accrow = _udiv[TC](tid)
+    var acccol = _urem[TC](tid)
+
+    var acc = SIMD[DType.float32, NCELL](0.0)
+    # FS == 1: the single leaf partial parks in registers (no tree at all).
+    # FS > 1: the stack is thread-local memory, `FS * NCELL` floats, touched
+    # once per leaf; see `_fold_push_local`.
+    var fstk = SIMD[DType.float32, NCELL](0.0)
+    var fl = stack_allocation[FS * NCELL, Scalar[DType.float32]]()
+    var occ = 0
+    var serial = SIMD[DType.float32, NCELL](0.0)
+    var emin_a = _EXP_NONE
+    var emin_b = _EXP_NONE
+
+    if p_count <= 0:
+        # `k == 0`, contract section 8: every cell is `+0.0`, and the
+        # implementation must WRITE it rather than skip the store. The
+        # dispatcher delegates this shape, so this arm is defensive.
+        comptime if SPLIT:
+            # No leaves, no partials; the dispatcher never launches this.
+            return
+        comptime for u0 in range(NR):
+            comptime for v0 in range(NCOL):
+                var zi = i0 + accrow + u0 * TR
+                var zj = j0 + acccol + v0 * TC
+                if zi < m and zj < n:
+                    c.unsafe_store(zi * n + zj, Float32(0.0))
+        return
+
+    var wpl = _tuned_windows_per_leaf[KS](leaf)
+    var w_total = p_count * wpl
+    var w = 0
+    var wt = 0  # w // wpl, carried (see `_tuned_window_at`)
+    var wq = 0  # w - wt * wpl
+    var w_end = w_total
+    comptime if SPLIT:
+        # This block's leaf only: the flat windows `[t * wpl, (t + 1) * wpl)`.
+        w = t_pos * wpl
+        wt = t_pos
+        w_end = w + wpl
+
+    # ---- PROLOGUE: the first window, DRAM to registers.
+    var w0 = _tuned_window_at[KS](wt, wq, wpl, leaf, k, p_count)
+    # The window after `w`, computed ONCE per iteration and carried into the
+    # next one (see `_tuned_window_at`): no window is computed twice.
+    var cur = w0
+    var pa = _tuned_g2r[ASLOTS, VEC, KV, BM, NTH](
+        a, a_si, a_sp, i0, m, w0[0], w0[1], tid
+    )
+    var pb = _tuned_g2r[BSLOTS, VEC, KV, BN, NTH](
+        b, b_sj, b_sp, j0, n, w0[0], w0[1], tid
+    )
+
+    var sub_seen = False  # DETECT seam: some step result of my cells was subnormal
+    while w < w_end:
+        var win = cur
+        var nxt = _tuned_window_next[KS](wt, wq, wpl, leaf, k, p_count)
+        var chunk = win[1]
+        var pgw = _urem[PAGES](w)
+        # The window's operand words, exactly once each (see
+        # `TUNED_BLOCK_ADMIT`). Unused slots are +0.0 and constrain nothing.
+        # A helper and not an inline `comptime if`: an empty `comptime if`
+        # block inside this loop changed the gfx942 schedule of five tuned
+        # kernels (integer address arithmetic only, bisected 2026-09-18).
+        _admit_track(pa, pb, emin_a, emin_b)
+        comptime if TUNED_WINDOW_ADMIT:
+            # This window's staged words, reduced over the warp; lane 0
+            # publishes them in page `pgw`'s slots before the barrier below.
+            var wadm_ma = _admit_warp_min(_admit_exp_min(pa))
+            var wadm_mb = _admit_warp_min(_admit_exp_min(pb))
+            if _urem[WARP_SIZE](tid) == 0:
+                wadm_s.unsafe_store(pgw * 2 * NWA + _udiv[WARP_SIZE](tid), wadm_ma)
+                wadm_s.unsafe_store(pgw * 2 * NWA + NWA + _udiv[WARP_SIZE](tid), wadm_mb)
+
+        # ---- REGISTERS TO SHARED, into page `w % PAGES`.
+        # The slot -> (row, column) expression is `_tuned_g2r`'s, in both
+        # mappings, so a staged float lands where the accumulate loop
+        # expects it whichever mapping loaded it.
+        comptime for sa in range(ASLOTS):
+            if a_outer_fast:
+                comptime for ea0 in range(VEC):
+                    var ia0 = tid + (sa * VEC + ea0) * NTH
+                    if ia0 < BM * KS:
+                        as_.unsafe_store(
+                            pgw * APAGE + _urem[BM](ia0) * SSTRIDE + _udiv[BM](ia0),
+                            pa[sa * VEC + ea0],
+                        )
+            else:
+                var ia = tid + sa * NTH
+                if ia < BM * KV:
+                    var rra = _udiv[KV](ia)
+                    var cca = _urem[KV](ia) * VEC
+                    var va = SIMD[DType.float32, VEC](0.0)
+                    comptime for ea in range(VEC):
+                        va[ea] = pa[sa * VEC + ea]
+                    as_.unsafe_store(pgw * APAGE + rra * SSTRIDE + cca, va)
+        comptime for sb in range(BSLOTS):
+            if b_outer_fast:
+                comptime for eb0 in range(VEC):
+                    var ib0 = tid + (sb * VEC + eb0) * NTH
+                    if ib0 < BN * KS:
+                        bs_.unsafe_store(
+                            pgw * BPAGE + _urem[BN](ib0) * SSTRIDE + _udiv[BN](ib0),
+                            pb[sb * VEC + eb0],
+                        )
+            else:
+                var ib = tid + sb * NTH
+                if ib < BN * KV:
+                    var rrb = _udiv[KV](ib)
+                    var ccb = _urem[KV](ib) * VEC
+                    var vb = SIMD[DType.float32, VEC](0.0)
+                    comptime for eb in range(VEC):
+                        vb[eb] = pb[sb * VEC + eb]
+                    bs_.unsafe_store(pgw * BPAGE + rrb * SSTRIDE + ccb, vb)
+        barrier()
+
+        # ---- PREFETCH window w+1 while page `w % PAGES` is being consumed.
+        # DEVIATION 1256. At PAGES == 2 the write of page `(w+1) % 2` at the
+        # top of the NEXT iteration conflicts only with the compute of
+        # iteration `w-1`, which every thread finished before the barrier
+        # just executed -- so one barrier per window is sufficient and the
+        # DRAM latency of window `w+1` overlaps the arithmetic of window
+        # `w`.
+        comptime if PAGES == 2:
+            if w + 1 < w_end:
+                var wn = nxt
+                pa = _tuned_g2r[ASLOTS, VEC, KV, BM, NTH](
+                    a, a_si, a_sp, i0, m, wn[0], wn[1], tid
+                )
+                pb = _tuned_g2r[BSLOTS, VEC, KV, BN, NTH](
+                    b, b_sj, b_sp, j0, n, wn[0], wn[1], tid
+                )
+
+        # ---- ACCUMULATE. Contract 7.1, 4 and 5, character for character
+        # the FLAT plan's step with the two loads served from threadgroup
+        # memory and the operand flushes hoisted (DEVIATION 1252).
+        # `TUNED_WINDOW_ADMIT`: block uniform, every thread reads the minima
+        # published for this page before the staging barrier.
+        var wadm_now = False
+        comptime if TUNED_WINDOW_ADMIT:
+            if chunk == KS and wadm_exact:
+                var wadm_na = UInt32(0xFF)
+                var wadm_nb = UInt32(0xFF)
+                comptime for ww in range(NWA):
+                    var wadm_xa = wadm_s.unsafe_load(pgw * 2 * NWA + ww)
+                    var wadm_xb = wadm_s.unsafe_load(pgw * 2 * NWA + NWA + ww)
+                    wadm_na = wadm_xa if wadm_xa < wadm_na else wadm_na
+                    wadm_nb = wadm_xb if wadm_xb < wadm_nb else wadm_nb
+                wadm_now = (wadm_na + wadm_nb) >= UInt32(GEMM_ADMIT_EXP_SUM)
+            if not wadm_now:
+                wadm_exact = False
+        var abase = pgw * APAGE + accrow * SSTRIDE
+        var bbase = pgw * BPAGE + acccol * SSTRIDE
+        if chunk == KS:
+            # THE FULL-WINDOW PATH. `VEC`-wide shared reads, then `VEC`
+            # ascending `p` steps out of them. `e` ascends inside `kc`
+            # ascending, so every accumulator sums its terms in exactly the
+            # order the scalar path below sums them in.
+            var fastw = False
+            comptime if TUNED_WINDOW_ADMIT:
+                fastw = wadm_now
+            if fastw:
+                # An ADMITTED window: the same loads, the same operand flushes,
+                # the same cells in the same ascending `p` order, the step
+                # without its flush (proven the identity on this window).
+                comptime for kca in range(KV):
+                    var raa = SIMD[DType.float32, RPT * VEC](0.0)
+                    comptime for ua in range(NR):
+                        var taa = as_.unsafe_load[width=VEC](
+                            abase + ua * TR * SSTRIDE + kca * VEC
+                        )
+                        comptime for ea in range(VEC):
+                            raa[ua * VEC + ea] = taa[ea]
+                    var rba = SIMD[DType.float32, CPT * VEC](0.0)
+                    comptime for va in range(NCOL):
+                        var tba = bs_.unsafe_load[width=VEC](
+                            bbase + va * TC * SSTRIDE + kca * VEC
+                        )
+                        comptime for eb in range(VEC):
+                            rba[va * VEC + eb] = tba[eb]
+                    comptime for ec in range(VEC):
+                        var bfa = SIMD[DType.float32, CPT](0.0)
+                        comptime for vb in range(NCOL):
+                            bfa[vb] = _tuned_loaded_operand(rba[vb * VEC + ec])
+                        comptime for ub in range(NR):
+                            var afa = _tuned_loaded_operand(raa[ub * VEC + ec])
+                            comptime for vc in range(NCOL):
+                                acc[ub * CPT + vc] = _tuned_admit_step(
+                                    afa, bfa[vc], acc[ub * CPT + vc]
+                                )
+            else:
+                comptime for kc in range(KV):
+                    var ra = SIMD[DType.float32, RPT * VEC](0.0)
+                    comptime for u in range(NR):
+                        var ta = as_.unsafe_load[width=VEC](
+                            abase + u * TR * SSTRIDE + kc * VEC
+                        )
+                        comptime for e in range(VEC):
+                            ra[u * VEC + e] = ta[e]
+                    var rb = SIMD[DType.float32, CPT * VEC](0.0)
+                    comptime for v in range(NCOL):
+                        var tb = bs_.unsafe_load[width=VEC](
+                            bbase + v * TC * SSTRIDE + kc * VEC
+                        )
+                        comptime for e2 in range(VEC):
+                            rb[v * VEC + e2] = tb[e2]
+                    comptime for e3 in range(VEC):
+                        # 5b: already flushed at staging when enabled; otherwise
+                        # once per shared-loaded B value rather than once per cell.
+                        var bfl = SIMD[DType.float32, CPT](0.0)
+                        comptime for v2 in range(NCOL):
+                            bfl[v2] = _tuned_loaded_operand(rb[v2 * VEC + e3])
+                        comptime if FASTK:
+                            # lane/amd-step-time: the DETECT seam, one packed FMA
+                            # per row plus one class test per result; a thread
+                            # that saw a subnormal recomputes its cells at the end.
+                            _fast_rows[NR, CPT, NCELL, RPT * VEC, VEC, e3](acc, ra, bfl, sub_seen)
+                        else:
+                         comptime for u2 in range(NR):
+                            # 5a, likewise.
+                            var afl = _tuned_loaded_operand(ra[u2 * VEC + e3])
+                            comptime for v3 in range(NCOL):
+                                # 4 (one fused rounding) and 5c (the accumulator
+                                # flushed after EVERY step). 5c is per cell per
+                                # step and is NOT hoisted, because it cannot be.
+                                acc[u2 * CPT + v3] = _tuned_step_admitted(
+                                    afl, bfl[v3], acc[u2 * CPT + v3]
+                                )
+        else:
+            # THE RAGGED PATH, and the EMPTY one: `chunk` may be 0. Scalar
+            # shared reads, same ascending `p`, same seams. No zero slot is
+            # ever read, so there is no operand padding (contract 8).
+            for cc in range(chunk):
+                var bfl2 = SIMD[DType.float32, CPT](0.0)
+                comptime for v4 in range(NCOL):
+                    bfl2[v4] = _tuned_loaded_operand(
+                        bs_.unsafe_load(bbase + v4 * TC * SSTRIDE + cc)
+                    )
+                comptime for u3 in range(NR):
+                    var afl2 = _tuned_loaded_operand(
+                        as_.unsafe_load(abase + u3 * TR * SSTRIDE + cc)
+                    )
+                    comptime for v5 in range(NCOL):
+                        acc[u3 * CPT + v5] = _tuned_step_admitted(
+                            afl2, bfl2[v5], acc[u3 * CPT + v5]
+                        )
+
+        comptime if PAGES == 1:
+            # One page: the compute above must finish before the next
+            # window overwrites it, and the prefetch cannot overlap. This is
+            # `identical_gemm_tiled_kernel`'s two-barrier shape exactly.
+            barrier()
+            if w + 1 < w_end:
+                var wn1 = nxt
+                pa = _tuned_g2r[ASLOTS, VEC, KV, BM, NTH](
+                    a, a_si, a_sp, i0, m, wn1[0], wn1[1], tid
+                )
+                pb = _tuned_g2r[BSLOTS, VEC, KV, BN, NTH](
+                    b, b_sj, b_sp, j0, n, wn1[0], wn1[1], tid
+                )
+
+        # ---- THE LEAF BOUNDARY. Fires exactly once per logical leaf.
+        if win[2] == 1:
+            var part = SIMD[DType.float32, NCELL](0.0)
+            comptime for pe in range(NCELL):
+                part[pe] = ftz(acc[pe])  # 5d, the leaf partial as written
+            comptime if SPLIT:
+                # THE PARTIAL, TO THE WORKSPACE, at the address of its
+                # LOGICAL position: leaf-major, `[t * m * n + cell]`, one
+                # legal layout of contract 7.2.2's level 0. Consecutive
+                # threads own consecutive columns, so the store coalesces.
+                var slot = t_pos
+                comptime if SAB_NODE_ORDER:
+                    # SABOTAGE: address by the PHYSICAL block instead
+                    # (`identical_gemm_leaf_kernel`'s arm). Contract 7.2.2.
+                    slot = (t_pos + Int(block_idx.x)) % p_count
+                comptime for us in range(NR):
+                    comptime for vs in range(NCOL):
+                        var si = i0 + accrow + us * TR
+                        var sj = j0 + acccol + vs * TC
+                        if si < m and sj < n:
+                            c.unsafe_store(
+                                slot * (m * n) + si * n + sj, part[us * CPT + vs]
+                            )
+            else:
+                comptime if SAB_FOLD_SERIAL:
+                    # SABOTAGE: the SUPERSEDED serial ascending fold.
+                    comptime for se in range(NCELL):
+                        serial[se] = ftz(ftz(serial[se]) + ftz(part[se]))
+                else:
+                    comptime if FS == 1:
+                        # `P == 1` by dispatch (`tuned_plan_max_leaves` is 1
+                        # at `FS = 1` and the host refuses otherwise).
+                        # Contract 7.3: the single leaf partial reaches the
+                        # output through seam 5g and through nothing else.
+                        # There is no "skip the fold at P == 1" optimization
+                        # to get wrong -- at `P == 1` the rule and the
+                        # optimization are the same rule -- and this branch
+                        # exists to spend NO registers on a stack the tree
+                        # does not have.
+                        comptime for fe in range(NCELL):
+                            fstk[fe] = part[fe]
+                        occ = 1
+                    else:
+                        _ = _fold_push_local[NCELL, FS](fl, occ, part)
+            acc = SIMD[DType.float32, NCELL](0.0)
+            wadm_exact = True  # the next leaf starts at +0.0
+
+        w = w + 1
+        cur = nxt
+        wq += 1
+        if wq == wpl:
+            wq = 0
+            wt += 1
+
+    comptime if TUNED_BLOCK_ADMIT:
+        comptime assert (NTH & (NTH - 1)) == 0, "block admission: NTH power of two"
+        # Every thread is here (the early returns above are block-uniform).
+        # The shared pages are free once every thread has left the last
+        # window's compute.
+        barrier()
+        as_.unsafe_store(tid, bitcast[DType.float32](emin_a))
+        bs_.unsafe_store(tid, bitcast[DType.float32](emin_b))
+        barrier()
+        var half = NTH // 2
+        while half > 0:
+            if tid < half:
+                var xa = bitcast[DType.uint32](as_.unsafe_load(tid))
+                var ya = bitcast[DType.uint32](as_.unsafe_load(tid + half))
+                as_.unsafe_store(tid, bitcast[DType.float32](min(xa, ya)))
+                var xb = bitcast[DType.uint32](bs_.unsafe_load(tid))
+                var yb = bitcast[DType.uint32](bs_.unsafe_load(tid + half))
+                bs_.unsafe_store(tid, bitcast[DType.float32](min(xb, yb)))
+            barrier()
+            half = half // 2
+        var admitted = _admission_holds(
+            bitcast[DType.uint32](as_.unsafe_load(0)),
+            bitcast[DType.uint32](bs_.unsafe_load(0)),
+        )
+        comptime if is_defined["ANONLIB_GEMM_ADMIT_NEVER"]():
+            admitted = False  # test arm: every block takes the exact path
+        if not admitted:
+            comptime for ur in range(NR):
+                comptime for vr in range(NCOL):
+                    var ri = i0 + accrow + ur * TR
+                    var rj = j0 + acccol + vr * TC
+                    if ri < m and rj < n:
+                        comptime if SPLIT:
+                            c.unsafe_store(
+                                t_pos * (m * n) + ri * n + rj,
+                                _rtf_leaf_partial(
+                                    a, b, ri, rj, t_pos, p_count, leaf, k,
+                                    a_si, a_sp, b_sp, b_sj,
+                                ),
+                            )
+                        else:
+                            c.unsafe_store(
+                                ri * n + rj,
+                                _rtf_cell(
+                                    a, b, ri, rj, p_count, leaf, k,
+                                    a_si, a_sp, b_sp, b_sj,
+                                ),
+                            )
+            return
+
+    comptime if SPLIT:
+        # Every partial is in the workspace; the fold is the next launch.
+        return
+
+    comptime if SAB_PAD_PLUS_ZERO:
+        # SABOTAGE: pad the level-0 width up to the next power of two with
+        # `+0.0` instead of carrying the odd tail. Contract 7.2 clause 4.
+        comptime if FS > 1:
+            var padded = 1
+            while padded < p_count:
+                padded = padded * 2
+            for _pad in range(p_count, padded):
+                _ = _fold_push_local[NCELL, FS](
+                    fl, occ, SIMD[DType.float32, NCELL](0.0)
+                )
+
+    var outv = SIMD[DType.float32, NCELL](0.0)
+    comptime if FS == 1:
+        comptime for oe in range(NCELL):
+            outv[oe] = fstk[oe]
+    else:
+        outv = _fold_drain_local[NCELL, FS](fl, occ)
+    comptime if SAB_FOLD_SERIAL:
+        outv = serial
+
+    comptime for u4 in range(NR):
+        comptime for v6 in range(NCOL):
+            var gi = i0 + accrow + u4 * TR
+            var gj = j0 + acccol + v6 * TC
+            if gi < m and gj < n:
+                # 5g: the output cell as stored.
+                c.unsafe_store(gi * n + gj, ftz(outv[u4 * CPT + v6]))
+    comptime if FASTK:
+        # lane/amd-step-time: a step result of my cells was subnormal, so
+        # the bare chain may differ from the contract's; recompute and
+        # overwrite every cell this thread owns with the exact step.
+        if _detect_recompute(sub_seen):
+            comptime for ux in range(NR):
+                comptime for vx in range(NCOL):
+                    var xi = i0 + accrow + ux * TR
+                    var xj = j0 + acccol + vx * TC
+                    if xi < m and xj < n:
+                        c.unsafe_store(
+                            xi * n + xj,
+                            _rtf_cell(a, b, xi, xj, p_count, leaf, k, a_si, a_sp, b_sp, b_sj),
+                        )
+
+
+# ===========================================================================
+# THE SPLIT PLANS' FOLD: one thread per cell, the FLAT plan's register stack
+# ===========================================================================
+
+
+def identical_gemm_fold_stack_kernel(
+    c: MutPointer[Float32, MutAnyOrigin],
+    ws: MutPointer[Float32, MutAnyOrigin],
+    mn_in: Int32,
+    p_in: Int32,
+):
+    """Fold each cell's `P` leaf partials, read leaf-major from the
+    workspace (`ws[t * mn + cell]`, so a warp's read is one line), through
+    `_fold_push` -- the register stack `identical_gemm_flat_kernel` folds
+    with and `check_stack_fold_is_the_contract_tree` proves against
+    `fold_balanced_tree` at every `P` in `1 .. 2049`. Same sabotage arms as
+    the FLAT plan, character for character. Contract 7.2, 7.3 and, at
+    `P == 0`, section 8 (`+0.0` STORED).
+    """
+    var mn = Int(mn_in)
+    var p_count = Int(p_in)
+    var cell = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if cell >= mn:
+        return
+    var stack = SIMD[DType.float32, GEMM_FOLD_SLOTS](0.0)
+    var occ = 0
+    var serial = Float32(0.0)
+    # The loads in batches of FOLD_BATCH, all issued before the first push of
+    # the batch, so the memory latency of `P` dependent-looking iterations
+    # overlaps (measured 2026-09-09 on an H100: one load per push was 0.19 ms
+    # at P = 512 whatever m n). The pushes still run in ascending `t`.
+    comptime FOLD_BATCH = 8
+    var t = 0
+    while t + FOLD_BATCH <= p_count:
+        var vals = SIMD[DType.float32, FOLD_BATCH](0.0)
+        comptime for e in range(FOLD_BATCH):
+            vals[e] = ws.unsafe_load((t + e) * mn + cell)
+        comptime for e2 in range(FOLD_BATCH):
+            comptime if SAB_FOLD_SERIAL:
+                # SABOTAGE: the SUPERSEDED serial ascending fold.
+                serial = ftz(ftz(serial) + ftz(vals[e2]))
+            else:
+                _ = _fold_push(stack, occ, vals[e2])
+        t += FOLD_BATCH
+    while t < p_count:
+        var part = ws.unsafe_load(t * mn + cell)
+        comptime if SAB_FOLD_SERIAL:
+            serial = ftz(ftz(serial) + ftz(part))
+        else:
+            _ = _fold_push(stack, occ, part)
+        t += 1
+    comptime if SAB_PAD_PLUS_ZERO:
+        # SABOTAGE: pad the level-0 width up to the next power of two with
+        # `+0.0` instead of carrying the odd tail. Contract 7.2 clause 4.
+        var padded = 1
+        while padded < p_count:
+            padded = padded * 2
+        for _pad in range(p_count, padded):
+            _ = _fold_push(stack, occ, Float32(0.0))
+    var out = _fold_drain(stack, occ)
+    comptime if SAB_FOLD_SERIAL:
+        out = serial
+    # 5g: the output cell as stored.
+    c.unsafe_store(cell, ftz(out))
+
+
+#: Outputs of at most this many cells fold one BLOCK per cell (the level-wise
+#: threadgroup fold, `D` barriers); larger outputs fold one THREAD per cell
+#: (the register stack). Scheduling only: both are the contract's tree.
+comptime SPLIT_BLOCK_FOLD_MAX_CELLS = 16384
+
+
+def _launch_split[
+    RPT: Int, CPT: Int, TC: Int, KS: Int
+](
+    ctx: DeviceContext,
+    mut c: DeviceBuffer[DType.float32],
+    mut a: DeviceBuffer[DType.float32],
+    mut b: DeviceBuffer[DType.float32],
+    mut ws: DeviceBuffer[DType.float32],
+    m: Int,
+    n: Int,
+    k: Int,
+    leaf: Int,
+    p_count: Int,
+    st: Tuple[Int, Int, Int, Int],
+) raises:
+    """Two launches: the tuned kernel in SPLIT mode over `(tiles, P)`, the
+    partials to `ws` (`m * n * P` floats, `identical_gemm_workspace_floats`),
+    then the fold into `c`. `p_count > 0` by dispatch."""
+    comptime NTH = TUNED_TPB
+    comptime TR = NTH // TC
+    comptime BM = RPT * TR
+    comptime BN = CPT * TC
+    comptime VEC = TUNED_VECLEN
+    comptime SSTRIDE = KS + VEC
+    comptime PAGE_BYTES = (BM + BN) * SSTRIDE * 4
+    comptime PAGES = lib_smem_pages_for[TARGET_COLUMN, PAGE_BYTES]()
+    comptime kern = identical_gemm_tuned_kernel[RPT, CPT, TC, KS, 1, PAGES, True]
+    var g = _tile_grid(m, n, BM, BN, False)
+    step_count_launch()
+    ctx.enqueue_function[kern](
+        ws.unsafe_ptr(),
+        a.unsafe_ptr(),
+        b.unsafe_ptr(),
+        Int32(m),
+        Int32(n),
+        Int32(k),
+        Int32(leaf),
+        Int32(p_count),
+        Int32(st[0]),
+        Int32(st[1]),
+        Int32(st[2]),
+        Int32(st[3]),
+        Int32(SWIZZLE_NONE),
+        grid_dim=(g[0], p_count, 1),
+        block_dim=(NTH, 1, 1),
+    )
+    if m * n <= SPLIT_BLOCK_FOLD_MAX_CELLS:
+        step_count_launch()
+        ctx.enqueue_function[identical_gemm_fold_kernel[True]](
+            c.unsafe_ptr(),
+            ws.unsafe_ptr(),
+            Int32(m * n),
+            Int32(p_count),
+            Int32(p_count),
+            grid_dim=(m * n, 1, 1),
+            block_dim=(SPLITK_FOLD_TPB, 1, 1),
+        )
+        return
+    step_count_launch()
+    ctx.enqueue_function[identical_gemm_fold_stack_kernel](
+        c.unsafe_ptr(),
+        ws.unsafe_ptr(),
+        Int32(m * n),
+        Int32(p_count),
+        grid_dim=((m * n + FLAT_TPB - 1) // FLAT_TPB, 1, 1),
+        block_dim=(FLAT_TPB, 1, 1),
+    )
+
+
+# ===========================================================================
+# THE MATRIX-CORE PLAN (lane/amd-step-time, 2026-09-24): `lib_gemm_mfma_for`
+# ===========================================================================
+# The contract step `ftz(fma_rn(a, b, acc))` on the gfx942 matrix cores:
+#   - `v_mfma_f32_32x32x1f32` has K = 1, so every output it writes is ONE
+#     product plus ITS accumulator: `fma_rn(a, b, acc)`, measured equal to
+#     the VALU fma on every element tried, subnormal results included, in
+#     IEEE mode and with the MODE flush set (gemm/checks/amd_mfma_probe.mojo,
+#     amd_mfma_probe2.mojo);
+#   - the flush after each step is `acc * one` on the VALU with the wave's
+#     MODE f32 FP_DENORM field at 2 (set once at kernel entry), where a
+#     product by one returned `ftz(x)` exactly on every element, signed zero
+#     included, and the MFMA kept its unflushed IEEE result
+#     (amd_mfma_probe2.mojo `MFMA2_MODE v=2`); `one` is a kernel ARGUMENT
+#     equal to 1.0, so the compiler cannot fold the product away.
+# So per cell: one accumulator, seeded +0.0 per leaf, one product per `p`
+# ascending, each result flushed: the contract's chain (7.1, 4, 5c), then the
+# same leaf partial, local fold stack and output seam as the tuned kernel.
+# Ownership is the MFMA's: 4 waves, each a 64x64 quarter of the 128x128 tile,
+# two instructions per step (columns 0..31 and 32..63 of the quarter), each
+# lane holding 64 cells. Under MODE 2 every other FP operation in the kernel
+# (the fold's adds of flushed operands, the class tests of the staging flush)
+# computes what it computed before: the class test was measured unchanged,
+# and a sum of two binary32 words is a multiple of 2^-149 and cannot lie in
+# the round-up window below 2^-126.
+
+#: hwreg(HW_REG_MODE = 1, offset 4, width 2): the f32 FP_DENORM field.
+comptime _MODE_F32_DENORM = 1 | (4 << 6) | (1 << 11)
+#: The field value measured to make a VALU product by one flush a subnormal
+#: result while the MFMA keeps its IEEE result (amd_mfma_probe2.mojo).
+comptime _MODE_MFMA_FLUSH = 2
+
+
+@always_inline
+def _mfma_step(a: Float32, b: Float32, acc: SIMD[DType.float32, 32]) -> SIMD[DType.float32, 32]:
+    comptime if is_amd_gpu():
+        return llvm_intrinsic["llvm.amdgcn.mfma.f32.32x32x1f32", SIMD[DType.float32, 32]](
+            a, b, acc, Int32(0), Int32(0), Int32(0)
+        )
+    # Not reachable (the plan is AMD only); keeps other targets compiling.
+    return acc
+
+
+@always_inline
+def _mfma_row(r: Int, lane: Int) -> Int:
+    """Row, inside a wave's 64-row quarter, of accumulator register `r` of
+    `lane` for `v_mfma_f32_32x32x1f32` (two 32x32 blocks, block `r div 16`),
+    read off the device (amd_mfma_probe2.mojo `MFMA_LAYOUT`)."""
+    return 32 * (r // 16) + 8 * ((r % 16) // 4) + 4 * (lane // 32) + (r % 4)
+
+
+# EXACT ADMISSION (lane/amd-step-time-2, 2026-09-25): when the flush after a
+# step is the identity, the matrix-core step needs no VALU product.
+#
+# THE ARGUMENT. Staged operands are flushed, so each is +-0 or a normal word
+# `m 2^(E-150)` with an integer mantissa `m` (biased exponent E >= 1). A
+# product of two nonzero staged words is an integer multiple of
+# `2^(Ea+Eb-300)`. If `Ea + Eb >= 174` for every product of a leaf, every
+# product is a multiple of G = 2^-126. The leaf's accumulator starts at +0.0,
+# a multiple of G; if `acc` is a multiple of G then the exact `a b + acc` is
+# a multiple of G, and so is its rounding (below 2^-102 it is exactly
+# representable; at or above, the result's ulp is at least 2^-125). A nonzero
+# multiple of G has magnitude at least 2^-126, and zero stays a signed zero,
+# so no rounded step result is subnormal and `ftz(fma_rn(a, b, acc))` equals
+# `fma_rn(a, b, acc)` word for word, sign of zero included (ftz never touches
+# a zero). The MFMA step alone therefore IS the contract step: same operands,
+# same order, same single rounding; only the product by one, which returns
+# its operand unchanged on every such word, is not issued.
+#
+# THE TEST, per window, per block: the smallest nonzero exponent field over
+# the A words the block stages and over the B words, summed, at least 174.
+# A block covers every product of its tile's cells in the window, so the
+# test bounds them all. The invariant needs EVERY window of the leaf so far
+# to pass: a window that fails switches the rest of the leaf to the shipped
+# step (acc times one under MODE 2), and the next leaf starts admitted again.
+# Zero words never bound (their products are signed zeros). Inf and NaN
+# (field 255) never lower the minimum; they produce no subnormal either.
+# `-D ANONLIB_GEMM_MFMA_NO_ADMIT=1` is the revert arm.
+comptime GEMM_MFMA_ADMIT = not is_defined["ANONLIB_GEMM_MFMA_NO_ADMIT"]()
+comptime _ADMIT_EXP_SUM = 174
+
+
+@always_inline
+def _min_exp_nz[W: Int](v: SIMD[DType.float32, W]) -> UInt32:
+    """The smallest nonzero biased exponent field over the lanes of `v`
+    (255 if every lane is zero)."""
+    var m = UInt32(255)
+    comptime for i in range(W):
+        var x = (bitcast[DType.uint32](v[i]) >> UInt32(23)) & UInt32(0xFF)
+        m = min(m, x if x != UInt32(0) else UInt32(255))
+    return m
+
+
+@__llvm_metadata(MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(GEMM_LAUNCH_BOUND)))
+def identical_gemm_mfma_kernel[
+    KS: Int, FS: Int, PAGES: Int, GROUP: Bool = False, ADMIT: Bool = False
+](
+    c: MutPointer[Float32, MutAnyOrigin],
+    a: MutPointer[Float32, MutAnyOrigin],
+    b: MutPointer[Float32, MutAnyOrigin],
+    m_in: Int32,
+    n_in: Int32,
+    k_in: Int32,
+    leaf_in: Int32,
+    p_in: Int32,
+    a_si_in: Int32,
+    a_sp_in: Int32,
+    b_sp_in: Int32,
+    b_sj_in: Int32,
+    gleaves_in: Int32,
+    groups_in: Int32,
+    one: Float32,
+):
+    """The 128x128 matrix-core IDENTICAL GEMM (see the section comment).
+    `GROUP = False`: a block owns one output tile and all of its leaves and
+    stores `ftz(root)` (5g). `GROUP = True`: block (tile, `q = block_idx.y`)
+    walks the leaves `[q G, min((q + 1) G, P))` (G = `gleaves_in`, a power of
+    two), pushes their partials through the same local fold stack, and stores
+    the group's node UNFLUSHED to `c[q m n + cell]` (`c` is then the node
+    workspace `_ksplit_fold_launch` folds), exactly the packed kernel's GROUP
+    mode. Staging, windows, pages and barriers are the tuned kernel's lines."""
+    comptime NTH = TUNED_TPB
+    comptime BM = 128
+    comptime BN = 128
+    comptime VEC = TUNED_VECLEN
+    comptime KV = KS // VEC
+    comptime SSTRIDE = KS + VEC
+    comptime APAGE = BM * SSTRIDE
+    comptime BPAGE = BN * SSTRIDE
+    comptime NCELL = 64
+    comptime ASLOTS = (BM * KV + NTH - 1) // NTH
+    comptime BSLOTS = (BN * KV + NTH - 1) // NTH
+    comptime assert NTH == 256, "identical_gemm_mfma_kernel: four waves of 64"
+    comptime assert KS % VEC == 0, "identical_gemm_mfma_kernel: KS a VEC multiple"
+
+    var m = Int(m_in)
+    var n = Int(n_in)
+    var k = Int(k_in)
+    var leaf = Int(leaf_in)
+    var p_count = Int(p_in)
+    var a_si = Int(a_si_in)
+    var a_sp = Int(a_sp_in)
+    var b_sp = Int(b_sp_in)
+    var b_sj = Int(b_sj_in)
+    var a_outer_fast = a_sp != 1 and a_si == 1
+    var b_outer_fast = b_sp != 1 and b_sj == 1
+
+    var as_ = stack_allocation[
+        PAGES * APAGE, Scalar[DType.float32], address_space = AddressSpace.SHARED,
+    ]()
+    var bs_ = stack_allocation[
+        PAGES * BPAGE, Scalar[DType.float32], address_space = AddressSpace.SHARED,
+    ]()
+
+    var tiles_i = (m + BM - 1) // BM
+    var tiles_j = (n + BN - 1) // BN
+    var n_tiles = tiles_i * tiles_j
+    var raw = Int(block_idx.x)
+    var q = 0
+    var gleaves = Int(gleaves_in)
+    comptime if GROUP:
+        q = Int(block_idx.y)
+        if q >= Int(groups_in) or p_count <= 0 or gleaves < 1:
+            return
+    if raw >= n_tiles:
+        return
+    var ti = Int(UInt(raw) // UInt(tiles_j))
+    var tj = raw - ti * tiles_j
+    var i0 = ti * BM
+    var j0 = tj * BN
+
+    var tid = Int(thread_idx.x)
+    var wv = _udiv[64](tid)
+    var lane = _urem[64](tid)
+    var qr = _udiv[2](wv) * 64  # the wave's quarter: rows qr .. qr+63
+    var qc = _urem[2](wv) * 64  # and columns qc .. qc+63
+    var ccol = _urem[32](lane)
+
+    if p_count <= 0:
+        # `k == 0`, contract section 8: every cell +0.0, STORED.
+        comptime if GROUP:
+            return
+        comptime for t0 in range(2):
+            comptime for r0 in range(32):
+                var zi = i0 + qr + _mfma_row(r0, lane)
+                var zj = j0 + qc + 32 * t0 + ccol
+                if zi < m and zj < n:
+                    c.unsafe_store(zi * n + zj, Float32(0.0))
+        return
+
+    comptime if is_amd_gpu():
+        llvm_intrinsic["llvm.amdgcn.s.setreg", NoneType](Int32(_MODE_F32_DENORM), Int32(_MODE_MFMA_FLUSH))
+
+    var acc0 = SIMD[DType.float32, 32](0.0)
+    var acc1 = SIMD[DType.float32, 32](0.0)
+    var ones = SIMD[DType.float32, 32](one)
+    var fl = stack_allocation[FS * NCELL, Scalar[DType.float32]]()
+    var occ = 0
+    # EXACT ADMISSION: per-wave exponent minima, two slot sets by window
+    # parity (a fast wave's next-window write never meets a slow wave's read).
+    var adm_s = stack_allocation[16, Scalar[DType.uint32], address_space = AddressSpace.SHARED]()
+    var adm_leaf = True
+
+    var wpl = _tuned_windows_per_leaf[KS](leaf)
+    var w = 0
+    var wt = 0
+    var wq = 0
+    var w_end = p_count * wpl
+    comptime if GROUP:
+        var lbeg = q * gleaves
+        var lend = lbeg + gleaves
+        if lend > p_count:
+            lend = p_count
+        w = lbeg * wpl
+        wt = lbeg
+        w_end = lend * wpl
+
+    var w0 = _tuned_window_at[KS](wt, wq, wpl, leaf, k, p_count)
+    var cur = w0
+    var pa = _tuned_g2r[ASLOTS, VEC, KV, BM, NTH](a, a_si, a_sp, i0, m, w0[0], w0[1], tid)
+    var pb = _tuned_g2r[BSLOTS, VEC, KV, BN, NTH](b, b_sj, b_sp, j0, n, w0[0], w0[1], tid)
+
+    while w < w_end:
+        var win = cur
+        var nxt = _tuned_window_next[KS](wt, wq, wpl, leaf, k, p_count)
+        var chunk = win[1]
+        var pgw = _urem[PAGES](w)
+
+        comptime if ADMIT:
+            var mea = _min_exp_nz[ASLOTS * VEC](pa)
+            var meb = _min_exp_nz[BSLOTS * VEC](pb)
+            comptime for sh in range(6):
+                mea = min(mea, shuffle_xor(mea, UInt32(32 >> sh)))
+                meb = min(meb, shuffle_xor(meb, UInt32(32 >> sh)))
+            if lane == 0:
+                var sw = _urem[2](w) * 8
+                adm_s.unsafe_store(sw + wv, mea)
+                adm_s.unsafe_store(sw + 4 + wv, meb)
+
+        # ---- REGISTERS TO SHARED (the tuned kernel's lines).
+        comptime for sa in range(ASLOTS):
+            if a_outer_fast:
+                comptime for ea0 in range(VEC):
+                    var ia0 = tid + (sa * VEC + ea0) * NTH
+                    if ia0 < BM * KS:
+                        as_.unsafe_store(
+                            pgw * APAGE + _urem[BM](ia0) * SSTRIDE + _udiv[BM](ia0),
+                            pa[sa * VEC + ea0],
+                        )
+            else:
+                var ia = tid + sa * NTH
+                if ia < BM * KV:
+                    var rra = _udiv[KV](ia)
+                    var cca = _urem[KV](ia) * VEC
+                    var va = SIMD[DType.float32, VEC](0.0)
+                    comptime for ea in range(VEC):
+                        va[ea] = pa[sa * VEC + ea]
+                    as_.unsafe_store(pgw * APAGE + rra * SSTRIDE + cca, va)
+        comptime for sb in range(BSLOTS):
+            if b_outer_fast:
+                comptime for eb0 in range(VEC):
+                    var ib0 = tid + (sb * VEC + eb0) * NTH
+                    if ib0 < BN * KS:
+                        bs_.unsafe_store(
+                            pgw * BPAGE + _urem[BN](ib0) * SSTRIDE + _udiv[BN](ib0),
+                            pb[sb * VEC + eb0],
+                        )
+            else:
+                var ib = tid + sb * NTH
+                if ib < BN * KV:
+                    var rrb = _udiv[KV](ib)
+                    var ccb = _urem[KV](ib) * VEC
+                    var vb = SIMD[DType.float32, VEC](0.0)
+                    comptime for eb in range(VEC):
+                        vb[eb] = pb[sb * VEC + eb]
+                    bs_.unsafe_store(pgw * BPAGE + rrb * SSTRIDE + ccb, vb)
+        barrier()
+
+        comptime if PAGES == 2:
+            if w + 1 < w_end:
+                var wn = nxt
+                pa = _tuned_g2r[ASLOTS, VEC, KV, BM, NTH](a, a_si, a_sp, i0, m, wn[0], wn[1], tid)
+                pb = _tuned_g2r[BSLOTS, VEC, KV, BN, NTH](b, b_sj, b_sp, j0, n, wn[0], wn[1], tid)
+
+        # ---- ACCUMULATE: per `p` ascending, one MFMA step per 32x32 block
+        # pair, then the flush of every accumulator.
+        var abase = pgw * APAGE + (qr + lane) * SSTRIDE
+        var bbase0 = pgw * BPAGE + (qc + ccol) * SSTRIDE
+        var bbase1 = bbase0 + 32 * SSTRIDE
+        var bare = False
+        comptime if ADMIT:
+            var sr = _urem[2](w) * 8
+            var ma = min(min(adm_s[sr], adm_s[sr + 1]), min(adm_s[sr + 2], adm_s[sr + 3]))
+            var mb = min(min(adm_s[sr + 4], adm_s[sr + 5]), min(adm_s[sr + 6], adm_s[sr + 7]))
+            if ma + mb < UInt32(_ADMIT_EXP_SUM):
+                adm_leaf = False
+            bare = adm_leaf
+        if bare:
+            # Admitted: the MFMA step is the contract step (EXACT ADMISSION).
+            if chunk == KS:
+                comptime for kc2 in range(KV):
+                    var avx = as_.unsafe_load[width=VEC](abase + kc2 * VEC)
+                    var bvx0 = bs_.unsafe_load[width=VEC](bbase0 + kc2 * VEC)
+                    var bvx1 = bs_.unsafe_load[width=VEC](bbase1 + kc2 * VEC)
+                    comptime for e2 in range(VEC):
+                        acc0 = _mfma_step(avx[e2], bvx0[e2], acc0)
+                        acc1 = _mfma_step(avx[e2], bvx1[e2], acc1)
+            else:
+                for cc2 in range(chunk):
+                    var avy = as_.unsafe_load(abase + cc2)
+                    var bwy0 = bs_.unsafe_load(bbase0 + cc2)
+                    var bwy1 = bs_.unsafe_load(bbase1 + cc2)
+                    acc0 = _mfma_step(avy, bwy0, acc0)
+                    acc1 = _mfma_step(avy, bwy1, acc1)
+        elif chunk == KS:
+            comptime for kc in range(KV):
+                var av = as_.unsafe_load[width=VEC](abase + kc * VEC)
+                var bv0 = bs_.unsafe_load[width=VEC](bbase0 + kc * VEC)
+                var bv1 = bs_.unsafe_load[width=VEC](bbase1 + kc * VEC)
+                comptime for e in range(VEC):
+                    acc0 = _mfma_step(av[e], bv0[e], acc0) * ones
+                    acc1 = _mfma_step(av[e], bv1[e], acc1) * ones
+        else:
+            for cc in range(chunk):
+                var av2 = as_.unsafe_load(abase + cc)
+                var bw0 = bs_.unsafe_load(bbase0 + cc)
+                var bw1 = bs_.unsafe_load(bbase1 + cc)
+                acc0 = _mfma_step(av2, bw0, acc0) * ones
+                acc1 = _mfma_step(av2, bw1, acc1) * ones
+
+        comptime if PAGES == 1:
+            barrier()
+            if w + 1 < w_end:
+                var wn1 = nxt
+                pa = _tuned_g2r[ASLOTS, VEC, KV, BM, NTH](a, a_si, a_sp, i0, m, wn1[0], wn1[1], tid)
+                pb = _tuned_g2r[BSLOTS, VEC, KV, BN, NTH](b, b_sj, b_sp, j0, n, wn1[0], wn1[1], tid)
+
+        # ---- THE LEAF BOUNDARY (5d), once per logical leaf.
+        if win[2] == 1:
+            var part = SIMD[DType.float32, NCELL](0.0)
+            comptime for r1 in range(32):
+                part[r1] = ftz(acc0[r1])
+                part[32 + r1] = ftz(acc1[r1])
+            _ = _fold_push_local[NCELL, FS](fl, occ, part)
+            acc0 = SIMD[DType.float32, 32](0.0)
+            acc1 = SIMD[DType.float32, 32](0.0)
+            adm_leaf = True
+
+        w = w + 1
+        cur = nxt
+        wq += 1
+        if wq == wpl:
+            wq = 0
+            wt += 1
+
+    var outv = _fold_drain_local[NCELL, FS](fl, occ)
+    comptime for t2 in range(2):
+        comptime for r3 in range(32):
+            var gi = i0 + qr + _mfma_row(r3, lane)
+            var gj = j0 + qc + 32 * t2 + ccol
+            if gi < m and gj < n:
+                comptime if GROUP:
+                    # The group's node, unflushed; the fold kernels flush on
+                    # read and every node is already flushed (long-k 5.4).
+                    c.unsafe_store(q * (m * n) + gi * n + gj, outv[32 * t2 + r3])
+                else:
+                    c.unsafe_store(gi * n + gj, ftz(outv[32 * t2 + r3]))
+
+
+def _mfma_run(
+    ctx: DeviceContext,
+    mut c: DeviceBuffer[DType.float32],
+    mut a: DeviceBuffer[DType.float32],
+    mut b: DeviceBuffer[DType.float32],
+    m: Int,
+    n: Int,
+    k: Int,
+    op: Int,
+    group_leaves: Int,
+) raises:
+    """One matrix-core call: `group_leaves <= 0`, all leaves in one launch
+    into `c` (asynchronous); otherwise the group launch over (tiles, groups)
+    into a fresh `m n groups` node workspace, `_ksplit_fold_launch`, a wait
+    (the packed body's `_kpack_run` lines)."""
+    if m <= 0 or n <= 0:
+        return
+    comptime KS = 16
+    comptime SSTRIDE = KS + TUNED_VECLEN
+    comptime PAGE_BYTES = (128 + 128) * SSTRIDE * 4
+    # 2026-10-05 one-page screen: NVIDIA B/A 1.013586 (slower), AMD
+    # 0.991303 (single-sample near-neutral); not a combined timing win.
+    # Exact cases retained in experiments/identical_speed/results/20261005/.
+    # EXPERIMENT: default OFF; enable only with ANONLIB_GEMM_ONE_PAGE.
+    # NEVER TESTED by this campaign: combinations with the other experiments.
+    # NOT PERFORMANCE-QUALIFIED: the recorded checks do not enable this flag.
+    # Individual-arm history is retained above. See the light-identity record
+    # beside GEMM_KSPLIT_SLACK for the tested cases and remaining limits.
+    # A02 current experiment: NEVER RUN — PENDING MEASUREMENT; existing defaults preserved.
+    comptime PAGES = 1 if is_defined["ANONLIB_GEMM_ONE_PAGE"]() else lib_smem_pages_for[TARGET_COLUMN, PAGE_BYTES]()
+    var part = contract_partition(k)
+    var leaf = part[0]
+    var p_count = part[1]
+    var st = gemm_operand_strides(op, m, n, k)
+    var tiles = ((m + 127) // 128) * ((n + 127) // 128)
+    if group_leaves <= 0 or p_count <= 1:
+        comptime kern = identical_gemm_mfma_kernel[KS, TUNED_FOLD_SLOTS, PAGES, False, GEMM_MFMA_ADMIT]
+        step_count_launch()
+        ctx.enqueue_function[kern](
+            c.unsafe_ptr(), a.unsafe_ptr(), b.unsafe_ptr(),
+            Int32(m), Int32(n), Int32(k), Int32(leaf), Int32(p_count),
+            Int32(st[0]), Int32(st[1]), Int32(st[2]), Int32(st[3]),
+            Int32(0), Int32(0), Float32(1.0),
+            grid_dim=(tiles, 1, 1), block_dim=(TUNED_TPB, 1, 1),
+        )
+        return
+    var rg = _ksplit_resolve_leaves(group_leaves, p_count)
+    step_count_device_alloc()
+    var ws = ctx.enqueue_create_buffer[DType.float32](m * n * rg[1])
+    comptime kern_g = identical_gemm_mfma_kernel[KS, TUNED_FOLD_SLOTS, PAGES, True, GEMM_MFMA_ADMIT]
+    step_count_launch()
+    ctx.enqueue_function[kern_g](
+        ws.unsafe_ptr(), a.unsafe_ptr(), b.unsafe_ptr(),
+        Int32(m), Int32(n), Int32(k), Int32(leaf), Int32(p_count),
+        Int32(st[0]), Int32(st[1]), Int32(st[2]), Int32(st[3]),
+        Int32(rg[0]), Int32(rg[1]), Float32(1.0),
+        grid_dim=(tiles, rg[1], 1), block_dim=(TUNED_TPB, 1, 1),
+    )
+    _ksplit_fold_launch(ctx, c, ws, m, n, rg[1])
+    step_count_sync()
+    ctx.synchronize()
+    _ = ws
+
+
+comptime IDN_GEMM_MFMA_REUSE_WS = GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL and not (
+    is_defined["ANONLIB_IDN_GEMM_MFMA_REUSE_WS_OFF"]() or is_defined["ANONLIB_IDN_ALL_OFF"]()
+)
+"""lane/fam-lm (2026-10-04), default ON under IDENTICAL; reached only where
+`lib_gemm_mfma_for` is on (the AMD column). The matrix-core GROUP launch
+writes its `m n groups` node partials into the CALLER's workspace when it
+is large enough (`identical_gemm_workspace_max_floats` sizes for it) and
+returns without waiting, as the NVIDIA packed body has since
+`GEMM_REUSE_GROUP_WS`. `_mfma_run` allocated a fresh node workspace, waited
+and freed it on every grouped call (every projection of an LM forward or
+train step). The same group kernel, the same groups, the same fold launch:
+the same partials through the same fold DAG, so no bit moves. A caller whose
+workspace is smaller takes `_mfma_run` unchanged.
+`-D ANONLIB_IDN_GEMM_MFMA_REUSE_WS_OFF` restores `_mfma_run` everywhere."""
+
+
+comptime IDN_GEMM_MFMA_NO_LONE_GROUP = GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL and not (
+    is_defined["ANONLIB_IDN_GEMM_MFMA_NO_LONE_GROUP_OFF"]() or is_defined["ANONLIB_IDN_ALL_OFF"]()
+)
+"""lane/nr-gemm (2026-10-04), default ON under IDENTICAL; reached only where
+`lib_gemm_mfma_for` is on (the AMD column). The leaf split's rule answers a
+group size with at least two groups, but raising it to
+`GEMM_MFMA_MIN_GROUP_LEAVES` (4) makes ONE group whenever `P <= 4` (the rule's
+`gl` was 1 or 2). One group used to write a full `m n` node plane and run a
+fold launch over a single node per cell. Now a size that resolves to one
+group answers 0: the all-leaves launch writes `ftz(root)` straight into `c`.
+PRESERVED ORDER: groups are powers of two aligned at leaf 0, so a group of
+size >= P holds leaves 0..P-1 and its in-register fold IS the contract tree
+over P leaves (the same `_fold_push_local` pushes in ascending leaf order);
+the old fold launch over one node only flushed it (`fold(P=1)` = ftz(node)),
+which the non-group store applies itself. Same bits.
+`-D ANONLIB_IDN_GEMM_MFMA_NO_LONE_GROUP_OFF` restores the one-group launch."""
+
+
+comptime IDN_GEMM_AMD_BAND_MFMA = GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL and not (
+    # A01 current experiment: NEVER RUN — PENDING MEASUREMENT; existing defaults preserved.
+    is_defined["ANONLIB_IDN_GEMM_AMD_BAND_MFMA_OFF"]() or is_defined["ANONLIB_IDN_ALL_OFF"]()
+)
+"""lane/nr-gemm (2026-10-04, review rank 1 "A4 fix"), default ON under
+IDENTICAL; reached only on the AMD column with `lib_gemm_mfma_for` on. The
+short-contraction band rule (`amd_short_contract_large_output`, 512 < k <=
+1024 with a large output) forces PLAN_TUNED_128_8X8, and
+`identical_gemm_with_plan` runs that plan on the scalar `_launch_tuned`
+128x128 kernel; every other TUNED_128 call on this column already runs the
+matrix-core body. The band now runs `_mfma_run_ws`, the TUNED_128 plan's
+matrix-core body. PRESERVED ORDER: the same 128-wide leaves of
+`contract_partition(k)`, each leaf one K=1 `fma_rn` chain per cell in
+ascending k from +0.0, flushed at the leaf boundary, and the leaves folded in
+ascending order through the contract's balanced tree (`_fold_push_local`);
+the same order the scalar TUNED kernel runs, so no bit moves.
+`-D ANONLIB_IDN_GEMM_AMD_BAND_MFMA_OFF` restores the scalar plan."""
+
+
+def _mfma_group_leaves(m: Int, n: Int, k: Int) -> Int:
+    """The group size the shipped matrix-core dispatch passes `_mfma_run`:
+    the leaf split's rule, raised to `GEMM_MFMA_MIN_GROUP_LEAVES`; 0 runs
+    all leaves in one launch. One spelling for the dispatch and for the
+    workspace sizing, so the two cannot disagree."""
+    comptime if is_defined["ANONLIB_GEMM_MFMA_NO_GROUPS"]():
+        return 0
+    var mgl = gemm_step_ksplit_rule(m, n, k, 0, False)
+    if mgl > 0 and mgl < GEMM_MFMA_MIN_GROUP_LEAVES:
+        mgl = GEMM_MFMA_MIN_GROUP_LEAVES
+    comptime if IDN_GEMM_MFMA_NO_LONE_GROUP:
+        # lane/nr-gemm: a group that holds every leaf is the all-leaves launch.
+        if mgl > 0 and mgl >= contract_partition(k)[1]:
+            return 0
+    return mgl
+
+
+def _mfma_run_ws(
+    ctx: DeviceContext,
+    mut c: DeviceBuffer[DType.float32],
+    mut a: DeviceBuffer[DType.float32],
+    mut b: DeviceBuffer[DType.float32],
+    mut ws: DeviceBuffer[DType.float32],
+    m: Int,
+    n: Int,
+    k: Int,
+    op: Int,
+    group_leaves: Int,
+) raises:
+    """`_mfma_run` with the group partials in the caller's `ws` when it
+    holds `m n groups` floats: the group launch and the fold, asynchronous,
+    no allocation and no wait. Every other call is `_mfma_run`."""
+    if m <= 0 or n <= 0:
+        return
+    comptime KS = 16
+    comptime SSTRIDE = KS + TUNED_VECLEN
+    comptime PAGE_BYTES = (128 + 128) * SSTRIDE * 4
+    # A02 current experiment: NEVER RUN — PENDING MEASUREMENT; existing defaults preserved.
+    comptime PAGES = 1 if is_defined["ANONLIB_GEMM_ONE_PAGE"]() else lib_smem_pages_for[TARGET_COLUMN, PAGE_BYTES]()
+    var part = contract_partition(k)
+    if group_leaves > 0 and part[1] > 1:
+        var rg = _ksplit_resolve_leaves(group_leaves, part[1])
+        if len(ws) >= m * n * rg[1]:
+            var st = gemm_operand_strides(op, m, n, k)
+            var tiles = ((m + 127) // 128) * ((n + 127) // 128)
+            comptime kern_g = identical_gemm_mfma_kernel[KS, TUNED_FOLD_SLOTS, PAGES, True, GEMM_MFMA_ADMIT]
+            step_count_launch()
+            ctx.enqueue_function[kern_g](
+                ws.unsafe_ptr(), a.unsafe_ptr(), b.unsafe_ptr(),
+                Int32(m), Int32(n), Int32(k), Int32(part[0]), Int32(part[1]),
+                Int32(st[0]), Int32(st[1]), Int32(st[2]), Int32(st[3]),
+                Int32(rg[0]), Int32(rg[1]), Float32(1.0),
+                grid_dim=(tiles, rg[1], 1), block_dim=(TUNED_TPB, 1, 1),
+            )
+            _ksplit_fold_launch(ctx, c, ws, m, n, rg[1])
+            return
+    _mfma_run(ctx, c, a, b, m, n, k, op, group_leaves)
+
+
+# ===========================================================================
+# THE SMALL-TILE MATRIX-CORE BODY (lane/nr-gemm, 2026-10-04, review rank 3 "A1")
+# ===========================================================================
+# The AMD column reaches the 128x128 matrix-core kernel only where
+# `choose_gemm_plan` answers PLAN_TUNED_128_8X8. Its 1024-block floor steps
+# most LM projections down to the scalar TUNED 64x64 / 32x32 plans, and the
+# small-output split plans (PLAN_SPLIT_64_4X4 / PLAN_SPLIT_32_2X2) are scalar
+# too. This body runs those calls on `v_mfma_f32_16x16x1f32` with a tile of
+# `16 NW` rows by 64 columns and `NW` waves (one wave at NW = 1).
+#
+# THE STEP is the 32x32x1 kernel's: K = 1, so every output is
+# `fma_rn(a, b, acc)` (re-proven for the 16x16x1 instruction by
+# gemm/checks/amd_mfma_probe3.mojo), then the product by `one` under the
+# wave's MODE f32 FP_DENORM field at 2 is `ftz` (probe2/probe3), skipped
+# under EXACT ADMISSION exactly as the 32x32x1 kernel skips it.
+# OWNERSHIP (fused_attention's MFMA16 lines, probe2 `MFMA16_LAYOUT`): wave
+# w owns rows 16w .. 16w+15 of the tile and all 64 columns; lane l supplies
+# A = row (l mod 16) and B = column l; its accumulator register r holds row
+# 4 (l div 16) + (r mod 4), column 16 (r div 4) + (l mod 16).
+# PRESERVED ORDER (contract 7.1, 7.2): per cell one accumulator, seeded
+# +0.0 per leaf of `contract_partition(k)`, one product per `p` ascending,
+# each step flushed; the leaf partial `ftz(acc)` pushed through the same
+# local fold stack (`_fold_push_local`) in ascending leaf order; `ftz(root)`
+# stored. GROUP mode with one leaf per group writes each leaf partial to
+# `ws[t m n + cell]`, the split plans' leaf-major level 0, and
+# `_ksplit_fold_launch` folds it as `_launch_split` folds it. The tile shape
+# and the wave count are scheduling: no product, leaf or fold moves.
+
+#: `-D ANONLIB_IDN_GEMM_MFMA16_OFF` keeps the scalar stepped-down and split
+#: plans on the AMD column; also off under `ANONLIB_IDN_ALL_OFF`.
+# A01 experiment: NEVER RUN — PENDING MEASUREMENT; incumbent defaults retained.
+# A01 PENDING: compile evidence alone does not qualify device correctness, quality or speed.
+# Incumbent MFMA16 default retained; this card only compares explicit rollback arms.
+comptime IDN_GEMM_MFMA16 = GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL and not (
+    is_defined["ANONLIB_IDN_GEMM_MFMA16_OFF"]() or is_defined["ANONLIB_IDN_ALL_OFF"]()
+)
+
+
+@always_inline
+def _mfma16_step_g(a: Float32, b: Float32, acc: SIMD[DType.float32, 16]) -> SIMD[DType.float32, 16]:
+    comptime if is_amd_gpu():
+        return llvm_intrinsic["llvm.amdgcn.mfma.f32.16x16x1f32", SIMD[DType.float32, 16]](
+            a, b, acc, Int32(0), Int32(0), Int32(0)
+        )
+    # Not reachable (the body is AMD only); keeps other targets compiling.
+    return acc
+
+
+@__llvm_metadata(MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(GEMM_LAUNCH_BOUND)))
+def identical_gemm_mfma16_kernel[
+    KS: Int, FS: Int, PAGES: Int, NW: Int, GROUP: Bool = False, ADMIT: Bool = False
+](
+    c: MutPointer[Float32, MutAnyOrigin],
+    a: MutPointer[Float32, MutAnyOrigin],
+    b: MutPointer[Float32, MutAnyOrigin],
+    m_in: Int32,
+    n_in: Int32,
+    k_in: Int32,
+    leaf_in: Int32,
+    p_in: Int32,
+    a_si_in: Int32,
+    a_sp_in: Int32,
+    b_sp_in: Int32,
+    b_sj_in: Int32,
+    gleaves_in: Int32,
+    groups_in: Int32,
+    one: Float32,
+):
+    """The `16 NW x 64` matrix-core IDENTICAL GEMM (see the section comment).
+    `GROUP = False`: a block owns one output tile and all of its leaves and
+    stores `ftz(root)`. `GROUP = True`: block (tile, `q = block_idx.y`)
+    walks the leaves `[q G, min((q + 1) G, P))` and stores the group's node
+    UNFLUSHED to `c[q m n + cell]`, the 32x32x1 kernel's GROUP mode."""
+    comptime NTH = 64 * NW
+    comptime BM = 16 * NW
+    comptime BN = 64
+    comptime VEC = TUNED_VECLEN
+    comptime KV = KS // VEC
+    comptime SSTRIDE = KS + VEC
+    comptime APAGE = BM * SSTRIDE
+    comptime BPAGE = BN * SSTRIDE
+    comptime NCELL = 16
+    comptime ASLOTS = (BM * KV + NTH - 1) // NTH
+    comptime BSLOTS = (BN * KV + NTH - 1) // NTH
+    comptime assert NW >= 1 and NW <= 4, "identical_gemm_mfma16_kernel: one to four waves"
+    comptime assert NTH <= GEMM_LAUNCH_BOUND, "identical_gemm_mfma16_kernel: launch bound"
+    comptime assert KS % VEC == 0, "identical_gemm_mfma16_kernel: KS a VEC multiple"
+
+    var m = Int(m_in)
+    var n = Int(n_in)
+    var k = Int(k_in)
+    var leaf = Int(leaf_in)
+    var p_count = Int(p_in)
+    var a_si = Int(a_si_in)
+    var a_sp = Int(a_sp_in)
+    var b_sp = Int(b_sp_in)
+    var b_sj = Int(b_sj_in)
+    var a_outer_fast = a_sp != 1 and a_si == 1
+    var b_outer_fast = b_sp != 1 and b_sj == 1
+
+    var as_ = stack_allocation[
+        PAGES * APAGE, Scalar[DType.float32], address_space = AddressSpace.SHARED,
+    ]()
+    var bs_ = stack_allocation[
+        PAGES * BPAGE, Scalar[DType.float32], address_space = AddressSpace.SHARED,
+    ]()
+
+    var tiles_i = (m + BM - 1) // BM
+    var tiles_j = (n + BN - 1) // BN
+    var n_tiles = tiles_i * tiles_j
+    var raw = Int(block_idx.x)
+    var q = 0
+    var gleaves = Int(gleaves_in)
+    comptime if GROUP:
+        q = Int(block_idx.y)
+        if q >= Int(groups_in) or p_count <= 0 or gleaves < 1:
+            return
+    if raw >= n_tiles:
+        return
+    var ti = Int(UInt(raw) // UInt(tiles_j))
+    var tj = raw - ti * tiles_j
+    var i0 = ti * BM
+    var j0 = tj * BN
+
+    var tid = Int(thread_idx.x)
+    var wv = _udiv[64](tid)
+    var lane = _urem[64](tid)
+    var wr = wv * 16  # the wave's rows: wr .. wr+15
+    var lq = _udiv[16](lane) * 4
+    var lc = _urem[16](lane)
+
+    if p_count <= 0:
+        # `k == 0`, contract section 8: every cell +0.0, STORED.
+        comptime if GROUP:
+            return
+        comptime for r0 in range(16):
+            var zi = i0 + wr + lq + r0 % 4
+            var zj = j0 + 16 * (r0 // 4) + lc
+            if zi < m and zj < n:
+                c.unsafe_store(zi * n + zj, Float32(0.0))
+        return
+
+    comptime if is_amd_gpu():
+        llvm_intrinsic["llvm.amdgcn.s.setreg", NoneType](Int32(_MODE_F32_DENORM), Int32(_MODE_MFMA_FLUSH))
+
+    var acc = SIMD[DType.float32, 16](0.0)
+    var ones = SIMD[DType.float32, 16](one)
+    var fl = stack_allocation[FS * NCELL, Scalar[DType.float32]]()
+    var occ = 0
+    # EXACT ADMISSION: per-wave exponent minima, two slot sets by window
+    # parity: A minima at `sw + wv`, B minima at `sw + NW + wv`.
+    var adm_s = stack_allocation[4 * NW, Scalar[DType.uint32], address_space = AddressSpace.SHARED]()
+    var adm_leaf = True
+
+    var wpl = _tuned_windows_per_leaf[KS](leaf)
+    var w = 0
+    var wt = 0
+    var wq = 0
+    var w_end = p_count * wpl
+    comptime if GROUP:
+        var lbeg = q * gleaves
+        var lend = lbeg + gleaves
+        if lend > p_count:
+            lend = p_count
+        w = lbeg * wpl
+        wt = lbeg
+        w_end = lend * wpl
+
+    var w0 = _tuned_window_at[KS](wt, wq, wpl, leaf, k, p_count)
+    var cur = w0
+    var pa = _tuned_g2r[ASLOTS, VEC, KV, BM, NTH](a, a_si, a_sp, i0, m, w0[0], w0[1], tid)
+    var pb = _tuned_g2r[BSLOTS, VEC, KV, BN, NTH](b, b_sj, b_sp, j0, n, w0[0], w0[1], tid)
+
+    while w < w_end:
+        var win = cur
+        var nxt = _tuned_window_next[KS](wt, wq, wpl, leaf, k, p_count)
+        var chunk = win[1]
+        var pgw = _urem[PAGES](w)
+
+        comptime if ADMIT:
+            var mea = _min_exp_nz[ASLOTS * VEC](pa)
+            var meb = _min_exp_nz[BSLOTS * VEC](pb)
+            comptime for sh in range(6):
+                mea = min(mea, shuffle_xor(mea, UInt32(32 >> sh)))
+                meb = min(meb, shuffle_xor(meb, UInt32(32 >> sh)))
+            if lane == 0:
+                var sw = _urem[2](w) * (2 * NW)
+                adm_s.unsafe_store(sw + wv, mea)
+                adm_s.unsafe_store(sw + NW + wv, meb)
+
+        # ---- REGISTERS TO SHARED (the tuned kernel's lines).
+        comptime for sa in range(ASLOTS):
+            if a_outer_fast:
+                comptime for ea0 in range(VEC):
+                    var ia0 = tid + (sa * VEC + ea0) * NTH
+                    if ia0 < BM * KS:
+                        as_.unsafe_store(
+                            pgw * APAGE + _urem[BM](ia0) * SSTRIDE + _udiv[BM](ia0),
+                            pa[sa * VEC + ea0],
+                        )
+            else:
+                var ia = tid + sa * NTH
+                if ia < BM * KV:
+                    var rra = _udiv[KV](ia)
+                    var cca = _urem[KV](ia) * VEC
+                    var va = SIMD[DType.float32, VEC](0.0)
+                    comptime for ea in range(VEC):
+                        va[ea] = pa[sa * VEC + ea]
+                    as_.unsafe_store(pgw * APAGE + rra * SSTRIDE + cca, va)
+        comptime for sb in range(BSLOTS):
+            if b_outer_fast:
+                comptime for eb0 in range(VEC):
+                    var ib0 = tid + (sb * VEC + eb0) * NTH
+                    if ib0 < BN * KS:
+                        bs_.unsafe_store(
+                            pgw * BPAGE + _urem[BN](ib0) * SSTRIDE + _udiv[BN](ib0),
+                            pb[sb * VEC + eb0],
+                        )
+            else:
+                var ib = tid + sb * NTH
+                if ib < BN * KV:
+                    var rrb = _udiv[KV](ib)
+                    var ccb = _urem[KV](ib) * VEC
+                    var vb = SIMD[DType.float32, VEC](0.0)
+                    comptime for eb in range(VEC):
+                        vb[eb] = pb[sb * VEC + eb]
+                    bs_.unsafe_store(pgw * BPAGE + rrb * SSTRIDE + ccb, vb)
+        barrier()
+
+        comptime if PAGES == 2:
+            if w + 1 < w_end:
+                var wn = nxt
+                pa = _tuned_g2r[ASLOTS, VEC, KV, BM, NTH](a, a_si, a_sp, i0, m, wn[0], wn[1], tid)
+                pb = _tuned_g2r[BSLOTS, VEC, KV, BN, NTH](b, b_sj, b_sp, j0, n, wn[0], wn[1], tid)
+
+        # ---- ACCUMULATE: per `p` ascending, one MFMA step, then the flush.
+        var abase = pgw * APAGE + (wr + lc) * SSTRIDE
+        var bbase = pgw * BPAGE + lane * SSTRIDE
+        var bare = False
+        comptime if ADMIT:
+            var sr = _urem[2](w) * (2 * NW)
+            var ma = adm_s[sr]
+            var mb = adm_s[sr + NW]
+            comptime for wi in range(1, NW):
+                ma = min(ma, adm_s[sr + wi])
+                mb = min(mb, adm_s[sr + NW + wi])
+            if ma + mb < UInt32(_ADMIT_EXP_SUM):
+                adm_leaf = False
+            bare = adm_leaf
+        if bare:
+            # Admitted: the MFMA step is the contract step (EXACT ADMISSION).
+            if chunk == KS:
+                comptime for kc2 in range(KV):
+                    var avx = as_.unsafe_load[width=VEC](abase + kc2 * VEC)
+                    var bvx = bs_.unsafe_load[width=VEC](bbase + kc2 * VEC)
+                    comptime for e2 in range(VEC):
+                        acc = _mfma16_step_g(avx[e2], bvx[e2], acc)
+            else:
+                for cc2 in range(chunk):
+                    acc = _mfma16_step_g(
+                        as_.unsafe_load(abase + cc2), bs_.unsafe_load(bbase + cc2), acc
+                    )
+        elif chunk == KS:
+            comptime for kc in range(KV):
+                var av = as_.unsafe_load[width=VEC](abase + kc * VEC)
+                var bv = bs_.unsafe_load[width=VEC](bbase + kc * VEC)
+                comptime for e in range(VEC):
+                    acc = _mfma16_step_g(av[e], bv[e], acc) * ones
+        else:
+            for cc in range(chunk):
+                acc = _mfma16_step_g(
+                    as_.unsafe_load(abase + cc), bs_.unsafe_load(bbase + cc), acc
+                ) * ones
+
+        comptime if PAGES == 1:
+            barrier()
+            if w + 1 < w_end:
+                var wn1 = nxt
+                pa = _tuned_g2r[ASLOTS, VEC, KV, BM, NTH](a, a_si, a_sp, i0, m, wn1[0], wn1[1], tid)
+                pb = _tuned_g2r[BSLOTS, VEC, KV, BN, NTH](b, b_sj, b_sp, j0, n, wn1[0], wn1[1], tid)
+
+        # ---- THE LEAF BOUNDARY (5d), once per logical leaf.
+        if win[2] == 1:
+            var part = SIMD[DType.float32, NCELL](0.0)
+            comptime for r1 in range(16):
+                part[r1] = ftz(acc[r1])
+            _ = _fold_push_local[NCELL, FS](fl, occ, part)
+            acc = SIMD[DType.float32, 16](0.0)
+            adm_leaf = True
+
+        w = w + 1
+        cur = nxt
+        wq += 1
+        if wq == wpl:
+            wq = 0
+            wt += 1
+
+    var outv = _fold_drain_local[NCELL, FS](fl, occ)
+    comptime for r3 in range(16):
+        var gi = i0 + wr + lq + r3 % 4
+        var gj = j0 + 16 * (r3 // 4) + lc
+        if gi < m and gj < n:
+            comptime if GROUP:
+                # The group's node, unflushed; the fold kernels flush on
+                # read and every node is already flushed (long-k 5.4).
+                c.unsafe_store(q * (m * n) + gi * n + gj, outv[r3])
+            else:
+                c.unsafe_store(gi * n + gj, ftz(outv[r3]))
+
+
+def _mfma16_launch[
+    NW: Int
+](
+    ctx: DeviceContext,
+    mut c: DeviceBuffer[DType.float32],
+    mut a: DeviceBuffer[DType.float32],
+    mut b: DeviceBuffer[DType.float32],
+    mut ws: DeviceBuffer[DType.float32],
+    m: Int,
+    n: Int,
+    k: Int,
+    op: Int,
+    split: Bool,
+) raises:
+    """One small-tile matrix-core call, asynchronous, no allocation.
+    `split = False`: all leaves in one launch into `c`. `split = True`: one
+    leaf per block over `(tiles, P)`, the leaf partials leaf-major in `ws`
+    (the caller checked `len(ws) >= m n P`), then `_ksplit_fold_launch`."""
+    if m <= 0 or n <= 0:
+        return
+    comptime KS = 16
+    comptime SSTRIDE = KS + TUNED_VECLEN
+    comptime PAGE_BYTES = (16 * NW + 64) * SSTRIDE * 4
+    comptime PAGES = lib_smem_pages_for[TARGET_COLUMN, PAGE_BYTES]()
+    var part = contract_partition(k)
+    var st = gemm_operand_strides(op, m, n, k)
+    var tiles = ((m + 16 * NW - 1) // (16 * NW)) * ((n + 63) // 64)
+    if split and part[1] > 1:
+        comptime kern_g = identical_gemm_mfma16_kernel[KS, TUNED_FOLD_SLOTS, PAGES, NW, True, GEMM_MFMA_ADMIT]
+        step_count_launch()
+        ctx.enqueue_function[kern_g](
+            ws.unsafe_ptr(), a.unsafe_ptr(), b.unsafe_ptr(),
+            Int32(m), Int32(n), Int32(k), Int32(part[0]), Int32(part[1]),
+            Int32(st[0]), Int32(st[1]), Int32(st[2]), Int32(st[3]),
+            Int32(1), Int32(part[1]), Float32(1.0),
+            grid_dim=(tiles, part[1], 1), block_dim=(64 * NW, 1, 1),
+        )
+        _ksplit_fold_launch(ctx, c, ws, m, n, part[1])
+        return
+    comptime kern = identical_gemm_mfma16_kernel[KS, TUNED_FOLD_SLOTS, PAGES, NW, False, GEMM_MFMA_ADMIT]
+    step_count_launch()
+    ctx.enqueue_function[kern](
+        c.unsafe_ptr(), a.unsafe_ptr(), b.unsafe_ptr(),
+        Int32(m), Int32(n), Int32(k), Int32(part[0]), Int32(part[1]),
+        Int32(st[0]), Int32(st[1]), Int32(st[2]), Int32(st[3]),
+        Int32(0), Int32(0), Float32(1.0),
+        grid_dim=(tiles, 1, 1), block_dim=(64 * NW, 1, 1),
+    )
+
+
+def gemm_mfma16_waves(m: Int, n: Int, k: Int, plan: Int, ws_floats: Int) -> Int:
+    """lane/nr-gemm: which small-tile matrix-core launch serves a call the
+    AMD dispatch would run on `plan`; 0 keeps `plan`. A host rule of the
+    EXECUTION plan only (contract 6.1): every answer runs the same leaves and
+    the same fold tree.
+
+    Reached for the scalar stepped-down tiles (PLAN_TUNED_64_4X4,
+    PLAN_TUNED_32_2X2) and the split plans PLAN_SPLIT_64_4X4 /
+    PLAN_SPLIT_32_2X2 (split launches need `ws_floats >= m n P`, the split
+    plan's own workspace). Narrow outputs (`n < 64`) keep their plan: the
+    tile is 64 columns wide.
+
+    A2 FILL SELECTION (per call, no workspace): the widest tile, 64, 32 or
+    16 rows by 64 columns, whose block count (times `P` for a split launch)
+    reaches `gemm_tile_min_blocks()`, the floor the step-down already uses;
+    the one-wave 16x64 tile when none does. Returns `NW` (4, 2 or 1) for an
+    all-leaves launch and `-NW` for a split launch."""
+    if m <= 0 or n < 64 or k <= 0:
+        return 0
+    var split: Bool
+    if plan == PLAN_TUNED_64_4X4 or plan == PLAN_TUNED_32_2X2:
+        split = False
+    elif plan == PLAN_SPLIT_64_4X4 or plan == PLAN_SPLIT_32_2X2:
+        split = True
+    else:
+        return 0
+    var p_count = contract_partition(k)[1]
+    if p_count <= 0:
+        return 0
+    if split and (p_count < 2 or ws_floats < m * n * p_count):
+        return 0
+    var mult = p_count if split else 1
+    var min_blocks = gemm_tile_min_blocks()
+    var cols = (n + 63) // 64
+    var nw = 1
+    if min_blocks > 0:
+        if ((m + 63) // 64) * cols * mult >= min_blocks:
+            nw = 4
+        elif ((m + 31) // 32) * cols * mult >= min_blocks:
+            nw = 2
+    else:
+        nw = 4
+    return -nw if split else nw
+
+
+def _mfma16_try(
+    ctx: DeviceContext,
+    mut c: DeviceBuffer[DType.float32],
+    mut a: DeviceBuffer[DType.float32],
+    mut b: DeviceBuffer[DType.float32],
+    mut ws: DeviceBuffer[DType.float32],
+    m: Int,
+    n: Int,
+    k: Int,
+    op: Int,
+    plan: Int,
+) raises -> Bool:
+    """Runs the small-tile matrix-core body where `gemm_mfma16_waves`
+    takes the call; False (nothing enqueued) where it keeps `plan`."""
+    var nwv = gemm_mfma16_waves(m, n, k, plan, len(ws))
+    if nwv == 0:
+        return False
+    var split = nwv < 0
+    var nw = -nwv if split else nwv
+    if nw == 4:
+        _mfma16_launch[4](ctx, c, a, b, ws, m, n, k, op, split)
+    elif nw == 2:
+        _mfma16_launch[2](ctx, c, a, b, ws, m, n, k, op, split)
+    else:
+        _mfma16_launch[1](ctx, c, a, b, ws, m, n, k, op, split)
+    return True
+
+
+#: lane/nr-gemm (2026-10-04, review A2), default ON under IDENTICAL on the
+#: NVIDIA column (kernel body row 1). `-D ANONLIB_IDN_GEMM_NV_STEP_KPACK_OFF`
+#: keeps the scalar stepped-down plans; also off under `ANONLIB_IDN_ALL_OFF`.
+comptime IDN_GEMM_NV_STEP_KPACK = GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL and not (
+    # N01 current experiment: NEVER RUN — PENDING MEASUREMENT; existing defaults preserved.
+    is_defined["ANONLIB_IDN_GEMM_NV_STEP_KPACK_OFF"]() or is_defined["ANONLIB_IDN_ALL_OFF"]()
+)
+
+
+def gemm_nv_step_kpack_rows(m: Int, n: Int, k: Int) -> Int:
+    """lane/nr-gemm (A2): per-call fill selection for the NVIDIA calls the
+    step-down sent from the TUNED 128x128 plan to a scalar TUNED 64x64 or
+    32x32 plan (`gemm_tile_step_down`, gated by the existing
+    `gemm_tile_min_blocks`, `gemm_tile_min_k` and `gemm_tile_short_k`;
+    stepped-down calls are never grouped). The step-down counts 128x128
+    tiles, but the packed body runs `GEMM_KPACK_RPT x GEMM_KPACK_CPT` tiles
+    (128x64 on NVIDIA), so a call can step down while the packed tile fills
+    the device. Answer: the row count of the widest packed tile, 128x64
+    then 64x64 (`TUNED_RPT`, the `KPACK_RPT4` geometry), whose block count
+    reaches `gemm_tile_min_blocks()`, run with all leaves in one launch (no
+    workspace); 0 keeps the scalar plan.
+    PRESERVED ORDER: the packed body is the shipped TUNED_128 body: per cell
+    one chain over `p` ascending from +0.0 per leaf, the leaf partial
+    `ftz(acc)`, the leaves through `_fold_push_local` in ascending order,
+    `ftz(root)` stored; the tile and the thread's cell count are
+    scheduling. Same bits as the scalar plan it replaces."""
+    if m <= 0 or n <= 0 or k <= 0:
+        return 0
+    if choose_gemm_plan_tiles(m, n, k) != PLAN_TUNED_128_8X8:
+        return 0
+    var plan = choose_gemm_plan(m, n, k)
+    if plan != PLAN_TUNED_64_4X4 and plan != PLAN_TUNED_32_2X2:
+        return 0
+    var min_blocks = gemm_tile_min_blocks()
+    if min_blocks <= 0:
+        return 0
+    comptime TR = TUNED_TPB // TUNED_TC
+    comptime KBN = GEMM_KPACK_CPT * TUNED_TC
+    comptime WIDE = GEMM_KPACK_RPT * TR
+    comptime SMALL = TUNED_RPT * TR
+    var cols = (n + KBN - 1) // KBN
+    if ((m + WIDE - 1) // WIDE) * cols >= min_blocks:
+        return WIDE
+    if ((m + SMALL - 1) // SMALL) * cols >= min_blocks:
+        return SMALL
+    return 0
+
+
+# THE HOST ENTRY POINTS
+# ===========================================================================
+
+
+def identical_gemm_workspace_floats(m: Int, n: Int, k: Int, plan: Int) -> Int:
+    """Floats of global scratch `plan` needs at this shape. Phase 3 and Phase
+    4 size the buffer with this and nothing else.
+
+    **Zero for FLAT and every TILE plan**, which is the whole content of
+    contract 13.5's second escape: the fused arm folds in registers and
+    materializes no partials at any `m`, `n` or `k`.
+
+    `PLAN_SPLITK` needs `m * n * P` (13.5's table: 128 MB at
+    `1024 x 1024 x 4096`, 2 GB at `4096 x 4096 x 4096`, 64 GB at
+    `4096 x 4096 x 4,000,000`) because it materializes LEVEL 0 only and folds
+    the rest in threadgroup memory.
+
+    `PLAN_SPLITK_STAGED` needs `m * n * fold_node_total(P)`, EVERY node of
+    the tree. **`fold_node_total` is not bounded by `2P`** -- contract 7.2.2:
+    `P = 5` gives 11 against `2P = 10`, because each level's ceiling rounds
+    up -- so this calls the function rather than a bound. A scratch allocator
+    that budgeted `2P` would be one node short at the first odd `P` it met.
+
+    `identical_gemm_splitk_fits` is the predicate the dispatcher uses; the
+    answer to a shape that does not fit is a different EXECUTION plan, never
+    a different leaf rule (section 6.1).
+    """
+    if m <= 0 or n <= 0 or k <= 0:
+        return 0
+    var part = contract_partition(k)
+    if plan == PLAN_SPLITK or _is_split_plan(plan):
+        return m * n * part[1]
+    if plan == PLAN_APPLE_MMA_SPLIT:
+        return m * n * apple_mma_split_groups(m, n, k)[1]
+    if plan == PLAN_APPLE_MMA_SPLIT_BIG:
+        return m * n * apple_mma_split_groups[True](m, n, k)[1]
+    if plan == PLAN_SPLITK_STAGED:
+        return m * n * fold_node_total(part[1])
+    return 0
+
+
+def _is_split_plan(plan: Int) -> Bool:
+    return (
+        plan == PLAN_SPLIT_32_2X2
+        or plan == PLAN_SPLIT_64_4X4
+        or plan == PLAN_SPLIT_128_8X8
+        or plan == PLAN_SPLIT_16_1X1
+        or plan == PLAN_SPLIT_1X256
+        or plan == PLAN_SPLIT_8X64
+    )
+
+
+#: The largest SPLITK workspace this file will allocate on its own: 64 M
+#: floats, 256 MB. A shape past it is served by a TILE plan, which is a
+#: change of EXECUTION plan and moves no bit. Contract 13.5.
+comptime SPLITK_MAX_WORKSPACE_FLOATS = 64 * 1024 * 1024
+
+
+#: The split plans' output cap, in cells: below it the output alone cannot
+#: fill the machine and the leaves of `contract_partition(k)` are spread
+#: over blocks (PLAN_SPLIT_64_4X4 and the smaller tiles). 128 K was measured
+#: on an L40S (142 SMs, 2026-09-09). lane/neural-pass45 (2026-10-01) reads it
+#: once per process from ANONLIB_GEMM_SPLIT_CELLS so a box can sweep it:
+#: the MI325X has 304 CUs, and the LM's 2048 x 384 x 384 projections (786 K
+#: cells, 192 tiles of 64 x 64) ran at 1.5 TFLOPS there
+#: (bench/results/neural-stage-timing-amd-m3-20261001). An execution plan
+#: only: every plan computes the same leaves and folds, the same bits
+#: (`check_device_is_launch_invariant`). MEASURED on the MI325X
+#: (2026-10-01, bench/results for PR #52): caps 128 K / 512 K / 1 M / 2 M
+#: read lm-train-step 121.6 / 105.0 / 100.9 / 101.0 ms and lm-forward 57.9 /
+#: 59.3 / 54.2 / 54.5, the MLP projections 1.60 -> 1.18 ms a layer, every
+#: digest and loss equal; so the AMD column's default is 1 M cells. NVIDIA
+#: keeps the L40S's 128 K; Apple keeps 128 K too (a raised cap would
+#: pre-empt PLAN_APPLE_MMA).
+comptime GEMM_SPLIT_CELLS_DEFAULT = (1 << 20) if TARGET_COLUMN == COLUMN_AMD else 128 * 1024
+
+
+struct _SplitCells(Defaultable, Movable):
+    var cells: Int
+
+    def __init__(out self):
+        self.cells = -1
+
+
+comptime _SPLIT_CELLS_NAME = "MojoGemmSplitCellsIdentical" if GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL else "MojoGemmSplitCellsFast"
+comptime GEMM_SPLIT_CELLS = _Global[StorageType=_SplitCells, name=_SPLIT_CELLS_NAME, init_fn=_SplitCells.__init__]
+
+
+def gemm_split_cells_cap() -> Int:
+    """The split plans' output cap: ANONLIB_GEMM_SPLIT_CELLS when set
+    (read once per process), else GEMM_SPLIT_CELLS_DEFAULT."""
+    try:
+        var p = GEMM_SPLIT_CELLS.get_or_create_ptr()
+        if p[].cells < 0:
+            var v = String(getenv("ANONLIB_GEMM_SPLIT_CELLS"))
+            var cells = GEMM_SPLIT_CELLS_DEFAULT
+            if v != "":
+                cells = Int(v)
+            if cells < 1:
+                cells = GEMM_SPLIT_CELLS_DEFAULT
+            p[].cells = cells
+        return p[].cells
+    except:
+        return GEMM_SPLIT_CELLS_DEFAULT
+
+#: The tuned tiles' minimum block count (lane/neural-pass47, 2026-10-01):
+#: when the output tiled at the chosen width makes fewer blocks than this,
+#: the chooser steps down to the next narrower tuned tile (128 -> 64 -> 32)
+#: while the output still fills it. The L40S (142 SMs) chose the widths at
+#: 128 K cells and above; the MI325X has 304 CUs, and the LM's 2048 x 384
+#: projections (k = 384, three leaves, under the split plans' floor) ran on
+#: 192 tiles of 64 x 64 at about 1.5 TFLOPS, the MLP gate/up on 128 tiles
+#: of 128 x 128. Read once per process from ANONLIB_GEMM_TILE_MIN_BLOCKS
+#: (0 = off); an execution plan only: every tuned plan computes the same
+#: leaves and folds (`check_device_is_launch_invariant`). MEASURED on the
+#: MI325X (2026-10-01, bench/results for PR #55, with the 1 M split cap):
+#: minimum blocks off / 256 / 512 / 1024 read lm-train-step 101.1 / 77.0 /
+#: 76.5 / 75.0 ms and lm-forward 56.6 / 40.6 / 40.9 / 39.9; q/k/v 1.21 ->
+#: 0.24 ms a layer, o_proj 0.40 -> 0.09, the MLP 1.22 -> 0.70 at 1024;
+#: every digest and loss equal. So the AMD column's default is 1024 (the
+#: 4096^3 gemm cell, 1,024 tiles of 128 x 128, is at the boundary and
+#: keeps its tile). NVIDIA uses 192 (lane/neural-pass62, below); Apple keeps
+#: 0 (off).
+comptime GEMM_TILE_MIN_BLOCKS_DEFAULT = (
+    1024 if TARGET_COLUMN == COLUMN_AMD else
+    192 if TARGET_COLUMN == COLUMN_NVIDIA else 0
+)
+#: lane/neural-pass62 tick table on the L40S (2026-10-01, PR #67 tree, same
+#: bits): with the step-down open at every k, the byte LM's forward
+#: projections (k = 384) halved on 64x64 tiles (q/o 0.104/0.084 -> 0.051/0.049
+#: ms a layer at 192 blocks; gate 0.147 -> 0.098 at 512) while the backward
+#: GEMMs with k 1024..2048 lost (+0.2 ms a layer in mlp_through_oproj) and
+#: the head doubled. So the NVIDIA column steps down SHORT chains, k at most
+#: GEMM_TILE_SHORT_K_DEFAULT, and long ones from `gemm_tile_min_k()`; the
+#: middle keeps the wide tile. The block floor is 192 on NVIDIA (the 48-tile
+#: projections stop at 64x64, 192 blocks; at 1024 they would fall to 32x32,
+#: the tiles the old TILE=256 sweep lost on). `ANONLIB_GEMM_TILE_SHORT_K`
+#: overrides (0 = no short rule).
+comptime GEMM_TILE_SHORT_K_DEFAULT = 512 if TARGET_COLUMN == COLUMN_NVIDIA else 0
+#: lane/neural-pass54 (2026-10-01): the step-down only from this k (0 = any).
+#: On the L40S the narrower tiles won the 4096^3 race (54.1 -> 47.1 ms) and
+#: lost the LM stages (k 384..2048; lm-train-step 40.7 -> 47 ms), so the
+#: NVIDIA column steps down only when the K loop is long enough to amortize
+#: the smaller tile; AMD keeps every k. ANONLIB_GEMM_TILE_MIN_K overrides.
+comptime GEMM_TILE_MIN_K_DEFAULT = 4096 if TARGET_COLUMN == COLUMN_NVIDIA else 0
+
+#: lane/neural-small (2026-10-07), IDENTICAL grid int sweep
+#: `gemm_tile_min_blocks`. The runtime env knob above cannot be varied by
+#: the define-only grid, so it also reads a build define. Absent = main (the
+#: env var when set, else the column default). Defined, the define wins over
+#: the env var.
+#:   -D ANONLIB_IDN_GEMM_TILE_MIN_BLOCKS=<n>, legal set {192, 512, 1024}.
+#:      Cost reasoning: the floor trades tile width (operand reuse per block)
+#:      for SM/CU fill; it was measured once per vendor (AMD 1024, NVIDIA
+#:      192), and the right value scales with the SM/CU count and the
+#:      output's tile count. lane/grid-prune (2026-10-07) narrowed the set:
+#:      0 is the measured AMD loser above (lm-train-step 101.1 vs 75.0 ms);
+#:      128 keeps 128-wide tiles that pass62 measured slower; 256 and 384
+#:      select no plan that 192 or 512 does not (the step-down is
+#:      128 -> 64 -> 32 below the floor).
+#: The define-ized short-chain bound (ANONLIB_IDN_GEMM_TILE_SHORT_K) was
+#: deleted by lane/grid-prune (2026-10-07): arm 512 is the NVIDIA column
+#: default, arm 0 is the pre-pass62 state and arm 1024 the long-k step-down
+#: pass62 measured slower, and every arm is inert on AMD (min k 0). The env
+#: knob ANONLIB_GEMM_TILE_SHORT_K and the column default stay.
+#: Recoverable at ab554bb4a. The define is refused in
+#: core/six_lane_experiment_guards.mojo.
+#: No bits: every tuned plan computes the same leaves and folds
+#: (`check_device_is_launch_invariant`); execution plan only. These knobs
+#: are read by every `choose_gemm_plan_tiles` caller in a build (classical
+#: GEMM users included), so a grid build carrying them must not be shared
+#: with classical workloads.
+comptime IDN_GEMM_TILE_MIN_BLOCKS = get_defined_int["ANONLIB_IDN_GEMM_TILE_MIN_BLOCKS", -1]()
+
+
+struct _TileMinK(Defaultable, Movable):
+    var k: Int
+
+    def __init__(out self):
+        self.k = -1
+
+
+comptime _TILE_MIN_K_NAME = "MojoGemmTileMinKIdentical" if GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL else "MojoGemmTileMinKFast"
+comptime GEMM_TILE_MIN_K = _Global[StorageType=_TileMinK, name=_TILE_MIN_K_NAME, init_fn=_TileMinK.__init__]
+
+
+def gemm_tile_min_k() -> Int:
+    """The smallest k the tile step-down applies to: ANONLIB_GEMM_TILE_MIN_K
+    when set (read once per process), else GEMM_TILE_MIN_K_DEFAULT."""
+    try:
+        var p = GEMM_TILE_MIN_K.get_or_create_ptr()
+        if p[].k < 0:
+            var v = String(getenv("ANONLIB_GEMM_TILE_MIN_K"))
+            var k = GEMM_TILE_MIN_K_DEFAULT
+            if v != "":
+                k = Int(v)
+            if k < 0:
+                k = 0
+            p[].k = k
+        return p[].k
+    except:
+        return GEMM_TILE_MIN_K_DEFAULT
+
+
+struct _TileMinBlocks(Defaultable, Movable):
+    var blocks: Int
+
+    def __init__(out self):
+        self.blocks = -1
+
+
+comptime _TILE_MIN_NAME = "MojoGemmTileMinBlocksIdentical" if GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL else "MojoGemmTileMinBlocksFast"
+comptime GEMM_TILE_MIN_BLOCKS = _Global[StorageType=_TileMinBlocks, name=_TILE_MIN_NAME, init_fn=_TileMinBlocks.__init__]
+
+
+struct _TileShortK(Defaultable, Movable):
+    var k: Int
+
+    def __init__(out self):
+        self.k = -1
+
+
+comptime _TILE_SHORT_K_NAME = "MojoGemmTileShortKIdentical" if GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL else "MojoGemmTileShortKFast"
+comptime GEMM_TILE_SHORT_K = _Global[StorageType=_TileShortK, name=_TILE_SHORT_K_NAME, init_fn=_TileShortK.__init__]
+
+
+def gemm_tile_short_k() -> Int:
+    """The largest k the SHORT-chain step-down applies to (0 = none):
+    ANONLIB_GEMM_TILE_SHORT_K when set (read once per process), else
+    GEMM_TILE_SHORT_K_DEFAULT."""
+    try:
+        var p = GEMM_TILE_SHORT_K.get_or_create_ptr()
+        if p[].k < 0:
+            var v = String(getenv("ANONLIB_GEMM_TILE_SHORT_K"))
+            var k = GEMM_TILE_SHORT_K_DEFAULT
+            if v != "":
+                k = Int(v)
+            if k < 0:
+                k = 0
+            p[].k = k
+        return p[].k
+    except:
+        return GEMM_TILE_SHORT_K_DEFAULT
+
+
+def gemm_tile_min_blocks() -> Int:
+    """The tuned tiles' minimum block count: ANONLIB_GEMM_TILE_MIN_BLOCKS
+    when set (read once per process), else GEMM_TILE_MIN_BLOCKS_DEFAULT.
+    `-D ANONLIB_IDN_GEMM_TILE_MIN_BLOCKS` wins over both when defined."""
+    comptime if IDN_GEMM_TILE_MIN_BLOCKS >= 0:
+        comptime assert (
+            IDN_GEMM_TILE_MIN_BLOCKS == 192 or IDN_GEMM_TILE_MIN_BLOCKS == 512
+            or IDN_GEMM_TILE_MIN_BLOCKS == 1024
+        ), "ANONLIB_IDN_GEMM_TILE_MIN_BLOCKS legal set is 192, 512, 1024"
+        return IDN_GEMM_TILE_MIN_BLOCKS
+    try:
+        var p = GEMM_TILE_MIN_BLOCKS.get_or_create_ptr()
+        if p[].blocks < 0:
+            var v = String(getenv("ANONLIB_GEMM_TILE_MIN_BLOCKS"))
+            var blocks = GEMM_TILE_MIN_BLOCKS_DEFAULT
+            if v != "":
+                blocks = Int(v)
+            if blocks < 0:
+                blocks = 0
+            p[].blocks = blocks
+        return p[].blocks
+    except:
+        return GEMM_TILE_MIN_BLOCKS_DEFAULT
+
+
+def _tuned_tile_blocks(m: Int, n: Int, tile: Int) -> Int:
+    return ((m + tile - 1) // tile) * ((n + tile - 1) // tile)
+
+
+def identical_gemm_splitk_fits(m: Int, n: Int, k: Int) -> Bool:
+    return (
+        identical_gemm_workspace_floats(m, n, k, PLAN_SPLITK)
+        <= SPLITK_MAX_WORKSPACE_FLOATS
+    )
+
+
+#: Apple IDENTICAL: skinny shapes (a tiny output, or one output dimension
+#: <= 4) on PLAN_SPLITK / PLAN_FLAT instead of the tile dispatcher's pick.
+#: Execution plan only; `-D ANONLIB_APPLE_GEMM_SKINNY_OFF` reverts.
+#: Apple IDENTICAL: outputs with a side in [8, 64) and >= 16384 cells on
+#: PLAN_APPLE_MMA. `-D ANONLIB_APPLE_GEMM_NARROW_MMA_OFF` reverts.
+comptime APPLE_GEMM_NARROW_MMA = (
+    APPLE_MMA
+    and not is_defined["ANONLIB_APPLE_GEMM_NARROW_MMA_OFF"]()
+)
+#: Apple IDENTICAL: the model-width band whose outputs/inputs take the 64x64
+#: tuned plan in `choose_gemm_plan_tiles` (range rule, not one board width).
+comptime APPLE_GEMM_NARROW_SIDE_MIN = 512
+comptime APPLE_GEMM_NARROW_SIDE_MAX = 1024
+comptime APPLE_GEMM_SKINNY = (
+    GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL
+    and TARGET_COLUMN == COLUMN_APPLE
+    and not is_defined["ANONLIB_APPLE_GEMM_SKINNY_OFF"]()
+)
+
+
+def choose_gemm_plan(m: Int, n: Int, k: Int) -> Int:
+    """The shipped dispatcher: Apple's simdgroup matrix plan
+    (`PLAN_APPLE_MMA`) wherever it applies to a shape the tile dispatcher
+    gives a TUNED plan, else `choose_gemm_plan_tiles`. The rules that ask
+    whether a shape takes the 128x128 tile read `choose_gemm_plan_tiles`:
+    they predate the matrix plan, and on every other column the two agree."""
+    var tiles = choose_gemm_plan_tiles(m, n, k)
+    comptime if APPLE_GEMM_SKINNY:
+        # Skinny shapes on Apple (lane/apple-identical-neural, M4 measured,
+        # every plan's bits equal): a tiny output with many leaves takes
+        # PLAN_SPLITK (a 1 x 1 x 100k dot 413 -> 49 us, 20 x 1 x 100k 815 ->
+        # 132 us, 4 x 4 x 1M 4.5 -> 1.9 ms); a GEMV-shaped output takes
+        # PLAN_FLAT (100k x 1 x 20 1273 -> 116 us, 3 x 100k x 20 1242 -> 385
+        # us, 4096 x 1 x 4096 5264 -> 1131 us). PLAN_SPLITK reloads both
+        # operands per cell, so past ~24 cells it LOSES (8 x 8 x 1M 5 -> 35
+        # ms, GMM's M-step): the bound is measured, keep it small. P >= 4
+        # keeps the P = 3 fixtures on their plans.
+        if m > 0 and n > 0 and k > 0:
+            if (
+                contract_partition(k)[1] >= 4
+                and m * n <= 24
+                and identical_gemm_splitk_fits(m, n, k)
+            ):
+                return PLAN_SPLITK
+            if min(m, n) <= 4 and m * n >= 2048:
+                return PLAN_FLAT
+    comptime if APPLE_GEMM_NARROW_MMA:
+        # Narrow outputs (lane/apple-identical-neural, 2026-09-27, M4, every
+        # pair hash-equal): one output side in [8, 64) with a large output
+        # also runs faster on the matrix plan than on the tile plan it got,
+        # 1M x 16 x 16 (GMM's E-step) 20.7 -> 4.1 ms, 16 x 200k x 32 5.0 ->
+        # 1.2 ms, 10k x 16 x 16 210 -> 63 us. It needs no workspace, so a
+        # caller sized for the old pick cannot overflow.
+        if (
+            m >= 8 and n >= 8 and m * n >= 16384
+            and apple_mma_applies(m, n, k)
+        ):
+            return PLAN_APPLE_MMA
+    comptime if GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL and TARGET_COLUMN == COLUMN_APPLE:
+        if (
+            tiles == PLAN_TUNED_64_4X4
+            or tiles == PLAN_TUNED_128_8X8
+            or tiles == PLAN_TUNED_32_2X2
+        ) and m >= 64 and n >= 64 and apple_mma_applies(m, n, k):
+            return PLAN_APPLE_MMA
+    return gemm_tile_step_down(m, n, k, tiles)
+
+
+def choose_gemm_plan_tiles(m: Int, n: Int, k: Int) -> Int:
+    """Pick an EXECUTION plan: a register-blocked TUNED plan where the
+    output is wide enough to fill it, otherwise `choose_gemm_plan_untuned`.
+
+    Measured on an NVIDIA L40S, 2026-09-09, bits equal at every row of
+    `bench/gemm_shapes.mojo`: the 4x4 plan is 3x faster than TILE 16x16 at
+    8192x64x128 and 4.3x at 512x4096x4096, the 8x8 plan 5.1x at
+    512x4096x4096; at 128x128 (16 K cells) every tuned tile LOSES to TILE
+    16x16, which is where the 128 K-cell floor comes from. Reads `m`, `n`
+    and `k` and is allowed to (contract 6.1); returns a plan id and nothing
+    else, and every plan takes its `(L, P)` from `contract_partition(k)`.
+    """
+    if m <= 0 or n <= 0 or k <= 0:
+        return choose_gemm_plan_untuned(m, n, k)
+    var base = choose_gemm_plan_untuned(m, n, k)
+    # THE SPLIT PLANS (2026-09-09): where the output alone cannot fill the
+    # machine and there are leaves to spread, spread them. `P >= 4` keeps the
+    # shapes the batch-invariance fixtures name (`P = 3` at `k = 300`) on
+    # their documented plans, and the workspace bound is the same 256 MB
+    # `PLAN_SPLITK` honoured. The decode rows first: `m <= 8` with a wide
+    # `n` is a GEMV-shaped product and gets a 1 x 256 (m == 1) or 8 x 64
+    # tile so no thread row idles; then the small outputs under the tuned
+    # plans' 128 K-cell floor.
+    var p_count = contract_partition(k)[1]
+    # lane/neural-small (2026-10-07), IDENTICAL grid int sweep
+    # `gemm_split_min_leaves`: -D ANONLIB_IDN_GEMM_SPLIT_MIN_LEAVES=4|3|2
+    # (absent = 4, main). The floor exists only to keep the P = 3 fixtures
+    # on their documented plans; below it a short-contraction product
+    # (k of two or three leaves) whose output is under about 1.5 blocks per
+    # SM/CU runs on too few tuned tiles, and a split plan multiplies the
+    # blocks by P with the SAME leaves and the same fold tree, at any model
+    # width with such a k. No bits (`check_device_is_launch_invariant`);
+    # under 3 or 2 the batch-invariance fixtures that name the P = 3 plans
+    # see the split plan instead (plan id only, same words).
+    comptime SPLIT_MIN_LEAVES = get_defined_int["ANONLIB_IDN_GEMM_SPLIT_MIN_LEAVES", 4]()
+    comptime assert (
+        SPLIT_MIN_LEAVES == 4 or SPLIT_MIN_LEAVES == 3 or SPLIT_MIN_LEAVES == 2
+    ), "ANONLIB_IDN_GEMM_SPLIT_MIN_LEAVES legal set is 4, 3, 2"
+    if p_count >= SPLIT_MIN_LEAVES and identical_gemm_splitk_fits(m, n, k):
+        var cap = gemm_split_cells_cap()
+        if m <= 8 and n >= 256:
+            if m == 1:
+                return PLAN_SPLIT_1X256
+            return PLAN_SPLIT_8X64
+        comptime if GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL and gemm_wide_split_for[TARGET_COLUMN]():
+            # Full tiles only: padding a just-over-128 shape to 256 would
+            # do more work than the existing 64-wide plan.
+            if p_count >= 512 and m % 128 == 0 and n % 128 == 0 and m * n <= 128 * 1024:
+                return PLAN_SPLIT_128_8X8
+        if m >= 64 and n >= 64 and m * n <= cap:
+            return PLAN_SPLIT_64_4X4
+        if m >= 32 and n >= 32 and m * n <= cap:
+            return PLAN_SPLIT_32_2X2
+        if m >= 16 and n >= 16 and m * n <= cap:
+            return PLAN_SPLIT_16_1X1
+        if base == PLAN_SPLITK:
+            return PLAN_SPLIT_16_1X1
+    if base == PLAN_SPLITK or base == PLAN_SPLITK_STAGED:
+        return base
+    if m < 32 or n < 32 or m * n < 128 * 1024:
+        return base
+    # Transformer-training projections on Apple are throughput-bound by the
+    # 128x128 tile's per-thread accumulator footprint.  The 64x64 plan keeps
+    # the identical leaf/fold DAG while exposing four times as many output
+    # tiles.  The original evidence covered m=32768 with k=768.  The GPT-3
+    # small qualification extends that scheduling choice to rows >=1024
+    # whenever one matrix output/input width is d_model=768: Q/K/V/O, both
+    # MLP directions, and the chunked head.  B1/L1024 through B8/L2048 and
+    # FFN widths 2048/3072 were faster on Apple M4 with zero bit mismatches.
+    # Keep this IDENTICAL-only; FAST retains its existing
+    # dispatcher unchanged.
+    #
+    # lane/no-bench-tuning (2026-10-04): the rules used to name d_model = 768
+    # exactly (`n == 768 or k == 768`, `m == 768`), which fits one board model
+    # and nothing near it. They now key on a RANGE of model widths: one of the
+    # two inner sides in [APPLE_GEMM_NARROW_SIDE_MIN, APPLE_GEMM_NARROW_SIDE_MAX]
+    # (512..1024, the d_model band of small/medium transformers and any
+    # similarly narrow projection). The reasoning is the same tile-count
+    # argument at every width in the band: with one side that narrow, the
+    # 128x128 grid has at most 8 tiles along it, and the 64x64 plan exposes
+    # four times as many independent output tiles at the same leaves and
+    # folds. Measured only at 768; needs neighbor-shape validation (640, 896,
+    # 1024 and the 767/769 edges) before the band is trusted.
+    comptime if GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL and TARGET_COLUMN == COLUMN_APPLE:
+        comptime if is_defined["ANONLIB_LEGACY_SHAPE_APPLE_PLAN64"]():
+            # LEGACY (default OFF): keyed to d_model = 768 exactly (the GPT-3
+            # small board). Removed Oct 4 as benchmark-shape tuning; the
+            # range rule below is unmeasured.
+            if m >= 1024 and n >= 768 and k >= 768 and (n == 768 or k == 768):
+                return PLAN_TUNED_64_4X4
+            # GPT weight gradients: m=d_model, k=rows.
+            if m == 768 and n >= 768 and k >= 1024:
+                return PLAN_TUNED_64_4X4
+        else:
+            # merge 2026-10-05: the IDENTICAL lane's narrow-side band rule (main's
+            # APPLE_PLAN64_NARROW range rule replaced by it; constant kept).
+            var narrow = min(n, k)
+            if (
+                m >= 1024
+                and narrow >= APPLE_GEMM_NARROW_SIDE_MIN
+                and narrow <= APPLE_GEMM_NARROW_SIDE_MAX
+            ):
+                return PLAN_TUNED_64_4X4
+            # Weight gradients transpose the token dimension into the
+            # contraction: Q/K/V/O and MLP-down have m = model width and
+            # k = rows. The smaller tile exposes more independent output tiles
+            # without changing any leaf or fold in the exact GEMM DAG.
+            if (
+                m >= APPLE_GEMM_NARROW_SIDE_MIN
+                and m <= APPLE_GEMM_NARROW_SIDE_MAX
+                and n >= APPLE_GEMM_NARROW_SIDE_MIN
+                and k >= 1024
+            ):
+                return PLAN_TUNED_64_4X4
+    if m >= 2 * TUNED_BM_WIDE and n >= 2 * TUNED_BN_WIDE:
+        return PLAN_TUNED_128_8X8
+    if m >= TUNED_BM_WIDE and n >= TUNED_BN_WIDE:
+        return PLAN_TUNED_64_4X4
+    return PLAN_TUNED_32_2X2
+
+
+def gemm_tile_step_down(m: Int, n: Int, k: Int, plan: Int) -> Int:
+    """lane/neural-pass47: a narrower tuned tile where the wide one makes
+    fewer than `gemm_tile_min_blocks()` blocks (0 = off): 128 -> 64 -> 32
+    while the output still fills the tile. Applied by `choose_gemm_plan`
+    (the shipped dispatcher) AFTER the ksplit rule has read the tile
+    chooser, so a call the long-k group rule takes keeps its group kernel
+    and only the calls that would run a plain tuned tile step down. The
+    same leaves and folds either way."""
+    var min_blocks = gemm_tile_min_blocks()
+    if min_blocks <= 0:
+        return plan
+    var short_k = gemm_tile_short_k()
+    if k < gemm_tile_min_k() and not (short_k > 0 and k <= short_k):
+        return plan
+    var pick = plan
+    if pick == PLAN_TUNED_128_8X8 and _tuned_tile_blocks(m, n, 2 * TUNED_BM_WIDE) < min_blocks:
+        pick = PLAN_TUNED_64_4X4
+    if pick == PLAN_TUNED_64_4X4 and _tuned_tile_blocks(m, n, TUNED_BM_WIDE) < min_blocks:
+        pick = PLAN_TUNED_32_2X2
+    return pick
+
+
+def choose_gemm_plan_untuned(m: Int, n: Int, k: Int) -> Int:
+    """The dispatcher as it stood before the tuned plans (2026-09-09), kept
+    as the fallback and as the plan the unpinned control arm
+    (`gemm_unpinned.mojo`) mirrors. **Reads `m`, `n`, `k` and is allowed to**
+    (contract 6.1: "the EXECUTION plan may look at `m`, `n`, the device, the
+    occupancy and anything else it likes, because under section 7 none of
+    that can reach the arithmetic").
+
+    What it may NOT do -- and structurally cannot, because it returns a plan
+    id and nothing else, and every plan calls `contract_partition(k)` -- is
+    influence a leaf boundary or a tree level. There is no
+    `if P < 32 use the serial fold` here and there never may be (13.5's last
+    sentence).
+
+    The rule: SPLITK when the output is small enough that a fused arm would
+    leave the machine idle AND the workspace fits; a wide tile when the
+    output is large enough to tile; FLAT otherwise. All three are the same
+    bits and `check_device_is_launch_invariant` is what keeps them so.
+    """
+    if m <= 0 or n <= 0:
+        return PLAN_FLAT
+    var part = contract_partition(k)
+    var p_count = part[1]
+    if (
+        m * n <= 4096
+        and p_count >= 4
+        and identical_gemm_splitk_fits(m, n, k)
+    ):
+        return PLAN_SPLITK
+    if m >= 16 and n >= 16:
+        return PLAN_TILE_16_16_32
+    if n >= 32:
+        return PLAN_TILE_8_32_32
+    if m >= 32:
+        return PLAN_TILE_32_8_16
+    return PLAN_FLAT
+
+
+def _tile_grid(m: Int, n: Int, tm: Int, tn: Int, two_d: Bool) -> Tuple[Int, Int]:
+    var tiles_i = (m + tm - 1) // tm
+    var tiles_j = (n + tn - 1) // tn
+    var total = tiles_i * tiles_j
+    if total < 1:
+        total = 1
+    if not two_d:
+        return (total, 1)
+    # A 2-D grid over the same tiles: `gy = ceil(total / 64)`, and the
+    # kernel's `block_idx.y * grid_dim.x + block_idx.x` linearizes it back.
+    # Blocks past `total` return immediately.
+    var gx = 64
+    if gx > total:
+        gx = total
+    var gy = (total + gx - 1) // gx
+    return (gx, gy)
+
+
+def _launch_tiled[
+    TM: Int, TN: Int, KS: Int
+](
+    ctx: DeviceContext,
+    mut c: DeviceBuffer[DType.float32],
+    mut a: DeviceBuffer[DType.float32],
+    mut b: DeviceBuffer[DType.float32],
+    m: Int,
+    n: Int,
+    k: Int,
+    leaf: Int,
+    p_count: Int,
+    st: Tuple[Int, Int, Int, Int],
+    swizzle: Int,
+    two_d: Bool,
+) raises:
+    comptime kern = identical_gemm_tiled_kernel[TM, TN, KS]
+    var g = _tile_grid(m, n, TM, TN, two_d)
+    step_count_launch()
+    ctx.enqueue_function[kern](
+        c.unsafe_ptr(),
+        a.unsafe_ptr(),
+        b.unsafe_ptr(),
+        Int32(m),
+        Int32(n),
+        Int32(k),
+        Int32(leaf),
+        Int32(p_count),
+        Int32(st[0]),
+        Int32(st[1]),
+        Int32(st[2]),
+        Int32(st[3]),
+        Int32(swizzle),
+        grid_dim=(g[0], g[1], 1),
+        block_dim=(TM * TN, 1, 1),
+    )
+
+
+# ===========================================================================
+# PLAN APPLE_MMA: admitted windows on the simdgroup matrix path (Apple only)
+# ===========================================================================
+
+#: lane/apple-identical-neural (2026-09-26). On the Apple M4 the fp32
+#: `simdgroup_multiply_accumulate` (8x8x8) returns, for every cell, exactly
+#: the chain of `identical_mul_add` steps in ascending `p` seeded with the
+#: incoming accumulator: 0 mismatches over 7 operand kinds x 4.19M cells
+#: (`gemm/checks/apple_simdgroup_probe.mojo`, which also shows the probe
+#: separates the descending, unfused and C + chain spellings). On a window
+#: `APPLE_MMA_ADMIT_EXP_SUM` admits (flushed operand exponent fields
+#: `Ea + Eb >= 151`: no exact step result can fall in the one window where
+#: Apple's flush-before-round differs from the contract's rtf) the chain the
+#: matrix unit computes IS the contract's, so the window runs on the
+#: matrix path with the contract's bits. Every other window, and every later
+#: window of its leaf, runs the exact step `rtf_mul_add` cell by cell. The
+#: leaf partial, the fold tree and the final flush are the tuned kernel's.
+#: `-D ANONLIB_GEMM_NO_APPLE_MMA` is the revert arm.
+comptime APPLE_MMA = (
+    GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL
+    and TARGET_COLUMN == COLUMN_APPLE
+    and TUNED_WINDOW_ADMIT
+    and not is_defined["ANONLIB_GEMM_NO_APPLE_MMA"]()
+)
+#: Tile geometry (scheduling only; `-D` overrides are measurement arms).
+comptime APPLE_MMA_SGM = get_defined_int["ANONLIB_APPLE_MMA_SGM", 2]()
+comptime APPLE_MMA_SGN = get_defined_int["ANONLIB_APPLE_MMA_SGN", 2]()
+comptime APPLE_MMA_FM = get_defined_int["ANONLIB_APPLE_MMA_FM", 4]()
+comptime APPLE_MMA_FN = get_defined_int["ANONLIB_APPLE_MMA_FN", 4]()
+comptime APPLE_MMA_KB = get_defined_int["ANONLIB_APPLE_MMA_KB", 16]()
+comptime APPLE_MMA_GROUP_M = get_defined_int["ANONLIB_APPLE_MMA_GROUP_M", 8]()
+#: lane/neural-apple2 (2026-09-28), measurement arm: two shared pages, one
+#: barrier per window (the same stagings, windows and chains; scheduling only).
+comptime APPLE_MMA_DB = is_defined["ANONLIB_APPLE_MMA_DB"]()
+#: lane/neural-apple2 (2026-09-28): the wider window a leaf that is a whole
+#: number of them runs at (0 = off; `_launch_apple_mma`).
+comptime APPLE_MMA_KB_WIDE = get_defined_int["ANONLIB_APPLE_MMA_KB_WIDE", 0]()
+#: lane/neural-apple2 (2026-09-28): leaf-group split of the matrix plan for
+#: outputs with fewer than this many default tiles (0 = off). Each block
+#: folds one power-of-two group of leaves aligned at leaf 0 and stores the
+#: group node unflushed; `_ksplit_fold_launch` folds the nodes (DEVIATION
+#: 2590's group tree, the contract's tree). The group is at least
+#: `APPLE_MMA_SPLIT_MIN_LEAVES` leaves. Scheduling only.
+comptime APPLE_MMA_AUTO_SPLIT_BLOCKS = get_defined_int["ANONLIB_APPLE_MMA_SPLIT_BLOCKS", 0]()
+comptime APPLE_MMA_SPLIT_MIN_LEAVES = get_defined_int["ANONLIB_APPLE_MMA_SPLIT_MIN_LEAVES", 8]()
+#: lane/neural-apple (2026-09-28): the small tile (FM = FN = 2, a quarter of
+#: the default's cells) for outputs with fewer than `APPLE_MMA_SMALL_BLOCKS`
+#: default tiles (scheduling only; `ANONLIB_APPLE_MMA_SMALL_OFF` reverts).
+#: M4 Pro (m4pro-b), the T3 shard calls (bench/gemm_excp_ab_main.mojo,
+#: ordinary operands, ms, every hash equal across all geometries):
+#:   call        default(no small)  small < 512  small < 2048
+#:   proj_fwd          7.2               7.3          6.1
+#:   proj_dA           7.4               7.4          6.1
+#:   proj_dB          21.5              10.5         10.4
+#:   gateup_dA        19.0              19.1         16.5
+#:   gateup_dB        40.9              20.3         20.5
+#:   down_fwd         18.6              18.8         16.4
+#:   down_dB          40.9              20.6         20.1
+#:   head_dA         604.5             592.5        517.4
+#: and head_fwd, head_dB, gateup_fwd, down_dA (>= 2048 tiles) unchanged.
+comptime APPLE_MMA_SMALL_TILE = not is_defined["ANONLIB_APPLE_MMA_SMALL_OFF"]()
+comptime APPLE_MMA_SMALL_FM = get_defined_int["ANONLIB_APPLE_MMA_SMALL_FM", 2]()
+comptime APPLE_MMA_SMALL_FN = get_defined_int["ANONLIB_APPLE_MMA_SMALL_FN", 2]()
+comptime APPLE_MMA_SMALL_BLOCKS = get_defined_int["ANONLIB_APPLE_MMA_SMALL_BLOCKS", 2048]()
+#: lane/neural-apple2 (2026-09-28): the small tile's window when the leaf is a
+#: whole number of them (else APPLE_MMA_KB). M3 Ultra (m3ultra-b, steward job
+#: 1790603073363), the T3 shard calls, ordinary operands, ms, KB 16 -> KB 32
+#: on every call, every hash equal:
+#:   small tile:  proj_fwd 2.31 -> 1.96, proj_dA 2.30 -> 1.93,
+#:     proj_dB 3.03 -> 2.27, gateup_dA 6.25 -> 4.77, gateup_dB 7.11 -> 5.10,
+#:     down_fwd 5.92 -> 4.78, down_dB 7.07 -> 4.94, head_dA 179.3 -> 128.0
+#:   default tile (NOT taken): head_fwd 102.4 -> 116.7, head_dB 115.6 ->
+#:     137.5, gateup_fwd 4.36 -> 5.27, down_dA 4.53 -> 5.42
+#: so only the small tile takes it. `-D ANONLIB_APPLE_MMA_SMALL_KB=16`
+#: reverts.
+comptime APPLE_MMA_SMALL_KB = get_defined_int["ANONLIB_APPLE_MMA_SMALL_KB", 32]()
+comptime APPLE_MMA_BM = 8 * APPLE_MMA_FM * APPLE_MMA_SGM
+comptime APPLE_MMA_BN = 8 * APPLE_MMA_FN * APPLE_MMA_SGN
+comptime _AMMA_M64 = SIMD[DType.float32, 64]
+comptime _AMMA_V2 = SIMD[DType.int64, 2]
+
+
+#: lane/cnn-apple2 (2026-09-28): the simdgroup matrix kernel in the FAST
+#: tier on Apple, for callers that NAME `PLAN_APPLE_MMA` or
+#: `PLAN_APPLE_MMA_SPLIT` (x_cnn's measured plans). Every full window runs
+#: on the matrix path (FAST keeps no rtf seam); no dispatcher picks it.
+#: `-D ANONLIB_GEMM_NO_APPLE_MMA_FAST` is the revert arm.
+comptime APPLE_MMA_FAST = (
+    GLOBAL_NUMERIC_MODE != NUMERIC_IDENTICAL
+    and TARGET_COLUMN == COLUMN_APPLE
+    and not is_defined["ANONLIB_GEMM_NO_APPLE_MMA"]()
+    and not is_defined["ANONLIB_GEMM_NO_APPLE_MMA_FAST"]()
+)
+
+
+def apple_mma_auto_split_groups(m: Int, n: Int, k: Int) -> Tuple[Int, Int]:
+    """`(leaves per group, groups)` of the matrix plan's leaf-group split at
+    this shape, `(0, 0)` when it does not split (APPLE_MMA_AUTO_SPLIT_BLOCKS)."""
+    comptime if APPLE_MMA_AUTO_SPLIT_BLOCKS <= 0:
+        return (0, 0)
+    if not apple_mma_applies(m, n, k):
+        return (0, 0)
+    var p = contract_partition(k)[1]
+    var tiles = ((m + APPLE_MMA_BM - 1) // APPLE_MMA_BM) * ((n + APPLE_MMA_BN - 1) // APPLE_MMA_BN)
+    if tiles >= APPLE_MMA_AUTO_SPLIT_BLOCKS:
+        return (0, 0)
+    var want = (APPLE_MMA_AUTO_SPLIT_BLOCKS + tiles - 1) // tiles
+    var per = (p + want - 1) // want
+    var gl = APPLE_MMA_SPLIT_MIN_LEAVES
+    while gl < per and gl < GEMM_KSPLIT_MAX_GROUP_LEAVES:
+        gl = gl * 2
+    var groups = (p + gl - 1) // gl
+    if groups <= 1:
+        return (0, 0)
+    return (gl, groups)
+
+
+def apple_mma_applies(m: Int, n: Int, k: Int) -> Bool:
+    """Every leaf a whole number of windows (no short window, no padding)."""
+    comptime if not (APPLE_MMA or APPLE_MMA_FAST):
+        return False
+    if m <= 0 or n <= 0 or k <= 0:
+        return False
+    # Leaves are whole windows; only the LAST leaf may end mid-window
+    # (ragged `k`), and its short tail runs the exact step, unpadded.
+    return contract_partition(k)[0] % APPLE_MMA_KB == 0
+
+
+@always_inline
+def apple_mma_applies_one_leaf(m: Int, n: Int, k: Int) -> Bool:
+    """lane/cnn-apple2: `apple_mma_applies`, or ONE leaf (`k <= K_LEAF_MIN`)
+    of any length: its short final window runs the exact step, unpadded,
+    as a ragged last leaf's does. For callers that name the plan (x_cnn's
+    k = C*KH*KW forward); the dispatchers read `apple_mma_applies`."""
+    if apple_mma_applies(m, n, k):
+        return True
+    comptime if not (APPLE_MMA or APPLE_MMA_FAST):
+        return False
+    return m > 0 and n > 0 and k > 0 and contract_partition(k)[1] == 1
+
+
+@always_inline
+def _amma_load_t(
+    p: UnsafePointer[Float32, MutUntrackedOrigin, address_space=AddressSpace.SHARED],
+    stride: Int,
+) -> _AMMA_M64:
+    """Fragment M[r][c] = p[c * stride + r]. The load's AIR signature depends
+    on the target (see `fast_mma_knn._sg_load_t`)."""
+    comptime if simdgroup_load_legacy_air():
+        return external_call["air.simdgroup_matrix_8x8_load.v64f32.p3f32", _AMMA_M64](
+            p, Int64(stride), _AMMA_V2(0, 0), True
+        )
+    else:
+        return external_call["air.simdgroup_matrix_8x8_load.v64f32.p3f32", _AMMA_M64](
+            p, _AMMA_V2(Int64(stride), 8), _AMMA_V2(Int64(stride), 1), _AMMA_V2(0, 0)
+        )
+
+
+@always_inline
+def _amma_mma(a: _AMMA_M64, b: _AMMA_M64, c: _AMMA_M64) -> _AMMA_M64:
+    return external_call[
+        "air.simdgroup_matrix_8x8_multiply_accumulate.v64f32.v64f32.v64f32.v64f32",
+        _AMMA_M64,
+    ](a, b, c)
+
+
+@always_inline
+def _amma_gload[
+    ROWS: Int, KB: Int, NT: Int
+](
+    src: MutPointer[Float32, MutAnyOrigin],
+    outer_stride: Int,
+    k_stride: Int,
+    base_outer: Int,
+    outer_limit: Int,
+    k0: Int,
+    chunk: Int,
+    tid: Int,
+    ofast: Bool,
+) -> SIMD[DType.float32, 4 * ((ROWS * KB) // (4 * NT))]:
+    """One window's operand words for this thread, 4 per slot, unflushed.
+    `ofast` (the outer index has stride 1): slot = (p, 4 consecutive outer);
+    else slot = (outer, 4 consecutive p), one vector load when `k_stride` is
+    1. Words outside `outer_limit` or past `chunk` read +0.0 and are never
+    used by a cell in range (the staged zeros only fill the fragment)."""
+    comptime SL = (ROWS * KB) // (4 * NT)
+    comptime assert SL * 4 * NT == ROWS * KB, "_amma_gload: whole slots"
+    var r = SIMD[DType.float32, 4 * SL](0.0)
+    comptime for sl in range(SL):
+        var s = sl * NT + tid
+        if ofast:
+            var pp = s // (ROWS // 4)
+            var o4 = (s % (ROWS // 4)) * 4
+            if pp < chunk:
+                var go = base_outer + o4
+                var at_ = src + go + (k0 + pp) * k_stride
+                if go + 3 < outer_limit:
+                    var v = at_.load[width=4, alignment=4]()
+                    comptime for q in range(4):
+                        r[4 * sl + q] = v[q]
+                else:
+                    comptime for q in range(4):
+                        if go + q < outer_limit:
+                            r[4 * sl + q] = at_[q]
+        else:
+            var o = s // (KB // 4)
+            var p4 = (s % (KB // 4)) * 4
+            var go = base_outer + o
+            if go < outer_limit:
+                var at_ = src + go * outer_stride + (k0 + p4) * k_stride
+                if k_stride == 1 and p4 + 3 < chunk:
+                    var v = at_.load[width=4, alignment=4]()
+                    comptime for q in range(4):
+                        r[4 * sl + q] = v[q]
+                else:
+                    comptime for q in range(4):
+                        if p4 + q < chunk:
+                            r[4 * sl + q] = at_[q * k_stride]
+    return r
+
+
+@always_inline
+def _amma_stage[
+    ROWS: Int, KB: Int, NT: Int, PMAJOR: Bool, ST: Int
+](
+    dst: UnsafePointer[Float32, MutUntrackedOrigin, address_space=AddressSpace.SHARED],
+    r: SIMD[DType.float32, 4 * ((ROWS * KB) // (4 * NT))],
+    tid: Int,
+    ofast: Bool,
+) -> UInt32:
+    """Flush and store one thread's slots; returns the minimum exponent field
+    of the nonzero flushed words (`_admit_exp_min`). `PMAJOR`: element
+    (outer o, p) at `dst[p * ST + o]` (A); else at `dst[o * ST + p]` (B)."""
+    comptime SL = (ROWS * KB) // (4 * NT)
+    var e = UInt32(0xFF)
+    comptime for sl in range(SL):
+        var s = sl * NT + tid
+        var v = SIMD[DType.float32, 4](0.0)
+        comptime for q in range(4):
+            v[q] = ftz(r[4 * sl + q])
+        e = min(e, _admit_exp_min[4](v))
+        if ofast:
+            var pp = s // (ROWS // 4)
+            var o4 = (s % (ROWS // 4)) * 4
+            comptime if PMAJOR:
+                (dst + pp * ST + o4).store[alignment=16](v)
+            else:
+                comptime for q in range(4):
+                    dst[(o4 + q) * ST + pp] = v[q]
+        else:
+            var o = s // (KB // 4)
+            var p4 = (s % (KB // 4)) * 4
+            comptime if PMAJOR:
+                comptime for q in range(4):
+                    dst[(p4 + q) * ST + o] = v[q]
+            else:
+                (dst + o * ST + p4).store[alignment=16](v)
+    return e
+
+
+def identical_gemm_apple_mma_kernel[
+    SGM: Int, SGN: Int, FM: Int, FN: Int, KB: Int, FS: Int,
+    GROUPED: Bool = False, SPLIT: Bool = False
+](
+    c: MutPointer[Float32, MutAnyOrigin],
+    a: MutPointer[Float32, MutAnyOrigin],
+    b: MutPointer[Float32, MutAnyOrigin],
+    m_in: Int32,
+    n_in: Int32,
+    k_in: Int32,
+    leaf_in: Int32,
+    p_in: Int32,
+    a_si_in: Int32,
+    a_sp_in: Int32,
+    b_sp_in: Int32,
+    b_sj_in: Int32,
+    gl_in: Int32,
+):
+    """One block owns a `BM x BN` output tile and all of its leaves; each
+    simdgroup owns `FM x FN` 8x8 fragments, each lane two cells of each.
+
+    Per window of `KB` steps the block stages A as `at[p][i]` and B as
+    `bt[j][p]` (flushed once, as the tuned kernel's staging does), and every
+    thread keeps the minimum exponent field of the nonzero words it staged.
+    The block minima decide the window: admitted, the simdgroups multiply on
+    the matrix path; not, every lane runs `rtf_mul_add` over its own cells,
+    `p` ascending, and the leaf stays exact to its end. At a leaf end every
+    cell's `ftz(acc)` enters `_fold_push_local`; the drained value is stored
+    flushed. The launch guarantees `L % KB == 0`, so every leaf boundary is a
+    window boundary; a ragged `k` leaves one short final window (`chunk <
+    KB`), which is never admitted and never padded: its staged words past
+    `k` are never read.
+
+    `GROUPED` (lane/cnn-apple2, `PLAN_APPLE_MMA_SPLIT`): block `(tile, q)`
+    walks only leaves `[q * G, min((q + 1) * G, P))` (`G = gl_in`, a
+    power of two; groups aligned at leaf 0), folds them through the same
+    local stack and stores the group's node at `c[q * m * n + cell]` (`c` is
+    the workspace), which `_ksplit_fold_launch` folds: the long-k group
+    argument (DEVIATIONS 2590/2595, Lemmas A and B). Every window of every
+    leaf runs the same body at the same absolute `k`; the grid is schedule.
+    Ungrouped, `gl_in` is unread. `SPLIT` uses the same leaf ranges
+    for the neural auto-dispatch arm, retaining its unflushed group nodes.
+    """
+    comptime NSG = SGM * SGN
+    comptime NT = NSG * 32
+    comptime BM = 8 * FM * SGM
+    comptime BN = 8 * FN * SGN
+    comptime AST = BM + 4
+    comptime BST = KB + 4
+    comptime NF = FM * FN
+    comptime NC = 2 * NF
+    var m = Int(m_in)
+    var n = Int(n_in)
+    var k = Int(k_in)
+    var leaf = Int(leaf_in)
+    var p_count = Int(p_in)
+    var a_si = Int(a_si_in)
+    var a_sp = Int(a_sp_in)
+    var b_sp = Int(b_sp_in)
+    var b_sj = Int(b_sj_in)
+    var tid = Int(thread_idx.x)
+    var sg = tid // 32
+    var lane = tid % 32
+    var sgm = sg // SGN
+    var sgn = sg % SGN
+    # Grouped block order (scheduling only): GM consecutive blocks share one
+    # B tile, so a wide `n` (the head's vocabulary) streams B about m / (BM
+    # GM) times instead of m / BM. `-D ANONLIB_APPLE_MMA_GROUP_M=1` is the
+    # row-major order.
+    var nbn = (n + BN - 1) // BN
+    var nbm = (m + BM - 1) // BM
+    var bid = Int(block_idx.x)
+    var per_group = APPLE_MMA_GROUP_M * nbn
+    var first_m = (bid // per_group) * APPLE_MMA_GROUP_M
+    var gsize = min(nbm - first_m, APPLE_MMA_GROUP_M)
+    var in_g = bid % per_group
+    var m0 = (first_m + in_g % gsize) * BM
+    var n0 = (in_g // gsize) * BN
+    var qd = lane // 4
+    var frow = (qd & 4) + ((lane // 2) % 4)
+    var fcol = (qd & 2) * 2 + (lane % 2) * 2
+    # APPLE_MMA_DB: two shared pages (window w computes from one while w + 1
+    # stages into the other), one barrier per window instead of two.
+    comptime NPG = 2 if APPLE_MMA_DB else 1
+    comptime ASZ = KB * AST
+    comptime BSZ = BN * BST
+    var at = stack_allocation[NPG * ASZ, Scalar[DType.float32], address_space = AddressSpace.SHARED]()
+    var bt = stack_allocation[NPG * BSZ, Scalar[DType.float32], address_space = AddressSpace.SHARED]()
+    var wmin = stack_allocation[NPG * 2 * NSG, Scalar[DType.uint32], address_space = AddressSpace.SHARED]()
+    var fl = stack_allocation[FS * NC, Scalar[DType.float32]]()
+    var occ = 0
+    var acc = InlineArray[_AMMA_M64, NF](fill=_AMMA_M64(0))
+    var exact_ok = True  # every earlier window of this leaf was admitted
+    var wpl = leaf // KB
+    if p_count == 1:
+        # one leaf (lane/cnn-apple2): it ends with `k`, whole windows or not
+        # (`apple_mma_applies_one_leaf`); where L % KB == 0 this is L / KB
+        wpl = (k + KB - 1) // KB
+    # A: outer index i (stride a_si), p stride a_sp; B: outer j (b_sj), p (b_sp).
+    var a_ofast = a_si == 1 and a_sp != 1
+    var b_ofast = b_sj == 1 and b_sp != 1
+    # SPLIT (APPLE_MMA_AUTO_SPLIT_BLOCKS): this block's leaf group, `gl_in`
+    # leaves from leaf `block_idx.y * gl_in`; otherwise every leaf.
+    var kb = 0
+    var ke = k
+    comptime if GROUPED or SPLIT:
+        kb = Int(block_idx.y) * Int(gl_in) * leaf
+        ke = min(k, kb + Int(gl_in) * leaf)
+    var windows = (ke - kb + KB - 1) // KB
+    # Register double buffer: the next window's words load while this one
+    # multiplies.
+    var ra = _amma_gload[BM, KB, NT](a, a_si, a_sp, m0, m, kb, min(KB, ke - kb), tid, a_ofast)
+    var rb = _amma_gload[BN, KB, NT](b, b_sj, b_sp, n0, n, kb, min(KB, ke - kb), tid, b_ofast)
+    comptime if APPLE_MMA_DB:
+        # Prologue: window 0 staged into page 0, window 1's words in flight.
+        var ea0 = _admit_warp_min(_amma_stage[BM, KB, NT, True, AST](at, ra, tid, a_ofast))
+        var eb0 = _admit_warp_min(_amma_stage[BN, KB, NT, False, BST](bt, rb, tid, b_ofast))
+        if lane == 0:
+            wmin[sg] = ea0
+            wmin[NSG + sg] = eb0
+        barrier()
+        if windows > 1:
+            ra = _amma_gload[BM, KB, NT](a, a_si, a_sp, m0, m, kb + KB, min(KB, ke - kb - KB), tid, a_ofast)
+            rb = _amma_gload[BN, KB, NT](b, b_sj, b_sp, n0, n, kb + KB, min(KB, ke - kb - KB), tid, b_ofast)
+    for w in range(windows):
+        var k0 = kb + w * KB
+        var chunk = min(KB, ke - k0)
+        var cur = w % NPG
+        var atc = at + cur * ASZ
+        var btc = bt + cur * BSZ
+        var wmc = wmin + cur * 2 * NSG
+        comptime if not APPLE_MMA_DB:
+            var ea = _amma_stage[BM, KB, NT, True, AST](at, ra, tid, a_ofast)
+            var eb = _amma_stage[BN, KB, NT, False, BST](bt, rb, tid, b_ofast)
+            ea = _admit_warp_min(ea)
+            eb = _admit_warp_min(eb)
+            if lane == 0:
+                wmin[sg] = ea
+                wmin[NSG + sg] = eb
+            barrier()
+            if w + 1 < windows:
+                var k1 = k0 + KB
+                ra = _amma_gload[BM, KB, NT](a, a_si, a_sp, m0, m, k1, min(KB, ke - k1), tid, a_ofast)
+                rb = _amma_gload[BN, KB, NT](b, b_sj, b_sp, n0, n, k1, min(KB, ke - k1), tid, b_ofast)
+        var bea = UInt32(0xFF)
+        var beb = UInt32(0xFF)
+        comptime for q in range(NSG):
+            bea = min(bea, wmc[q])
+            beb = min(beb, wmc[NSG + q])
+        var admitted = exact_ok and chunk == KB and (bea + beb) >= UInt32(APPLE_MMA_ADMIT_EXP_SUM)
+        comptime if APPLE_MMA_FAST:
+            admitted = chunk == KB  # FAST: no seam to keep
+        if not admitted:
+            exact_ok = False
+        if admitted:
+            comptime for p8 in range(KB // 8):
+                var af = InlineArray[_AMMA_M64, FM](fill=_AMMA_M64(0))
+                var bf = InlineArray[_AMMA_M64, FN](fill=_AMMA_M64(0))
+                comptime for fm in range(FM):
+                    af[fm] = _amma_load_t(atc + (8 * p8) * AST + (sgm * FM + fm) * 8, AST)
+                comptime for fq in range(FN):
+                    bf[fq] = _amma_load_t(btc + ((sgn * FN + fq) * 8) * BST + 8 * p8, BST)
+                comptime for fm in range(FM):
+                    comptime for fq in range(FN):
+                        acc[fm * FN + fq] = _amma_mma(af[fm], bf[fq], acc[fm * FN + fq])
+                        comptime if is_defined["ANONLIB_GEMM_SABOTAGE_APPLE_MMA"]():
+                            # Check arm: perturbs every matrix-path window, so a
+                            # gate shows it reaches them (it must FAIL the fixtures).
+                            acc[fm * FN + fq] = acc[fm * FN + fq] * Float32(1.0000001)
+        else:
+            for p in range(chunk):
+                comptime for fm in range(FM):
+                    var av = atc[p * AST + (sgm * FM + fm) * 8 + frow]
+                    comptime for fq in range(FN):
+                        comptime for e in range(2):
+                            var bv = btc[((sgn * FN + fq) * 8 + fcol + e) * BST + p]
+                            acc[fm * FN + fq][e] = rtf_mul_add(av, bv, acc[fm * FN + fq][e])
+        comptime if APPLE_MMA_DB:
+            # Stage window w + 1 into the other page (last read by window
+            # w - 1, before the previous barrier), then fetch window w + 2.
+            if w + 1 < windows:
+                var nxt = (w + 1) % NPG
+                var ean = _admit_warp_min(_amma_stage[BM, KB, NT, True, AST](at + nxt * ASZ, ra, tid, a_ofast))
+                var ebn = _admit_warp_min(_amma_stage[BN, KB, NT, False, BST](bt + nxt * BSZ, rb, tid, b_ofast))
+                if lane == 0:
+                    wmin[nxt * 2 * NSG + sg] = ean
+                    wmin[nxt * 2 * NSG + NSG + sg] = ebn
+                if w + 2 < windows:
+                    var k2 = k0 + 2 * KB
+                    ra = _amma_gload[BM, KB, NT](a, a_si, a_sp, m0, m, k2, min(KB, ke - k2), tid, a_ofast)
+                    rb = _amma_gload[BN, KB, NT](b, b_sj, b_sp, n0, n, k2, min(KB, ke - k2), tid, b_ofast)
+        barrier()
+        if (w + 1) % wpl == 0 or w + 1 == windows:
+            var part = SIMD[DType.float32, NC](0.0)
+            comptime for f in range(NF):
+                comptime for e in range(2):
+                    part[2 * f + e] = ftz(acc[f][e])  # 5d, the leaf partial as written
+            comptime if FS == 1:
+                comptime for pe in range(NC):
+                    fl[pe] = part[pe]
+                occ = 1
+            else:
+                _ = _fold_push_local[NC, FS](fl, occ, part)
+            comptime for f in range(NF):
+                acc[f] = _AMMA_M64(0)
+            exact_ok = True  # the next leaf starts at +0.0
+    var outv = SIMD[DType.float32, NC](0.0)
+    comptime if FS == 1:
+        comptime for oe in range(NC):
+            outv[oe] = fl[oe]
+    else:
+        outv = _fold_drain_local[NC, FS](fl, occ)
+    var cbase = 0
+    comptime if GROUPED:
+        cbase = Int(block_idx.y) * m * n
+    comptime for fm in range(FM):
+        comptime for fq in range(FN):
+            comptime for e in range(2):
+                var gi = m0 + (sgm * FM + fm) * 8 + frow
+                var gj = n0 + (sgn * FN + fq) * 8 + fcol + e
+                if gi < m and gj < n:
+                    comptime if SPLIT:
+                        # The group node, unflushed (the fold flushes on read).
+                        c[Int(block_idx.y) * m * n + gi * n + gj] = outv[2 * (fm * FN + fq) + e]
+                    else:
+                        c[cbase + gi * n + gj] = ftz(outv[2 * (fm * FN + fq) + e])
+
+
+def _launch_apple_mma(
+    ctx: DeviceContext,
+    mut c: DeviceBuffer[DType.float32],
+    mut a: DeviceBuffer[DType.float32],
+    mut b: DeviceBuffer[DType.float32],
+    mut ws: DeviceBuffer[DType.float32],
+    m: Int,
+    n: Int,
+    k: Int,
+    leaf: Int,
+    p_count: Int,
+    st: Tuple[Int, Int, Int, Int],
+) raises:
+    """lane/neural-apple2 (2026-09-28): a leaf that is a whole number of
+    `APPLE_MMA_KB_WIDE` windows runs the same kernel at that window width
+    (scheduling only: every window is either the matrix chain the contract's
+    chain equals or the exact step, at any width), else `APPLE_MMA_KB`."""
+    comptime if APPLE_MMA_KB_WIDE > APPLE_MMA_KB:
+        if leaf % APPLE_MMA_KB_WIDE == 0:
+            _launch_apple_mma_kb[APPLE_MMA_KB_WIDE](ctx, c, a, b, ws, m, n, k, leaf, p_count, st)
+            return
+    _launch_apple_mma_kb[APPLE_MMA_KB](ctx, c, a, b, ws, m, n, k, leaf, p_count, st)
+
+
+def _launch_apple_mma_small[KBW: Int](
+    ctx: DeviceContext,
+    mut c: DeviceBuffer[DType.float32],
+    mut a: DeviceBuffer[DType.float32],
+    mut b: DeviceBuffer[DType.float32],
+    m: Int,
+    n: Int,
+    k: Int,
+    leaf: Int,
+    p_count: Int,
+    st: Tuple[Int, Int, Int, Int],
+) raises:
+    """The small tile (APPLE_MMA_SMALL_FM x APPLE_MMA_SMALL_FN) at window
+    `KBW`, one block per tile (scheduling only)."""
+    comptime ks = identical_gemm_apple_mma_kernel[
+        APPLE_MMA_SGM, APPLE_MMA_SGN, APPLE_MMA_SMALL_FM, APPLE_MMA_SMALL_FN, KBW, TUNED_FOLD_SLOTS
+    ]
+    comptime SBM = 8 * APPLE_MMA_SMALL_FM * APPLE_MMA_SGM
+    comptime SBN = 8 * APPLE_MMA_SMALL_FN * APPLE_MMA_SGN
+    var sblocks = ((m + SBM - 1) // SBM) * ((n + SBN - 1) // SBN)
+    step_count_launch()
+    ctx.enqueue_function[ks](
+        c.unsafe_ptr(), a.unsafe_ptr(), b.unsafe_ptr(),
+        Int32(m), Int32(n), Int32(k), Int32(leaf), Int32(p_count),
+        Int32(st[0]), Int32(st[1]), Int32(st[2]), Int32(st[3]), Int32(0),
+        grid_dim=(sblocks, 1, 1),
+        block_dim=(APPLE_MMA_SGM * APPLE_MMA_SGN * 32, 1, 1),
+    )
+
+
+def _launch_apple_mma_kb[KBW: Int](
+    ctx: DeviceContext,
+    mut c: DeviceBuffer[DType.float32],
+    mut a: DeviceBuffer[DType.float32],
+    mut b: DeviceBuffer[DType.float32],
+    mut ws: DeviceBuffer[DType.float32],
+    m: Int,
+    n: Int,
+    k: Int,
+    leaf: Int,
+    p_count: Int,
+    st: Tuple[Int, Int, Int, Int],
+) raises:
+    comptime kern = identical_gemm_apple_mma_kernel[
+        APPLE_MMA_SGM, APPLE_MMA_SGN, APPLE_MMA_FM, APPLE_MMA_FN, KBW, TUNED_FOLD_SLOTS
+    ]
+    comptime if APPLE_MMA_AUTO_SPLIT_BLOCKS > 0:
+        # lane/neural-apple2: the leaf-group split into the caller's
+        # workspace (sized by identical_gemm_workspace_max_floats), then the
+        # group fold; a workspace too small for it takes the plain launch.
+        var sg = apple_mma_auto_split_groups(m, n, k)
+        if sg[1] > 1 and len(ws) >= sg[1] * m * n:
+            comptime kspl = identical_gemm_apple_mma_kernel[
+                APPLE_MMA_SGM, APPLE_MMA_SGN, APPLE_MMA_FM, APPLE_MMA_FN, KBW, TUNED_FOLD_SLOTS, False, True
+            ]
+            var tb = ((m + APPLE_MMA_BM - 1) // APPLE_MMA_BM) * ((n + APPLE_MMA_BN - 1) // APPLE_MMA_BN)
+            step_count_launch()
+            ctx.enqueue_function[kspl](
+                ws.unsafe_ptr(), a.unsafe_ptr(), b.unsafe_ptr(),
+                Int32(m), Int32(n), Int32(k), Int32(leaf), Int32(p_count),
+                Int32(st[0]), Int32(st[1]), Int32(st[2]), Int32(st[3]), Int32(sg[0]),
+                grid_dim=(tb, sg[1], 1),
+                block_dim=(APPLE_MMA_SGM * APPLE_MMA_SGN * 32, 1, 1),
+            )
+            _ksplit_fold_launch(ctx, c, ws, m, n, sg[1])
+            return
+    var blocks = ((m + APPLE_MMA_BM - 1) // APPLE_MMA_BM) * ((n + APPLE_MMA_BN - 1) // APPLE_MMA_BN)
+    comptime if APPLE_MMA_SMALL_TILE:
+        # lane/neural-apple (2026-09-28): an output too small to fill the GPU
+        # with the default tile (the weight gradients: 768 x 768 is 144
+        # blocks, each walking k = 8192 tokens) takes the same kernel at a
+        # quarter of the tile, four times the blocks. The tile is a
+        # schedule: every cell's leaf chains and leaf fold are the same.
+        if blocks < APPLE_MMA_SMALL_BLOCKS:
+            # lane/neural-apple2: the small tile walks its long k in
+            # APPLE_MMA_SMALL_KB-step windows when the leaf is a whole number
+            # of them (half the barriers and admission reductions per step).
+            comptime if APPLE_MMA_SMALL_KB > KBW:
+                if leaf % APPLE_MMA_SMALL_KB == 0:
+                    _launch_apple_mma_small[APPLE_MMA_SMALL_KB](ctx, c, a, b, m, n, k, leaf, p_count, st)
+                    return
+            _launch_apple_mma_small[KBW](ctx, c, a, b, m, n, k, leaf, p_count, st)
+            return
+    step_count_launch()
+    ctx.enqueue_function[kern](
+        c.unsafe_ptr(),
+        a.unsafe_ptr(),
+        b.unsafe_ptr(),
+        Int32(m),
+        Int32(n),
+        Int32(k),
+        Int32(leaf),
+        Int32(p_count),
+        Int32(st[0]),
+        Int32(st[1]),
+        Int32(st[2]),
+        Int32(st[3]),
+        Int32(0),
+        grid_dim=(blocks, 1, 1),
+        block_dim=(APPLE_MMA_SGM * APPLE_MMA_SGN * 32, 1, 1),
+    )
+
+
+#: lane/cnn-apple2 (2026-09-28): `PLAN_APPLE_MMA_SPLIT` targets about this
+#: many blocks (tiles x leaf groups). Scheduling only (`-D` is a
+#: measurement arm).
+comptime APPLE_MMA_SPLIT_BLOCKS = get_defined_int["ANONLIB_APPLE_MMA_SPLIT_BLOCKS", 1024]()
+comptime _AMMA_SPLIT_BM = 8 * APPLE_MMA_SMALL_FM * APPLE_MMA_SGM
+comptime _AMMA_SPLIT_BN = 8 * APPLE_MMA_SMALL_FN * APPLE_MMA_SGN
+
+
+def apple_mma_split_groups[BIG: Bool = False](m: Int, n: Int, k: Int) -> Tuple[Int, Int]:
+    """`(leaves per group, groups)` of `PLAN_APPLE_MMA_SPLIT` at `(m, n, k)`:
+    the smallest power-of-two group whose grid (small tiles x groups) is at
+    most `APPLE_MMA_SPLIT_BLOCKS`. A pure function of the shape; `(1, 0)` at
+    `k <= 0`. The group size is SCHEDULE: groups are aligned powers of two,
+    so every size folds to the contract's tree (Lemmas A and B)."""
+    var p_count = contract_partition(k)[1]
+    if m <= 0 or n <= 0 or p_count <= 0:
+        return (1, 0)
+    var tiles = ((m + _AMMA_SPLIT_BM - 1) // _AMMA_SPLIT_BM) * ((n + _AMMA_SPLIT_BN - 1) // _AMMA_SPLIT_BN)
+    comptime if BIG:
+        tiles = ((m + APPLE_MMA_BM - 1) // APPLE_MMA_BM) * ((n + APPLE_MMA_BN - 1) // APPLE_MMA_BN)
+    var gl = 1
+    while gl < p_count and tiles * ((p_count + gl - 1) // gl) > APPLE_MMA_SPLIT_BLOCKS:
+        gl *= 2
+    return (gl, (p_count + gl - 1) // gl)
+
+
+def _launch_apple_mma_split[BIG: Bool = False](
+    ctx: DeviceContext,
+    mut c: DeviceBuffer[DType.float32],
+    mut a: DeviceBuffer[DType.float32],
+    mut b: DeviceBuffer[DType.float32],
+    mut ws: DeviceBuffer[DType.float32],
+    m: Int,
+    n: Int,
+    k: Int,
+    leaf: Int,
+    p_count: Int,
+    st: Tuple[Int, Int, Int, Int],
+) raises:
+    """lane/cnn-apple2: `PLAN_APPLE_MMA_SPLIT`. The APPLE_MMA kernel at the
+    small tile over `(tiles, groups)` (each block one aligned power-of-two
+    group of leaves, its node to `ws[q * m * n + cell]`), then the SPLIT
+    plans' fold of the `groups` nodes per cell (`_ksplit_fold_launch`). For
+    the outputs too small to fill the GPU with whole-`k` blocks (weight
+    gradients over many rows: 64 x 288 x 65536 is 18 small tiles)."""
+    var g = apple_mma_split_groups[BIG](m, n, k)
+    comptime FM_ = APPLE_MMA_FM if BIG else APPLE_MMA_SMALL_FM
+    comptime FN_ = APPLE_MMA_FN if BIG else APPLE_MMA_SMALL_FN
+    comptime ks = identical_gemm_apple_mma_kernel[
+        APPLE_MMA_SGM, APPLE_MMA_SGN, FM_, FN_, APPLE_MMA_KB, TUNED_FOLD_SLOTS, True
+    ]
+    comptime TBM = 8 * FM_ * APPLE_MMA_SGM
+    comptime TBN = 8 * FN_ * APPLE_MMA_SGN
+    var tiles = ((m + TBM - 1) // TBM) * ((n + TBN - 1) // TBN)
+    step_count_launch()
+    ctx.enqueue_function[ks](
+        ws.unsafe_ptr(), a.unsafe_ptr(), b.unsafe_ptr(),
+        Int32(m), Int32(n), Int32(k), Int32(leaf), Int32(p_count),
+        Int32(st[0]), Int32(st[1]), Int32(st[2]), Int32(st[3]), Int32(g[0]),
+        grid_dim=(tiles, g[1], 1),
+        block_dim=(APPLE_MMA_SGM * APPLE_MMA_SGN * 32, 1, 1),
+    )
+    _ksplit_fold_launch(ctx, c, ws, m, n, g[1])
+
+
+def _launch_tuned[
+    RPT: Int, CPT: Int, TC: Int, KS: Int, FS: Int
+](
+    ctx: DeviceContext,
+    mut c: DeviceBuffer[DType.float32],
+    mut a: DeviceBuffer[DType.float32],
+    mut b: DeviceBuffer[DType.float32],
+    m: Int,
+    n: Int,
+    k: Int,
+    leaf: Int,
+    p_count: Int,
+    st: Tuple[Int, Int, Int, Int],
+    swizzle: Int,
+    two_d: Bool,
+) raises:
+    """`_launch_tiled`'s twin, with `PAGES` resolved from the matrix.
+
+    The grid comes from the IMPORTED `_tile_grid` with the tile this plan's
+    parameters imply, so there is no second opinion about how many blocks a
+    shape needs.
+    """
+    comptime NTH = TUNED_TPB
+    comptime TR = NTH // TC
+    comptime BM = RPT * TR
+    comptime BN = CPT * TC
+    comptime VEC = TUNED_VECLEN
+    comptime SSTRIDE = KS + VEC
+    #: Both pages of both operands, in bytes. `lib_smem_pages_for` answers 2
+    #: when twice this fits under `column_shared_limit(TARGET_COLUMN)` and 1
+    #: when it does not, which at `KS = 32` is the Apple column and only the
+    #: Apple column. `[[ALWAYS GPU-agnostic]]`: that divergence is a matrix
+    #: row, not an `if apple`.
+    comptime PAGE_BYTES = (BM + BN) * SSTRIDE * 4
+    # lane/amd-step-time trial arm: one page (half the LDS, so more blocks can
+    # be resident per CU); scheduling only.
+    # A02 current experiment: NEVER RUN — PENDING MEASUREMENT; existing defaults preserved.
+    comptime PAGES = 1 if is_defined["ANONLIB_GEMM_ONE_PAGE"]() else lib_smem_pages_for[TARGET_COLUMN, PAGE_BYTES]()
+    comptime kern = identical_gemm_tuned_kernel[RPT, CPT, TC, KS, FS, PAGES]
+    var g = _tile_grid(m, n, BM, BN, two_d)
+    step_count_launch()
+    ctx.enqueue_function[kern](
+        c.unsafe_ptr(),
+        a.unsafe_ptr(),
+        b.unsafe_ptr(),
+        Int32(m),
+        Int32(n),
+        Int32(k),
+        Int32(leaf),
+        Int32(p_count),
+        Int32(st[0]),
+        Int32(st[1]),
+        Int32(st[2]),
+        Int32(st[3]),
+        Int32(swizzle),
+        grid_dim=(g[0], g[1], 1),
+        block_dim=(NTH, 1, 1),
+    )
+
+
+
+def identical_gemm_with_plan(
+    ctx: DeviceContext,
+    mut c: DeviceBuffer[DType.float32],
+    mut a: DeviceBuffer[DType.float32],
+    mut b: DeviceBuffer[DType.float32],
+    mut ws: DeviceBuffer[DType.float32],
+    m: Int,
+    n: Int,
+    k: Int,
+    op: Int,
+    plan: Int,
+) raises:
+    """`C = op(A) . op(B)` under `anonlib.identical.gemm.fp32.v1`, on a
+    NAMED execution plan. The gates call this; production calls
+    `identical_gemm` below.
+
+    `ws` must hold at least `identical_gemm_workspace_floats(m, n, k, plan)`
+    floats and is UNTOUCHED by every plan but SPLITK. The caller owns every
+    buffer and synchronizes; nothing here waits.
+
+    THE THREE LINES THAT ARE THE NUMERICAL PLAN are the next three: the
+    partition from `k`, the strides from the orientation, and then a switch
+    that chooses geometry. After `part` is computed there is no path back
+    into the arithmetic -- every branch below passes the SAME `leaf` and
+    `p_count` to its kernel.
+    """
+    if m <= 0 or n <= 0:
+        return
+    var part = contract_partition(k)
+    var leaf = part[0]
+    var p_count = part[1]
+    var st = gemm_operand_strides(op, m, n, k)
+
+    if (plan == PLAN_SPLITK or plan == PLAN_SPLITK_STAGED) and p_count > 0:
+        var staged = plan == PLAN_SPLITK_STAGED
+        var stride = p_count
+        if staged:
+            stride = fold_node_total(p_count)
+        step_count_launch()
+        ctx.enqueue_function[identical_gemm_leaf_kernel](
+            ws.unsafe_ptr(),
+            a.unsafe_ptr(),
+            b.unsafe_ptr(),
+            Int32(m),
+            Int32(n),
+            Int32(k),
+            Int32(leaf),
+            Int32(p_count),
+            Int32(st[0]),
+            Int32(st[1]),
+            Int32(st[2]),
+            Int32(st[3]),
+            Int32(stride),
+            grid_dim=(
+                (m * n * p_count + SPLITK_LEAF_LAUNCH_TPB - 1) // SPLITK_LEAF_LAUNCH_TPB,
+                1,
+                1,
+            ),
+            block_dim=(SPLITK_LEAF_LAUNCH_TPB, 1, 1),
+        )
+        if not staged:
+            step_count_launch()
+            ctx.enqueue_function[identical_gemm_fold_kernel[False]](
+                c.unsafe_ptr(),
+                ws.unsafe_ptr(),
+                Int32(m * n),
+                Int32(p_count),
+                Int32(stride),
+                grid_dim=(m * n, 1, 1),
+                block_dim=(SPLITK_FOLD_TPB, 1, 1),
+            )
+            return
+        # THE FULLY STAGED FOLD: one launch per LOGICAL LEVEL. Every base and
+        # width below comes from `gemm_oracle`'s own addressing functions, on
+        # the host, from `p_count` alone -- contract 7.2.2. The launch that
+        # computes a level cannot influence which nodes the level HAS.
+        var levels = fold_level_count(p_count)
+        for d in range(1, levels):
+            var w_prev = fold_level_width(p_count, d - 1)
+            var w_next = fold_level_width(p_count, d)
+            step_count_launch()
+            ctx.enqueue_function[identical_gemm_fold_level_kernel](
+                ws.unsafe_ptr(),
+                Int32(m * n),
+                Int32(stride),
+                Int32(fold_level_base(p_count, d - 1)),
+                Int32(fold_level_base(p_count, d)),
+                Int32(w_prev),
+                Int32(w_next),
+                grid_dim=(
+                    (m * n * w_next + SPLITK_LEAF_TPB - 1) // SPLITK_LEAF_TPB,
+                    1,
+                    1,
+                ),
+                block_dim=(SPLITK_LEAF_TPB, 1, 1),
+            )
+        step_count_launch()
+        ctx.enqueue_function[identical_gemm_emit_kernel](
+            c.unsafe_ptr(),
+            ws.unsafe_ptr(),
+            Int32(m * n),
+            Int32(stride),
+            Int32(fold_level_base(p_count, levels - 1)),
+            Int32(p_count),
+            grid_dim=((m * n + FLAT_TPB - 1) // FLAT_TPB, 1, 1),
+            block_dim=(FLAT_TPB, 1, 1),
+        )
+        return
+    if _is_split_plan(plan) and p_count > 0:
+        # The per-thread tile and thread grid of each split plan; the
+        # names in `gemm_plan_name` derive from the same numbers.
+        # KS = 32 (RAFT's Kblk) where two pages of both operands fit under
+        # every column's shared limit (32x32 and 16x16: 18 KB and 9 KB), 16
+        # for the wide decode tiles (1x256 at KS = 32 would be 37 KB a page).
+        if plan == PLAN_SPLIT_32_2X2:
+            _launch_split[TUNED_RPT // 2, TUNED_CPT // 2, TUNED_TC, TUNED_KBLK](
+                ctx, c, a, b, ws, m, n, k, leaf, p_count, st
+            )
+        elif plan == PLAN_SPLIT_64_4X4:
+            _launch_split[TUNED_RPT, TUNED_CPT, TUNED_TC, TUNED_KBLK](
+                ctx, c, a, b, ws, m, n, k, leaf, p_count, st
+            )
+        elif plan == PLAN_SPLIT_128_8X8:
+            _launch_split[TUNED_RPT * 2, TUNED_CPT * 2, TUNED_TC, 16](
+                ctx, c, a, b, ws, m, n, k, leaf, p_count, st
+            )
+        elif plan == PLAN_SPLIT_16_1X1:
+            _launch_split[1, 1, TUNED_TC, TUNED_KBLK](
+                ctx, c, a, b, ws, m, n, k, leaf, p_count, st
+            )
+        elif plan == PLAN_SPLIT_1X256:
+            _launch_split[1, 1, TUNED_TPB, 16](
+                ctx, c, a, b, ws, m, n, k, leaf, p_count, st
+            )
+        else:
+            _launch_split[1, 2, TUNED_TPB // 8, 16](
+                ctx, c, a, b, ws, m, n, k, leaf, p_count, st
+            )
+        return
+    if plan == PLAN_TILE_16_16_32:
+        _launch_tiled[16, 16, 32](
+            ctx, c, a, b, m, n, k, leaf, p_count, st, SWIZZLE_NONE, False
+        )
+        return
+    if plan == PLAN_TILE_8_32_32:
+        _launch_tiled[8, 32, 32](
+            ctx, c, a, b, m, n, k, leaf, p_count, st, SWIZZLE_NONE, True
+        )
+        return
+    if plan == PLAN_TILE_32_8_16:
+        _launch_tiled[32, 8, 16](
+            ctx, c, a, b, m, n, k, leaf, p_count, st, SWIZZLE_REVERSE, False
+        )
+        return
+    if plan == PLAN_TILE_16_16_8_REV:
+        _launch_tiled[16, 16, 8](
+            ctx, c, a, b, m, n, k, leaf, p_count, st, SWIZZLE_TRANSPOSE, True
+        )
+        return
+    if plan == PLAN_TILE_4_4_32_TSP:
+        _launch_tiled[4, 4, 32](
+            ctx, c, a, b, m, n, k, leaf, p_count, st, SWIZZLE_TRANSPOSE, False
+        )
+        return
+    if plan == PLAN_TUNED_32_2X2:
+        _launch_tuned[TUNED_RPT // 2, TUNED_CPT // 2, TUNED_TC, 16, TUNED_FOLD_SLOTS](
+            ctx, c, a, b, m, n, k, leaf, p_count, st, SWIZZLE_NONE, False
+        )
+        return
+    comptime if APPLE_MMA or APPLE_MMA_FAST:
+        # Compile-time gated: the kernel calls Apple AIR intrinsics, so no
+        # other column may instantiate it (the chooser never names the plan
+        # there; a gate naming it falls through to the tuned 64x64 plan).
+        if plan == PLAN_APPLE_MMA:
+            _launch_apple_mma(ctx, c, a, b, ws, m, n, k, leaf, p_count, st)
+            return
+        if plan == PLAN_APPLE_MMA_SPLIT and p_count > 0 and apple_mma_applies(m, n, k):
+            _launch_apple_mma_split(ctx, c, a, b, ws, m, n, k, leaf, p_count, st)
+            return
+        if plan == PLAN_APPLE_MMA_SPLIT_BIG and p_count > 0 and apple_mma_applies(m, n, k):
+            _launch_apple_mma_split[True](ctx, c, a, b, ws, m, n, k, leaf, p_count, st)
+            return
+    if plan == PLAN_TUNED_64_4X4:
+        _launch_tuned[TUNED_RPT, TUNED_CPT, TUNED_TC, TUNED_64_KS, TUNED_FOLD_SLOTS](
+            ctx, c, a, b, m, n, k, leaf, p_count, st, SWIZZLE_NONE, False
+        )
+        return
+    if plan == PLAN_TUNED_128_8X8:
+        _launch_tuned[TUNED_RPT * 2, TUNED_CPT * 2, TUNED_TC, 16, TUNED_FOLD_SLOTS](
+            ctx, c, a, b, m, n, k, leaf, p_count, st, SWIZZLE_NONE, False
+        )
+        return
+    if plan == PLAN_TUNED_128_8X8_TSP:
+        _launch_tuned[TUNED_RPT * 2, TUNED_CPT * 2, TUNED_TC, 16, TUNED_FOLD_SLOTS](
+            ctx, c, a, b, m, n, k, leaf, p_count, st, SWIZZLE_TRANSPOSE, False
+        )
+        return
+    if plan == PLAN_TUNED_64_4X4_K32:
+        _launch_tuned[TUNED_RPT, TUNED_CPT, TUNED_TC, TUNED_KBLK, TUNED_FOLD_SLOTS](
+            ctx, c, a, b, m, n, k, leaf, p_count, st, SWIZZLE_NONE, False
+        )
+        return
+    if plan == PLAN_TUNED_128_8X8_K32:
+        _launch_tuned[TUNED_RPT * 2, TUNED_CPT * 2, TUNED_TC, TUNED_128_KS, TUNED_FOLD_SLOTS](
+            ctx, c, a, b, m, n, k, leaf, p_count, st, SWIZZLE_NONE, False
+        )
+        return
+    # PLAN_FLAT, and the fallback for both SPLITK plans and the four SPLIT
+    # plans at `k == 0` (there are no partials to write, and section 8 still requires `+0.0` to be
+    # STORED rather than the store skipped).
+    step_count_launch()
+    ctx.enqueue_function[identical_gemm_flat_kernel](
+        c.unsafe_ptr(),
+        a.unsafe_ptr(),
+        b.unsafe_ptr(),
+        Int32(m),
+        Int32(n),
+        Int32(k),
+        Int32(leaf),
+        Int32(p_count),
+        Int32(st[0]),
+        Int32(st[1]),
+        Int32(st[2]),
+        Int32(st[3]),
+        grid_dim=((m * n + FLAT_TPB - 1) // FLAT_TPB, 1, 1),
+        block_dim=(FLAT_TPB, 1, 1),
+    )
+
+
+def identical_gemm_into[allow_vendor: Bool = True](
+    ctx: DeviceContext,
+    mut c: DeviceBuffer[DType.float32],
+    mut a: DeviceBuffer[DType.float32],
+    mut b: DeviceBuffer[DType.float32],
+    mut ws: DeviceBuffer[DType.float32],
+    m: Int,
+    n: Int,
+    k: Int,
+    op: Int,
+) raises:
+    """`C = op(A) . op(B)` into a CALLER-OWNED workspace, on the plan
+    `choose_gemm_plan` picks. ASYNCHRONOUS: nothing here waits, and the
+    caller must keep every buffer alive past its own `ctx.synchronize()`.
+
+    `allow_vendor=False` retains full-FP32 operands in every mode by
+    bypassing the vendor path. The default preserves existing callers.
+    IDENTICAL never uses that path, regardless of this argument.
+
+    `ws` must hold at least `identical_gemm_workspace_max_floats(m, n, k)`
+    floats. **Sizing it for one plan and letting the dispatcher pick another
+    is an out-of-bounds write that a small shape will not show you** -- it
+    cost this lane a run: a 1-float workspace passed to a SPLITK dispatch at
+    `64 x 4` still produced the right answer because the allocation had
+    slack, and only at `64 x 64` (512 KB of partials) did whole regions of
+    the output come back `+0.0`. `check_device_is_batch_invariant` is what
+    caught it. Use the helper, not a guess.
+
+    DEVIATION 2595: on a column whose `lib_gemm_block_parallelism_for` row
+    is above 0 (NVIDIA), a call the long-k group rule takes allocates its
+    own node workspace and SYNCHRONIZES before it returns (a buffer created
+    inside is freed at its last use); `ws` is unused on that path. The wait
+    is ordered on the caller's stream, so no caller's result moves, and the
+    workspace helper above still sizes `ws` for every other call.
+    """
+    # DEVIATION 1900 -- DEVIATION 1876'S SIBLING: THE _INTO FORM HAD NO MODE
+    # BRANCH EITHER. `identical_gemm` grew its FAST branch (1876, below) and
+    # this entry did not, so every caller that owns its workspace -- the
+    # training loop's lm_head, the loss reductions, the GP mean -- kept
+    # landing on the pinned kernel under FAST (~70x off the vendor GEMM on
+    # H100). Same branch, same boundaries: `_fast_vendor_gemm` writes the
+    # SAME caller-owned `c` with the same row-major shape semantics, is
+    # stream-ordered on the same ctx and returns without waiting -- which is
+    # this entry's documented contract already (ASYNCHRONOUS above), so no
+    # postcondition moves. `ws` is simply unused on the vendor path; it is
+    # the caller's buffer, not ours to free. OP_TN and any shape the vendor
+    # arm declines return False and FALL THROUGH to the pinned plan exactly
+    # as 1876 does. Under IDENTICAL this branch is not compiled at all:
+    # bit-unchanged by construction.
+    # lane/apple-fast-neural-gemm (2026-10-03): the Apple FAST simdgroup
+    # route (gemm/afn_apple_fast.mojo), ahead of the vendor route and of the
+    # pinned plans. Full fp32 products and f32 accumulation, so it also
+    # serves the callers that closed the vendor route for its precision cut
+    # (`allow_vendor=False`). Compiled only under FAST on an Apple build with
+    # a ANONLIB_AFN_GEMM_* define; IDENTICAL compiles the lines below
+    # unchanged.
+    comptime if AFN_GEMM_FP32_MMA:
+        if afn_gemm_fp32_into(ctx, c, a, b, m, n, k, op):
+            return
+    comptime if allow_vendor and GLOBAL_NUMERIC_MODE != NUMERIC_IDENTICAL:
+        # TOMBSTONE: ANONLIB_APPLE_FAST_GEMM_PINNED (DROPPED-noise) deleted 2026-10-03 by 75c59ea26; code recoverable at 75c59ea26^.
+        # Restore: git apply experiments/removed/ANONLIB_APPLE_FAST_GEMM_PINNED.patch; record in docs/TOMBSTONES.md.
+        if _fast_vendor_gemm(ctx, c, a, b, m, n, k, op):
+            return
+    # DEVIATION 2542 -- THE GEMM STEP ARM HOOK. Compiled only under
+    # `-D ANONLIB_GEMM_ARM_TRIAL=1`. On a shipped build this block is not
+    # compiled and the dispatch below it is the shipped dispatch. On a
+    # trial build the arm ANONLIB_GEMM_ARM names takes the calls
+    # `choose_gemm_plan` sends to PLAN_TUNED_128_8X8 (every GEMM of the byte
+    # LM step at the target shape, brief section 2) and returns; every other
+    # call, and the clean `shipped` arm, falls through. A SABOTAGED call the
+    # arm does not take is served by the hook through the shipped dispatch's
+    # own body (DEVIATION 2595), so the default's reach can be proven.
+    comptime if GEMM_ARM_TRIAL:
+        if _gemm_step_arm_hook(ctx, c, a, b, ws, m, n, k, op):
+            return
+    # DEVIATION 2595 -- THE SHIPPED DISPATCH. Where the column's
+    # `lib_gemm_block_parallelism_for` row is above 0 (NVIDIA 132), every call
+    # the long-k group rule takes runs the `ksplit` group kernel and its fold.
+    # Where the row is 0 (AMD until the MI300X leg, Apple, every other column) it
+    # compiles to the line it replaced,
+    # `identical_gemm_with_plan(..., choose_gemm_plan(m, n, k))`.
+    identical_gemm_shipped_into(ctx, c, a, b, ws, m, n, k, op)
+
+
+# ===========================================================================
+# THE GEMM STEP ARMS (DEVIATIONS 2540 to 2542, 2026-09-11)
+# ===========================================================================
+# `-D ANONLIB_GEMM_ARM_TRIAL=1` (never on a shipped build) makes
+# `identical_gemm_into` read the arm from the host environment on every call,
+# the ANONLIB_ATTN_ARM_TRIAL pattern:
+#
+#   ANONLIB_GEMM_ARM=shipped     the shipped DEFAULT (also: unset or empty).
+#                                  DEVIATION 2595: `ksplit` at the column's
+#                                  block parallelism row where that row is
+#                                  above 0 and the group rule takes the
+#                                  call, else the plan `choose_gemm_plan`
+#                                  picks (TUNED 128x128 on the step's calls)
+#   ANONLIB_GEMM_ARM=tuned128    2595: the OLD shipped plan, TUNED 128x128,
+#                                  forced on every call `choose_gemm_plan`
+#                                  sends to it (the A/B against the default)
+#   ANONLIB_GEMM_ARM=lfold       2540: 128x128 reg 8x8 KS 16, cell-serial fold
+#   ANONLIB_GEMM_ARM=half        2540: 64x128 reg 4x8, KS 32 where two pages
+#                                  fit the column's shared limit, else 16
+#   ANONLIB_GEMM_ARM=half_ks16   2540: 64x128 reg 4x8, KS 16 on every column
+#   ANONLIB_GEMM_ARM=quarter     2540: 64x64 reg 4x4, KS TUNED_64_KS
+#   ANONLIB_GEMM_ARM=head        2541: the three head calls on a 32x256
+#                                  (n >= m) or 256x32 (m > n) tile whose thread
+#                                  grid reads the lane width; other calls
+#                                  take the shipped plan
+#   ANONLIB_GEMM_ARM=half_head   2541: head calls take head, the rest half
+#   ANONLIB_GEMM_ARM=ksplit      2591: the shipped 128x128 block over a
+#                                  power-of-two GROUP of leaves on grid.y,
+#                                  group nodes to a workspace, one fold
+#                                  launch; the group size reads the column's
+#                                  block parallelism TRIAL row (2595:
+#                                  `lib_gemm_block_parallelism_trial_for`,
+#                                  the shipped row where it is above 0, AMD
+#                                  110 from a reading), so a leg can force it
+#                                  where the default is off
+#   ANONLIB_GEMM_ARM=ksplit_leaf 2591: the same at the finest group the
+#                                  workspace cap allows (reads no machine row)
+#   ANONLIB_GEMM_ARM=kpack       2599: the shipped 128x128 block and group
+#                                  rule with the shared page packed in the
+#                                  order the accumulate reads it and one
+#                                  operand load per step
+#   ANONLIB_GEMM_ARM=kpack_wide  2599: kpack on a 128x256 tile, register
+#                                  tile 8x16, K step from the page row
+#                                  (section 4.2)
+#   ANONLIB_GEMM_ARM=kfoldv      2640: the shipped group launch and group
+#                                  rule, the group nodes folded 16 cells per
+#                                  thread through a lane-wise register stack
+#   ANONLIB_GEMM_ARM=kfoldv_leaf 2641: the same lane fold at `ksplit_leaf`'s
+#                                  rule, the finest group under the workspace
+#                                  cap (section 4.3)
+#   anything else                  RAISES; the harnesses rely on it
+#   ANONLIB_GEMM_ARM_SABOTAGE=1  the arm's sabotage instantiation: one cell
+#                                  per block moves (reach proof). With
+#                                  `shipped` (2595) it is the shipped
+#                                  default's own body, sabotaged: the group
+#                                  launch's cells move where the default
+#                                  takes the call, nothing where the old
+#                                  plan runs
+#
+# Every arm applies only where `choose_gemm_plan` returns PLAN_TUNED_128_8X8.
+# Harnesses that alternate arms inside one process call
+# `identical_gemm_step_geometry_into` with a geometry explicitly. The arm
+# kernel and its launcher live in this file, not a module of their own,
+# because the hook above dispatches them and they reuse this file's private
+# helpers: a second module would import this one and be imported by it.
+#
+# The kernel's identity argument is brief section 10.1, written before this
+# code. Only the trial-gated hook above and the trial harnesses reference
+# this section's arms. DEVIATION 2595 made `ksplit` the shipped default where
+# the column's row is above 0: the shipped dispatch reaches
+# `identical_gemm_shipped_into` and `_ksplit_run` in the long-k section below
+# and nothing else here.
+# N04 experiment: NEVER RUN — PENDING MEASUREMENT; incumbent defaults retained.
+# N04 PENDING: compile evidence alone does not qualify device correctness, quality or speed.
+# Experimental staging entrance requires ANONLIB_GEMM_ARM_TRIAL; shipped route retained.
+comptime GEMM_ARM_TRIAL = is_defined["ANONLIB_GEMM_ARM_TRIAL"]()
+
+comptime GEMM_ARM_SHIPPED = 0
+comptime GEMM_ARM_LFOLD = 1
+comptime GEMM_ARM_HALF = 2
+comptime GEMM_ARM_HALF_KS16 = 3
+comptime GEMM_ARM_QUARTER = 4
+comptime GEMM_ARM_HEAD = 5
+comptime GEMM_ARM_HALF_HEAD = 6
+comptime GEMM_ARM_KSPLIT = 7
+comptime GEMM_ARM_KSPLIT_LEAF = 8
+#: DEVIATION 2595: the old shipped plan, TUNED 128x128, as a trial arm.
+comptime GEMM_ARM_TUNED128 = 9
+#: DEVIATION 2599: the packed-page body at the shipped tile, and on a 128x256
+#: tile.
+comptime GEMM_ARM_KPACK = 10
+comptime GEMM_ARM_KPACK_WIDE = 11
+#: DEVIATIONS 2640 and 2641: the lane fold after the shipped group launch, at
+#: the shipped rule and at `ksplit_leaf`'s. Arm ids stay below GEMM_ARM_SABOTAGE.
+comptime GEMM_ARM_KFOLDV = 12
+comptime GEMM_ARM_KFOLDV_LEAF = 13
+#: DEVIATION 2700: `kpack` with its packed page PADDED by `GEMM_KPACK_PAD`
+#: words per line group, so the per-step B load of the 16 column threads of
+#: a warp lands on distinct bank groups instead of one.
+comptime GEMM_ARM_KPACK_PAD = 14
+#: DEVIATION 2703: `kpack_pad` with the page 16-byte ALIGNED and the per-step
+#: loads spelled at that alignment, so they lower to `ld.shared.v4` instead
+#: of scalar `ld.shared.b32` (brief section 15).
+comptime GEMM_ARM_KPACK_PADV = 15
+#: DEVIATION 2706: `kpack_padv` with the hardware flush in the fold (`hf`),
+#: with gather staging (`gs`), and with both (`hg`) (brief section 17).
+comptime GEMM_ARM_KPACK_HF = 16
+comptime GEMM_ARM_KPACK_GS = 17
+comptime GEMM_ARM_KPACK_HG = 18
+comptime GEMM_ARM_COUNT = 19
+#: OR'd into an arm by ANONLIB_GEMM_ARM_SABOTAGE=1.
+comptime GEMM_ARM_SABOTAGE = 32
+
+#: Geometry ids: what one launch actually runs. An arm maps a call to one.
+comptime GEMM_GEOM_SHIPPED = 0
+comptime GEMM_GEOM_LFOLD = 1
+comptime GEMM_GEOM_HALF = 2
+comptime GEMM_GEOM_HALF_KS16 = 3
+comptime GEMM_GEOM_QUARTER = 4
+comptime GEMM_GEOM_HEAD_N = 5
+comptime GEMM_GEOM_HEAD_M = 6
+comptime GEMM_GEOM_KSPLIT = 7
+comptime GEMM_GEOM_KSPLIT_LEAF = 8
+#: DEVIATION 2595: PLAN_TUNED_128_8X8 forced, on every build. Geometry 0
+#: (`GEMM_GEOM_SHIPPED`) is the shipped DEFAULT dispatch.
+comptime GEMM_GEOM_TUNED128 = 9
+#: DEVIATION 2599: `identical_gemm_kpack_kernel` at 128x128 and at 128x256,
+#: group launch where the arm's rule takes the call, else all leaves.
+comptime GEMM_GEOM_KPACK = 10
+comptime GEMM_GEOM_KPACK_WIDE = 11
+#: DEVIATIONS 2640 and 2641: the ksplit group launch at the arm's rule, then
+#: `identical_gemm_kfold_lanes_kernel` (the shipped fold where `G > 255`).
+comptime GEMM_GEOM_KFOLDV = 12
+comptime GEMM_GEOM_KFOLDV_LEAF = 13
+#: DEVIATION 2700: `identical_gemm_kpack_kernel` at 128x128 with the padded page.
+comptime GEMM_GEOM_KPACK_PAD = 14
+#: DEVIATION 2703: the padded page, 16-byte aligned, vector loads.
+comptime GEMM_GEOM_KPACK_PADV = 15
+#: DEVIATION 2706: hardware fold flush, gather staging, both.
+comptime GEMM_GEOM_KPACK_HF = 16
+comptime GEMM_GEOM_KPACK_GS = 17
+comptime GEMM_GEOM_KPACK_HG = 18
+comptime GEMM_GEOM_COUNT = 19
+
+#: `head` applies to calls with `max(m, n, k)` at least this: the step's
+#: three head calls (V = 50,257), and no per-layer call (at most 2,048).
+comptime GEMM_HEAD_MIN_DIM = 16384
+
+#: `half`'s K step: RAFT's Kblk where TWO pages of the 64x128 pair at KS 32
+#: (27,648 B a page) fit the column's shared limit (the AMD column), else 16.
+#: A matrix row read, never a vendor name.
+comptime GEMM_HALF_PAGE_BYTES_K32 = (
+    (TUNED_BM_WIDE + 2 * TUNED_BN_WIDE) * (TUNED_KBLK + TUNED_VECLEN) * 4
+)
+comptime GEMM_HALF_KS = (
+    TUNED_KBLK
+    if lib_smem_pages_for[TARGET_COLUMN, GEMM_HALF_PAGE_BYTES_K32]() == 2
+    else 16
+)
+
+#: The head tile's thread grid reads the column's lane width (AMD 64, NVIDIA
+#: and Apple 32) through the matrix; a width that is not a power of two in
+#: 8 .. 256, or a block that is not 256 threads, falls back to 16.
+comptime GEMM_HEAD_LANES = lib_lane_width_for[TARGET_COLUMN]()
+comptime GEMM_HEAD_W = (
+    GEMM_HEAD_LANES
+    if (
+        TUNED_TPB == 256
+        and GEMM_HEAD_LANES >= 8
+        and GEMM_HEAD_LANES <= 256
+        and (GEMM_HEAD_LANES & (GEMM_HEAD_LANES - 1)) == 0
+    )
+    else 16
+)
+comptime GEMM_HEAD_SHORT = 32
+comptime GEMM_HEAD_LONG = 256
+#: N-wide (n >= m): tile 32 x 256, thread columns = the lane width.
+comptime GEMM_HEADN_TC = GEMM_HEAD_W
+comptime GEMM_HEADN_RPT = GEMM_HEAD_SHORT // (TUNED_TPB // GEMM_HEAD_W)
+comptime GEMM_HEADN_CPT = GEMM_HEAD_LONG // GEMM_HEAD_W
+#: M-wide (m > n): tile 256 x 32, thread rows = the lane width. Brief 10.2:
+#: under this ownership rule a lane does NOT own consecutive long-axis rows.
+comptime GEMM_HEADM_TC = TUNED_TPB // GEMM_HEAD_W
+comptime GEMM_HEADM_RPT = GEMM_HEAD_LONG // GEMM_HEAD_W
+comptime GEMM_HEADM_CPT = GEMM_HEAD_SHORT // GEMM_HEADM_TC
+
+
+def gemm_step_arm_parse(name: String) raises -> Int:
+    """An arm name to its id. The empty name is `shipped`; an unknown name
+    RAISES."""
+    if name == "" or name == "shipped":
+        return GEMM_ARM_SHIPPED
+    if name == "lfold":
+        return GEMM_ARM_LFOLD
+    if name == "half":
+        return GEMM_ARM_HALF
+    if name == "half_ks16":
+        return GEMM_ARM_HALF_KS16
+    if name == "quarter":
+        return GEMM_ARM_QUARTER
+    if name == "head":
+        return GEMM_ARM_HEAD
+    if name == "half_head":
+        return GEMM_ARM_HALF_HEAD
+    if name == "ksplit":
+        return GEMM_ARM_KSPLIT
+    if name == "ksplit_leaf":
+        return GEMM_ARM_KSPLIT_LEAF
+    if name == "tuned128":
+        return GEMM_ARM_TUNED128
+    if name == "kpack":
+        return GEMM_ARM_KPACK
+    if name == "kpack_wide":
+        return GEMM_ARM_KPACK_WIDE
+    if name == "kfoldv":
+        return GEMM_ARM_KFOLDV
+    if name == "kfoldv_leaf":
+        return GEMM_ARM_KFOLDV_LEAF
+    if name == "kpack_pad":
+        return GEMM_ARM_KPACK_PAD
+    if name == "kpack_padv":
+        return GEMM_ARM_KPACK_PADV
+    if name == "kpack_hf":
+        return GEMM_ARM_KPACK_HF
+    if name == "kpack_gs":
+        return GEMM_ARM_KPACK_GS
+    if name == "kpack_hg":
+        return GEMM_ARM_KPACK_HG
+    raise Error(
+        "ANONLIB_GEMM_ARM='" + name + "' is not a GEMM step arm (shipped, lfold,"
+        + " half, half_ks16, quarter, head, half_head, ksplit, ksplit_leaf, tuned128,"
+        + " kpack, kpack_wide, kfoldv, kfoldv_leaf, kpack_pad, kpack_padv, kpack_hf, kpack_gs, kpack_hg, or unset)"
+    )
+
+
+def gemm_step_arm_name(arm: Int) -> String:
+    """The name the environment would spell for `arm` (sabotage marked)."""
+    var which = arm & (GEMM_ARM_SABOTAGE - 1)
+    var name = String("arm") + String(which)
+    if which == GEMM_ARM_SHIPPED:
+        name = String("shipped")
+    elif which == GEMM_ARM_LFOLD:
+        name = String("lfold")
+    elif which == GEMM_ARM_HALF:
+        name = String("half")
+    elif which == GEMM_ARM_HALF_KS16:
+        name = String("half_ks16")
+    elif which == GEMM_ARM_QUARTER:
+        name = String("quarter")
+    elif which == GEMM_ARM_HEAD:
+        name = String("head")
+    elif which == GEMM_ARM_HALF_HEAD:
+        name = String("half_head")
+    elif which == GEMM_ARM_KSPLIT:
+        name = String("ksplit")
+    elif which == GEMM_ARM_KSPLIT_LEAF:
+        name = String("ksplit_leaf")
+    elif which == GEMM_ARM_TUNED128:
+        name = String("tuned128")
+    elif which == GEMM_ARM_KPACK:
+        name = String("kpack")
+    elif which == GEMM_ARM_KPACK_WIDE:
+        name = String("kpack_wide")
+    elif which == GEMM_ARM_KFOLDV:
+        name = String("kfoldv")
+    elif which == GEMM_ARM_KFOLDV_LEAF:
+        name = String("kfoldv_leaf")
+    elif which == GEMM_ARM_KPACK_PAD:
+        name = String("kpack_pad")
+    elif which == GEMM_ARM_KPACK_PADV:
+        name = String("kpack_padv")
+    elif which == GEMM_ARM_KPACK_HF:
+        name = String("kpack_hf")
+    elif which == GEMM_ARM_KPACK_GS:
+        name = String("kpack_gs")
+    elif which == GEMM_ARM_KPACK_HG:
+        name = String("kpack_hg")
+    if (arm & GEMM_ARM_SABOTAGE) != 0:
+        name += "+sabotage"
+    return name
+
+
+def gemm_step_arm_from_env() raises -> Int:
+    """The arm for THIS call, read on the host.
+
+    Trial builds read ANONLIB_GEMM_ARM (unknown raises) and
+    ANONLIB_GEMM_ARM_SABOTAGE (exactly "1" sets GEMM_ARM_SABOTAGE). Every
+    other build returns GEMM_ARM_SHIPPED without reading the environment."""
+    comptime if not GEMM_ARM_TRIAL:
+        return GEMM_ARM_SHIPPED
+    var arm = gemm_step_arm_parse(String(getenv("ANONLIB_GEMM_ARM")))
+    if String(getenv("ANONLIB_GEMM_ARM_SABOTAGE")) == "1":
+        arm = arm | GEMM_ARM_SABOTAGE
+    return arm
+
+
+def _is_kpack_geometry(geom: Int) -> Bool:
+    """Every geometry `identical_gemm_kpack_kernel` runs (2599, 2700, 2703, 2706)."""
+    return (
+        geom == GEMM_GEOM_KPACK or geom == GEMM_GEOM_KPACK_WIDE
+        or geom == GEMM_GEOM_KPACK_PAD or geom == GEMM_GEOM_KPACK_PADV
+        or geom == GEMM_GEOM_KPACK_HF or geom == GEMM_GEOM_KPACK_GS
+        or geom == GEMM_GEOM_KPACK_HG
+    )
+
+
+def gemm_step_arm_geometry(arm: Int, m: Int, n: Int, k: Int) raises -> Int:
+    """The geometry `arm` runs at `(m, n, k)`: GEMM_GEOM_SHIPPED unless
+    `choose_gemm_plan` answers PLAN_TUNED_128_8X8. Reads `m`, `n`, `k` and
+    returns a geometry id, never a partition (contract 6.1)."""
+    var which = arm & (GEMM_ARM_SABOTAGE - 1)
+    if arm < 0 or arm >= 2 * GEMM_ARM_SABOTAGE or which >= GEMM_ARM_COUNT:
+        raise Error("gemm_step_arm_geometry: no GEMM step arm " + String(arm))
+    if which == GEMM_ARM_SHIPPED:
+        return GEMM_GEOM_SHIPPED
+    if choose_gemm_plan_tiles(m, n, k) != PLAN_TUNED_128_8X8:
+        return GEMM_GEOM_SHIPPED
+    if which == GEMM_ARM_TUNED128:
+        # 2595: the old plan, on every call the old plan served.
+        return GEMM_GEOM_TUNED128
+    if which == GEMM_ARM_KPACK:
+        # 2599: every call the old plan served; the geometry itself picks
+        # the group launch or the all-leaves launch (brief 4).
+        return GEMM_GEOM_KPACK
+    if which == GEMM_ARM_KPACK_WIDE:
+        return GEMM_GEOM_KPACK_WIDE
+    if which == GEMM_ARM_KPACK_PAD:
+        # 2700: `kpack`'s calls and rule, on the padded page.
+        return GEMM_GEOM_KPACK_PAD
+    if which == GEMM_ARM_KPACK_PADV:
+        # 2703: the same, aligned, vector loads.
+        return GEMM_GEOM_KPACK_PADV
+    if which == GEMM_ARM_KPACK_HF:
+        return GEMM_GEOM_KPACK_HF
+    if which == GEMM_ARM_KPACK_GS:
+        return GEMM_GEOM_KPACK_GS
+    if which == GEMM_ARM_KPACK_HG:
+        return GEMM_GEOM_KPACK_HG
+    if which == GEMM_ARM_KFOLDV:
+        # 2640: the rule decides applicability, as for ksplit (brief 4.2).
+        if gemm_step_kfold_leaves(GEMM_GEOM_KFOLDV, m, n, k) > 0:
+            return GEMM_GEOM_KFOLDV
+        return GEMM_GEOM_SHIPPED
+    if which == GEMM_ARM_KFOLDV_LEAF:
+        # 2641: `ksplit_leaf`'s rule (brief 4.3).
+        if gemm_step_kfold_leaves(GEMM_GEOM_KFOLDV_LEAF, m, n, k) > 0:
+            return GEMM_GEOM_KFOLDV_LEAF
+        return GEMM_GEOM_SHIPPED
+    if which == GEMM_ARM_KSPLIT:
+        # 2591: the group rule decides applicability (brief section 4).
+        if gemm_step_ksplit_group_leaves(GEMM_GEOM_KSPLIT, m, n, k) > 0:
+            return GEMM_GEOM_KSPLIT
+        return GEMM_GEOM_SHIPPED
+    if which == GEMM_ARM_KSPLIT_LEAF:
+        if gemm_step_ksplit_group_leaves(GEMM_GEOM_KSPLIT_LEAF, m, n, k) > 0:
+            return GEMM_GEOM_KSPLIT_LEAF
+        return GEMM_GEOM_SHIPPED
+    if which == GEMM_ARM_LFOLD:
+        return GEMM_GEOM_LFOLD
+    if which == GEMM_ARM_HALF:
+        return GEMM_GEOM_HALF
+    if which == GEMM_ARM_HALF_KS16:
+        return GEMM_GEOM_HALF_KS16
+    if which == GEMM_ARM_QUARTER:
+        return GEMM_GEOM_QUARTER
+    var longest = m
+    if n > longest:
+        longest = n
+    if k > longest:
+        longest = k
+    if longest >= GEMM_HEAD_MIN_DIM:
+        if n >= m:
+            return GEMM_GEOM_HEAD_N
+        return GEMM_GEOM_HEAD_M
+    if which == GEMM_ARM_HALF_HEAD:
+        return GEMM_GEOM_HALF
+    return GEMM_GEOM_SHIPPED
+
+
+def gemm_step_geometry_tile(geom: Int) raises -> Tuple[Int, Int]:
+    """`(BM, BN)`, the output tile one block owns, from the same constants
+    the launcher binds."""
+    if (
+        geom == GEMM_GEOM_SHIPPED
+        or geom == GEMM_GEOM_LFOLD
+        or geom == GEMM_GEOM_KSPLIT
+        or geom == GEMM_GEOM_KSPLIT_LEAF
+        or geom == GEMM_GEOM_TUNED128
+        or geom == GEMM_GEOM_KPACK
+        or geom == GEMM_GEOM_KPACK_PAD
+        or geom == GEMM_GEOM_KPACK_PADV
+        or geom == GEMM_GEOM_KPACK_HF
+        or geom == GEMM_GEOM_KPACK_GS
+        or geom == GEMM_GEOM_KPACK_HG
+        or geom == GEMM_GEOM_KFOLDV
+        or geom == GEMM_GEOM_KFOLDV_LEAF
+    ):
+        return (2 * TUNED_BM_WIDE, 2 * TUNED_BN_WIDE)
+    if geom == GEMM_GEOM_KPACK_WIDE:
+        return (GEMM_KPACKW_BM, GEMM_KPACKW_BN)
+    if geom == GEMM_GEOM_HALF or geom == GEMM_GEOM_HALF_KS16:
+        return (TUNED_BM_WIDE, 2 * TUNED_BN_WIDE)
+    if geom == GEMM_GEOM_QUARTER:
+        return (TUNED_BM_WIDE, TUNED_BN_WIDE)
+    if geom == GEMM_GEOM_HEAD_N:
+        return (
+            GEMM_HEADN_RPT * (TUNED_TPB // GEMM_HEADN_TC),
+            GEMM_HEADN_CPT * GEMM_HEADN_TC,
+        )
+    if geom == GEMM_GEOM_HEAD_M:
+        return (
+            GEMM_HEADM_RPT * (TUNED_TPB // GEMM_HEADM_TC),
+            GEMM_HEADM_CPT * GEMM_HEADM_TC,
+        )
+    raise Error("gemm_step_geometry_tile: no geometry " + String(geom))
+
+
+def gemm_step_geometry_blocks(geom: Int, m: Int, n: Int) raises -> Int:
+    """Blocks `_tile_grid` launches for `geom` at `m x n`: the number of
+    cells a sabotage launch of that geometry moves."""
+    if m <= 0 or n <= 0:
+        return 0
+    var t = gemm_step_geometry_tile(geom)
+    return ((m + t[0] - 1) // t[0]) * ((n + t[1] - 1) // t[1])
+
+
+def _step_arm_geometry_name[
+    RPT: Int, CPT: Int, TC: Int, KS: Int, LFOLD: Bool
+](label: String) -> String:
+    """Built from the constants the launcher binds, never a literal."""
+    comptime TR = TUNED_TPB // TC
+    comptime BM = RPT * TR
+    comptime BN = CPT * TC
+    comptime PAGES = lib_smem_pages_for[
+        TARGET_COLUMN, (BM + BN) * (KS + TUNED_VECLEN) * 4
+    ]()
+    var s = label + " " + String(BM) + "x" + String(BN)
+    s += " reg" + String(RPT) + "x" + String(CPT) + " TC=" + String(TC)
+    s += " KS=" + String(KS) + " pages=" + String(PAGES) + " fold="
+    s += String("cell-serial") if LFOLD else String("lane-wide")
+    s += " local tpb=" + String(TUNED_TPB) + " hwftz=" + String(TUNED_HW_FTZ_FMA)
+    return s
+
+
+def gemm_step_geometry_name(geom: Int) -> String:
+    if geom == GEMM_GEOM_SHIPPED:
+        # DEVIATION 2595: says whether the ksplit default is on.
+        return gemm_shipped_plan_summary()
+    if geom == GEMM_GEOM_TUNED128:
+        return String("tuned128 (the OLD shipped plan, forced) ") + gemm_plan_name(PLAN_TUNED_128_8X8)
+    var s = String("")
+    if geom == GEMM_GEOM_LFOLD:
+        s = _step_arm_geometry_name[TUNED_RPT * 2, TUNED_CPT * 2, TUNED_TC, 16, True]("lfold")
+    elif geom == GEMM_GEOM_HALF:
+        s = _step_arm_geometry_name[TUNED_RPT, TUNED_CPT * 2, TUNED_TC, GEMM_HALF_KS, True]("half")
+    elif geom == GEMM_GEOM_HALF_KS16:
+        s = _step_arm_geometry_name[TUNED_RPT, TUNED_CPT * 2, TUNED_TC, 16, True]("half_ks16")
+    elif geom == GEMM_GEOM_QUARTER:
+        s = _step_arm_geometry_name[TUNED_RPT, TUNED_CPT, TUNED_TC, TUNED_64_KS, True]("quarter")
+    elif geom == GEMM_GEOM_HEAD_N:
+        s = _step_arm_geometry_name[GEMM_HEADN_RPT, GEMM_HEADN_CPT, GEMM_HEADN_TC, 16, True]("head_n")
+    elif geom == GEMM_GEOM_HEAD_M:
+        s = _step_arm_geometry_name[GEMM_HEADM_RPT, GEMM_HEADM_CPT, GEMM_HEADM_TC, 16, True]("head_m")
+    elif geom == GEMM_GEOM_KSPLIT:
+        s = _ksplit_geometry_name(String("ksplit"), True)
+    elif geom == GEMM_GEOM_KSPLIT_LEAF:
+        s = _ksplit_geometry_name(String("ksplit_leaf"), False)
+    elif geom == GEMM_GEOM_KPACK:
+        s = _kpack_geometry_name[
+            GEMM_KPACK_RPT, GEMM_KPACK_CPT, TUNED_TC, GEMM_KPACK_KS, GEMM_KPACK_FS
+        ](String("kpack"))
+    elif geom == GEMM_GEOM_KPACK_WIDE:
+        s = _kpack_geometry_name[
+            GEMM_KPACKW_RPT, GEMM_KPACKW_CPT, TUNED_TC, GEMM_KPACKW_KS, GEMM_KPACKW_FS
+        ](String("kpack_wide"))
+    elif geom == GEMM_GEOM_KPACK_PAD:
+        s = _kpack_geometry_name[
+            GEMM_KPACK_RPT, GEMM_KPACK_CPT, TUNED_TC, GEMM_KPACK_KS, GEMM_KPACK_FS, GEMM_KPACK_PAD
+        ](String("kpack_pad"))
+    elif geom == GEMM_GEOM_KPACK_PADV:
+        s = _kpack_geometry_name[
+            GEMM_KPACK_RPT, GEMM_KPACK_CPT, TUNED_TC, GEMM_KPACK_KS, GEMM_KPACK_FS, GEMM_KPACK_PAD,
+            GEMM_KPACK_ALIGN,
+        ](String("kpack_padv"))
+    elif geom == GEMM_GEOM_KPACK_HF:
+        s = _kpack_geometry_name[
+            GEMM_KPACK_RPT, GEMM_KPACK_CPT, TUNED_TC, GEMM_KPACK_KS, GEMM_KPACK_FS, GEMM_KPACK_PAD,
+            GEMM_KPACK_ALIGN, True, False,
+        ](String("kpack_hf"))
+    elif geom == GEMM_GEOM_KPACK_GS:
+        s = _kpack_geometry_name[
+            GEMM_KPACK_RPT, GEMM_KPACK_CPT, TUNED_TC, GEMM_KPACK_KS, GEMM_KPACK_FS, GEMM_KPACK_PAD,
+            GEMM_KPACK_ALIGN, False, True,
+        ](String("kpack_gs"))
+    elif geom == GEMM_GEOM_KPACK_HG:
+        s = _kpack_geometry_name[
+            GEMM_KPACK_RPT, GEMM_KPACK_CPT, TUNED_TC, GEMM_KPACK_KS, GEMM_KPACK_FS, GEMM_KPACK_PAD,
+            GEMM_KPACK_ALIGN, True, True,
+        ](String("kpack_hg"))
+    elif geom == GEMM_GEOM_KFOLDV:
+        s = _kfold_geometry_name(String("kfoldv"), True)
+    elif geom == GEMM_GEOM_KFOLDV_LEAF:
+        s = _kfold_geometry_name(String("kfoldv_leaf"), False)
+    else:
+        return String("GEOMETRY?") + String(geom)
+    comptime if not GEMM_ARM_TRIAL:
+        s += " (NOT RUN: no -D ANONLIB_GEMM_ARM_TRIAL=1, the shipped default ran)"
+    return s
+
+
+@always_inline
+def _gemm_step_arm_sabotage(v: Float32) -> Float32:
+    """Reach (brief 6.3, 10.1 item 6): `+-0.0` becomes `+-2^-100` (a normal
+    no later seam flushes), any other bit pattern becomes the pattern plus
+    one. Always a different bit pattern."""
+    var bits = bitcast[DType.uint32](v)
+    if (bits & UInt32(0x7FFFFFFF)) == UInt32(0):
+        return bitcast[DType.float32](
+            (bits & UInt32(0x80000000)) | UInt32(0x0D800000)
+        )
+    return bitcast[DType.float32](bits + UInt32(1))
+
+
+@__llvm_metadata(MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(GEMM_LAUNCH_BOUND)))
+def identical_gemm_step_arm_kernel[
+    RPT: Int, CPT: Int, TC: Int, KS: Int, PAGES: Int, LFOLD: Bool, SAB: Bool
+](
+    c: MutPointer[Float32, MutAnyOrigin],
+    a: MutPointer[Float32, MutAnyOrigin],
+    b: MutPointer[Float32, MutAnyOrigin],
+    m_in: Int32,
+    n_in: Int32,
+    k_in: Int32,
+    leaf_in: Int32,
+    p_in: Int32,
+    a_si_in: Int32,
+    a_sp_in: Int32,
+    b_sp_in: Int32,
+    b_sj_in: Int32,
+):
+    """DEVIATIONS 2540 and 2541: `identical_gemm_tuned_kernel`, trimmed.
+
+    `SPLIT = False`, `FS = TUNED_FOLD_SLOTS` and no swizzle are fixed; the
+    staging, the prefetch, both accumulate paths and the seams are the
+    shipped kernel's lines. `LFOLD = True` replaces the lane-wide leaf push
+    and drain with the cell-serial runtime walk of brief 6.1; `SAB = True`
+    moves one cell per block (6.3). The identity argument is brief section
+    10.1, item by item.
+
+    Every thread of the block reaches every `barrier()`: the loop bounds are
+    the shipped kernel's (functions of `leaf`, `k`, `p_count` and the
+    comptime `KS`), and the one added return (fold overflow, unreachable
+    under the profile cap) is a function of the leaf count alone, so it is
+    block uniform.
+    """
+    comptime NTH = TUNED_TPB
+    comptime TR = NTH // TC
+    comptime BM = RPT * TR
+    comptime BN = CPT * TC
+    comptime VEC = TUNED_VECLEN
+    comptime KV = KS // VEC
+    comptime SSTRIDE = KS + VEC
+    comptime APAGE = BM * SSTRIDE
+    comptime BPAGE = BN * SSTRIDE
+    comptime NCELL = RPT * CPT
+    comptime NR = RPT
+    comptime NCOL = CPT
+    comptime FS = TUNED_FOLD_SLOTS
+    comptime ASLOTS = (BM * KV + NTH - 1) // NTH
+    comptime BSLOTS = (BN * KV + NTH - 1) // NTH
+
+    comptime assert KS % VEC == 0, (
+        "identical_gemm_step_arm_kernel: KS must be a VEC multiple"
+    )
+    comptime assert NTH % TC == 0, (
+        "identical_gemm_step_arm_kernel: TC must divide the block size"
+    )
+    comptime assert (NCELL & (NCELL - 1)) == 0, (
+        "identical_gemm_step_arm_kernel: RPT * CPT must be a power of two"
+    )
+    comptime assert PAGES == 1 or PAGES == 2, (
+        "identical_gemm_step_arm_kernel: PAGES comes from lib_smem_pages_for"
+    )
+    comptime assert FS > 1, (
+        "identical_gemm_step_arm_kernel: the arms fold through the local stack"
+    )
+
+    var m = Int(m_in)
+    var n = Int(n_in)
+    var k = Int(k_in)
+    var leaf = Int(leaf_in)
+    var p_count = Int(p_in)
+    var a_si = Int(a_si_in)
+    var a_sp = Int(a_sp_in)
+    var b_sp = Int(b_sp_in)
+    var b_sj = Int(b_sj_in)
+    var a_outer_fast = a_sp != 1 and a_si == 1
+    var b_outer_fast = b_sp != 1 and b_sj == 1
+
+    var as_ = stack_allocation[
+        PAGES * APAGE,
+        Scalar[DType.float32],
+        address_space = AddressSpace.SHARED,
+    ]()
+    var bs_ = stack_allocation[
+        PAGES * BPAGE,
+        Scalar[DType.float32],
+        address_space = AddressSpace.SHARED,
+    ]()
+
+    var tiles_i = (m + BM - 1) // BM
+    var tiles_j = (n + BN - 1) // BN
+    var n_tiles = tiles_i * tiles_j
+    var raw = Int(block_idx.y) * Int(grid_dim.x) + Int(block_idx.x)
+    if raw >= n_tiles:
+        return
+    # Unsigned: `raw >= 0` and `tiles_j > 0` here, and a signed floor division
+    # is one more sign fix-up for the optimizer to associate (`_tuned_window_at`).
+    var ti = Int(UInt(raw) // UInt(tiles_j))
+    var tj = raw - ti * tiles_j
+    var i0 = ti * BM
+    var j0 = tj * BN
+
+    var tid = Int(thread_idx.x)
+    var accrow = _udiv[TC](tid)
+    var acccol = _urem[TC](tid)
+
+    var acc = SIMD[DType.float32, NCELL](0.0)
+    var fl = stack_allocation[FS * NCELL, Scalar[DType.float32]]()
+    var occ = 0
+
+    if p_count <= 0:
+        # `k == 0`, contract section 8: every cell is `+0.0`, STORED.
+        comptime for u0 in range(NR):
+            comptime for v0 in range(NCOL):
+                var zi = i0 + accrow + u0 * TR
+                var zj = j0 + acccol + v0 * TC
+                if zi < m and zj < n:
+                    var z = Float32(0.0)
+                    comptime if SAB:
+                        comptime if u0 == 0 and v0 == 0:
+                            if tid == 0:
+                                z = _gemm_step_arm_sabotage(z)
+                    c.unsafe_store(zi * n + zj, z)
+        return
+
+    var wpl = _tuned_windows_per_leaf[KS](leaf)
+    var w_end = p_count * wpl
+    var w = 0
+    var wt = 0  # w // wpl, carried (see `_tuned_window_at`)
+    var wq = 0  # w - wt * wpl
+
+    # ---- PROLOGUE: the first window, DRAM to registers (shipped lines).
+    var w0 = _tuned_window_at[KS](wt, wq, wpl, leaf, k, p_count)
+    # The window after `w`, computed ONCE per iteration and carried into the
+    # next one (see `_tuned_window_at`): no window is computed twice.
+    var cur = w0
+    var pa = _tuned_g2r[ASLOTS, VEC, KV, BM, NTH](
+        a, a_si, a_sp, i0, m, w0[0], w0[1], tid
+    )
+    var pb = _tuned_g2r[BSLOTS, VEC, KV, BN, NTH](
+        b, b_sj, b_sp, j0, n, w0[0], w0[1], tid
+    )
+
+    while w < w_end:
+        var win = cur
+        var nxt = _tuned_window_next[KS](wt, wq, wpl, leaf, k, p_count)
+        var chunk = win[1]
+        var pgw = _urem[PAGES](w)
+
+        # ---- REGISTERS TO SHARED, into page `w % PAGES` (shipped lines).
+        comptime for sa in range(ASLOTS):
+            if a_outer_fast:
+                comptime for ea0 in range(VEC):
+                    var ia0 = tid + (sa * VEC + ea0) * NTH
+                    if ia0 < BM * KS:
+                        as_.unsafe_store(
+                            pgw * APAGE + _urem[BM](ia0) * SSTRIDE + _udiv[BM](ia0),
+                            pa[sa * VEC + ea0],
+                        )
+            else:
+                var ia = tid + sa * NTH
+                if ia < BM * KV:
+                    var rra = _udiv[KV](ia)
+                    var cca = _urem[KV](ia) * VEC
+                    var va = SIMD[DType.float32, VEC](0.0)
+                    comptime for ea in range(VEC):
+                        va[ea] = pa[sa * VEC + ea]
+                    as_.unsafe_store(pgw * APAGE + rra * SSTRIDE + cca, va)
+        comptime for sb in range(BSLOTS):
+            if b_outer_fast:
+                comptime for eb0 in range(VEC):
+                    var ib0 = tid + (sb * VEC + eb0) * NTH
+                    if ib0 < BN * KS:
+                        bs_.unsafe_store(
+                            pgw * BPAGE + _urem[BN](ib0) * SSTRIDE + _udiv[BN](ib0),
+                            pb[sb * VEC + eb0],
+                        )
+            else:
+                var ib = tid + sb * NTH
+                if ib < BN * KV:
+                    var rrb = _udiv[KV](ib)
+                    var ccb = _urem[KV](ib) * VEC
+                    var vb = SIMD[DType.float32, VEC](0.0)
+                    comptime for eb in range(VEC):
+                        vb[eb] = pb[sb * VEC + eb]
+                    bs_.unsafe_store(pgw * BPAGE + rrb * SSTRIDE + ccb, vb)
+        barrier()
+
+        # ---- PREFETCH window w+1 (shipped lines, DEVIATION 1256).
+        comptime if PAGES == 2:
+            if w + 1 < w_end:
+                var wn = nxt
+                pa = _tuned_g2r[ASLOTS, VEC, KV, BM, NTH](
+                    a, a_si, a_sp, i0, m, wn[0], wn[1], tid
+                )
+                pb = _tuned_g2r[BSLOTS, VEC, KV, BN, NTH](
+                    b, b_sj, b_sp, j0, n, wn[0], wn[1], tid
+                )
+
+        # ---- ACCUMULATE (shipped lines: contract 7.1, 4 and 5).
+        var abase = pgw * APAGE + accrow * SSTRIDE
+        var bbase = pgw * BPAGE + acccol * SSTRIDE
+        if chunk == KS:
+            comptime for kc in range(KV):
+                var ra = SIMD[DType.float32, RPT * VEC](0.0)
+                comptime for u in range(NR):
+                    var ta = as_.unsafe_load[width=VEC](
+                        abase + u * TR * SSTRIDE + kc * VEC
+                    )
+                    comptime for e in range(VEC):
+                        ra[u * VEC + e] = ta[e]
+                var rb = SIMD[DType.float32, CPT * VEC](0.0)
+                comptime for v in range(NCOL):
+                    var tb = bs_.unsafe_load[width=VEC](
+                        bbase + v * TC * SSTRIDE + kc * VEC
+                    )
+                    comptime for e2 in range(VEC):
+                        rb[v * VEC + e2] = tb[e2]
+                comptime for e3 in range(VEC):
+                    var bfl = SIMD[DType.float32, CPT](0.0)
+                    comptime for v2 in range(NCOL):
+                        bfl[v2] = _tuned_loaded_operand(rb[v2 * VEC + e3])
+                    comptime for u2 in range(NR):
+                        var afl = _tuned_loaded_operand(ra[u2 * VEC + e3])
+                        comptime for v3 in range(NCOL):
+                            acc[u2 * CPT + v3] = _tuned_step(
+                                afl, bfl[v3], acc[u2 * CPT + v3]
+                            )
+        else:
+            for cc in range(chunk):
+                var bfl2 = SIMD[DType.float32, CPT](0.0)
+                comptime for v4 in range(NCOL):
+                    bfl2[v4] = _tuned_loaded_operand(
+                        bs_.unsafe_load(bbase + v4 * TC * SSTRIDE + cc)
+                    )
+                comptime for u3 in range(NR):
+                    var afl2 = _tuned_loaded_operand(
+                        as_.unsafe_load(abase + u3 * TR * SSTRIDE + cc)
+                    )
+                    comptime for v5 in range(NCOL):
+                        acc[u3 * CPT + v5] = _tuned_step(
+                            afl2, bfl2[v5], acc[u3 * CPT + v5]
+                        )
+
+        comptime if PAGES == 1:
+            barrier()
+            if w + 1 < w_end:
+                var wn1 = nxt
+                pa = _tuned_g2r[ASLOTS, VEC, KV, BM, NTH](
+                    a, a_si, a_sp, i0, m, wn1[0], wn1[1], tid
+                )
+                pb = _tuned_g2r[BSLOTS, VEC, KV, BN, NTH](
+                    b, b_sj, b_sp, j0, n, wn1[0], wn1[1], tid
+                )
+
+        # ---- THE LEAF BOUNDARY. Fires exactly once per logical leaf.
+        if win[2] == 1:
+            comptime if LFOLD:
+                # 2540, brief 10.1 item 1: the merge depth once, then each
+                # cell walked in a runtime loop with `_fold_push_local`'s
+                # per-element merge, then `occ + 1`.
+                var depth = 0
+                while depth < FS and ((occ >> depth) & 1) == 1:
+                    depth += 1
+                if depth >= FS:
+                    # Fold overflow (P >= 2^16): unreachable under the
+                    # profile cap, block uniform, returns without writing.
+                    return
+                for e in range(NCELL):
+                    var val = ftz(acc[e])  # 5d, the leaf partial
+                    for d in range(depth):
+                        # 5e and 5f: the occupied slot holds the EARLIER
+                        # leaves, so it is the left operand.
+                        val = ftz(ftz(fl.unsafe_load(d * NCELL + e)) + ftz(val))
+                    fl.unsafe_store(depth * NCELL + e, val)
+                occ = occ + 1
+            else:
+                var part = SIMD[DType.float32, NCELL](0.0)
+                comptime for pe in range(NCELL):
+                    part[pe] = ftz(acc[pe])
+                _ = _fold_push_local[NCELL, FS](fl, occ, part)
+            acc = SIMD[DType.float32, NCELL](0.0)
+
+        w = w + 1
+        cur = nxt
+        wq += 1
+        if wq == wpl:
+            wq = 0
+            wt += 1
+
+    comptime if LFOLD:
+        # Brief 10.1 item 2: `_fold_drain_local`'s element expression per
+        # in-range cell, then the stored `ftz(root)` (5g).
+        for e in range(NCELL):
+            var ur = e // NCOL
+            var vc = e - ur * NCOL
+            var gi = i0 + accrow + ur * TR
+            var gj = j0 + acccol + vc * TC
+            if gi < m and gj < n:
+                var have = False
+                var root = Float32(0.0)
+                for d in range(FS):
+                    if ((occ >> d) & 1) == 1:
+                        if have:
+                            root = ftz(ftz(fl.unsafe_load(d * NCELL + e)) + ftz(root))
+                        else:
+                            root = fl.unsafe_load(d * NCELL + e)
+                            have = True
+                var out = ftz(root)
+                comptime if SAB:
+                    if tid == 0 and e == 0:
+                        out = _gemm_step_arm_sabotage(out)
+                c.unsafe_store(gi * n + gj, out)
+    else:
+        var outv = _fold_drain_local[NCELL, FS](fl, occ)
+        comptime for u4 in range(NR):
+            comptime for v6 in range(NCOL):
+                var gi2 = i0 + accrow + u4 * TR
+                var gj2 = j0 + acccol + v6 * TC
+                if gi2 < m and gj2 < n:
+                    var out2 = ftz(outv[u4 * CPT + v6])
+                    comptime if SAB:
+                        comptime if u4 == 0 and v6 == 0:
+                            if tid == 0:
+                                out2 = _gemm_step_arm_sabotage(out2)
+                    c.unsafe_store(gi2 * n + gj2, out2)
+
+
+def _launch_step_arm[
+    RPT: Int, CPT: Int, TC: Int, KS: Int, LFOLD: Bool, SAB: Bool
+](
+    ctx: DeviceContext,
+    mut c: DeviceBuffer[DType.float32],
+    mut a: DeviceBuffer[DType.float32],
+    mut b: DeviceBuffer[DType.float32],
+    m: Int,
+    n: Int,
+    k: Int,
+    leaf: Int,
+    p_count: Int,
+    st: Tuple[Int, Int, Int, Int],
+) raises:
+    """`_launch_tuned`'s twin for the arm kernel: PAGES from the matrix, the
+    grid from the IMPORTED `_tile_grid`, one launch."""
+    comptime NTH = TUNED_TPB
+    comptime TR = NTH // TC
+    comptime BM = RPT * TR
+    comptime BN = CPT * TC
+    comptime SSTRIDE = KS + TUNED_VECLEN
+    comptime PAGE_BYTES = (BM + BN) * SSTRIDE * 4
+    comptime PAGES = lib_smem_pages_for[TARGET_COLUMN, PAGE_BYTES]()
+    comptime assert lib_smem_page_fits_for[TARGET_COLUMN, PAGE_BYTES](), (
+        "_launch_step_arm: one shared page of this geometry exceeds the column's"
+        " shared limit"
+    )
+    comptime kern = identical_gemm_step_arm_kernel[RPT, CPT, TC, KS, PAGES, LFOLD, SAB]
+    var g = _tile_grid(m, n, BM, BN, False)
+    step_count_launch()
+    ctx.enqueue_function[kern](
+        c.unsafe_ptr(),
+        a.unsafe_ptr(),
+        b.unsafe_ptr(),
+        Int32(m),
+        Int32(n),
+        Int32(k),
+        Int32(leaf),
+        Int32(p_count),
+        Int32(st[0]),
+        Int32(st[1]),
+        Int32(st[2]),
+        Int32(st[3]),
+        grid_dim=(g[0], g[1], 1),
+        block_dim=(NTH, 1, 1),
+    )
+
+
+def _step_geometry_launch[
+    SAB: Bool
+](
+    ctx: DeviceContext,
+    mut c: DeviceBuffer[DType.float32],
+    mut a: DeviceBuffer[DType.float32],
+    mut b: DeviceBuffer[DType.float32],
+    m: Int,
+    n: Int,
+    k: Int,
+    op: Int,
+    geom: Int,
+) raises:
+    """THE NUMERICAL PLAN'S THREE LINES, as `identical_gemm_with_plan` spells
+    them, then a switch that chooses geometry and nothing else."""
+    var part = contract_partition(k)
+    var leaf = part[0]
+    var p_count = part[1]
+    var st = gemm_operand_strides(op, m, n, k)
+    if geom == GEMM_GEOM_LFOLD:
+        _launch_step_arm[TUNED_RPT * 2, TUNED_CPT * 2, TUNED_TC, 16, True, SAB](
+            ctx, c, a, b, m, n, k, leaf, p_count, st
+        )
+    elif geom == GEMM_GEOM_HALF:
+        _launch_step_arm[TUNED_RPT, TUNED_CPT * 2, TUNED_TC, GEMM_HALF_KS, True, SAB](
+            ctx, c, a, b, m, n, k, leaf, p_count, st
+        )
+    elif geom == GEMM_GEOM_HALF_KS16:
+        _launch_step_arm[TUNED_RPT, TUNED_CPT * 2, TUNED_TC, 16, True, SAB](
+            ctx, c, a, b, m, n, k, leaf, p_count, st
+        )
+    elif geom == GEMM_GEOM_QUARTER:
+        _launch_step_arm[TUNED_RPT, TUNED_CPT, TUNED_TC, TUNED_64_KS, True, SAB](
+            ctx, c, a, b, m, n, k, leaf, p_count, st
+        )
+    elif geom == GEMM_GEOM_HEAD_N:
+        _launch_step_arm[GEMM_HEADN_RPT, GEMM_HEADN_CPT, GEMM_HEADN_TC, 16, True, SAB](
+            ctx, c, a, b, m, n, k, leaf, p_count, st
+        )
+    elif geom == GEMM_GEOM_HEAD_M:
+        _launch_step_arm[GEMM_HEADM_RPT, GEMM_HEADM_CPT, GEMM_HEADM_TC, 16, True, SAB](
+            ctx, c, a, b, m, n, k, leaf, p_count, st
+        )
+    else:
+        raise Error("gemm step arm: no geometry " + String(geom))
+
+
+# ===========================================================================
+# THE LONG-K GROUP ARMS (DEVIATIONS 2590 and 2591, 2026-09-11)
+# ===========================================================================
+# One block owns a 128x128 output tile and a GROUP of `2^g` consecutive
+# leaves (grid.y = the group), runs the shipped per-window body over exactly
+# those leaves, and stores one tree node per cell to a workspace laid out
+# leaf-major like the SPLIT plans (`ws[q * m * n + cell]`). A second launch
+# folds the `G = ceil(P / 2^g)` nodes per cell with the SPLIT plans' fold
+# kernels. The identity argument is brief section 5, written before this
+# code. The trial-gated dispatch in `identical_gemm_step_geometry_into` and
+# the trial harnesses reach the arms; since DEVIATION 2595 the SHIPPED
+# dispatch reaches `_ksplit_run` too, through `identical_gemm_shipped_into`,
+# on a column whose block parallelism row is above 0 (brief section 10).
+
+#: The shipped 128x128 geometry, bound once for the group kernel.
+comptime GEMM_KSPLIT_RPT = TUNED_RPT * 2
+comptime GEMM_KSPLIT_CPT = TUNED_CPT * 2
+comptime GEMM_KSPLIT_KS = 16
+#: `ksplit` coarsens a group while the coarser split still issues at least
+#: this many times `S` blocks (brief section 4, rule 4).
+#: lane/fam2-lm (2026-10-04) CANDIDATE ARMS, IDENTICAL only, schedule only
+#: (groups are powers of two aligned at leaf 0, so every group size is the
+#: same fold tree and the same bits; the arms move how many blocks a grouped
+#: launch issues, nothing else):
+#:   slack 8 is the IDENTICAL default since 2026-10-08 (lane/grid-act-2,
+#:        grid ge123e6f9, record at GEMM_KSPLIT_SLACK below);
+#:   -D ANONLIB_IDN_GEMM_GROUP_SLACK_OFF   the old slack 4;
+#:   -D ANONLIB_IDN_GEMM_GROUP_SLACK_2     slack 2;
+#:   -D ANONLIB_IDN_GEMM_GROUP_S_HALF / _X2   the SHIPPED row S halved /
+#:        doubled (`GEMM_KSPLIT_DEFAULT_S`; the trial row is untouched)
+#: (The body-tiles arm, ANONLIB_IDN_GEMM_GROUP_TILES_BODY, was deleted by
+#: lane/grid-prune 2026-10-07: OVN N01 on the L40S read it as noise, median
+#: 1.005 over 72 cells with 46% faster; recoverable at ab554bb4a.)
+#: The rule's hand-count checks (`check_kpack_rule_hand_counts` and the
+#: section 4 counts) hold the brief's slack-4 numbers (`GEMM_KSPLIT_BRIEF_SLACK`):
+#: gemm/checks/gemm_step_arms_check.mojo compares them only on a slack-4
+#: build (`-D ANONLIB_IDN_GEMM_GROUP_SLACK_OFF`) and prints them beside the
+#: build's own answers otherwise; the rule-equals-rule checks run on every build.
+# 2026-10-05 measured A/B record (frozen a006da73d, one sample per arm):
+# experiments/identical_speed/results/20261005/{nvidia,amd}-screen.json
+# retains every case, timings, bit hashes, compiler flags and binary hashes.
+# NVIDIA: body-tiles B/A geometric mean 0.779911 (~22.0% lower time),
+# slack2 0.855287 (~14.5% lower). AMD slack2 0.995711 (essentially neutral).
+# All 180 NVIDIA and 108 AMD pairs matched bits. These are separate arms:
+# body-tiles + slack2 together was NOT tested; their speedups do not add.
+# slack8 did not win: NVIDIA 1.048267 (4.83% slower), AMD 0.999053.
+# body-tiles: that 0.78 is an RTX 4090 synthetic single-sample screen (18 cases,
+# 0.42..1.10); the later L40S N01 screen (72 cells) read 1.005, so lane/grid-prune
+# deleted the arm (2026-10-07).
+# Keep unsuccessful arms available explicitly so the experiment is reproducible.
+# Initial public-harness attempt was incomplete: AMD baseline GEMM and
+# transformer succeeded; MLP timing succeeded but its driver emitted hash=null,
+# so the identity audit correctly refused it before candidate execution.
+# amd-integrated-{status,baseline-board,error} records retain that failure.
+# Harness-only fix 11420aa8 records complete weights/AdamW state outside timing.
+# These flags remain opt-in until the full-lane identity/timing checks finish;
+# a synthetic win alone does not prove a model-level gain or the combined arm.
+# Follow-up actual public harness, AMD MI325X, a006 binaries + 11420aa8
+# state-evidence fix: all 9 candidate/lane comparisons MATCH; independently
+# reloaded all model/AdamW/metadata arrays and checked dtype/shape/raw bytes.
+# One excluded warmup + one scored sample; timings are not significance tests.
+# B/A (GEMM, MLP train step, transformer): slack2 1.0012/1.1313/1.0597;
+# one-page 1.0399/1.1734/1.0171; slack8 0.9968/1.1789/1.0517.
+# Decision: no AMD default switch. Correct bits but no material timing win;
+# model lanes regressed in this sample. Preserve these arms for reproducibility.
+# Coverage: GEMM4096^3, full harness transformer, and harness SmallMLP
+# (8->16->3, batch256); this does NOT establish large-model training behavior.
+# Prior GEMM/transformer baseline timings retained with old ad1d provenance;
+# only baseline MLP was rerun. Original missing-hash failure remains recorded.
+# Evidence: experiments/identical_speed/results/20261005/amd-integrated-resume/.
+# Final owner capture 6ed220677906c67fe99968d5394309304494c1650f43f0a42dd3d46904b36dcd.
+# NVIDIA real public-harness follow-up (same frozen a006, harness11420aa8):
+# all15 candidate/lane comparisons MATCH, including full saved MLP state.
+# One warmup/sample; B/A (GEMM, MLP, transformer):
+# slack2 0.9868/1.0092/1.4520; body-tiles 1.0163/1.0018/1.4029;
+# one-page 1.0336/1.0178/1.0219; slack8 1.0240/1.0401/1.4360;
+# packed64 1.2068/1.0092/1.0575. No end-to-end default winner identified.
+# In particular the synthetic body-tiles/slack2 wins did NOT carry through
+# these public workloads. Keep defaults unchanged on both vendors. This is
+# single-sample evidence, not a statistically established regression claim.
+# Exact shapes/old retained baseline origins are recorded alongside results:
+# experiments/identical_speed/results/20261005/nvidia-integrated-resume/.
+# Final capture bdd685793e39f274a99bbf7319fbd1263cb9169908645eeb39d40a73403af41b.
+# EXPERIMENTS (2026-10-05): SLACK_2 and SLACK_8 remained default OFF (TILES_BODY deleted,
+# above); superseded 2026-10-08: slack 8 is the IDENTICAL default (record below). NEVER TESTED by
+# this campaign: combined defines, including ONE_PAGE/KPACK_RPT4 combinations.
+# NOT PERFORMANCE-QUALIFIED: identity checks alone never enable these flags.
+# Individual-arm measurements above are historical; no new measurement is
+# required to keep these experiments available with their defaults OFF.
+# Light identity, 2026-10-05: Apple M4 and NVIDIA RTX 4090 each PASS 135/135
+# baseline/candidate pairs (27 fixtures x 5 individual arms). All 270 output
+# fingerprints MATCH across vendors (FNV-1a64 over every output byte); the
+# 18 tiny fixtures also compare every word to the flat reference plan.
+# Frozen a006da73d binaries were reused: the complete local Mojo import
+# closure has only comment changes through this record; toolchain unchanged.
+# ZERO timed samples. This checks GEMM only, not full models or combined
+# defines. Apple checks identity; these scheduling changes target NVIDIA/AMD.
+# Evidence: experiments/identical_speed/results/20261005/light-identity/.
+comptime _IDN_GEMM_GROUP_ARMS = GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL and not is_defined["ANONLIB_IDN_ALL_OFF"]()
+# PROMOTED 2026-10-08 (lane/grid-act-2): slack 8 is the IDENTICAL default.
+# IDENTICAL grid run ge123e6f9 (NVIDIA L40S sm_89 + AMD MI325X gfx942, full
+# board data, one scored run per arm, noise floor from incumbent repeats),
+# gemm:gemm gaussian, slack 4 -> slack 8: NV 69.6 -> 51.7 ms (0.743x), AMD
+# 28.5 -> 28.3 ms (0.99x, inside the floor); combined 0.857x, no vendor split;
+# NV hash == AMD hash on both arms. This supersedes the 2026-10-05 synthetic
+# screen above (slack8 NVIDIA 1.048): that was one sample on the 4090 trial
+# harness, the grid is the board GEMM on the L40S. Bits: the slack only moves
+# the group size (a power of two aligned at leaf 0, Lemmas A-C of brief
+# section 5, `check_group_fold_is_the_contract_tree`), so every group size is
+# the same contract fold tree; the leaf partition (`contract_partition`) and
+# the fold kernels are untouched. Cost reasoning: the rule doubles the group
+# while the coarser split still issues `slack * S` blocks (S = the column's
+# block parallelism row, about its SM count); slack 8 keeps finer groups, so a
+# long-k call with few output tiles issues about 8 blocks per SM instead of 4,
+# which hides more load latency per SM at the cost of more `m n G` workspace
+# (still under SPLITK_MAX_WORKSPACE_FLOATS, `gemm_step_ksplit_finest_leaves`)
+# and a longer second-level fold. Off IDENTICAL (and under
+# ANONLIB_IDN_ALL_OFF) the slack stays 4.
+comptime GEMM_KSPLIT_BRIEF_SLACK = 4
+"""The slack the long-k brief's section 4 hand counts were written at."""
+comptime GEMM_KSPLIT_SLACK = (
+    2 if (_IDN_GEMM_GROUP_ARMS and is_defined["ANONLIB_IDN_GEMM_GROUP_SLACK_2"]()) else (
+        GEMM_KSPLIT_BRIEF_SLACK if (not _IDN_GEMM_GROUP_ARMS or is_defined["ANONLIB_IDN_GEMM_GROUP_SLACK_OFF"]()) else 8
+    )
+)
+#: `S` the `ksplit` TRIAL arm reads (kernel matrix SCHEDULING row, 2591;
+#: 2595 moved it to `lib_gemm_block_parallelism_trial_for`, which is the
+#: shipped row where that row is above 0 and the column's reading elsewhere,
+#: so the MI300X leg can still force the arm at AMD's 110). 0 means no
+#: reading.
+comptime GEMM_KSPLIT_S = lib_gemm_block_parallelism_trial_for[TARGET_COLUMN]()
+#: DEVIATION 2595: `S` the SHIPPED dispatch reads. Above 0 turns the ksplit
+#: default on (NVIDIA 132; AMD 110, measured 2026-09-11 on the MI300X, see
+#: `lib_gemm_block_parallelism_for`); 0 compiles the old dispatch line (Apple,
+#: every other column).
+comptime _GEMM_KSPLIT_ROW_S = lib_gemm_block_parallelism_for[TARGET_COLUMN]()
+comptime GEMM_KSPLIT_DEFAULT_S = (
+    (_GEMM_KSPLIT_ROW_S + 1) // 2
+    if (_IDN_GEMM_GROUP_ARMS and is_defined["ANONLIB_IDN_GEMM_GROUP_S_HALF"]()) else (
+        _GEMM_KSPLIT_ROW_S * 2
+        if (_IDN_GEMM_GROUP_ARMS and is_defined["ANONLIB_IDN_GEMM_GROUP_S_X2"]())
+        else _GEMM_KSPLIT_ROW_S
+    )
+)
+comptime GEMM_KSPLIT_DEFAULT_ON = GEMM_KSPLIT_DEFAULT_S > 0
+#: DEVIATION 2707: the KERNEL BODY row (kernel matrix `lib_gemm_kernel_body_for`).
+#: 1 routes every call the TUNED 128x128 plan serves through the `kpack_hg`
+#: body (`_shipped_body_kpack_hg`), at the ksplit row's group sizes; 0 is the
+#: 2595 dispatch and compiles no kpack kernel into the shipped build.
+comptime GEMM_BODY_ROW = lib_gemm_kernel_body_for[TARGET_COLUMN]()
+comptime GEMM_IDENTICAL_MFMA = (
+    GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL and lib_gemm_mfma_for[TARGET_COLUMN]()
+)
+#: The smallest group a matrix-core group launch takes (a schedule: groups
+#: are powers of two aligned at leaf 0, so any size is the same tree).
+#: MEASURED on an MI300X (leg 7, every hash equal to the VALU kernels):
+#: lean B4 step 0.512 s at 1, 0.504 s at 4; the per-call prices at 1, 2, 4
+#: and 16 are in the leg's `ab/leg7-*.log`. Trial defines price 1, 2, 16.
+comptime GEMM_MFMA_MIN_GROUP_LEAVES = (
+    16 if is_defined["ANONLIB_GEMM_MFMA_GMIN16"]() else
+    2 if is_defined["ANONLIB_GEMM_MFMA_GMIN2"]() else
+    1 if is_defined["ANONLIB_GEMM_MFMA_GMIN1"]() else 4
+)
+comptime GEMM_IDENTICAL_LEAF_SPLIT = (
+    GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL and lib_gemm_leaf_split_for[TARGET_COLUMN]()
+)
+comptime GEMM_BODY_KPACK_HG = GEMM_BODY_ROW == 1
+#: lane/neural-pass62 (2026-10-01): ON by default. Where the kernel body row
+#: is 1 (the NVIDIA column) every call the group rule takes (the byte LM's
+#: layer projections: k 384..1024, under the S tiles) ran `_kpack_run`: a
+#: fresh `m n G` device buffer, a hard `synchronize`, the group launch, the
+#: fold, a second hard `synchronize` and the free, PER GEMM, 56 times an
+#: lm-forward and more a train step, and those waits bypass the step
+#: counters. With the caller's `GemmWorkspace` sized for the groups
+#: (`identical_gemm_workspace_max_floats` below) the same group launch and
+#: the same fold run asynchronously on the stream into the kept buffer: the
+#: same partials, the same fold DAG, no allocation and no wait. A caller
+#: whose scratch is too small still takes the allocating path.
+#: `-D ANONLIB_GEMM_LEGACY_REUSE_GROUP_WS=1` restores it everywhere.
+comptime GEMM_REUSE_GROUP_WS = (
+    not is_defined["ANONLIB_GEMM_LEGACY_REUSE_GROUP_WS"]()
+)
+#: The largest group size `_ksplit_resolve_leaves` accepts (it travels as an
+#: Int32 kernel argument).
+comptime GEMM_KSPLIT_MAX_GROUP_LEAVES = 1 << 20
+
+
+@__llvm_metadata(MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(GEMM_LAUNCH_BOUND)))
+def identical_gemm_ksplit_kernel[
+    RPT: Int, CPT: Int, TC: Int, KS: Int, PAGES: Int, SAB: Bool
+](
+    ws: MutPointer[Float32, MutAnyOrigin],
+    a: MutPointer[Float32, MutAnyOrigin],
+    b: MutPointer[Float32, MutAnyOrigin],
+    m_in: Int32,
+    n_in: Int32,
+    k_in: Int32,
+    leaf_in: Int32,
+    p_in: Int32,
+    a_si_in: Int32,
+    a_sp_in: Int32,
+    b_sp_in: Int32,
+    b_sj_in: Int32,
+    gleaves_in: Int32,
+    groups_in: Int32,
+):
+    """DEVIATION 2590: `identical_gemm_step_arm_kernel` with `LFOLD = False`,
+    over ONE group of leaves.
+
+    Block `(tile, q)`: `raw = block_idx.x`, `q = block_idx.y`. The window
+    loop starts at flat window `q * gleaves * wpl` and stops before
+    `min((q + 1) * gleaves, P) * wpl`; every other line of the loop is the
+    step arm kernel's non-LFOLD path, which is the shipped tuned kernel's
+    non-SPLIT path (brief 5.1). The leaf partials enter a fresh
+    `_fold_push_local` stack, `_fold_drain_local` returns the group's node
+    (Lemma A for a full group, Lemma B for the tail), and the node is stored
+    unflushed at `ws[q * m * n + cell]` for in-range cells. The fold kernels
+    flush on read, and every node is already flushed (brief 5.4).
+
+    `leaf_in` and `p_in` come from `contract_partition(k)`; `gleaves_in`
+    selects which leaves this block walks and reaches no leaf boundary.
+
+    Every thread of the block reaches every `barrier()`: the two early
+    returns (`raw >= n_tiles or q >= groups`, and an empty group) read only
+    block-uniform values and come before any barrier, and the window range
+    reads `q`, which every thread of the block shares.
+
+    `SAB = True` (brief 5.6) stores `1.0e30` in place of the node of ONE cell
+    per block: thread `q mod NTH`, register cell `q // NTH` (row
+    `(q // NTH) // CPT`, column `(q // NTH) mod CPT`), when that cell is in
+    the output. `gemm_step_ksplit_reach` counts those cells.
+    """
+    comptime NTH = TUNED_TPB
+    comptime TR = NTH // TC
+    comptime BM = RPT * TR
+    comptime BN = CPT * TC
+    comptime VEC = TUNED_VECLEN
+    comptime KV = KS // VEC
+    comptime SSTRIDE = KS + VEC
+    comptime APAGE = BM * SSTRIDE
+    comptime BPAGE = BN * SSTRIDE
+    comptime NCELL = RPT * CPT
+    comptime NR = RPT
+    comptime NCOL = CPT
+    comptime FS = TUNED_FOLD_SLOTS
+    comptime ASLOTS = (BM * KV + NTH - 1) // NTH
+    comptime BSLOTS = (BN * KV + NTH - 1) // NTH
+
+    comptime assert KS % VEC == 0, (
+        "identical_gemm_ksplit_kernel: KS must be a VEC multiple"
+    )
+    comptime assert NTH % TC == 0, (
+        "identical_gemm_ksplit_kernel: TC must divide the block size"
+    )
+    comptime assert (NCELL & (NCELL - 1)) == 0, (
+        "identical_gemm_ksplit_kernel: RPT * CPT must be a power of two"
+    )
+    comptime assert PAGES == 1 or PAGES == 2, (
+        "identical_gemm_ksplit_kernel: PAGES comes from lib_smem_pages_for"
+    )
+    comptime assert FS > 1, (
+        "identical_gemm_ksplit_kernel: the group folds through the local stack"
+    )
+
+    var m = Int(m_in)
+    var n = Int(n_in)
+    var k = Int(k_in)
+    var leaf = Int(leaf_in)
+    var p_count = Int(p_in)
+    var a_si = Int(a_si_in)
+    var a_sp = Int(a_sp_in)
+    var b_sp = Int(b_sp_in)
+    var b_sj = Int(b_sj_in)
+    var gleaves = Int(gleaves_in)
+    var groups = Int(groups_in)
+    var a_outer_fast = a_sp != 1 and a_si == 1
+    var b_outer_fast = b_sp != 1 and b_sj == 1
+
+    var as_ = stack_allocation[
+        PAGES * APAGE,
+        Scalar[DType.float32],
+        address_space = AddressSpace.SHARED,
+    ]()
+    var bs_ = stack_allocation[
+        PAGES * BPAGE,
+        Scalar[DType.float32],
+        address_space = AddressSpace.SHARED,
+    ]()
+
+    var tiles_i = (m + BM - 1) // BM
+    var tiles_j = (n + BN - 1) // BN
+    var n_tiles = tiles_i * tiles_j
+    var raw = Int(block_idx.x)
+    var q = Int(block_idx.y)
+    if raw >= n_tiles or q >= groups:
+        return
+    if p_count <= 0 or gleaves < 1:
+        # The launcher never sends `k == 0` here (brief 5.5).
+        return
+    var lbeg = q * gleaves
+    var lend = lbeg + gleaves
+    if lend > p_count:
+        lend = p_count
+    if lbeg >= lend:
+        return
+    # Unsigned: `raw >= 0` and `tiles_j > 0` here, and a signed floor division
+    # is one more sign fix-up for the optimizer to associate (`_tuned_window_at`).
+    var ti = Int(UInt(raw) // UInt(tiles_j))
+    var tj = raw - ti * tiles_j
+    var i0 = ti * BM
+    var j0 = tj * BN
+    var mn = m * n
+
+    var tid = Int(thread_idx.x)
+    var accrow = _udiv[TC](tid)
+    var acccol = _urem[TC](tid)
+
+    var acc = SIMD[DType.float32, NCELL](0.0)
+    var fl = stack_allocation[FS * NCELL, Scalar[DType.float32]]()
+    var occ = 0
+
+    var wpl = _tuned_windows_per_leaf[KS](leaf)
+    # THE ONLY CHANGE IN THE WINDOW LOOP: its range (brief 5.1).
+    var w = lbeg * wpl
+    var wt = lbeg  # w // wpl, carried (see `_tuned_window_at`)
+    var wq = 0  # w - wt * wpl
+    var w_end = lend * wpl
+
+    # ---- PROLOGUE: the first window, DRAM to registers (shipped lines).
+    var w0 = _tuned_window_at[KS](wt, wq, wpl, leaf, k, p_count)
+    # The window after `w`, computed ONCE per iteration and carried into the
+    # next one (see `_tuned_window_at`): no window is computed twice.
+    var cur = w0
+    var pa = _tuned_g2r[ASLOTS, VEC, KV, BM, NTH](
+        a, a_si, a_sp, i0, m, w0[0], w0[1], tid
+    )
+    var pb = _tuned_g2r[BSLOTS, VEC, KV, BN, NTH](
+        b, b_sj, b_sp, j0, n, w0[0], w0[1], tid
+    )
+
+    while w < w_end:
+        var win = cur
+        var nxt = _tuned_window_next[KS](wt, wq, wpl, leaf, k, p_count)
+        var chunk = win[1]
+        var pgw = _urem[PAGES](w)
+
+        # ---- REGISTERS TO SHARED, into page `w % PAGES` (shipped lines).
+        comptime for sa in range(ASLOTS):
+            if a_outer_fast:
+                comptime for ea0 in range(VEC):
+                    var ia0 = tid + (sa * VEC + ea0) * NTH
+                    if ia0 < BM * KS:
+                        as_.unsafe_store(
+                            pgw * APAGE + _urem[BM](ia0) * SSTRIDE + _udiv[BM](ia0),
+                            pa[sa * VEC + ea0],
+                        )
+            else:
+                var ia = tid + sa * NTH
+                if ia < BM * KV:
+                    var rra = _udiv[KV](ia)
+                    var cca = _urem[KV](ia) * VEC
+                    var va = SIMD[DType.float32, VEC](0.0)
+                    comptime for ea in range(VEC):
+                        va[ea] = pa[sa * VEC + ea]
+                    as_.unsafe_store(pgw * APAGE + rra * SSTRIDE + cca, va)
+        comptime for sb in range(BSLOTS):
+            if b_outer_fast:
+                comptime for eb0 in range(VEC):
+                    var ib0 = tid + (sb * VEC + eb0) * NTH
+                    if ib0 < BN * KS:
+                        bs_.unsafe_store(
+                            pgw * BPAGE + _urem[BN](ib0) * SSTRIDE + _udiv[BN](ib0),
+                            pb[sb * VEC + eb0],
+                        )
+            else:
+                var ib = tid + sb * NTH
+                if ib < BN * KV:
+                    var rrb = _udiv[KV](ib)
+                    var ccb = _urem[KV](ib) * VEC
+                    var vb = SIMD[DType.float32, VEC](0.0)
+                    comptime for eb in range(VEC):
+                        vb[eb] = pb[sb * VEC + eb]
+                    bs_.unsafe_store(pgw * BPAGE + rrb * SSTRIDE + ccb, vb)
+        barrier()
+
+        # ---- PREFETCH window w+1 (shipped lines, DEVIATION 1256).
+        comptime if PAGES == 2:
+            if w + 1 < w_end:
+                var wn = nxt
+                pa = _tuned_g2r[ASLOTS, VEC, KV, BM, NTH](
+                    a, a_si, a_sp, i0, m, wn[0], wn[1], tid
+                )
+                pb = _tuned_g2r[BSLOTS, VEC, KV, BN, NTH](
+                    b, b_sj, b_sp, j0, n, wn[0], wn[1], tid
+                )
+
+        # ---- ACCUMULATE (shipped lines: contract 7.1, 4 and 5).
+        var abase = pgw * APAGE + accrow * SSTRIDE
+        var bbase = pgw * BPAGE + acccol * SSTRIDE
+        if chunk == KS:
+            comptime for kc in range(KV):
+                var ra = SIMD[DType.float32, RPT * VEC](0.0)
+                comptime for u in range(NR):
+                    var ta = as_.unsafe_load[width=VEC](
+                        abase + u * TR * SSTRIDE + kc * VEC
+                    )
+                    comptime for e in range(VEC):
+                        ra[u * VEC + e] = ta[e]
+                var rb = SIMD[DType.float32, CPT * VEC](0.0)
+                comptime for v in range(NCOL):
+                    var tb = bs_.unsafe_load[width=VEC](
+                        bbase + v * TC * SSTRIDE + kc * VEC
+                    )
+                    comptime for e2 in range(VEC):
+                        rb[v * VEC + e2] = tb[e2]
+                comptime for e3 in range(VEC):
+                    var bfl = SIMD[DType.float32, CPT](0.0)
+                    comptime for v2 in range(NCOL):
+                        bfl[v2] = _tuned_loaded_operand(rb[v2 * VEC + e3])
+                    comptime for u2 in range(NR):
+                        var afl = _tuned_loaded_operand(ra[u2 * VEC + e3])
+                        comptime for v3 in range(NCOL):
+                            acc[u2 * CPT + v3] = _tuned_step(
+                                afl, bfl[v3], acc[u2 * CPT + v3]
+                            )
+        else:
+            for cc in range(chunk):
+                var bfl2 = SIMD[DType.float32, CPT](0.0)
+                comptime for v4 in range(NCOL):
+                    bfl2[v4] = _tuned_loaded_operand(
+                        bs_.unsafe_load(bbase + v4 * TC * SSTRIDE + cc)
+                    )
+                comptime for u3 in range(NR):
+                    var afl2 = _tuned_loaded_operand(
+                        as_.unsafe_load(abase + u3 * TR * SSTRIDE + cc)
+                    )
+                    comptime for v5 in range(NCOL):
+                        acc[u3 * CPT + v5] = _tuned_step(
+                            afl2, bfl2[v5], acc[u3 * CPT + v5]
+                        )
+
+        comptime if PAGES == 1:
+            barrier()
+            if w + 1 < w_end:
+                var wn1 = nxt
+                pa = _tuned_g2r[ASLOTS, VEC, KV, BM, NTH](
+                    a, a_si, a_sp, i0, m, wn1[0], wn1[1], tid
+                )
+                pb = _tuned_g2r[BSLOTS, VEC, KV, BN, NTH](
+                    b, b_sj, b_sp, j0, n, wn1[0], wn1[1], tid
+                )
+
+        # ---- THE LEAF BOUNDARY. Fires exactly once per logical leaf.
+        if win[2] == 1:
+            var part = SIMD[DType.float32, NCELL](0.0)
+            comptime for pe in range(NCELL):
+                part[pe] = ftz(acc[pe])  # 5d, the leaf partial
+            _ = _fold_push_local[NCELL, FS](fl, occ, part)
+            acc = SIMD[DType.float32, NCELL](0.0)
+
+        w = w + 1
+        cur = nxt
+        wq += 1
+        if wq == wpl:
+            wq = 0
+            wt += 1
+
+    # ---- THE GROUP NODE: the group's own drain (Lemmas A and B), stored.
+    var outv = _fold_drain_local[NCELL, FS](fl, occ)
+    comptime for u4 in range(NR):
+        comptime for v6 in range(NCOL):
+            var gi = i0 + accrow + u4 * TR
+            var gj = j0 + acccol + v6 * TC
+            if gi < m and gj < n:
+                var node = outv[u4 * CPT + v6]
+                comptime if SAB:
+                    if tid == _urem[NTH](q) and _udiv[NTH](q) == u4 * CPT + v6:
+                        node = Float32(1.0e30)
+                ws.unsafe_store(q * mn + gi * n + gj, node)
+
+
+def _ksplit_groups_launch[
+    RPT: Int, CPT: Int, TC: Int, KS: Int, SAB: Bool
+](
+    ctx: DeviceContext,
+    mut ws: DeviceBuffer[DType.float32],
+    mut a: DeviceBuffer[DType.float32],
+    mut b: DeviceBuffer[DType.float32],
+    m: Int,
+    n: Int,
+    k: Int,
+    leaf: Int,
+    p_count: Int,
+    st: Tuple[Int, Int, Int, Int],
+    gleaves: Int,
+    groups: Int,
+) raises:
+    """DEVIATION 2590, launch one: the group kernel over `(tiles, groups)`,
+    PAGES from the matrix at the page bytes `_launch_tuned` computes, the
+    grid's x axis from the IMPORTED `_tile_grid`."""
+    comptime NTH = TUNED_TPB
+    comptime TR = NTH // TC
+    comptime BM = RPT * TR
+    comptime BN = CPT * TC
+    comptime SSTRIDE = KS + TUNED_VECLEN
+    comptime PAGE_BYTES = (BM + BN) * SSTRIDE * 4
+    comptime PAGES = lib_smem_pages_for[TARGET_COLUMN, PAGE_BYTES]()
+    comptime assert lib_smem_page_fits_for[TARGET_COLUMN, PAGE_BYTES](), (
+        "_ksplit_groups_launch: one shared page of this geometry exceeds the"
+        " column's shared limit"
+    )
+    comptime kern = identical_gemm_ksplit_kernel[RPT, CPT, TC, KS, PAGES, SAB]
+    var g = _tile_grid(m, n, BM, BN, False)
+    step_count_launch()
+    ctx.enqueue_function[kern](
+        ws.unsafe_ptr(),
+        a.unsafe_ptr(),
+        b.unsafe_ptr(),
+        Int32(m),
+        Int32(n),
+        Int32(k),
+        Int32(leaf),
+        Int32(p_count),
+        Int32(st[0]),
+        Int32(st[1]),
+        Int32(st[2]),
+        Int32(st[3]),
+        Int32(gleaves),
+        Int32(groups),
+        grid_dim=(g[0], groups, 1),
+        block_dim=(NTH, 1, 1),
+    )
+
+
+def _ksplit_fold_launch(
+    ctx: DeviceContext,
+    mut c: DeviceBuffer[DType.float32],
+    mut ws: DeviceBuffer[DType.float32],
+    m: Int,
+    n: Int,
+    groups: Int,
+) raises:
+    """DEVIATION 2590, launch two: `_launch_split`'s fold dispatch with the
+    group count as the count (brief 5.4)."""
+    if m * n <= SPLIT_BLOCK_FOLD_MAX_CELLS:
+        step_count_launch()
+        ctx.enqueue_function[identical_gemm_fold_kernel[True]](
+            c.unsafe_ptr(),
+            ws.unsafe_ptr(),
+            Int32(m * n),
+            Int32(groups),
+            Int32(groups),
+            grid_dim=(m * n, 1, 1),
+            block_dim=(SPLITK_FOLD_TPB, 1, 1),
+        )
+        return
+    step_count_launch()
+    ctx.enqueue_function[identical_gemm_fold_stack_kernel](
+        c.unsafe_ptr(),
+        ws.unsafe_ptr(),
+        Int32(m * n),
+        Int32(groups),
+        grid_dim=((m * n + FLAT_TPB - 1) // FLAT_TPB, 1, 1),
+        block_dim=(FLAT_TPB, 1, 1),
+    )
+
+
+def _ksplit_resolve_leaves(group_leaves: Int, p_count: Int) raises -> Tuple[Int, Int]:
+    """`(leaves per group, groups)`. RAISES unless `group_leaves` is a power
+    of two in `1 .. GEMM_KSPLIT_MAX_GROUP_LEAVES` (brief 5.5: groups are
+    powers of two aligned at leaf 0). A size at or above `P` is one group.
+    `P <= 0` has no groups."""
+    if (
+        group_leaves < 1
+        or group_leaves > GEMM_KSPLIT_MAX_GROUP_LEAVES
+        or (group_leaves & (group_leaves - 1)) != 0
+    ):
+        raise Error(
+            "ksplit: " + String(group_leaves)
+            + " leaves per group is not a power of two in 1 .. "
+            + String(GEMM_KSPLIT_MAX_GROUP_LEAVES)
+        )
+    if p_count <= 0:
+        return (group_leaves, 0)
+    return (group_leaves, (p_count + group_leaves - 1) // group_leaves)
+
+
+def _ksplit_tiles(m: Int, n: Int) -> Tuple[Int, Int]:
+    """`(tiles_i, tiles_j)` of the 128x128 tile the group kernel binds."""
+    comptime BM = GEMM_KSPLIT_RPT * (TUNED_TPB // TUNED_TC)
+    comptime BN = GEMM_KSPLIT_CPT * TUNED_TC
+    if m <= 0 or n <= 0:
+        return (0, 0)
+    return ((m + BM - 1) // BM, (n + BN - 1) // BN)
+
+
+def _ksplit_run[
+    SAB: Bool
+](
+    ctx: DeviceContext,
+    mut c: DeviceBuffer[DType.float32],
+    mut a: DeviceBuffer[DType.float32],
+    mut b: DeviceBuffer[DType.float32],
+    m: Int,
+    n: Int,
+    k: Int,
+    op: Int,
+    group_leaves: Int,
+) raises:
+    """DEVIATIONS 2590 and 2595: one ksplit call with `P >= 1`. Allocate
+    `m n G` floats, SYNCHRONIZE, launch the groups, launch the fold,
+    SYNCHRONIZE, keep the buffer past the wait
+    (`[[mojo-buffer-freed-at-last-use]]`).
+
+    These are the lines the H100 leg timed as the `ksplit` arm, moved here
+    unchanged so the arm (`identical_gemm_step_ksplit_into`) and the shipped
+    default (`identical_gemm_shipped_at_row_into`) run ONE body and cannot
+    drift. RAISES at `P == 0` (brief 5.5: no group launch there; the arm
+    routes `k == 0` to the step arm kernel and the default's rule never takes
+    it) and on any group size `_ksplit_resolve_leaves` refuses."""
+    if m <= 0 or n <= 0:
+        return
+    var part = contract_partition(k)
+    var leaf = part[0]
+    var p_count = part[1]
+    var rg = _ksplit_resolve_leaves(group_leaves, p_count)
+    if p_count <= 0:
+        raise Error("_ksplit_run: k == 0 has no leaf groups (long-k brief section 5.5)")
+    var st = gemm_operand_strides(op, m, n, k)
+    step_count_device_alloc()
+    var gws = ctx.enqueue_create_buffer[DType.float32](m * n * rg[1])
+    # DEVIATION 2721: the wait between this allocation and the launch that
+    # consumes it is gone, same in-order argument as `identical_gemm`. The
+    # trailing wait before `_ = gws` stays, and has to.
+    _ksplit_groups_launch[
+        GEMM_KSPLIT_RPT, GEMM_KSPLIT_CPT, TUNED_TC, GEMM_KSPLIT_KS, SAB
+    ](ctx, gws, a, b, m, n, k, leaf, p_count, st, rg[0], rg[1])
+    _ksplit_fold_launch(ctx, c, gws, m, n, rg[1])
+    step_count_sync()
+    ctx.synchronize()
+    _ = gws
+
+
+# ===========================================================================
+# THE KSPLIT DEFAULT (DEVIATION 2595, 2026-09-11)
+# ===========================================================================
+# The `ksplit` arm won on the H100 (lean LM step geometric mean 0.895 over
+# enwik8 and Pile GitHub, every step witness equal) and CONTRIBUTING.md (Performance claims)
+# flips a winning arm in the same session. The shipped dispatch reads ONE
+# kernel matrix row, `lib_gemm_block_parallelism_for`. Above 0 it runs the
+# group rule of brief section 4 at that `S` and takes the ksplit path on every
+# call the rule marks applicable; every other call runs the plan
+# `choose_gemm_plan` picks. At 0 the dispatch compiles to the old line. No
+# vendor name is read here. Identity: brief section 5 (Lemmas A to C, checked
+# exhaustively on the host by `check_group_fold_is_the_contract_tree`); the
+# group size, the grid and the row are execution plan, so no stored cell moves
+# on any column. The old plan stays reachable as the `tuned128` trial arm and
+# as `identical_gemm_with_plan(..., PLAN_TUNED_128_8X8)`.
+
+
+def gemm_default_ksplit_leaves_at(m: Int, n: Int, k: Int, row: Int) -> Int:
+    """DEVIATION 2595: leaves per group the shipped dispatch's body uses at
+    `(m, n, k)` when the block parallelism row reads `row`; 0 means the plan
+    `choose_gemm_plan` picks runs (TUNED 128x128 on the step's calls). A row
+    at or below 0 answers 0 at every shape: the row turns the default off.
+    A row above 0 is `ksplit`'s group rule (brief section 4, rules 1, 2 and 4)
+    at `S = row`. Execution plan only (contract 6.1); the row is an argument
+    so a check can hold both sides of the switch on any column."""
+    if row <= 0:
+        return 0
+    return gemm_step_ksplit_rule(m, n, k, row, True)
+
+
+def gemm_default_ksplit_leaves(m: Int, n: Int, k: Int) -> Int:
+    """`gemm_default_ksplit_leaves_at` at the column's shipped row
+    (`GEMM_KSPLIT_DEFAULT_S`): what `identical_gemm_into` runs here."""
+    return gemm_default_ksplit_leaves_at(m, n, k, GEMM_KSPLIT_DEFAULT_S)
+
+
+def identical_gemm_shipped_at_row_into[
+    SAB: Bool
+](
+    ctx: DeviceContext,
+    mut c: DeviceBuffer[DType.float32],
+    mut a: DeviceBuffer[DType.float32],
+    mut b: DeviceBuffer[DType.float32],
+    mut ws: DeviceBuffer[DType.float32],
+    m: Int,
+    n: Int,
+    k: Int,
+    op: Int,
+    row: Int,
+) raises:
+    """DEVIATION 2595: THE SHIPPED DISPATCH'S BODY at a NAMED block
+    parallelism row. `identical_gemm_shipped_into` is exactly this at the
+    column's row with `SAB = False` wherever that row is above 0.
+
+    `gemm_default_ksplit_leaves_at(m, n, k, row) > 0`: `_ksplit_run`, which
+    allocates its node workspace and SYNCHRONIZES (`ws` unused). Otherwise
+    `identical_gemm_with_plan(..., choose_gemm_plan(m, n, k))`, asynchronous,
+    the line the default replaced. At `row = 0` the second branch runs at
+    every shape, which is how a check proves the old plan runs with the row
+    at 0 on a column whose row is not.
+
+    `SAB = True` sabotages the group launch (brief 5.6): exactly
+    `gemm_step_ksplit_reach(m, n, k, leaves)` cells move where the ksplit
+    branch runs, and none where the old plan runs. Only the trial hook and
+    the trial checks instantiate it."""
+    var gl = gemm_default_ksplit_leaves_at(m, n, k, row)
+    if gl > 0:
+        _ksplit_run[SAB](ctx, c, a, b, m, n, k, op, gl)
+        return
+    identical_gemm_with_plan(
+        ctx, c, a, b, ws, m, n, k, op, choose_gemm_plan(m, n, k)
+    )
+
+
+def _shipped_body_kpack_hg[
+    SAB: Bool
+](
+    ctx: DeviceContext,
+    mut c: DeviceBuffer[DType.float32],
+    mut a: DeviceBuffer[DType.float32],
+    mut b: DeviceBuffer[DType.float32],
+    mut ws: DeviceBuffer[DType.float32],
+    m: Int,
+    n: Int,
+    k: Int,
+    op: Int,
+) raises:
+    """DEVIATION 2707: THE SHIPPED DISPATCH'S BODY where the kernel body row
+    is 1. Every call `choose_gemm_plan` sends to the TUNED 128x128 plan runs
+    `identical_gemm_kpack_kernel` as the `kpack_hg` arm ran it (padded
+    aligned page, gather staging, hardware fold flush): the group launch plus
+    the fold at the ksplit row's group size where the rule takes the call
+    (the reusable-workspace arm uses sufficiently sized caller scratch;
+    otherwise `_kpack_run` allocates the nodes and synchronizes), all leaves
+    in one asynchronous launch otherwise. Every other
+    call keeps `choose_gemm_plan`'s plan. `SAB = True` is the trial hook's
+    sabotage of this body: exactly `gemm_step_kpack_reach` cells move."""
+    if m <= 0 or n <= 0:
+        return
+    # MI325X, 2026-09-20: the packed body wins strongly for the narrow
+    # d_model output of B1/L2048 and for the MLP down projections, but its
+    # gather staging loses once a k=768 training projection has enough rows
+    # or output columns.  Keep this a measured AMD-only scheduling choice;
+    # NVIDIA and Apple have opposite results at the same shapes.  The forced
+    # plan and packed body have the same leaf/fold DAG and were bit-equal over
+    # every output cell in the GPT-3-small production-shape matrix.
+    # lane/amd-step-time (2026-09-24): `lib_gemm_mfma_for` (AMD): the
+    # matrix-core plan on every call the TUNED 128x128 plan would serve; the
+    # leaf partials split over the grid where the output alone is under four
+    # tiles a CU and the partials fit the workspace cap.
+    comptime if not SAB and GEMM_IDENTICAL_MFMA:
+        if choose_gemm_plan(m, n, k) == PLAN_TUNED_128_8X8:
+            # The group size is the leaf split's rule (the finest power-of-two
+            # group whose node workspace fits the cap, where the rule takes
+            # the call); 0 runs all leaves in one launch.
+            comptime if is_defined["ANONLIB_GEMM_MFMA_NO_GROUPS"]():
+                _mfma_run(ctx, c, a, b, m, n, k, op, 0)
+            elif IDN_GEMM_MFMA_REUSE_WS:
+                # lane/fam-lm: the same group size, the partials in the
+                # caller's workspace when it fits them (no allocation, no
+                # wait); `_mfma_run` otherwise.
+                _mfma_run_ws(ctx, c, a, b, ws, m, n, k, op, _mfma_group_leaves(m, n, k))
+            else:
+                var mgl = gemm_step_ksplit_group_leaves(GEMM_GEOM_KSPLIT_LEAF, m, n, k)
+                if mgl > 0 and mgl < GEMM_MFMA_MIN_GROUP_LEAVES:
+                    mgl = GEMM_MFMA_MIN_GROUP_LEAVES
+                comptime if IDN_GEMM_MFMA_NO_LONE_GROUP:
+                    # lane/nr-gemm: one group of every leaf is the all-leaves launch.
+                    if mgl > 0 and mgl >= contract_partition(k)[1]:
+                        mgl = 0
+                _mfma_run(ctx, c, a, b, m, n, k, op, mgl)
+            return
+    # lane/amd-step-time (2026-09-24): `lib_gemm_leaf_split_for` (AMD): the
+    # `ksplit_leaf` geometry on every call its rule takes, before the rest.
+    comptime if not SAB and GEMM_IDENTICAL_LEAF_SPLIT:
+        if choose_gemm_plan(m, n, k) == PLAN_TUNED_128_8X8:
+            var lgl = gemm_step_ksplit_group_leaves(GEMM_GEOM_KSPLIT_LEAF, m, n, k)
+            if lgl > 0 and contract_partition(k)[1] > 0:
+                # The ksplit group kernel. Trial arm
+                # `-D ANONLIB_GEMM_LEAF_SPLIT_KPACK_BODY=1` runs the packed
+                # body in GROUP mode instead: rocprofv3 on an MI300X counted
+                # about 8.4 VALU instructions a product in the ksplit kernel
+                # against 3.6 in the packed loop, yet the packed body measured
+                # SLOWER here (twelve calls 183.9 -> 192.7 ms, lean B4 step
+                # 0.763 -> 0.816 s, bits equal): the kernel is not issue bound.
+                comptime if not is_defined["ANONLIB_GEMM_LEAF_SPLIT_KPACK_BODY"]():
+                    _ksplit_run[False](ctx, c, a, b, m, n, k, op, lgl)
+                else:
+                    _kpack_run[
+                        GEMM_KPACK_RPT, GEMM_KPACK_CPT, TUNED_TC, GEMM_KPACK_KS,
+                        GEMM_KPACK_FS, False, GEMM_KPACK_PAD, GEMM_KPACK_ALIGN,
+                        0, True, True,
+                    ](ctx, c, a, b, m, n, k, op, lgl)
+                return
+    # lane/amd-step-time (2026-09-24): measured again once the kernels stopped
+    # spilling (GEMM_LAUNCH_BOUND). Trial arms, scheduling only:
+    # `-D ANONLIB_GEMM_AMD_NO_K768_TUNED=1` sends these calls to the packed
+    # body like every other column, `-D ANONLIB_GEMM_AMD_K768_PLAN64=1` to
+    # the TUNED 64x64 plan (Apple's choice at these shapes).
+    comptime if not SAB and TARGET_COLUMN == COLUMN_AMD and not is_defined["ANONLIB_GEMM_AMD_NO_K768_TUNED"]():
+        if gemm_amd_short_k_tuned(m, n, k):
+            comptime if is_defined["ANONLIB_GEMM_AMD_K768_PLAN64"]():
+                identical_gemm_with_plan(
+                    ctx, c, a, b, ws, m, n, k, op, PLAN_TUNED_64_4X4
+                )
+            elif GEMM_IDENTICAL_MFMA and IDN_GEMM_AMD_BAND_MFMA:
+                # lane/nr-gemm (review rank 1): the band forces the TUNED
+                # 128x128 plan, whose matrix-core body is `_mfma_run_ws`; the
+                # scalar `_launch_tuned` ran here before. The band's calls are
+                # not TUNED_128 under `choose_gemm_plan`, but the leaf split's
+                # tile chooser may still say TUNED_128 (the step-down ran
+                # after it), so the leaf split's rule can answer a group:
+                # it runs grouped only when the caller's workspace holds the
+                # nodes (sized by `identical_gemm_workspace_max_floats`),
+                # else all leaves in one launch, never an allocation + wait.
+                var bgl = _mfma_group_leaves(m, n, k)
+                if bgl > 0:
+                    var bp = contract_partition(k)[1]
+                    if len(ws) < m * n * ((bp + bgl - 1) // bgl):
+                        bgl = 0
+                _mfma_run_ws(ctx, c, a, b, ws, m, n, k, op, bgl)
+            else:
+                identical_gemm_with_plan(
+                    ctx, c, a, b, ws, m, n, k, op, PLAN_TUNED_128_8X8
+                )
+            return
+    if choose_gemm_plan(m, n, k) == PLAN_TUNED_128_8X8:
+        # L40S, 2026-09-20: a call with at most eight leaves per fold group
+        # needs only the FS4 stack, which avoids 3 KiB of unreachable
+        # per-thread local stack. Measured at one board shape (OP_TN
+        # 768x768x2048, six leaves); the general fold-slot rule (Oct 4) is
+        # unmeasured elsewhere. FS bounds unused local storage only; it
+        # cannot change the fold DAG, so no bit changes.
+        comptime if not SAB and TARGET_COLUMN == COLUMN_NVIDIA:
+            comptime if is_defined["ANONLIB_LEGACY_SHAPE_NV_FS4"]():
+                # LEGACY (default OFF): the exact GPT-3-small dWeight board
+                # shape. Removed Oct 4 as benchmark-shape tuning.
+                if op == OP_TN and m == 768 and n == 768 and k == 2048:
+                    _kpack_hg_run_with_ws[4, SAB](ctx, c, a, b, ws, m, n, k, op)
+                    return
+            else:
+                # `-D ANONLIB_GEMM_NV_FS4_OFF` keeps the profile-wide stack.
+                comptime if not is_defined["ANONLIB_GEMM_NV_FS4_OFF"]():
+                    # N02 (ANONLIB_IDN_GEMM_FS2, a 2-level stack for <= 2
+                    # leaves) was deleted by lane/grid-prune (2026-10-07):
+                    # OVN N02 on NVIDIA read FS2 vs FS4 as noise (medians
+                    # 0.996 / 0.995). Recoverable at ab554bb4a.
+                    if gemm_kpack_fold_slots_for(
+                        contract_partition(k)[1], gemm_default_ksplit_leaves(m, n, k)
+                    ) == 4:
+                        _kpack_hg_run_with_ws[4, SAB](ctx, c, a, b, ws, m, n, k, op)
+                        return
+        _kpack_hg_run_with_ws[GEMM_KPACK_FS, SAB](
+            ctx, c, a, b, ws, m, n, k, op
+        )
+        return
+    # lane/nr-gemm (A2, NVIDIA): a stepped-down call on the packed body at
+    # the widest packed tile that fills the device (all leaves, no workspace).
+    comptime if not SAB and TARGET_COLUMN == COLUMN_NVIDIA and GEMM_BODY_KPACK_HG and IDN_GEMM_NV_STEP_KPACK:
+        var kp_rows = gemm_nv_step_kpack_rows(m, n, k)
+        if kp_rows == GEMM_KPACK_RPT * (TUNED_TPB // TUNED_TC):
+            _kpack_run[
+                GEMM_KPACK_RPT, GEMM_KPACK_CPT, TUNED_TC, GEMM_KPACK_KS, GEMM_KPACK_FS, False,
+                GEMM_KPACK_PAD, GEMM_KPACK_ALIGN, 0, True, True,
+            ](ctx, c, a, b, m, n, k, op, 0)
+            return
+        if kp_rows == TUNED_RPT * (TUNED_TPB // TUNED_TC):
+            _kpack_run[
+                TUNED_RPT, GEMM_KPACK_CPT, TUNED_TC, GEMM_KPACK_KS, GEMM_KPACK_FS, False,
+                GEMM_KPACK_PAD, GEMM_KPACK_ALIGN, 0, True, True,
+            ](ctx, c, a, b, m, n, k, op, 0)
+            return
+    # lane/nr-gemm (review rank 3, A1 + A2 fill selection): the AMD column's
+    # stepped-down and split plans on the small-tile matrix-core body, the
+    # same leaves and fold tree (`identical_gemm_mfma16_kernel`).
+    comptime if not SAB and GEMM_IDENTICAL_MFMA and IDN_GEMM_MFMA16:
+        if _mfma16_try(ctx, c, a, b, ws, m, n, k, op, choose_gemm_plan(m, n, k)):
+            return
+    identical_gemm_with_plan(
+        ctx, c, a, b, ws, m, n, k, op, choose_gemm_plan(m, n, k)
+    )
+
+
+#: AMD: the short-contraction band where the packed body's gather staging
+#: loses to the forced TUNED plan once the output is large. In leaves of
+#: `CONTRACT_K_LEAF_MIN` (128): 4 < P <= 8, i.e. 512 < k <= 1024.
+comptime AMD_SHORT_CONTRACT_MIN_LEAVES = 5
+comptime AMD_SHORT_CONTRACT_MAX_LEAVES = 8
+
+
+def amd_short_contract_large_output(m: Int, n: Int, k: Int) -> Bool:
+    """AMD scheduling rule (execution plan only, contract 6.1).
+
+    MI325X, 2026-09-20: the packed kpack body's gather staging loses to the
+    TUNED plan at k = 768 (six leaves) once the output has enough rows or
+    columns, and wins at k = 3072 (24 leaves). lane/no-bench-tuning
+    (2026-10-04): this used to test `k == 768`, one board width. The cost it
+    reflects is per-leaf staging amortized over few leaves, so the rule now
+    keys on the leaf count band `AMD_SHORT_CONTRACT_MIN_LEAVES..MAX` (the
+    same <= 8 bound where the 4-slot fold class applies), with the original
+    output-size gate. Both plans run the same leaf/fold DAG (bit-equal over
+    the GPT-3-small production matrix), so only WHICH same-order plan runs
+    changes: no bits move. Needs neighbor-shape validation at k = 640, 896,
+    1024 (and 512/1152 outside the band)."""
+    var p_count = contract_partition(k)[1]
+    if (
+        p_count < AMD_SHORT_CONTRACT_MIN_LEAVES
+        or p_count > AMD_SHORT_CONTRACT_MAX_LEAVES
+    ):
+        return False
+    return m >= 4096 or (m >= 2048 and n >= 1024)
+
+
+def identical_gemm_shipped_into(
+    ctx: DeviceContext,
+    mut c: DeviceBuffer[DType.float32],
+    mut a: DeviceBuffer[DType.float32],
+    mut b: DeviceBuffer[DType.float32],
+    mut ws: DeviceBuffer[DType.float32],
+    m: Int,
+    n: Int,
+    k: Int,
+    op: Int,
+) raises:
+    """DEVIATION 2595: the shipped IDENTICAL dispatch, the lines
+    `identical_gemm_into` runs after its FAST branch and its trial hook, and
+    the reference every GEMM step harness calls `shipped`. It reads no
+    environment on any build.
+
+    DEVIATION 2707: kernel body row 1 (NVIDIA): `_shipped_body_kpack_hg`.
+    Row above 0 (NVIDIA): `identical_gemm_shipped_at_row_into[False]` at the
+    row. Row 0 (AMD until the MI300X leg decides, Apple, every other column):
+    the old line, and the ksplit path is not compiled at all."""
+    # (NI02 stream_all dispatch deleted 2026-10-08, grid ge123e6f9 loser; recoverable at main bc10b8b56.)
+    # A05 (ANONLIB_IDN_GEMM_COMPACT_LIVE_TILE, halved per-thread row
+    # accumulators) was deleted by lane/grid-prune (2026-10-07): OVN A05 was
+    # slower on both vendors (AMD 4096x1024x1024 0.392 -> 0.639 ms, AMD
+    # 127x130x4097 0.064 -> 1.83 ms; NVIDIA slower in nearly every fixture).
+    # Recoverable at ab554bb4a.
+    comptime if GEMM_BODY_KPACK_HG:
+        _shipped_body_kpack_hg[False](ctx, c, a, b, ws, m, n, k, op)
+        return
+    comptime if GEMM_KSPLIT_DEFAULT_ON:
+        identical_gemm_shipped_at_row_into[False](
+            ctx, c, a, b, ws, m, n, k, op, GEMM_KSPLIT_DEFAULT_S
+        )
+    else:
+        identical_gemm_with_plan(
+            ctx, c, a, b, ws, m, n, k, op, choose_gemm_plan(m, n, k)
+        )
+
+
+def gemm_shipped_plan_summary() -> String:
+    """DEVIATION 2595: the shipped dispatch in one shape-free line, from the
+    bound constants: whether the ksplit default is on and at which row."""
+    comptime if GEMM_BODY_KPACK_HG:
+        return (
+            String("shipped DEFAULT kpack_hg body (DEVIATION 2707, kernel body row 1: padded aligned page,")
+            + " gather staging, hardware fold flush) on every call the TUNED 128x128 plan serves, ksplit groups"
+            + " (block parallelism row S=" + String(GEMM_KSPLIT_DEFAULT_S) + " slack=" + String(GEMM_KSPLIT_SLACK)
+            + ") where the group rule takes the call, else all leaves; other calls choose_gemm_plan's plan"
+        )
+    comptime if GEMM_KSPLIT_DEFAULT_ON:
+        return (
+            String("shipped DEFAULT ksplit (DEVIATION 2595, block parallelism row S=")
+            + String(GEMM_KSPLIT_DEFAULT_S) + " slack=" + String(GEMM_KSPLIT_SLACK)
+            + ") where the group rule takes the call, else choose_gemm_plan's plan ("
+            + gemm_plan_name(PLAN_TUNED_128_8X8) + " on the step's calls)"
+        )
+    return (
+        String("shipped DEFAULT ") + gemm_plan_name(PLAN_TUNED_128_8X8)
+        + " (ksplit default off: block parallelism row 0)"
+    )
+
+
+def gemm_shipped_dispatch_name_at(m: Int, n: Int, k: Int, row: Int) -> String:
+    """DEVIATION 2595: the plan the shipped dispatch's body RUNS at
+    `(m, n, k)` with the row at `row`, built from the bound constants:
+    the ksplit geometry with its group size, group count and launched blocks,
+    or the plan `choose_gemm_plan` picks with the reason the default did not
+    take the call."""
+    var plan = choose_gemm_plan(m, n, k)
+    var gl = gemm_default_ksplit_leaves_at(m, n, k, row)
+    comptime if GEMM_BODY_KPACK_HG:
+        if plan == PLAN_TUNED_128_8X8 and row == GEMM_KSPLIT_DEFAULT_S:
+            var sb = String("DEFAULT kpack_hg body (DEVIATION 2707) ") + gemm_step_geometry_name(GEMM_GEOM_KPACK_HG)
+            if gl > 0:
+                sb += " leaves_per_group=" + String(gl) + " groups=" + String((contract_partition(k)[1] + gl - 1) // gl)
+            else:
+                sb += " all leaves in one launch"
+            return sb
+    if gl <= 0:
+        var s = gemm_plan_name(plan)
+        if plan == PLAN_TUNED_128_8X8:
+            if row <= 0:
+                s += " (ksplit default off: block parallelism row 0)"
+            else:
+                s += String(" (ksplit default on at S=") + String(row) + ": the group rule declines this call)"
+        return s
+    var p_count = contract_partition(k)[1]
+    var groups = (p_count + gl - 1) // gl
+    var tt = _ksplit_tiles(m, n)
+    var s2 = _step_arm_geometry_name[
+        GEMM_KSPLIT_RPT, GEMM_KSPLIT_CPT, TUNED_TC, GEMM_KSPLIT_KS, False
+    ](String("DEFAULT ksplit (DEVIATION 2595)"))
+    s2 += " leaf groups on grid.y -> node workspace -> fold (block per cell <= "
+    s2 += String(SPLIT_BLOCK_FOLD_MAX_CELLS) + ", else register stack)"
+    s2 += " S=" + String(row) + " slack=" + String(GEMM_KSPLIT_SLACK)
+    s2 += " leaves_per_group=" + String(gl) + " groups=" + String(groups)
+    s2 += " launched_blocks=" + String(tt[0] * tt[1] * groups)
+    return s2
+
+
+def gemm_shipped_dispatch_name(m: Int, n: Int, k: Int) -> String:
+    """`gemm_shipped_dispatch_name_at` at the column's shipped row."""
+    return gemm_shipped_dispatch_name_at(m, n, k, GEMM_KSPLIT_DEFAULT_S)
+
+
+def gemm_step_arm_plan_label(arm: Int) -> String:
+    """DEVIATION 2595: which plan `arm` runs, in one line with no tab, from
+    the bound constants, so a probe row or a summary row can never confuse
+    the new default with the old plan. `tools/gemm_step_leg.sh` writes it
+    beside `gemm_arm` (the probe's `gemm_plan` field)."""
+    var which = arm & (GEMM_ARM_SABOTAGE - 1)
+    var dflt = String("default=tuned128 (block parallelism row 0)")
+    comptime if GEMM_KSPLIT_DEFAULT_ON:
+        dflt = String("default=ksplit(S=") + String(GEMM_KSPLIT_DEFAULT_S) + ") else tuned128"
+    comptime if GEMM_BODY_KPACK_HG:
+        dflt = String("default=kpack_hg body (2707) at ksplit(S=") + String(GEMM_KSPLIT_DEFAULT_S) + ") groups"
+    var s = String("")
+    if which == GEMM_ARM_SHIPPED:
+        s = String("shipped: ") + dflt
+    elif which == GEMM_ARM_TUNED128:
+        s = String("tuned128: the old TUNED 128x128 plan forced on every call it served")
+    elif which == GEMM_ARM_KSPLIT:
+        s = String("ksplit(S=") + String(GEMM_KSPLIT_S) + ") where its rule takes the call, else " + dflt
+    elif which == GEMM_ARM_KSPLIT_LEAF:
+        s = String("ksplit_leaf(finest under the cap) where its rule takes the call, else ") + dflt
+    elif which == GEMM_ARM_KPACK:
+        s = (
+            String("kpack: packed page 128x128 reg8x8 KS=") + String(GEMM_KPACK_KS)
+            + ", ksplit groups (S=" + String(GEMM_KSPLIT_S) + ") where the rule takes the call,"
+            + " else all leaves, on every call tuned128 served; other calls " + dflt
+        )
+    elif which == GEMM_ARM_KPACK_WIDE:
+        s = (
+            String("kpack_wide: packed page ") + String(GEMM_KPACKW_BM) + "x" + String(GEMM_KPACKW_BN)
+            + " reg" + String(GEMM_KPACKW_RPT) + "x" + String(GEMM_KPACKW_CPT) + " KS="
+            + String(GEMM_KPACKW_KS) + ", groups (S=" + String(GEMM_KSPLIT_S)
+            + ", rule on its tile) where the rule takes the call, else all leaves, on every call"
+            + " tuned128 served; other calls " + dflt
+        )
+    elif which == GEMM_ARM_KFOLDV or which == GEMM_ARM_KFOLDV_LEAF:
+        var rule = String("ksplit(S=") + String(GEMM_KSPLIT_S) + ") rule"
+        if which == GEMM_ARM_KFOLDV_LEAF:
+            rule = String("ksplit_leaf rule (finest under the cap)")
+        s = (
+            gemm_step_arm_name(which) + ": shipped group launch at the " + rule
+            + ", lane fold " + String(GEMM_KFOLD_W) + " cells/thread register stack "
+            + String(GEMM_KFOLD_FS) + " levels (shipped fold above "
+            + String(GEMM_KFOLD_MAX_GROUPS) + " groups) where the rule takes the call, else " + dflt
+        )
+    else:
+        s = gemm_step_arm_name(which) + " on the calls it takes, else " + dflt
+    comptime if not GEMM_ARM_TRIAL:
+        if which != GEMM_ARM_SHIPPED:
+            s += " (NOT RUN: no -D ANONLIB_GEMM_ARM_TRIAL=1, the shipped default ran)"
+    return s
+
+
+def identical_gemm_step_ksplit_workspace_floats(
+    m: Int, n: Int, k: Int, group_leaves: Int
+) raises -> Int:
+    """`m n G`, the node workspace one ksplit call allocates (0 at `k == 0`)."""
+    if m <= 0 or n <= 0:
+        return 0
+    var rg = _ksplit_resolve_leaves(group_leaves, contract_partition(k)[1])
+    return m * n * rg[1]
+
+
+def identical_gemm_step_ksplit_into(
+    ctx: DeviceContext,
+    mut c: DeviceBuffer[DType.float32],
+    mut a: DeviceBuffer[DType.float32],
+    mut b: DeviceBuffer[DType.float32],
+    mut ws: DeviceBuffer[DType.float32],
+    m: Int,
+    n: Int,
+    k: Int,
+    op: Int,
+    group_leaves: Int,
+    sabotage: Bool,
+) raises:
+    """DEVIATION 2590. `C = op(A) . op(B)` through leaf groups of
+    `group_leaves` leaves: allocate `m n G` floats, launch the groups, launch
+    the fold, SYNCHRONIZE (the workspace is allocated here, so returning
+    before the wait would free it under the kernels,
+    `[[mojo-buffer-freed-at-last-use]]`). `ws` is the caller's and untouched
+    on a trial build.
+
+    `k == 0` takes no group launch: the step arm kernel at the shipped
+    geometry with `LFOLD = False` stores `+0.0` per cell (brief 5.5).
+
+    DEVIATION 2595: the `P >= 1` path is `_ksplit_run`, the body the shipped
+    default runs.
+
+    On a build without `-D ANONLIB_GEMM_ARM_TRIAL=1` this runs the shipped
+    dispatch (`identical_gemm_shipped_into`) and ignores `group_leaves` and
+    `sabotage`. THAT FALLBACK READS `ws`: the shipped dispatch runs the plan
+    `choose_gemm_plan` picks, a SPLIT plan at small outputs with `P >= 4`,
+    so `ws` must then hold `identical_gemm_workspace_max_floats(m, n, k)`
+    floats, not the trial path's none (brief section 11: the arms check sized
+    it for FLAT and the old plan and the M4 no-trial run wrote past it). The
+    arms check launches nothing through this fallback."""
+    if m <= 0 or n <= 0:
+        return
+    comptime if GEMM_ARM_TRIAL:
+        var part = contract_partition(k)
+        var leaf = part[0]
+        var p_count = part[1]
+        var st = gemm_operand_strides(op, m, n, k)
+        _ = _ksplit_resolve_leaves(group_leaves, p_count)
+        if p_count <= 0:
+            if sabotage:
+                _launch_step_arm[
+                    GEMM_KSPLIT_RPT, GEMM_KSPLIT_CPT, TUNED_TC, GEMM_KSPLIT_KS, False, True
+                ](ctx, c, a, b, m, n, k, leaf, p_count, st)
+            else:
+                _launch_step_arm[
+                    GEMM_KSPLIT_RPT, GEMM_KSPLIT_CPT, TUNED_TC, GEMM_KSPLIT_KS, False, False
+                ](ctx, c, a, b, m, n, k, leaf, p_count, st)
+            step_count_sync()
+            ctx.synchronize()
+            return
+        if sabotage:
+            _ksplit_run[True](ctx, c, a, b, m, n, k, op, group_leaves)
+        else:
+            _ksplit_run[False](ctx, c, a, b, m, n, k, op, group_leaves)
+        return
+    identical_gemm_shipped_into(ctx, c, a, b, ws, m, n, k, op)
+    step_count_sync()
+    ctx.synchronize()
+
+
+def identical_gemm_step_ksplit_phase_into(
+    ctx: DeviceContext,
+    mut c: DeviceBuffer[DType.float32],
+    mut a: DeviceBuffer[DType.float32],
+    mut b: DeviceBuffer[DType.float32],
+    mut ws: DeviceBuffer[DType.float32],
+    m: Int,
+    n: Int,
+    k: Int,
+    op: Int,
+    group_leaves: Int,
+) raises -> Tuple[Int, Int, Int]:
+    """`identical_gemm_step_ksplit_into` (clean) with a host synchronize
+    after each phase: `(alloc_ns, group_ns, fold_ns)`. The price harness's
+    PHASE lines (2593). A non-trial build runs the shipped dispatch
+    (`identical_gemm_shipped_into`) and reports it all as `group_ns`."""
+    if m <= 0 or n <= 0:
+        return (0, 0, 0)
+    comptime if GEMM_ARM_TRIAL:
+        var part = contract_partition(k)
+        var leaf = part[0]
+        var p_count = part[1]
+        var st = gemm_operand_strides(op, m, n, k)
+        var rg = _ksplit_resolve_leaves(group_leaves, p_count)
+        if p_count <= 0:
+            var tz = perf_counter_ns()
+            _launch_step_arm[
+                GEMM_KSPLIT_RPT, GEMM_KSPLIT_CPT, TUNED_TC, GEMM_KSPLIT_KS, False, False
+            ](ctx, c, a, b, m, n, k, leaf, p_count, st)
+            step_count_sync()
+            ctx.synchronize()
+            return (0, Int(perf_counter_ns() - tz), 0)
+        var t0 = perf_counter_ns()
+        step_count_device_alloc()
+        var gws = ctx.enqueue_create_buffer[DType.float32](m * n * rg[1])
+        step_count_sync()
+        ctx.synchronize()
+        var t1 = perf_counter_ns()
+        _ksplit_groups_launch[
+            GEMM_KSPLIT_RPT, GEMM_KSPLIT_CPT, TUNED_TC, GEMM_KSPLIT_KS, False
+        ](ctx, gws, a, b, m, n, k, leaf, p_count, st, rg[0], rg[1])
+        step_count_sync()
+        ctx.synchronize()
+        var t2 = perf_counter_ns()
+        _ksplit_fold_launch(ctx, c, gws, m, n, rg[1])
+        step_count_sync()
+        ctx.synchronize()
+        var t3 = perf_counter_ns()
+        _ = gws
+        return (Int(t1 - t0), Int(t2 - t1), Int(t3 - t2))
+    var ts = perf_counter_ns()
+    identical_gemm_shipped_into(ctx, c, a, b, ws, m, n, k, op)
+    step_count_sync()
+    ctx.synchronize()
+    return (0, Int(perf_counter_ns() - ts), 0)
+
+
+def gemm_step_ksplit_finest_leaves(m: Int, n: Int, k: Int) -> Int:
+    """The finest power-of-two leaves per group whose workspace `m n G` fits
+    `SPLITK_MAX_WORKSPACE_FLOATS` (a size at or above `P` is one group). 0
+    when `P == 0` or not even one group fits. Execution plan only."""
+    if m <= 0 or n <= 0:
+        return 0
+    var p_count = contract_partition(k)[1]
+    if p_count <= 0:
+        return 0
+    var mn = m * n
+    if mn > SPLITK_MAX_WORKSPACE_FLOATS:
+        return 0
+    var gl = 1
+    while gl < p_count and mn * ((p_count + gl - 1) // gl) > SPLITK_MAX_WORKSPACE_FLOATS:
+        gl = gl * 2
+    return gl
+
+
+def gemm_step_ksplit_rule(m: Int, n: Int, k: Int, s: Int, read_s: Bool) -> Int:
+    """THE GROUP RULE (brief section 4), with `S` as an argument so a host
+    check can hold it to the section 4 hand counts at any reading. Leaves per
+    group, or 0 when the rule declines. Reads `m`, `n`, `k` and `s`; returns
+    an execution plan quantity, never a partition (contract 6.1).
+
+    1. Only where `choose_gemm_plan` answers PLAN_TUNED_128_8X8 and `P >= 2`.
+    2. The finest power-of-two group under the workspace cap; declines when
+       fewer than two groups result.
+    3. `read_s = False` (`ksplit_leaf`) stops there.
+    4. `read_s = True` (`ksplit`) with `s > 0`: declines at `tiles >= s`,
+       then doubles the group while the doubled split still issues at least
+       `GEMM_KSPLIT_SLACK * s` blocks. With `s <= 0` it stops at 2."""
+    if choose_gemm_plan_tiles(m, n, k) != PLAN_TUNED_128_8X8:
+        return 0
+    var p_count = contract_partition(k)[1]
+    if p_count < 2:
+        return 0
+    var gl = gemm_step_ksplit_finest_leaves(m, n, k)
+    if gl < 1:
+        return 0
+    if (p_count + gl - 1) // gl < 2:
+        return 0
+    if not read_s or s <= 0:
+        return gl
+    var tt = _ksplit_tiles(m, n)
+    var tiles = tt[0] * tt[1]
+    if tiles >= s:
+        return 0
+    while tiles * ((p_count + 2 * gl - 1) // (2 * gl)) >= GEMM_KSPLIT_SLACK * s:
+        gl = gl * 2
+    return gl
+
+
+def gemm_step_ksplit_group_leaves(geom: Int, m: Int, n: Int, k: Int) raises -> Int:
+    """The rule for a ksplit geometry at this column: `ksplit` reads
+    `GEMM_KSPLIT_S` (the kernel matrix row), `ksplit_leaf` reads nothing. 0
+    when it declines."""
+    if geom == GEMM_GEOM_KSPLIT:
+        return gemm_step_ksplit_rule(m, n, k, GEMM_KSPLIT_S, True)
+    if geom == GEMM_GEOM_KSPLIT_LEAF:
+        return gemm_step_ksplit_rule(m, n, k, 0, False)
+    raise Error("gemm_step_ksplit_group_leaves: geometry " + String(geom) + " is not a ksplit geometry")
+
+
+def gemm_step_geometry_group_leaves(geom: Int, m: Int, n: Int, k: Int) raises -> Int:
+    """Leaves per group a FORCED launch of `geom` uses: for the shipped
+    geometry (DEVIATION 2595) the shipped default's group size, 0 where the
+    old plan runs; 0 for any other geometry that is not ksplit; the rule
+    where it applies; where it declines (a forced harness launch only, never
+    the hook), the finest group under the cap, and 1 at `k == 0` (no group
+    launch runs). RAISES when not even one group fits the cap."""
+    if geom == GEMM_GEOM_SHIPPED:
+        return gemm_default_ksplit_leaves(m, n, k)
+    if _is_kpack_geometry(geom):
+        # DEVIATION 2599: the arm's own rule; 0 means its all-leaves launch.
+        return gemm_step_kpack_leaves(geom, m, n, k)
+    if geom == GEMM_GEOM_KFOLDV or geom == GEMM_GEOM_KFOLDV_LEAF:
+        # DEVIATIONS 2640 and 2641: the ksplit geometry of the same rule,
+        # forced fallback included (brief 5.2).
+        return gemm_step_geometry_group_leaves(_kfold_ksplit_geometry(geom), m, n, k)
+    if geom != GEMM_GEOM_KSPLIT and geom != GEMM_GEOM_KSPLIT_LEAF:
+        return 0
+    var gl = gemm_step_ksplit_group_leaves(geom, m, n, k)
+    if gl > 0:
+        return gl
+    if m <= 0 or n <= 0 or contract_partition(k)[1] <= 0:
+        return 1
+    gl = gemm_step_ksplit_finest_leaves(m, n, k)
+    if gl < 1:
+        raise Error(
+            "forced ksplit at " + String(m) + "x" + String(n) + "x" + String(k)
+            + ": the output alone exceeds the workspace cap"
+        )
+    return gl
+
+
+def gemm_step_ksplit_reach(m: Int, n: Int, k: Int, group_leaves: Int) raises -> Int:
+    """Cells a sabotage launch of `identical_gemm_step_ksplit_into` moves:
+    one per `(tile, q)` whose sabotaged cell (thread `q mod NTH`, register
+    cell `q // NTH`) lies in the output; one per tile at `k == 0` (the step
+    arm kernel's thread 0, cell (0, 0)). Names the group count that ran."""
+    comptime NTH = TUNED_TPB
+    comptime TR = NTH // TUNED_TC
+    comptime BM = GEMM_KSPLIT_RPT * TR
+    comptime BN = GEMM_KSPLIT_CPT * TUNED_TC
+    comptime NCELL = GEMM_KSPLIT_RPT * GEMM_KSPLIT_CPT
+    if m <= 0 or n <= 0:
+        return 0
+    var tt = _ksplit_tiles(m, n)
+    var p_count = contract_partition(k)[1]
+    if p_count <= 0:
+        return tt[0] * tt[1]
+    var rg = _ksplit_resolve_leaves(group_leaves, p_count)
+    var moved = 0
+    for ti in range(tt[0]):
+        for tj in range(tt[1]):
+            for q in range(rg[1]):
+                var reg = q // NTH
+                if reg >= NCELL:
+                    continue
+                var th = q - reg * NTH
+                var arow = th // TUNED_TC
+                var acol = th - arow * TUNED_TC
+                var gi = ti * BM + arow + (reg // GEMM_KSPLIT_CPT) * TR
+                var gj = tj * BN + acol + (reg % GEMM_KSPLIT_CPT) * TUNED_TC
+                if gi < m and gj < n:
+                    moved += 1
+    return moved
+
+
+def gemm_step_geometry_reach(geom: Int, m: Int, n: Int, k: Int) raises -> Int:
+    """Cells a sabotage launch of `geom` through
+    `identical_gemm_step_geometry_into` moves: for shipped (DEVIATION 2595)
+    the default's group launch reach where the default takes the call and 0
+    where the old plan runs; 0 for `tuned128`; one per block for the 2540 and
+    2541 geometries; `gemm_step_ksplit_reach` for ksplit."""
+    if geom == GEMM_GEOM_SHIPPED:
+        comptime if GEMM_BODY_KPACK_HG:
+            # DEVIATION 2707: the kpack_hg body's reach on every call the
+            # TUNED plan serves (its rule reads the trial row, which is the
+            # shipped row wherever the shipped row is above 0).
+            if m <= 0 or n <= 0 or choose_gemm_plan_tiles(m, n, k) != PLAN_TUNED_128_8X8:
+                return 0
+            return gemm_step_kpack_reach(GEMM_GEOM_KPACK_HG, m, n, k)
+        var gl0 = gemm_default_ksplit_leaves(m, n, k)
+        if gl0 <= 0:
+            return 0
+        return gemm_step_ksplit_reach(m, n, k, gl0)
+    if geom == GEMM_GEOM_TUNED128:
+        return 0
+    if _is_kpack_geometry(geom):
+        return gemm_step_kpack_reach(geom, m, n, k)
+    if geom == GEMM_GEOM_KFOLDV or geom == GEMM_GEOM_KFOLDV_LEAF:
+        return gemm_step_kfold_reach(geom, m, n, k)
+    if geom == GEMM_GEOM_KSPLIT or geom == GEMM_GEOM_KSPLIT_LEAF:
+        return gemm_step_ksplit_reach(
+            m, n, k, gemm_step_geometry_group_leaves(geom, m, n, k)
+        )
+    return gemm_step_geometry_blocks(geom, m, n)
+
+
+def gemm_step_geometry_launched_blocks(geom: Int, m: Int, n: Int, k: Int) raises -> Int:
+    """Blocks the (first) launch of `geom` issues: tiles times groups for
+    ksplit and for the shipped geometry where the ksplit default takes the
+    call (DEVIATION 2595; the fold launch is not counted), tiles otherwise."""
+    var blocks = gemm_step_geometry_blocks(geom, m, n)
+    var p_count = contract_partition(k)[1]
+    if blocks <= 0 or p_count <= 0:
+        return blocks
+    var gl = gemm_step_geometry_group_leaves(geom, m, n, k)
+    if gl <= 0:
+        return blocks
+    return blocks * ((p_count + gl - 1) // gl)
+
+
+def _ksplit_geometry_name(label: String, reads_s: Bool) -> String:
+    """Built from the constants the launcher binds, never a literal."""
+    var s = _step_arm_geometry_name[
+        GEMM_KSPLIT_RPT, GEMM_KSPLIT_CPT, TUNED_TC, GEMM_KSPLIT_KS, False
+    ](label)
+    s += " leaf groups on grid.y -> node workspace -> fold (block per cell <= "
+    s += String(SPLIT_BLOCK_FOLD_MAX_CELLS) + ", else register stack)"
+    if reads_s:
+        s += " group rule S=" + String(GEMM_KSPLIT_S) + " slack=" + String(GEMM_KSPLIT_SLACK)
+    else:
+        s += " group rule finest under the cap"
+    return s
+
+
+def identical_gemm_step_geometry_into(
+    ctx: DeviceContext,
+    mut c: DeviceBuffer[DType.float32],
+    mut a: DeviceBuffer[DType.float32],
+    mut b: DeviceBuffer[DType.float32],
+    mut ws: DeviceBuffer[DType.float32],
+    m: Int,
+    n: Int,
+    k: Int,
+    op: Int,
+    geom: Int,
+    sabotage: Bool,
+) raises:
+    """`C = op(A) . op(B)` on a NAMED step-arm geometry, forced (the
+    harnesses; `identical_gemm_into`'s hook reaches it through
+    `gemm_step_arm_geometry`). ASYNCHRONOUS like `identical_gemm_into`.
+
+    DEVIATION 2595. GEMM_GEOM_SHIPPED runs the shipped dispatch
+    (`identical_gemm_shipped_into`: ksplit where the column's row is above 0
+    and the group rule takes the call, else `choose_gemm_plan`'s plan); with
+    `sabotage` on a trial build it runs that dispatch's body sabotaged
+    (`identical_gemm_shipped_at_row_into[True]` at the column's row).
+    GEMM_GEOM_TUNED128 runs PLAN_TUNED_128_8X8, the old plan, on EVERY
+    build. On a build without `-D ANONLIB_GEMM_ARM_TRIAL=1` every other
+    geometry runs the shipped dispatch and `sabotage` is ignored. That
+    fallback (like GEMM_GEOM_SHIPPED on every build) READS `ws`: size it with
+    `identical_gemm_workspace_max_floats(m, n, k)`, because at a small output
+    with `P >= 4` `choose_gemm_plan` picks a SPLIT plan that writes `m n P`
+    floats there (brief section 11, the M4 no-trial crash). The arms check
+    launches no arm geometry but `tuned128` on such a build.
+
+    The two ksplit geometries (2591), and the shipped geometry wherever the
+    ksplit default takes the call, allocate their own workspace and
+    therefore SYNCHRONIZE before returning (`_ksplit_run`); their group size
+    is `gemm_step_geometry_group_leaves`."""
+    if geom < 0 or geom >= GEMM_GEOM_COUNT:
+        raise Error("identical_gemm_step_geometry_into: no geometry " + String(geom))
+    if m <= 0 or n <= 0:
+        return
+    if geom == GEMM_GEOM_TUNED128:
+        identical_gemm_with_plan(ctx, c, a, b, ws, m, n, k, op, PLAN_TUNED_128_8X8)
+        return
+    if geom == GEMM_GEOM_SHIPPED:
+        comptime if GEMM_ARM_TRIAL:
+            if sabotage:
+                comptime if GEMM_BODY_KPACK_HG:
+                    _shipped_body_kpack_hg[True](ctx, c, a, b, ws, m, n, k, op)
+                else:
+                    identical_gemm_shipped_at_row_into[True](
+                        ctx, c, a, b, ws, m, n, k, op, GEMM_KSPLIT_DEFAULT_S
+                    )
+                return
+        identical_gemm_shipped_into(ctx, c, a, b, ws, m, n, k, op)
+        return
+    comptime if GEMM_ARM_TRIAL:
+        if geom == GEMM_GEOM_KSPLIT or geom == GEMM_GEOM_KSPLIT_LEAF:
+            identical_gemm_step_ksplit_into(
+                ctx, c, a, b, ws, m, n, k, op,
+                gemm_step_geometry_group_leaves(geom, m, n, k), sabotage,
+            )
+            return
+        if _is_kpack_geometry(geom):
+            # DEVIATION 2599: synchronizes where the group launch runs (it
+            # allocates the node workspace), asynchronous otherwise.
+            identical_gemm_step_kpack_into(ctx, c, a, b, ws, m, n, k, op, geom, sabotage)
+            return
+        if geom == GEMM_GEOM_KFOLDV or geom == GEMM_GEOM_KFOLDV_LEAF:
+            # DEVIATIONS 2640 and 2641: synchronizes (it allocates the node
+            # workspace, like the ksplit geometries).
+            identical_gemm_step_kfold_into(ctx, c, a, b, ws, m, n, k, op, geom, sabotage)
+            return
+        if sabotage:
+            _step_geometry_launch[True](ctx, c, a, b, m, n, k, op, geom)
+        else:
+            _step_geometry_launch[False](ctx, c, a, b, m, n, k, op, geom)
+    else:
+        identical_gemm_shipped_into(ctx, c, a, b, ws, m, n, k, op)
+
+
+def _gemm_step_arm_hook(
+    ctx: DeviceContext,
+    mut c: DeviceBuffer[DType.float32],
+    mut a: DeviceBuffer[DType.float32],
+    mut b: DeviceBuffer[DType.float32],
+    mut ws: DeviceBuffer[DType.float32],
+    m: Int,
+    n: Int,
+    k: Int,
+    op: Int,
+) raises -> Bool:
+    """DEVIATION 2542. True when an arm served the call. Raises on an
+    unknown ANONLIB_GEMM_ARM before anything is enqueued.
+
+    DEVIATION 2595: a SABOTAGED call whose geometry is shipped (the
+    `shipped` arm, or any arm at a call it does not take) is served here by
+    the shipped dispatch's own body, sabotaged, so the default's reach is
+    provable through the entry; a clean one falls through to the shipped
+    dispatch line."""
+    var arm = gemm_step_arm_from_env()
+    var geom = gemm_step_arm_geometry(arm, m, n, k)
+    var sabotage = (arm & GEMM_ARM_SABOTAGE) != 0
+    if geom == GEMM_GEOM_SHIPPED and not sabotage:
+        return False
+    identical_gemm_step_geometry_into(
+        ctx, c, a, b, ws, m, n, k, op, geom, sabotage
+    )
+    return True
+
+
+# ===========================================================================
+# THE KERNEL ARMS (DEVIATION 2599, 2026-09-11)
+# ===========================================================================
+# `identical_gemm_kpack_kernel` is the shipped per-window body (the tuned
+# kernel's non-SPLIT path, the ksplit kernel's group range) with three
+# changes, all in where operand words sit and how they are loaded, none in
+# what is added to what: the shared page is packed in the order the
+# accumulate reads it (`gemm_kpack_addr`), each step loads its operands
+# straight into the registers it reads (one `RPT`-wide and one `CPT`-wide
+# load), and the page carries no slack words. The identity argument is brief
+# section 5, written before this code. Only the trial-gated dispatch in
+# `identical_gemm_step_geometry_into` and the trial harnesses reach it.
+
+#: Bytes of headroom per page when the arms ask the matrix for two pages:
+#: cuobjdump reported 41,984 shared bytes for the shipped 40,960-byte
+#: allocation (`bench/results/gemm_resources_2026-09-10/README.md`).
+comptime GEMM_KPACK_PAGE_GUARD_BYTES = 1024
+#: `kpack`: the shipped 128x128 geometry.
+#: lane/nvidia-step-time (2026-09-25), trial geometry defines (schedule only:
+#: a thread's cells, their chains and their fold are unchanged):
+#: `-D ANONLIB_GEMM_KPACK_RPT4=1` (64-row tile), `-D ANONLIB_GEMM_KPACK_CPT4=1`
+#: (64-column tile).
+# 2026-10-05 packed64 screen: NVIDIA B/A 1.015291 (~1.53% slower),
+# all bits matched. No timing win; retain explicit arm, do not enable default.
+# Raw per-case evidence: experiments/identical_speed/results/20261005/nvidia-screen.json.
+# EXPERIMENT: KPACK_RPT4 is default OFF and NOT PERFORMANCE-QUALIFIED.
+# NEVER TESTED by this campaign: combined scheduling toggles.
+# Individual-arm evidence is recorded above.
+# N01 current experiment: NEVER RUN — PENDING MEASUREMENT; existing defaults preserved.
+comptime GEMM_KPACK_RPT = TUNED_RPT if is_defined["ANONLIB_GEMM_KPACK_RPT4"]() else TUNED_RPT * 2
+comptime GEMM_KPACK_CPT = TUNED_CPT if (
+    is_defined["ANONLIB_GEMM_KPACK_CPT4"]() or lib_gemm_kpack_narrow_for[TARGET_COLUMN]()
+) else TUNED_CPT * 2
+#: The kpack kernel's declared launch bound: twice its 256-thread launch
+#: where the narrow tile runs (`lib_gemm_kpack_narrow_for`, NVIDIA: 128
+#: registers a thread, two blocks an SM), else the GEMM kernels' bound.
+comptime GEMM_KPACK_LAUNCH_BOUND = 2 * TUNED_TPB if lib_gemm_kpack_narrow_for[TARGET_COLUMN]() else GEMM_LAUNCH_BOUND
+# TOMBSTONE: ANONLIB_IDN_GEMM_NV_MICROTILE (loser: neural:gemm NV 1.15x slower, NVIDIA-only) deleted 2026-10-11 by c38d7bc89; code recoverable at c38d7bc89^.
+# Restore: git apply experiments/removed/ANONLIB_IDN_GEMM_NV_MICROTILE.patch
+comptime GEMM_KPACK_KS = 16
+comptime GEMM_KPACK_FS = TUNED_FOLD_SLOTS
+# Oct 4 range bounds replacing exact-dimension rules (unmeasured).
+comptime APPLE_PLAN64_NARROW = 1024
+comptime AMD_SHORT_K_MIN = 512
+comptime AMD_SHORT_K_MAX = 1024
+#: DEVIATION 2700, `kpack_pad`: words of padding after each line group of
+#: the packed page. `VEC` (4) turns the 128-word group stride of the 128x128
+#: geometry into 132, `4 mod 32`, so the per-step B loads of a warp's 16
+#: column threads spread over eight bank groups (the kernel's docstring).
+# A03: physical LDS stride experiment only. Vector-aligned padding leaves
+# every logical staged address and the accumulator traversal unchanged.
+# Compare 0/4/8 words; resource counters decide, never dataset dimensions.
+# A03 experiment: NEVER RUN — PENDING MEASUREMENT; incumbent defaults retained.
+# A03 PENDING: compile evidence alone does not qualify device correctness, quality or speed.
+# LDS padding overrides require explicit IDENTICAL define; incumbent padding retained.
+comptime GEMM_KPACK_PAD = (
+    get_defined_int["ANONLIB_IDN_GEMM_LDS_PAD_WORDS", TUNED_VECLEN]()
+    if GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL else TUNED_VECLEN
+)
+#: DEVIATION 2703, `kpack_padv`: the shared page alignment in bytes at which
+#: the per-step loads become `ld.shared.v4` (brief section 15).
+comptime GEMM_KPACK_ALIGN = 16
+#: `kpack_wide`: register tile 8x16, output tile 128x256, a 12-level local
+#: fold stack (covers `P <= CONTRACT_MAX_LEAVES`, brief 5.4).
+comptime GEMM_KPACKW_RPT = TUNED_RPT * 2
+comptime GEMM_KPACKW_CPT = TUNED_CPT * 4
+comptime GEMM_KPACKW_FS = GEMM_FOLD_LEVELS
+comptime GEMM_KPACKW_BM = GEMM_KPACKW_RPT * (TUNED_TPB // TUNED_TC)
+comptime GEMM_KPACKW_BN = GEMM_KPACKW_CPT * TUNED_TC
+comptime GEMM_KPACKW_PAGE_BYTES_K16 = (GEMM_KPACKW_BM + GEMM_KPACKW_BN) * 16 * 4
+#: `kpack_wide`'s K step, read through the matrix like `TUNED_64_KS`: 16 where
+#: two guarded pages of the 128x256 pack at K step 16 fit the column's shared
+#: limit (AMD), else 12 (NVIDIA; Apple, which uses one page either way).
+comptime GEMM_KPACKW_KS = (
+    16
+    if lib_smem_pages_for[
+        TARGET_COLUMN, GEMM_KPACKW_PAGE_BYTES_K16 + GEMM_KPACK_PAGE_GUARD_BYTES
+    ]() == 2
+    else 12
+)
+
+
+@always_inline
+def gemm_kpack_addr(
+    line: Int, step: Int, group_lines: Int, per_thread: Int, ks: Int, pad: Int = 0
+) -> Int:
+    """The packed page address of `line` (a tile row of A or a tile column
+    of B) at window step `step`:
+    `(line mod G) (KS R + pad) + step R + (line div G)`, with `(G, R)` =
+    `(TR, RPT)` for A and `(TC, CPT)` for B. At `pad` 0 a bijection from
+    `[0, R G) x [0, KS)` onto `[0, R G KS)` (brief 5.2); at `pad > 0`
+    (DEVIATION 2700, brief section 13) an injection into `[0, G (KS R + pad))`
+    whose last `pad` words of every group are never named. A thread's lines
+    are `g + u G` with `g < G` its `accrow` or `acccol`, so its `R` lines at
+    one step are `R` consecutive words at `g (KS R + pad) + step R`. The
+    kernel's stores and reads and the host check
+    `check_kpack_page_is_a_bijection` all call this one spelling."""
+    return (line % group_lines) * (ks * per_thread + pad) + step * per_thread + line // group_lines
+
+
+@always_inline
+def gemm_kpack_stage_p(
+    tid: Int, s: Int, e: Int, lines: Int, kv: Int, vec: Int, nth: Int
+) -> Tuple[Int, Int, Bool]:
+    """`(line, step, staged)` of slot `(s, e)` of thread `tid` under
+    `_tuned_g2r`'s p-contiguous mapping: `idx = tid + s nth`, line
+    `idx // kv`, step `(idx mod kv) vec + e`, staged when `idx < lines kv`
+    (the shipped register-to-shared copy's own expressions)."""
+    var idx = tid + s * nth
+    var rr = idx // kv
+    var cc = (idx - rr * kv) * vec
+    return (rr, cc + e, idx < lines * kv)
+
+
+@always_inline
+def gemm_kpack_stage_outer(
+    tid: Int, s: Int, e: Int, lines: Int, ks: Int, vec: Int, nth: Int
+) -> Tuple[Int, Int, Bool]:
+    """`(line, step, staged)` of slot `(s, e)` of thread `tid` under
+    `_tuned_g2r`'s outer-contiguous mapping: `idx0 = tid + (s vec + e) nth`,
+    line `idx0 mod lines`, step `idx0 // lines`, staged when
+    `idx0 < lines ks`."""
+    var idx0 = tid + (s * vec + e) * nth
+    return (idx0 % lines, idx0 // lines, idx0 < lines * ks)
+
+
+@always_inline
+def gemm_kpack_register_slots(slots: Int) -> Int:
+    """The slot count `identical_gemm_kpack_kernel` INSTANTIATES `_tuned_g2r`
+    with for an operand that stages into `slots` slots, the least power of two
+    at or above `slots` (0 above 256, which the kernel asserts against).
+
+    `_tuned_g2r[SLOTS, VEC, ...]` returns `SIMD[DType.float32, SLOTS * VEC]`
+    and a SIMD width must be a power of two. `kpack_wide` at KS 12 stages B
+    (256 lines, KV 3) in 3 slots, width 12, which the offload pass refuses
+    (found by the M4 trial build, brief section 11). The staging stores still
+    walk only the `slots` real slots. A padded slot `s >= slots` is never
+    staged under either mapping (`idx = tid + s NTH >= lines KV` and
+    `idx0 = tid + (s VEC + e) NTH >= lines KV VEC`), so `_tuned_g2r` leaves it
+    `+0.0`, nothing stores it and nothing reads it, and slots below `slots`
+    hold the same words at any instantiation. `check_kpack_page_is_a_bijection`
+    walks the padded slots too. Loop free, so it evaluates at comptime the way
+    `column_shared_limit` does."""
+    if slots <= 1:
+        return 1
+    if slots <= 2:
+        return 2
+    if slots <= 4:
+        return 4
+    if slots <= 8:
+        return 8
+    if slots <= 16:
+        return 16
+    if slots <= 32:
+        return 32
+    if slots <= 64:
+        return 64
+    if slots <= 128:
+        return 128
+    if slots <= 256:
+        return 256
+    return 0
+
+
+@always_inline
+def gemm_amd_short_k_tuned(m: Int, n: Int, k: Int) -> Bool:
+    """AMD IDENTICAL: send a short-contraction, large-output call to the
+    TUNED 128x128 plan instead of the packed body. Range rule (Oct 4,
+    unmeasured): k in [AMD_SHORT_K_MIN, AMD_SHORT_K_MAX] is too shallow for
+    the packed body's group setup to amortize, and the output must fill the
+    CUs several times over (m >= 4096, or m >= 2048 with n >= 1024).
+    Scheduling only: the same leaf/fold DAG, so no bit changes."""
+    comptime if is_defined["ANONLIB_LEGACY_SHAPE_AMD_K768"]():
+        # LEGACY (default OFF): keyed to k == 768 exactly (GPT-3 small
+        # d_model). Removed Oct 4 as benchmark-shape tuning.
+        return k == 768 and (m >= 4096 or (m >= 2048 and n >= 1024))
+    # merge 2026-10-05: main's AMD_SHORT_K_MIN..MAX range rule and the
+    # IDENTICAL lane's leaf-band rule both replaced k == 768; IDENTICAL keeps
+    # the lane's `amd_short_contract_large_output` (AMD_SHORT_K_* kept for
+    # reference), the legacy arm above stays.
+    return amd_short_contract_large_output(m, n, k)
+
+
+def gemm_kpack_fold_slots_for(p_count: Int, group_leaves: Int) -> Int:
+    """Smallest compiled kpack fold-stack class covering this launch.
+
+    A stack with `FS` indexed levels covers at most `2^(FS-1)` leaves: the
+    final power-of-two push occupies level `FS-1`. Group mode never folds
+    more than `group_leaves`; all-leaves mode folds `p_count`.
+    """
+    var bound = p_count
+    if group_leaves > 0 and group_leaves < bound:
+        bound = group_leaves
+    if bound <= 8:
+        return 4
+    if bound <= 128:
+        return 8
+    return GEMM_KPACK_FS
+
+
+@always_inline
+def _kpack_gather_gs[G: Int, KS: Int](tid: Int, outer_fast: Bool) -> Tuple[Int, Int]:
+    """DEVIATION 2706: `(g, step)` thread `tid` stages under GATHER: the
+    p-contiguous operand `(tid div KS, tid mod KS)`, the outer-contiguous one
+    `(tid mod G, tid div KS)`. `check_kpack_gather_covers_the_page` walks both."""
+    if outer_fast:
+        return (tid % G, tid // KS)
+    return (tid // KS, tid % KS)
+
+
+@always_inline
+def _kpack_gather[
+    R: Int, G: Int
+](
+    src: MutPointer[Float32, MutAnyOrigin],
+    outer_stride: Int,
+    k_stride: Int,
+    base_outer: Int,
+    outer_limit: Int,
+    p0: Int,
+    chunk: Int,
+    g: Int,
+    step: Int,
+) -> SIMD[DType.float32, R]:
+    """DEVIATION 2706: the `R` lines `g + u G` of one operand at window step
+    `step`, DRAM to registers, in the order the packed page holds them
+    (`gemm_kpack_addr(g + u G, step) = g stride + step R + u`). Zero where the
+    line is past the matrix or the step past the window (the slot mapping's
+    zeros, `_tuned_g2r`), flushed at staging exactly as `_tuned_g2r` flushes."""
+    var out = SIMD[DType.float32, R](0.0)
+    if step < chunk:
+        comptime if is_defined["ANONLIB_GEMM_GATHER_FULL_TILE"]():
+            # A block-uniform full-tile test replaces R per-line predicates.
+            # The ragged path still checks every line; no operand is padded.
+            if base_outer + R * G <= outer_limit:
+                comptime for u in range(R):
+                    var oi = base_outer + g + u * G
+                    out[u] = src.unsafe_load(oi * outer_stride + (p0 + step) * k_stride)
+                comptime if is_defined["ANONLIB_GEMM_SABOTAGE_GATHER_FULL"]():
+                    out[0] = Float32(12345.0)
+            else:
+                comptime for u in range(R):
+                    var oi = base_outer + g + u * G
+                    if oi < outer_limit:
+                        out[u] = src.unsafe_load(oi * outer_stride + (p0 + step) * k_stride)
+        else:
+            comptime for u in range(R):
+                var oi = base_outer + g + u * G
+                if oi < outer_limit:
+                    out[u] = src.unsafe_load(oi * outer_stride + (p0 + step) * k_stride)
+    comptime if TUNED_STAGE_FTZ and not is_defined["ANONLIB_GEMM_SABOTAGE_GATHER_FTZ"]():
+        comptime for f in range(R):
+            out[f] = ftz(out[f])
+    return out
+
+
+@always_inline
+def _kpack_step[DIAG: Int](a: Float32, b: Float32, acc: Float32) -> Float32:
+    """DEVIATION 2705: the per-step seam of `identical_gemm_kpack_kernel`.
+    `DIAG` 0 is `_tuned_step` exactly. `DIAG` 1 and 5 (DIAGNOSTIC ONLY,
+    compiled only under -D ANONLIB_GEMM_DIAG=1, never bit-checked, never
+    shipped) drop the flush multiply so the cost of the second instruction
+    can be read by subtraction."""
+    comptime if DIAG == 1 or DIAG == 5:
+        return identical_mul_add(a, b, acc)
+    return _tuned_step(a, b, acc)
+
+
+# TOMBSTONE: ANONLIB_IDN_GEMM_NV_MICROTILE (loser: neural:gemm NV 1.15x slower, NVIDIA-only) deleted 2026-10-11 by c38d7bc89; code recoverable at c38d7bc89^.
+# Restore: git apply experiments/removed/ANONLIB_IDN_GEMM_NV_MICROTILE.patch
+@__llvm_metadata(MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](Int32(GEMM_KPACK_LAUNCH_BOUND)))
+def identical_gemm_kpack_kernel[
+    RPT: Int, CPT: Int, TC: Int, KS: Int, FS: Int, PAGES: Int, GROUP: Bool, SAB: Bool,
+    PAD: Int = 0,
+    ALIGN: Int = 4,
+    DIAG: Int = 0,
+    HWFOLD: Bool = False,
+    GATHER: Bool = False,
+](
+    dst: MutPointer[Float32, MutAnyOrigin],
+    a: MutPointer[Float32, MutAnyOrigin],
+    b: MutPointer[Float32, MutAnyOrigin],
+    m_in: Int32,
+    n_in: Int32,
+    k_in: Int32,
+    leaf_in: Int32,
+    p_in: Int32,
+    a_si_in: Int32,
+    a_sp_in: Int32,
+    b_sp_in: Int32,
+    b_sj_in: Int32,
+    gleaves_in: Int32,
+    groups_in: Int32,
+):
+    """DEVIATION 2599: the shipped per-window body over a PACKED page.
+
+    `GROUP = False`: block `raw = block_idx.x` owns a `BM x BN` tile and all
+    of its `P` leaves and stores `ftz(root)` to `dst[i n + j]` (the tuned
+    kernel's non-SPLIT path; `dst` is `C`). `k == 0` stores `+0.0` per cell.
+    `GROUP = True`: block `(raw, q)` walks leaves
+    `[q gleaves, min((q + 1) gleaves, P))` and stores the group's node
+    unflushed to `dst[q m n + i n + j]` (the ksplit kernel's path; `dst` is
+    the node workspace, folded by `_ksplit_fold_launch`).
+
+    Unchanged from the shipped body: ownership (`accrow = tid // TC`,
+    `acccol = tid mod TC`), `_tuned_window`, `_tuned_g2r` for both operands,
+    the page `w mod PAGES`, the barrier and the prefetch, `_tuned_step`,
+    `_tuned_loaded_operand`, the leaf partial `ftz(acc)` pushed by
+    `_fold_push_local`, `_fold_drain_local`. Changed (brief 4.1 and 5):
+
+    - staging stores write slot `(s, e)` at `gemm_kpack_addr` of the
+      `(line, step)` `_tuned_g2r` put there, `VEC` scalar stores per slot;
+    - the accumulate loads line `accrow + u TR` at step `c` as element `u`
+      of ONE `RPT`-wide load at `accrow KS RPT + c RPT` (B likewise with
+      `acccol`, `TC`, `CPT`), `c` ascending, which is the shipped
+      `kc VEC + e` order;
+    - the page is `lines x KS` floats, no slack words (PAD 0, DEVIATION 2599).
+
+    DEVIATION 2700, `PAD > 0`: each line group `g` (the `RPT` A lines or `CPT` B lines one
+    `accrow` or `acccol` reads) is `KS RPT + PAD` (A) or `KS CPT + PAD` (B)
+    words long instead of `KS RPT` or `KS CPT`, and the PAD words at the end
+    of each group are never stored or read. At PAD 0 the B groups of the 16
+    column threads of a warp start `KS CPT` words apart, `128` at the 128x128
+    geometry, which is a multiple of the 32-word bank period: every per-step
+    B load of the warp lands on the same bank group, a 16-way conflict. At
+    PAD 4 the groups start `132` words apart, `4 mod 32`, so the eight
+    threads a 16-byte load phase serves take eight distinct bank groups. A
+    placement only: the same words, the same `_tuned_step` order, no bit can
+    move (`check_kpack_page_is_a_bijection` walks the padded page too).
+
+    DEVIATION 2703, `ALIGN` (bytes, default 4 = 2599's page): the alignment
+    the two shared pages are allocated at and the per-step loads are spelled
+    at. The local PTX census (brief section 15) found every shared load of
+    2599's body and of the shipped kernel lowered to scalar `ld.shared.b32`,
+    256 per thread per window, because the page is declared `.align 4` and
+    no vector load can be proven aligned. At `ALIGN` 16 with `PAD` a multiple
+    of `VEC`, every load start `g (KS R + PAD) + c R` is a multiple of 4
+    words, so an `RPT`-wide load is two `ld.shared.v4`. The same words in the
+    same order: no bit can move.
+
+    DEVIATION 2706 (brief section 17), two more placement-and-spelling
+    parameters, both default off:
+    - `HWFOLD`: the leaf partial, the fold push, the drain and the output
+      flush use `_fold_flush[True]`, the hardware `mul.rn.ftz` by one on
+      the NVIDIA column (the step seam's own instruction) instead of the
+      six-operation software `ftz`. The decomposition of section 16.3 put
+      the fold at a fifth of the window because of that spelling.
+    - `GATHER`: the staging writes ONE `RPT`-wide (A) and one `CPT`-wide (B)
+      vector per thread per window instead of 16 scalar stores at a
+      four-way bank conflict. Thread `tid` owns line group `g` at window
+      step `c`: the p-contiguous operand maps `(g, c) = (tid div KS, tid
+      mod KS)` so a warp's loads run along `p` of two lines and its stores
+      are 128 contiguous words; the outer-contiguous operand maps `(tid
+      mod G, tid div KS)` so the loads run along the outer index and the
+      stores land on distinct bank groups (`4 g mod 32`). It gathers the
+      `R` lines `g + u G` at step `c` from DRAM, flushed at staging as
+      `_tuned_g2r` flushes, zero where the line or the step is outside the
+      matrix or the window, and stores them at `gemm_kpack_addr(g + u G,
+      c) = g stride + c R + u`: the same words at the same addresses as the
+      slot mapping, so the accumulate loop and every check are untouched.
+      Section 16.3 put the staging phase at a third of the window.
+
+    Every thread of the block reaches every `barrier()`: the early returns
+    (`raw >= tiles`, `q >= groups`, an empty group, `k == 0` in all-leaves
+    mode) read block-uniform values and come before the first barrier, and
+    the window range reads `q`, which every thread of the block shares.
+
+    `SAB = True` (brief 5.5): all-leaves mode moves thread 0's cell (0, 0),
+    one cell per tile, by `_gemm_step_arm_sabotage`; group mode stores
+    `1.0e30` for thread `q mod NTH` at register cell `q // NTH`.
+    `gemm_step_kpack_reach` counts both.
+    """
+    comptime NTH = TUNED_TPB
+    comptime FASTK = GEMM_DETECT_SEAM and TUNED_STAGE_FTZ and DIAG == 0
+    comptime TR = NTH // TC
+    comptime BM = RPT * TR
+    comptime BN = CPT * TC
+    comptime VEC = TUNED_VECLEN
+    comptime KV = KS // VEC
+    comptime ASTRIDE = KS * RPT + PAD
+    comptime BSTRIDE = KS * CPT + PAD
+    comptime APAGE = TR * ASTRIDE
+    comptime BPAGE = TC * BSTRIDE
+    comptime NCELL = RPT * CPT
+    comptime NR = RPT
+    comptime NCOL = CPT
+    comptime ASLOTS = (BM * KV + NTH - 1) // NTH
+    comptime BSLOTS = (BN * KV + NTH - 1) // NTH
+    # The slot counts `_tuned_g2r` is instantiated with, so its
+    # `SIMD[DType.float32, SLOTS * VEC]` register is a power of two wide
+    # (`kpack_wide` at KS 12 stages B in 3 slots, width 12). The staging stores
+    # below walk only ASLOTS and BSLOTS; the padded slots stage nothing, stay
+    # `+0.0` and are never stored or read (`gemm_kpack_register_slots`).
+    comptime AREG = gemm_kpack_register_slots(ASLOTS)
+    comptime BREG = gemm_kpack_register_slots(BSLOTS)
+
+    comptime assert KS % VEC == 0, (
+        "identical_gemm_kpack_kernel: KS must be a VEC multiple, so a staged"
+        " window is a whole number of vector slots"
+    )
+    comptime assert (VEC & (VEC - 1)) == 0, (
+        "identical_gemm_kpack_kernel: VEC must be a power of two, so a"
+        " power-of-two slot count gives a power-of-two register width"
+    )
+    comptime assert AREG >= ASLOTS and BREG >= BSLOTS, (
+        "identical_gemm_kpack_kernel: gemm_kpack_register_slots covers at most"
+        " 256 staging slots"
+    )
+    comptime assert NTH % TC == 0, (
+        "identical_gemm_kpack_kernel: TC must divide the block size"
+    )
+    comptime assert (RPT & (RPT - 1)) == 0 and (CPT & (CPT - 1)) == 0, (
+        "identical_gemm_kpack_kernel: RPT and CPT are vector load widths and"
+        " must be powers of two"
+    )
+    comptime assert PAGES == 1 or PAGES == 2, (
+        "identical_gemm_kpack_kernel: PAGES comes from lib_smem_pages_for"
+    )
+    comptime assert PAD >= 0 and PAD % VEC == 0, (
+        "identical_gemm_kpack_kernel: PAD must keep every line group start"
+        " VEC-aligned, so the per-step vector loads stay aligned"
+    )
+    comptime assert ALIGN == 4 or (ALIGN == 16 and PAD % VEC == 0 and RPT % VEC == 0 and CPT % VEC == 0), (
+        "identical_gemm_kpack_kernel: ALIGN 16 needs PAD, RPT and CPT to be VEC multiples"
+    )
+    # DEVIATION 2705: the DIAGNOSTIC variants exist only in a build that says
+    # so. 1 = no flush multiply, 2 = operands loaded once per window (no
+    # per-step shared loads), 3 = no staging stores, no barrier, no prefetch,
+    # 4 = no fold push at the leaf boundary, 5 = all four (the FMA floor).
+    # Every one of them computes WRONG bits by design.
+    comptime assert DIAG == 0 or is_defined["ANONLIB_GEMM_DIAG"](), (
+        "identical_gemm_kpack_kernel: DIAG != 0 needs -D ANONLIB_GEMM_DIAG=1"
+    )
+    comptime assert (not GATHER) or (ALIGN == 16 and TR * KS == NTH and TC * KS == NTH), (
+        "identical_gemm_kpack_kernel: GATHER needs a 16-byte page and one (group, step)"
+        " pair per thread: TR * KS == TC * KS == the block size"
+    )
+    comptime assert (
+        FS >= GEMM_FOLD_LEVELS
+        or is_defined["ANONLIB_GEMM_FOLD_SPECIALIZE_TRIAL"]()
+        or (TARGET_COLUMN == COLUMN_NVIDIA and (FS == 4 or FS == 8))
+    ), (
+        "identical_gemm_kpack_kernel: the local fold stack must cover the"
+        " profile cap CONTRACT_MAX_LEAVES (smaller stacks are trial-only and"
+        " must be host-bounded by the launched group leaf count)"
+    )
+
+    var m = Int(m_in)
+    var n = Int(n_in)
+    var k = Int(k_in)
+    var leaf = Int(leaf_in)
+    var p_count = Int(p_in)
+    var a_si = Int(a_si_in)
+    var a_sp = Int(a_sp_in)
+    var b_sp = Int(b_sp_in)
+    var b_sj = Int(b_sj_in)
+    var gleaves = Int(gleaves_in)
+    var groups = Int(groups_in)
+    # Block-uniform: which staging mapping each operand takes (`_tuned_g2r`
+    # takes the outer-contiguous mapping exactly when these hold).
+    var a_outer_fast = a_sp != 1 and a_si == 1
+    var b_outer_fast = b_sp != 1 and b_sj == 1
+
+    var as_ = stack_allocation[
+        PAGES * APAGE,
+        Scalar[DType.float32],
+        alignment=ALIGN,
+        address_space = AddressSpace.SHARED,
+    ]()
+    var bs_ = stack_allocation[
+        PAGES * BPAGE,
+        Scalar[DType.float32],
+        alignment=ALIGN,
+        address_space = AddressSpace.SHARED,
+    ]()
+
+    var tiles_i = (m + BM - 1) // BM
+    var tiles_j = (n + BN - 1) // BN
+    var n_tiles = tiles_i * tiles_j
+    var raw = Int(block_idx.x)
+    if raw >= n_tiles:
+        return
+    var q = 0
+    comptime if GROUP:
+        q = Int(block_idx.y)
+        if q >= groups or p_count <= 0 or gleaves < 1:
+            # The launcher never sends `k == 0` to the group launch.
+            return
+    # Unsigned: `raw >= 0` and `tiles_j > 0` here, and a signed floor division
+    # is one more sign fix-up for the optimizer to associate (`_tuned_window_at`).
+    var ti = Int(UInt(raw) // UInt(tiles_j))
+    var tj = raw - ti * tiles_j
+    var i0 = ti * BM
+    var j0 = tj * BN
+    var mn = m * n
+
+    var tid = Int(thread_idx.x)
+    var accrow = _udiv[TC](tid)
+    var acccol = _urem[TC](tid)
+
+    comptime if not GROUP:
+        if p_count <= 0:
+            # `k == 0`, contract section 8: every cell is `+0.0`, STORED.
+            comptime for u0 in range(NR):
+                comptime for v0 in range(NCOL):
+                    var zi = i0 + accrow + u0 * TR
+                    var zj = j0 + acccol + v0 * TC
+                    if zi < m and zj < n:
+                        var z = Float32(0.0)
+                        comptime if SAB:
+                            comptime if u0 == 0 and v0 == 0:
+                                if tid == 0:
+                                    z = _gemm_step_arm_sabotage(z)
+                        dst.unsafe_store(zi * n + zj, z)
+            return
+
+    var acc = SIMD[DType.float32, NCELL](0.0)
+    var fl = stack_allocation[FS * NCELL, Scalar[DType.float32]]()
+    var occ = 0
+
+    var wpl = _tuned_windows_per_leaf[KS](leaf)
+    var w = 0
+    var wt = 0  # w // wpl, carried (see `_tuned_window_at`)
+    var wq = 0  # w - wt * wpl
+    var w_end = p_count * wpl
+    comptime if GROUP:
+        # The ksplit kernel's window range: this block's group of leaves.
+        var lbeg = q * gleaves
+        var lend = lbeg + gleaves
+        if lend > p_count:
+            lend = p_count
+        if lbeg >= lend:
+            return
+        w = lbeg * wpl
+        wt = lbeg
+        w_end = lend * wpl
+
+    # ---- PROLOGUE: the first window, DRAM to registers (shipped lines).
+    var w0 = _tuned_window_at[KS](wt, wq, wpl, leaf, k, p_count)
+    # The window after `w`, computed ONCE per iteration and carried into the
+    # next one (see `_tuned_window_at`): no window is computed twice.
+    var cur = w0
+    var pa = SIMD[DType.float32, AREG * VEC](0.0)
+    var pb = SIMD[DType.float32, BREG * VEC](0.0)
+    # GATHER's registers and (group, step) ownership (2706); unused otherwise.
+    var ga = _kpack_gather_gs[TR, KS](tid, a_outer_fast)
+    var gb = _kpack_gather_gs[TC, KS](tid, b_outer_fast)
+    var pga = SIMD[DType.float32, RPT](0.0)
+    var pgb = SIMD[DType.float32, CPT](0.0)
+    comptime if GATHER:
+        pga = _kpack_gather[RPT, TR](a, a_si, a_sp, i0, m, w0[0], w0[1], ga[0], ga[1])
+        pgb = _kpack_gather[CPT, TC](b, b_sj, b_sp, j0, n, w0[0], w0[1], gb[0], gb[1])
+    else:
+        pa = _tuned_g2r[AREG, VEC, KV, BM, NTH](
+            a, a_si, a_sp, i0, m, w0[0], w0[1], tid
+        )
+        pb = _tuned_g2r[BREG, VEC, KV, BN, NTH](
+            b, b_sj, b_sp, j0, n, w0[0], w0[1], tid
+        )
+
+    comptime if (DIAG == 3 or DIAG == 5) and GATHER:
+        comptime for initial_page in range(PAGES):
+            as_.store[alignment=ALIGN](initial_page * APAGE + ga[0] * ASTRIDE + ga[1] * RPT, pga)
+            bs_.store[alignment=ALIGN](initial_page * BPAGE + gb[0] * BSTRIDE + gb[1] * CPT, pgb)
+        barrier()
+
+    var sub_seen = False  # DETECT seam: some step result of my cells was subnormal
+    # lane/nvidia-step-time: the WINDOW ADMISSION (`GEMM_WINDOW_ADMIT`). Per
+    # page, NW warp minima of the staged A words' exponent fields and NW of
+    # B's; `adm_exact` says every accumulator of this leaf so far is a
+    # multiple of 2^-126 (true at a leaf start, kept by admitted windows).
+    comptime ADMIT = GEMM_WINDOW_ADMIT and GATHER and DIAG == 0 and not FASTK
+    comptime NW = NTH // WARP_SIZE
+    var adm_s = stack_allocation[
+        4 * NW if ADMIT else 1,
+        Scalar[DType.uint32],
+        alignment=16,
+        address_space = AddressSpace.SHARED,
+    ]()
+    var adm_exact = True
+    var adm = False
+    while w < w_end:
+        var win = cur
+        var nxt = _tuned_window_next[KS](wt, wq, wpl, leaf, k, p_count)
+        var chunk = win[1]
+        var pgw = _urem[PAGES](w)
+
+        # ---- REGISTERS TO THE PACKED PAGE `w % PAGES`. Slot `(s, e)` holds
+        # the `(line, step)` its mapping names; it is stored at that pair's
+        # packed address. A copy of one register slot, never arithmetic.
+        # (DIAG 3 and 5: no stores, no barrier, no prefetch; the page is
+        # whatever it holds.)
+        comptime if DIAG != 3 and DIAG != 5:
+         comptime if GATHER:
+          comptime if DIAG != 8:
+            as_.store[alignment=ALIGN](pgw * APAGE + ga[0] * ASTRIDE + ga[1] * RPT, pga)
+            bs_.store[alignment=ALIGN](pgw * BPAGE + gb[0] * BSTRIDE + gb[1] * CPT, pgb)
+          comptime if ADMIT:
+            # The exponent minima of the words this thread staged (window
+            # w, flushed), reduced over the warp; lane 0 publishes them in
+            # the page's slots before the barrier below.
+            var adm_ma = _admit_warp_min(_admit_exp_min(pga))
+            var adm_mb = _admit_warp_min(_admit_exp_min(pgb))
+            if _urem[WARP_SIZE](tid) == 0:
+                adm_s.unsafe_store(pgw * 2 * NW + _udiv[WARP_SIZE](tid), adm_ma)
+                adm_s.unsafe_store(pgw * 2 * NW + NW + _udiv[WARP_SIZE](tid), adm_mb)
+         else:
+          comptime for sa in range(ASLOTS):
+            comptime for ea in range(VEC):
+                var sla = gemm_kpack_stage_p(tid, sa, ea, BM, KV, VEC, NTH)
+                if a_outer_fast:
+                    sla = gemm_kpack_stage_outer(tid, sa, ea, BM, KS, VEC, NTH)
+                if sla[2]:
+                    as_.unsafe_store(
+                        pgw * APAGE + gemm_kpack_addr(sla[0], sla[1], TR, RPT, KS, PAD),
+                        pa[sa * VEC + ea],
+                    )
+          comptime for sb in range(BSLOTS):
+            comptime for eb in range(VEC):
+                var slb = gemm_kpack_stage_p(tid, sb, eb, BN, KV, VEC, NTH)
+                if b_outer_fast:
+                    slb = gemm_kpack_stage_outer(tid, sb, eb, BN, KS, VEC, NTH)
+                if slb[2]:
+                    bs_.unsafe_store(
+                        pgw * BPAGE + gemm_kpack_addr(slb[0], slb[1], TC, CPT, KS, PAD),
+                        pb[sb * VEC + eb],
+                    )
+         # lane/nvidia-step-time (trial `-D ANONLIB_GEMM_PREFETCH_EARLY=1`):
+         # the gather of window w+1 issued BEFORE the barrier, after this
+         # thread's stores of window w read the same registers. Placement only.
+         comptime if PAGES == 2 and GATHER and GEMM_PREFETCH_EARLY and DIAG != 7:
+            if w + 1 < w_end:
+                var wn_e = nxt
+                pga = _kpack_gather[RPT, TR](a, a_si, a_sp, i0, m, wn_e[0], wn_e[1], ga[0], ga[1])
+                pgb = _kpack_gather[CPT, TC](b, b_sj, b_sp, j0, n, wn_e[0], wn_e[1], gb[0], gb[1])
+         # lane/nvidia-step-time DIAGNOSTIC variants (wrong bits by design):
+         # 6 no barrier, 7 no prefetch, 8 no staging stores.
+         comptime if DIAG != 6:
+            barrier()
+
+         # ---- PREFETCH window w+1 (shipped lines, DEVIATION 1256).
+         comptime if PAGES == 2 and DIAG != 7 and not (GATHER and GEMM_PREFETCH_EARLY):
+            if w + 1 < w_end:
+                var wn = nxt
+                comptime if GATHER:
+                    pga = _kpack_gather[RPT, TR](a, a_si, a_sp, i0, m, wn[0], wn[1], ga[0], ga[1])
+                    pgb = _kpack_gather[CPT, TC](b, b_sj, b_sp, j0, n, wn[0], wn[1], gb[0], gb[1])
+                else:
+                    pa = _tuned_g2r[AREG, VEC, KV, BM, NTH](
+                        a, a_si, a_sp, i0, m, wn[0], wn[1], tid
+                    )
+                    pb = _tuned_g2r[BREG, VEC, KV, BN, NTH](
+                        b, b_sj, b_sp, j0, n, wn[0], wn[1], tid
+                    )
+
+        # ---- ACCUMULATE. Contract 7.1, 4 and 5: per cell one `_tuned_step`
+        # per step, steps ascending. The operands of step `c` are one
+        # `RPT`-wide load (this thread's A lines) and one `CPT`-wide load (its
+        # B lines), read in the order the page was packed.
+        comptime if ADMIT:
+            # Block-uniform: every thread reads the same published minima.
+            adm = False
+            if chunk == KS and adm_exact:
+                var adm_na = UInt32(0xFF)
+                var adm_nb = UInt32(0xFF)
+                comptime for ww in range(NW):
+                    var adm_xa = adm_s.unsafe_load(pgw * 2 * NW + ww)
+                    var adm_xb = adm_s.unsafe_load(pgw * 2 * NW + NW + ww)
+                    adm_na = adm_xa if adm_xa < adm_na else adm_na
+                    adm_nb = adm_xb if adm_xb < adm_nb else adm_nb
+                adm = (adm_na + adm_nb) >= UInt32(GEMM_ADMIT_EXP_SUM)
+            if not adm:
+                adm_exact = False
+        var abase = pgw * APAGE + accrow * ASTRIDE
+        var bbase = pgw * BPAGE + acccol * BSTRIDE
+        if chunk == KS:
+          comptime if DIAG == 2 or DIAG == 5:
+            # DIAGNOSTIC: the step-0 operands for every step, no per-step load.
+            var ra1 = as_.load[width=RPT, alignment=ALIGN](abase)
+            var rb1 = bs_.load[width=CPT, alignment=ALIGN](bbase)
+            comptime for c1 in range(KS):
+                comptime for u6 in range(NR):
+                    comptime for v8 in range(NCOL):
+                        acc[u6 * CPT + v8] = _kpack_step[DIAG](
+                            ra1[u6], rb1[v8], acc[u6 * CPT + v8]
+                        )
+          else:
+           var fastw = False
+           comptime if ADMIT:
+            fastw = adm
+           if fastw:
+            # An ADMITTED window: the same loads, the same cells in the same
+            # ascending steps, the bare `fma.rn` (its flush proven the identity).
+            comptime for ca in range(KS):
+                var raa = as_.load[width=RPT, alignment=ALIGN](abase + ca * RPT)
+                var rba = bs_.load[width=CPT, alignment=ALIGN](bbase + ca * CPT)
+                comptime for ua in range(NR):
+                    comptime for va in range(NCOL):
+                        acc[ua * CPT + va] = _admit_step(raa[ua], rba[va], acc[ua * CPT + va])
+           else:
+            comptime for c0 in range(KS):
+                var ra = as_.load[width=RPT, alignment=ALIGN](abase + c0 * RPT)
+                var rb = bs_.load[width=CPT, alignment=ALIGN](bbase + c0 * CPT)
+                comptime if FASTK:
+                    # lane/amd-step-time: the DETECT seam (see the tuned kernel).
+                    _fast_rows[NR, CPT, NCELL, RPT, 1, 0](acc, ra, rb, sub_seen)
+                elif TUNED_STAGE_FTZ:
+                    # 5a and 5b were applied at staging (`_tuned_g2r`), where
+                    # `_tuned_loaded_operand` is the identity: read the loads.
+                    comptime for u2 in range(NR):
+                        comptime for v3 in range(NCOL):
+                            acc[u2 * CPT + v3] = _kpack_step[DIAG](
+                                ra[u2], rb[v3], acc[u2 * CPT + v3]
+                            )
+                else:
+                    var bfl = SIMD[DType.float32, CPT](0.0)
+                    comptime for v2 in range(NCOL):
+                        bfl[v2] = _tuned_loaded_operand(rb[v2])
+                    comptime for u3 in range(NR):
+                        var afl = _tuned_loaded_operand(ra[u3])
+                        comptime for v4 in range(NCOL):
+                            acc[u3 * CPT + v4] = _kpack_step[DIAG](
+                                afl, bfl[v4], acc[u3 * CPT + v4]
+                            )
+        else:
+            # THE RAGGED PATH, and the EMPTY one: `chunk` may be 0. Same loads,
+            # same ascending steps, same seams; no zero slot is ever read.
+            for cc in range(chunk):
+                var ra2 = as_.load[width=RPT, alignment=ALIGN](abase + cc * RPT)
+                var rb2 = bs_.load[width=CPT, alignment=ALIGN](bbase + cc * CPT)
+                var bfl2 = SIMD[DType.float32, CPT](0.0)
+                comptime for v5 in range(NCOL):
+                    bfl2[v5] = _tuned_loaded_operand(rb2[v5])
+                comptime for u5 in range(NR):
+                    var afl2 = _tuned_loaded_operand(ra2[u5])
+                    comptime for v6 in range(NCOL):
+                        acc[u5 * CPT + v6] = _kpack_step[DIAG](
+                            afl2, bfl2[v6], acc[u5 * CPT + v6]
+                        )
+
+        comptime if PAGES == 1:
+            # One page: `identical_gemm_tuned_kernel`'s two-barrier shape.
+            barrier()
+            if w + 1 < w_end:
+                var wn1 = nxt
+                comptime if GATHER:
+                    pga = _kpack_gather[RPT, TR](a, a_si, a_sp, i0, m, wn1[0], wn1[1], ga[0], ga[1])
+                    pgb = _kpack_gather[CPT, TC](b, b_sj, b_sp, j0, n, wn1[0], wn1[1], gb[0], gb[1])
+                else:
+                    pa = _tuned_g2r[AREG, VEC, KV, BM, NTH](
+                        a, a_si, a_sp, i0, m, wn1[0], wn1[1], tid
+                    )
+                    pb = _tuned_g2r[BREG, VEC, KV, BN, NTH](
+                        b, b_sj, b_sp, j0, n, wn1[0], wn1[1], tid
+                    )
+
+        # ---- THE LEAF BOUNDARY. Fires exactly once per logical leaf.
+        # (DIAG 4 and 5: no push; the accumulator is reset and the drain
+        # returns zeros.)
+        # DIAG 4 and 5 keep accumulating across leaves and store `acc` itself,
+        # so the FMA chain stays live (a reset-to-zero let the compiler delete
+        # the whole loop on the first diagnostic leg, 2026-09-13).
+        if win[2] == 1:
+            comptime if DIAG != 4 and DIAG != 5:
+                var part = SIMD[DType.float32, NCELL](0.0)
+                comptime for pe in range(NCELL):
+                    part[pe] = _fold_flush[HWFOLD](acc[pe])  # 5d, the leaf partial
+                _ = _fold_push_local[NCELL, FS, HWFOLD](fl, occ, part)
+                acc = SIMD[DType.float32, NCELL](0.0)
+            comptime if ADMIT:
+                adm_exact = True
+
+        w = w + 1
+        cur = nxt
+        wq += 1
+        if wq == wpl:
+            wq = 0
+            wt += 1
+
+    var outv = _fold_drain_local[NCELL, FS, HWFOLD](fl, occ)
+    comptime if DIAG == 4 or DIAG == 5:
+        outv = acc
+    comptime for u4 in range(NR):
+        comptime for v7 in range(NCOL):
+            var gi = i0 + accrow + u4 * TR
+            var gj = j0 + acccol + v7 * TC
+            if gi < m and gj < n:
+                comptime if GROUP:
+                    # The group's node, unflushed; the fold kernels flush on
+                    # read and every node is already flushed (long-k 5.4).
+                    var node = outv[u4 * CPT + v7]
+                    comptime if SAB:
+                        if tid == _urem[NTH](q) and _udiv[NTH](q) == u4 * CPT + v7:
+                            node = Float32(1.0e30)
+                    dst.unsafe_store(q * mn + gi * n + gj, node)
+                else:
+                    # 5g: the output cell as stored.
+                    var cell = _fold_flush[HWFOLD](outv[u4 * CPT + v7])
+                    comptime if SAB:
+                        comptime if u4 == 0 and v7 == 0:
+                            if tid == 0:
+                                cell = _gemm_step_arm_sabotage(cell)
+                    dst.unsafe_store(gi * n + gj, cell)
+    comptime if FASTK:
+        # lane/amd-step-time: a step result of my cells was subnormal; every
+        # cell (or group node) this thread owns is recomputed exactly.
+        if _detect_recompute(sub_seen):
+            var xbeg = 0
+            var xend = p_count
+            comptime if GROUP:
+                xbeg = q * gleaves
+                xend = xbeg + gleaves
+                if xend > p_count:
+                    xend = p_count
+            comptime for ux in range(NR):
+                comptime for vx in range(NCOL):
+                    var xi = i0 + accrow + ux * TR
+                    var xj = j0 + acccol + vx * TC
+                    if xi < m and xj < n:
+                        comptime if GROUP:
+                            dst.unsafe_store(
+                                q * mn + xi * n + xj,
+                                _rtf_group_node(a, b, xi, xj, xbeg, xend, p_count, leaf, k, a_si, a_sp, b_sp, b_sj),
+                            )
+                        else:
+                            dst.unsafe_store(
+                                xi * n + xj,
+                                _rtf_cell(a, b, xi, xj, p_count, leaf, k, a_si, a_sp, b_sp, b_sj),
+                            )
+
+
+def _kpack_launch[
+    RPT: Int, CPT: Int, TC: Int, KS: Int, FS: Int, GROUP: Bool, SAB: Bool, PAD: Int = 0,
+    ALIGN: Int = 4, DIAG: Int = 0, HWFOLD: Bool = False, GATHER: Bool = False,
+](
+    ctx: DeviceContext,
+    mut dst: DeviceBuffer[DType.float32],
+    mut a: DeviceBuffer[DType.float32],
+    mut b: DeviceBuffer[DType.float32],
+    m: Int,
+    n: Int,
+    k: Int,
+    leaf: Int,
+    p_count: Int,
+    st: Tuple[Int, Int, Int, Int],
+    gleaves: Int,
+    groups: Int,
+) raises:
+    """DEVIATION 2599: one launch of the packed body. `PAGES` from the matrix
+    at the packed page bytes plus the guard; the grid's x axis from the
+    IMPORTED `_tile_grid`; y is the group count in group mode, else 1."""
+    comptime NTH = TUNED_TPB
+    comptime TR = NTH // TC
+    comptime BM = RPT * TR
+    comptime BN = CPT * TC
+    # DEVIATION 2700: the kernel's page is `TR` A line groups of `KS RPT + PAD`
+    # words and `TC` B line groups of `KS CPT + PAD` (PAD 0 is 2599's page).
+    comptime PAGE_BYTES = (BM * KS + TR * PAD + BN * KS + TC * PAD) * 4
+    # A02 current experiment: NEVER RUN — PENDING MEASUREMENT; existing defaults preserved.
+    comptime PAGES = 1 if (NI06_ONE_PAGE or is_defined["ANONLIB_GEMM_ONE_PAGE"]()) else lib_smem_pages_for[
+        TARGET_COLUMN, PAGE_BYTES + GEMM_KPACK_PAGE_GUARD_BYTES
+    ]()
+    comptime assert lib_smem_page_fits_for[TARGET_COLUMN, PAGE_BYTES](), (
+        "_kpack_launch: one packed page of this geometry exceeds the column's"
+        " shared limit"
+    )
+    comptime kern = identical_gemm_kpack_kernel[
+        RPT, CPT, TC, KS, FS, PAGES, GROUP, SAB, PAD, ALIGN, DIAG, HWFOLD, GATHER
+    ]
+    var g = _tile_grid(m, n, BM, BN, False)
+    var gy = 1
+    comptime if GROUP:
+        gy = groups
+    ctx.enqueue_function[kern](
+        dst.unsafe_ptr(),
+        a.unsafe_ptr(),
+        b.unsafe_ptr(),
+        Int32(m),
+        Int32(n),
+        Int32(k),
+        Int32(leaf),
+        Int32(p_count),
+        Int32(st[0]),
+        Int32(st[1]),
+        Int32(st[2]),
+        Int32(st[3]),
+        Int32(gleaves),
+        Int32(groups),
+        grid_dim=(g[0], gy, 1),
+        block_dim=(NTH, 1, 1),
+    )
+
+
+def _kpack_run[
+    RPT: Int, CPT: Int, TC: Int, KS: Int, FS: Int, SAB: Bool, PAD: Int = 0, ALIGN: Int = 4,
+    DIAG: Int = 0, HWFOLD: Bool = False, GATHER: Bool = False,
+](
+    ctx: DeviceContext,
+    mut c: DeviceBuffer[DType.float32],
+    mut a: DeviceBuffer[DType.float32],
+    mut b: DeviceBuffer[DType.float32],
+    m: Int,
+    n: Int,
+    k: Int,
+    op: Int,
+    group_leaves: Int,
+) raises:
+    """DEVIATION 2599: one call. `group_leaves > 0` and `P >= 1`:
+    `_ksplit_run`'s lines with the packed group launch (allocate `m n G`,
+    synchronize, group launch, `_ksplit_fold_launch`, synchronize, keep the
+    buffer, `[[mojo-buffer-freed-at-last-use]]`). Otherwise one all-leaves
+    launch into `c`, asynchronous (`k == 0` stores `+0.0`)."""
+    if m <= 0 or n <= 0:
+        return
+    var part = contract_partition(k)
+    var leaf = part[0]
+    var p_count = part[1]
+    var st = gemm_operand_strides(op, m, n, k)
+    if group_leaves <= 0 or p_count <= 0:
+        _kpack_launch[RPT, CPT, TC, KS, FS, False, SAB, PAD, ALIGN, DIAG, HWFOLD, GATHER](
+            ctx, c, a, b, m, n, k, leaf, p_count, st, 0, 0
+        )
+        return
+    var rg = _ksplit_resolve_leaves(group_leaves, p_count)
+    var gws = ctx.enqueue_create_buffer[DType.float32](m * n * rg[1])
+    ctx.synchronize()
+    _kpack_launch[RPT, CPT, TC, KS, FS, True, SAB, PAD, ALIGN, DIAG, HWFOLD, GATHER](
+        ctx, gws, a, b, m, n, k, leaf, p_count, st, rg[0], rg[1]
+    )
+    _ksplit_fold_launch(ctx, c, gws, m, n, rg[1])
+    ctx.synchronize()
+    _ = gws
+
+
+def _kpack_hg_run_with_ws[
+    FS: Int, SAB: Bool
+](
+    ctx: DeviceContext,
+    mut c: DeviceBuffer[DType.float32],
+    mut a: DeviceBuffer[DType.float32],
+    mut b: DeviceBuffer[DType.float32],
+    mut ws: DeviceBuffer[DType.float32],
+    m: Int,
+    n: Int,
+    k: Int,
+    op: Int,
+) raises:
+    """The shipped kpack-hg launch mechanics with an explicit fold-stack
+    extent. `FS` changes only unused thread-local storage above the highest
+    reachable leaf-tree level; it cannot change the fold DAG."""
+    var gl = gemm_default_ksplit_leaves(m, n, k)
+    var part = contract_partition(k)
+    comptime if GEMM_REUSE_GROUP_WS:
+        if gl > 0 and part[1] > 0:
+            var rg = _ksplit_resolve_leaves(gl, part[1])
+            if len(ws) >= m * n * rg[1]:
+                _kpack_launch[
+                    GEMM_KPACK_RPT, GEMM_KPACK_CPT, TUNED_TC,
+                    GEMM_KPACK_KS, FS, True, SAB,
+                    GEMM_KPACK_PAD, GEMM_KPACK_ALIGN, 0, True, True,
+                ](ctx, ws, a, b, m, n, k, part[0], part[1],
+                  gemm_operand_strides(op, m, n, k), rg[0], rg[1])
+                comptime if not is_defined["ANONLIB_GEMM_SABOTAGE_WS_FOLD"]():
+                    _ksplit_fold_launch(ctx, c, ws, m, n, rg[1])
+                return
+            # Older callers with only plan-sized scratch retain the
+            # allocating path; they never write past a small buffer.
+    _kpack_run[
+        GEMM_KPACK_RPT, GEMM_KPACK_CPT, TUNED_TC, GEMM_KPACK_KS, FS, SAB,
+        GEMM_KPACK_PAD, GEMM_KPACK_ALIGN, 0, True, True,
+    ](ctx, c, a, b, m, n, k, op, gl)
+
+
+def identical_gemm_kpack_fold_specialized_trial_into(
+    ctx: DeviceContext,
+    mut c: DeviceBuffer[DType.float32],
+    mut a: DeviceBuffer[DType.float32],
+    mut b: DeviceBuffer[DType.float32],
+    mut ws: DeviceBuffer[DType.float32],
+    m: Int,
+    n: Int,
+    k: Int,
+    op: Int,
+) raises:
+    """Trial-only shipped dispatch with the kpack local fold stack bounded by
+    this call's maximum leaves per group. The GPT-3-small `k=768` and
+    `k=3072` cases need 4 and 8 slots rather than the profile-wide 16.
+
+    The branch is host-side and depends only on `contract_partition(k)` and
+    the existing group rule. It never changes a leaf, merge, or operation.
+    """
+    comptime if not GEMM_ARM_TRIAL:
+        raise Error(
+            "identical_gemm_kpack_fold_specialized_trial_into needs "
+            "-D ANONLIB_GEMM_ARM_TRIAL=1"
+        )
+    comptime if not GEMM_BODY_KPACK_HG:
+        identical_gemm_shipped_into(ctx, c, a, b, ws, m, n, k, op)
+        return
+    if m <= 0 or n <= 0:
+        return
+    comptime if TARGET_COLUMN == COLUMN_AMD:
+        if gemm_amd_short_k_tuned(m, n, k):
+            identical_gemm_shipped_into(ctx, c, a, b, ws, m, n, k, op)
+            return
+    if choose_gemm_plan_tiles(m, n, k) != PLAN_TUNED_128_8X8:
+        identical_gemm_shipped_into(ctx, c, a, b, ws, m, n, k, op)
+        return
+    var p_count = contract_partition(k)[1]
+    var gl = gemm_default_ksplit_leaves(m, n, k)
+    var fs = gemm_kpack_fold_slots_for(p_count, gl)
+    if fs == 4:
+        _kpack_hg_run_with_ws[4, False](ctx, c, a, b, ws, m, n, k, op)
+    elif fs == 8:
+        _kpack_hg_run_with_ws[8, False](ctx, c, a, b, ws, m, n, k, op)
+    else:
+        _kpack_hg_run_with_ws[GEMM_KPACK_FS, False](
+            ctx, c, a, b, ws, m, n, k, op
+        )
+
+
+def _kpack_geometry_run[
+    SAB: Bool
+](
+    ctx: DeviceContext,
+    mut c: DeviceBuffer[DType.float32],
+    mut a: DeviceBuffer[DType.float32],
+    mut b: DeviceBuffer[DType.float32],
+    m: Int,
+    n: Int,
+    k: Int,
+    op: Int,
+    geom: Int,
+) raises:
+    """The geometry's constants bound, its own rule's group size passed."""
+    var gl = gemm_step_kpack_leaves(geom, m, n, k)
+    if geom == GEMM_GEOM_KPACK:
+        _kpack_run[
+            GEMM_KPACK_RPT, GEMM_KPACK_CPT, TUNED_TC, GEMM_KPACK_KS, GEMM_KPACK_FS, SAB
+        ](ctx, c, a, b, m, n, k, op, gl)
+        return
+    if geom == GEMM_GEOM_KPACK_WIDE:
+        _kpack_run[
+            GEMM_KPACKW_RPT, GEMM_KPACKW_CPT, TUNED_TC, GEMM_KPACKW_KS, GEMM_KPACKW_FS, SAB
+        ](ctx, c, a, b, m, n, k, op, gl)
+        return
+    if geom == GEMM_GEOM_KPACK_PAD:
+        # DEVIATION 2700: `kpack`'s constants and rule, the page padded.
+        _kpack_run[
+            GEMM_KPACK_RPT, GEMM_KPACK_CPT, TUNED_TC, GEMM_KPACK_KS, GEMM_KPACK_FS, SAB,
+            GEMM_KPACK_PAD,
+        ](ctx, c, a, b, m, n, k, op, gl)
+        return
+    if geom == GEMM_GEOM_KPACK_PADV:
+        # DEVIATION 2703: the padded page, 16-byte aligned, vector loads.
+        _kpack_run[
+            GEMM_KPACK_RPT, GEMM_KPACK_CPT, TUNED_TC, GEMM_KPACK_KS, GEMM_KPACK_FS, SAB,
+            GEMM_KPACK_PAD, GEMM_KPACK_ALIGN,
+        ](ctx, c, a, b, m, n, k, op, gl)
+        return
+    if geom == GEMM_GEOM_KPACK_HF:
+        # DEVIATION 2706: padv with the hardware flush in the fold.
+        _kpack_run[
+            GEMM_KPACK_RPT, GEMM_KPACK_CPT, TUNED_TC, GEMM_KPACK_KS, GEMM_KPACK_FS, SAB,
+            GEMM_KPACK_PAD, GEMM_KPACK_ALIGN, 0, True, False,
+        ](ctx, c, a, b, m, n, k, op, gl)
+        return
+    if geom == GEMM_GEOM_KPACK_GS:
+        # DEVIATION 2706: padv with gather staging.
+        _kpack_run[
+            GEMM_KPACK_RPT, GEMM_KPACK_CPT, TUNED_TC, GEMM_KPACK_KS, GEMM_KPACK_FS, SAB,
+            GEMM_KPACK_PAD, GEMM_KPACK_ALIGN, 0, False, True,
+        ](ctx, c, a, b, m, n, k, op, gl)
+        return
+    if geom == GEMM_GEOM_KPACK_HG:
+        # DEVIATION 2706: both.
+        _kpack_run[
+            GEMM_KPACK_RPT, GEMM_KPACK_CPT, TUNED_TC, GEMM_KPACK_KS, GEMM_KPACK_FS, SAB,
+            GEMM_KPACK_PAD, GEMM_KPACK_ALIGN, 0, True, True,
+        ](ctx, c, a, b, m, n, k, op, gl)
+        return
+    raise Error("_kpack_geometry_run: geometry " + String(geom) + " is not a kpack geometry")
+
+
+def identical_gemm_step_kpack_into(
+    ctx: DeviceContext,
+    mut c: DeviceBuffer[DType.float32],
+    mut a: DeviceBuffer[DType.float32],
+    mut b: DeviceBuffer[DType.float32],
+    mut ws: DeviceBuffer[DType.float32],
+    m: Int,
+    n: Int,
+    k: Int,
+    op: Int,
+    geom: Int,
+    sabotage: Bool,
+) raises:
+    """DEVIATION 2599. `C = op(A) . op(B)` on `kpack` or `kpack_wide`: the
+    group launch and fold where the arm's rule takes the call (SYNCHRONIZES,
+    it allocates the node workspace), else one all-leaves launch
+    (asynchronous). `ws` is untouched on a trial build.
+
+    Without `-D ANONLIB_GEMM_ARM_TRIAL=1` the kernel is not compiled and
+    this runs the shipped dispatch, which READS `ws` (size it with
+    `identical_gemm_workspace_max_floats`), and ignores `sabotage`."""
+    if not _is_kpack_geometry(geom):
+        raise Error("identical_gemm_step_kpack_into: geometry " + String(geom) + " is not a kpack geometry")
+    if m <= 0 or n <= 0:
+        return
+    comptime if GEMM_ARM_TRIAL:
+        if sabotage:
+            _kpack_geometry_run[True](ctx, c, a, b, m, n, k, op, geom)
+        else:
+            _kpack_geometry_run[False](ctx, c, a, b, m, n, k, op, geom)
+        return
+    identical_gemm_shipped_into(ctx, c, a, b, ws, m, n, k, op)
+    ctx.synchronize()
+
+
+def identical_gemm_step_kpack_phase_into(
+    ctx: DeviceContext,
+    mut c: DeviceBuffer[DType.float32],
+    mut a: DeviceBuffer[DType.float32],
+    mut b: DeviceBuffer[DType.float32],
+    mut ws: DeviceBuffer[DType.float32],
+    m: Int,
+    n: Int,
+    k: Int,
+    op: Int,
+    geom: Int,
+) raises -> Tuple[Int, Int, Int]:
+    """`identical_gemm_step_kpack_into` (clean) with a host synchronize after
+    each phase: `(alloc_ns, group_ns, fold_ns)`, the price harness's PHASE
+    line for the arms. Where the arm's rule declines, the all-leaves launch
+    is reported as `group_ns`. A non-trial build runs the shipped dispatch
+    and reports it all as `group_ns`."""
+    if not _is_kpack_geometry(geom):
+        raise Error("identical_gemm_step_kpack_phase_into: geometry " + String(geom) + " is not a kpack geometry")
+    if m <= 0 or n <= 0:
+        return (0, 0, 0)
+    comptime if GEMM_ARM_TRIAL:
+        var gl = gemm_step_kpack_leaves(geom, m, n, k)
+        var part = contract_partition(k)
+        var leaf = part[0]
+        var p_count = part[1]
+        var st = gemm_operand_strides(op, m, n, k)
+        if gl <= 0 or p_count <= 0:
+            var tz = perf_counter_ns()
+            _kpack_geometry_run[False](ctx, c, a, b, m, n, k, op, geom)
+            ctx.synchronize()
+            return (0, Int(perf_counter_ns() - tz), 0)
+        var rg = _ksplit_resolve_leaves(gl, p_count)
+        var t0 = perf_counter_ns()
+        var gws = ctx.enqueue_create_buffer[DType.float32](m * n * rg[1])
+        ctx.synchronize()
+        var t1 = perf_counter_ns()
+        if geom == GEMM_GEOM_KPACK:
+            _kpack_launch[
+                GEMM_KPACK_RPT, GEMM_KPACK_CPT, TUNED_TC, GEMM_KPACK_KS, GEMM_KPACK_FS, True, False
+            ](ctx, gws, a, b, m, n, k, leaf, p_count, st, rg[0], rg[1])
+        elif geom == GEMM_GEOM_KPACK_PAD:
+            _kpack_launch[
+                GEMM_KPACK_RPT, GEMM_KPACK_CPT, TUNED_TC, GEMM_KPACK_KS, GEMM_KPACK_FS, True, False,
+                GEMM_KPACK_PAD,
+            ](ctx, gws, a, b, m, n, k, leaf, p_count, st, rg[0], rg[1])
+        elif geom == GEMM_GEOM_KPACK_PADV:
+            _kpack_launch[
+                GEMM_KPACK_RPT, GEMM_KPACK_CPT, TUNED_TC, GEMM_KPACK_KS, GEMM_KPACK_FS, True, False,
+                GEMM_KPACK_PAD, GEMM_KPACK_ALIGN,
+            ](ctx, gws, a, b, m, n, k, leaf, p_count, st, rg[0], rg[1])
+        elif geom == GEMM_GEOM_KPACK_HF:
+            _kpack_launch[
+                GEMM_KPACK_RPT, GEMM_KPACK_CPT, TUNED_TC, GEMM_KPACK_KS, GEMM_KPACK_FS, True, False,
+                GEMM_KPACK_PAD, GEMM_KPACK_ALIGN, 0, True, False,
+            ](ctx, gws, a, b, m, n, k, leaf, p_count, st, rg[0], rg[1])
+        elif geom == GEMM_GEOM_KPACK_GS:
+            _kpack_launch[
+                GEMM_KPACK_RPT, GEMM_KPACK_CPT, TUNED_TC, GEMM_KPACK_KS, GEMM_KPACK_FS, True, False,
+                GEMM_KPACK_PAD, GEMM_KPACK_ALIGN, 0, False, True,
+            ](ctx, gws, a, b, m, n, k, leaf, p_count, st, rg[0], rg[1])
+        elif geom == GEMM_GEOM_KPACK_HG:
+            _kpack_launch[
+                GEMM_KPACK_RPT, GEMM_KPACK_CPT, TUNED_TC, GEMM_KPACK_KS, GEMM_KPACK_FS, True, False,
+                GEMM_KPACK_PAD, GEMM_KPACK_ALIGN, 0, True, True,
+            ](ctx, gws, a, b, m, n, k, leaf, p_count, st, rg[0], rg[1])
+        else:
+            _kpack_launch[
+                GEMM_KPACKW_RPT, GEMM_KPACKW_CPT, TUNED_TC, GEMM_KPACKW_KS, GEMM_KPACKW_FS, True, False
+            ](ctx, gws, a, b, m, n, k, leaf, p_count, st, rg[0], rg[1])
+        ctx.synchronize()
+        var t2 = perf_counter_ns()
+        _ksplit_fold_launch(ctx, c, gws, m, n, rg[1])
+        ctx.synchronize()
+        var t3 = perf_counter_ns()
+        _ = gws
+        return (Int(t1 - t0), Int(t2 - t1), Int(t3 - t2))
+    var ts = perf_counter_ns()
+    identical_gemm_shipped_into(ctx, c, a, b, ws, m, n, k, op)
+    ctx.synchronize()
+    return (0, Int(perf_counter_ns() - ts), 0)
+
+
+def gemm_step_kpack_rule(m: Int, n: Int, k: Int, s: Int, bm: Int, bn: Int) -> Int:
+    """The long-k group rule (brief section 4, rules 1, 2 and 4) with the
+    tiles counted on a `bm x bn` tile. At 128x128 it is
+    `gemm_step_ksplit_rule(m, n, k, s, True)`, which
+    `check_kpack_rule_hand_counts` holds it to. Leaves per group, 0 when it
+    declines. Execution plan only (contract 6.1)."""
+    if choose_gemm_plan_tiles(m, n, k) != PLAN_TUNED_128_8X8:
+        return 0
+    var p_count = contract_partition(k)[1]
+    if p_count < 2:
+        return 0
+    var gl = gemm_step_ksplit_finest_leaves(m, n, k)
+    if gl < 1:
+        return 0
+    if (p_count + gl - 1) // gl < 2:
+        return 0
+    if s <= 0:
+        return gl
+    var tiles = ((m + bm - 1) // bm) * ((n + bn - 1) // bn)
+    if tiles >= s:
+        return 0
+    while tiles * ((p_count + 2 * gl - 1) // (2 * gl)) >= GEMM_KSPLIT_SLACK * s:
+        gl = gl * 2
+    return gl
+
+
+def gemm_step_kpack_leaves(geom: Int, m: Int, n: Int, k: Int) raises -> Int:
+    """Leaves per group the arm's group launch uses at `(m, n, k)`, 0 for its
+    all-leaves launch. `kpack` reads `gemm_step_ksplit_rule` itself at the
+    trial row `GEMM_KSPLIT_S` (the shipped default's group sizes on NVIDIA),
+    `kpack_wide` the same rule on its 128x256 tile."""
+    if _is_kpack_geometry(geom) and geom != GEMM_GEOM_KPACK_WIDE:
+        return gemm_step_ksplit_rule(m, n, k, GEMM_KSPLIT_S, True)
+    if geom == GEMM_GEOM_KPACK_WIDE:
+        return gemm_step_kpack_rule(m, n, k, GEMM_KSPLIT_S, GEMM_KPACKW_BM, GEMM_KPACKW_BN)
+    raise Error("gemm_step_kpack_leaves: geometry " + String(geom) + " is not a kpack geometry")
+
+
+def gemm_step_kpack_reach(geom: Int, m: Int, n: Int, k: Int) raises -> Int:
+    """Cells a sabotage launch of `identical_gemm_step_kpack_into` moves: one
+    per tile in all-leaves mode (thread 0, cell (0, 0), always in the output,
+    `k == 0` included), and in group mode one per `(tile, q)` whose cell
+    (thread `q mod NTH`, register cell `q // NTH`) lies in the output."""
+    comptime NTH = TUNED_TPB
+    comptime TR = TUNED_TPB // TUNED_TC
+    var bm = GEMM_KPACK_RPT * TR
+    var bn = GEMM_KPACK_CPT * TUNED_TC
+    var cpt = GEMM_KPACK_CPT
+    var ncell = GEMM_KPACK_RPT * GEMM_KPACK_CPT
+    if geom == GEMM_GEOM_KPACK_WIDE:
+        bm = GEMM_KPACKW_BM
+        bn = GEMM_KPACKW_BN
+        cpt = GEMM_KPACKW_CPT
+        ncell = GEMM_KPACKW_RPT * GEMM_KPACKW_CPT
+    elif not _is_kpack_geometry(geom):
+        raise Error("gemm_step_kpack_reach: geometry " + String(geom) + " is not a kpack geometry")
+    if m <= 0 or n <= 0:
+        return 0
+    var tiles_i = (m + bm - 1) // bm
+    var tiles_j = (n + bn - 1) // bn
+    var p_count = contract_partition(k)[1]
+    var gl = gemm_step_kpack_leaves(geom, m, n, k)
+    if gl <= 0 or p_count <= 0:
+        return tiles_i * tiles_j
+    var rg = _ksplit_resolve_leaves(gl, p_count)
+    var moved = 0
+    for ti in range(tiles_i):
+        for tj in range(tiles_j):
+            for q in range(rg[1]):
+                var reg = q // NTH
+                if reg >= ncell:
+                    continue
+                var th = q - reg * NTH
+                var arow = th // TUNED_TC
+                var acol = th - arow * TUNED_TC
+                var gi = ti * bm + arow + (reg // cpt) * TR
+                var gj = tj * bn + acol + (reg % cpt) * TUNED_TC
+                if gi < m and gj < n:
+                    moved += 1
+    return moved
+
+
+def _kpack_geometry_name[
+    RPT: Int, CPT: Int, TC: Int, KS: Int, FS: Int, PAD: Int = 0, ALIGN: Int = 4,
+    HWFOLD: Bool = False, GATHER: Bool = False,
+](label: String) -> String:
+    """Built from the constants the launcher binds, never a literal."""
+    comptime TR = TUNED_TPB // TC
+    comptime BM = RPT * TR
+    comptime BN = CPT * TC
+    comptime PAGE_BYTES = (BM * KS + TR * PAD + BN * KS + TC * PAD) * 4
+    comptime PAGES = lib_smem_pages_for[
+        TARGET_COLUMN, PAGE_BYTES + GEMM_KPACK_PAGE_GUARD_BYTES
+    ]()
+    var s = label + " " + String(BM) + "x" + String(BN)
+    s += " reg" + String(RPT) + "x" + String(CPT) + " TC=" + String(TC)
+    s += " KS=" + String(KS) + " page=packed(group,step,line) pad=" + String(PAD)
+    s += " align=" + String(ALIGN)
+    comptime if HWFOLD:
+        s += " fold_flush=hw"
+    comptime if GATHER:
+        s += " stage=gather"
+    s += " page_bytes=" + String(PAGE_BYTES)
+    s += " pages=" + String(PAGES) + " load=per-step fold=lane-wide local FS=" + String(FS)
+    s += " tpb=" + String(TUNED_TPB) + " hwftz=" + String(TUNED_HW_FTZ_FMA)
+    s += " groups where its rule takes the call (S=" + String(GEMM_KSPLIT_S)
+    s += " slack=" + String(GEMM_KSPLIT_SLACK) + "), else all leaves in one launch"
+    return s
+
+
+# ===========================================================================
+# THE LANE FOLD ARMS (DEVIATIONS 2640 and 2641, 2026-09-11)
+# ===========================================================================
+# The shipped ksplit default spends 13.3 ms per H100 step in its FOLD launch
+# (brief 2.1): `identical_gemm_fold_stack_kernel`, one thread per output
+# cell, a 12-level register stack per thread. Both arms keep the shipped
+# group launch (`_ksplit_groups_launch`, `identical_gemm_ksplit_kernel`
+# unchanged) and fold the group nodes with `identical_gemm_kfold_lanes_kernel`
+# instead: one thread per `GEMM_KFOLD_W` consecutive cells, `_fold_push` and
+# `_fold_drain` spelled lane by lane over a `GEMM_KFOLD_FS`-level register
+# stack. `kfoldv` (2640) runs at the shipped rule, `kfoldv_leaf` (2641) at
+# `ksplit_leaf`'s. The identity argument is brief section 5, written and
+# committed before this code. Only the trial-gated dispatch in
+# `identical_gemm_step_geometry_into`, the trial harnesses and the host checks
+# reach this section; no shipped kernel, dispatch line or kernel matrix value
+# changes.
+
+#: Cells per fold thread (lanes of every fold register). Execution plan only
+#: (brief 5.6), the same on every column, a power of two.
+comptime GEMM_KFOLD_W = 16
+#: Levels of the lane-wise register stack: `G <= 2^FS - 1` groups (brief 5.5).
+comptime GEMM_KFOLD_FS = 8
+#: Group vectors loaded before their pushes (the shipped fold's FOLD_BATCH idea).
+comptime GEMM_KFOLD_VB = 2
+#: Threads per fold block, the shipped fold's block size.
+comptime GEMM_KFOLD_TPB = FLAT_TPB
+#: The most groups the lane fold takes; above it the shipped fold runs.
+comptime GEMM_KFOLD_MAX_GROUPS = (1 << GEMM_KFOLD_FS) - 1
+
+
+def _fold_push_lanes[
+    W: Int, FS: Int
+](
+    mut stack: SIMD[DType.float32, FS * W],
+    mut occ: Int,
+    value: SIMD[DType.float32, W],
+) -> Bool:
+    """DEVIATION 2640: `_fold_push`, lane by lane. Level `d` of lane `e` is
+    `stack[d * W + e]`. The branches read only `occ`, `d` and `placed`, which
+    are one per thread, so every lane takes the branches `_fold_push` takes for
+    its cell; a merge is `_fold_push`'s expression on one lane, a store copies
+    one lane. No expression reads two lanes (brief 5.3, 5.4). Returns False
+    when all `FS` levels were occupied (overflow), which needs `occ = 2^FS - 1`
+    before the push (brief 5.5). `check_kfold_lanes_is_the_stack_fold` holds
+    it to `_fold_push` and `fold_balanced_tree` on the host."""
+    var val = value
+    var placed = False
+    comptime for d in range(FS):
+        if not placed:
+            if ((occ >> d) & 1) == 1:
+                comptime if SAB_FOLD_STRIDE:
+                    # SABOTAGE: `_fold_push_local`'s far-end pairing, lane-wise.
+                    comptime for es in range(W):
+                        val[es] = ftz(ftz(val[es]) + ftz(stack[(FS - 1 - d) * W + es]))
+                else:
+                    comptime for e in range(W):
+                        val[e] = ftz(ftz(stack[d * W + e]) + ftz(val[e]))
+                occ = occ - (1 << d)
+            else:
+                comptime for e2 in range(W):
+                    stack[d * W + e2] = val[e2]
+                occ = occ + (1 << d)
+                placed = True
+    return placed
+
+
+def _fold_drain_lanes[
+    W: Int, FS: Int
+](stack: SIMD[DType.float32, FS * W], occ: Int) -> SIMD[DType.float32, W]:
+    """DEVIATION 2640: `_fold_drain`, lane by lane: the lowest occupied level
+    copies, each higher occupied level joins on the left. No addition at
+    `occ == 1`."""
+    var have = False
+    var acc = SIMD[DType.float32, W](0.0)
+    comptime for d in range(FS):
+        if ((occ >> d) & 1) == 1:
+            if have:
+                comptime for e in range(W):
+                    acc[e] = ftz(ftz(stack[d * W + e]) + ftz(acc[e]))
+            else:
+                comptime for e2 in range(W):
+                    acc[e2] = stack[d * W + e2]
+                have = True
+    return acc
+
+
+def identical_gemm_kfold_lanes_kernel[
+    W: Int, FS: Int, VB: Int, SAB: Bool
+](
+    c: MutPointer[Float32, MutAnyOrigin],
+    ws: MutPointer[Float32, MutAnyOrigin],
+    mn_in: Int32,
+    groups_in: Int32,
+):
+    """DEVIATION 2640: fold each cell's `G` group nodes (`ws[q * mn + cell]`,
+    the ksplit kernel's layout) into `c[cell]`, `W` cells per thread.
+
+    Block `b`, thread `t` owns cells `base + e`, `e < W`,
+    `base = (b * GEMM_KFOLD_TPB + t) * W`: a bijection onto `[0, mn)` (brief
+    5.3). A full run loads each group vector `W` wide and stores `W` wide; the
+    last thread of a ragged output loads and stores only lanes inside `mn`
+    (the others stay `+0.0` and are never stored). `VB` vectors load before
+    their pushes, then the tail one at a time, `q` ascending in both. The push
+    and the drain are `_fold_push_lanes` and `_fold_drain_lanes`; the stored
+    cell is `ftz(root)` per lane, the shipped fold stack kernel's 5g.
+
+    The launcher never sends `G < 1` or `G > 2^FS - 1`; a thread that would see
+    one returns before any load or store.
+
+    `SAB = True` (brief 5.6) moves lane 0 of thread 0 of every block through
+    `_gemm_step_arm_sabotage`: one cell per fold block, always inside the
+    output. `gemm_step_kfold_reach` counts it with the group launch's cells.
+    """
+    comptime NTH = GEMM_KFOLD_TPB
+    comptime assert W >= 1 and (W & (W - 1)) == 0, (
+        "identical_gemm_kfold_lanes_kernel: W is a register width and must be a"
+        " power of two"
+    )
+    comptime assert FS >= 1 and ((FS * W) & (FS * W - 1)) == 0, (
+        "identical_gemm_kfold_lanes_kernel: FS * W is the stack register's width"
+        " and must be a power of two"
+    )
+    comptime assert VB >= 1 and ((VB * W) & (VB * W - 1)) == 0, (
+        "identical_gemm_kfold_lanes_kernel: VB * W is the load batch register's"
+        " width and must be a power of two"
+    )
+
+    var mn = Int(mn_in)
+    var groups = Int(groups_in)
+    var tid = Int(thread_idx.x)
+    var base = (Int(block_idx.x) * NTH + tid) * W
+    if base >= mn:
+        return
+    if groups < 1 or groups > (1 << FS) - 1:
+        return
+    var full = base + W <= mn
+
+    var stack = SIMD[DType.float32, FS * W](0.0)
+    var occ = 0
+    var q = 0
+    while q + VB <= groups:
+        var batch = SIMD[DType.float32, VB * W](0.0)
+        if full:
+            comptime for bv in range(VB):
+                var lv = ws.unsafe_load[width=W]((q + bv) * mn + base)
+                comptime for e in range(W):
+                    batch[bv * W + e] = lv[e]
+        else:
+            comptime for bv2 in range(VB):
+                comptime for e2 in range(W):
+                    if base + e2 < mn:
+                        batch[bv2 * W + e2] = ws.unsafe_load((q + bv2) * mn + base + e2)
+        comptime for bv3 in range(VB):
+            var val = SIMD[DType.float32, W](0.0)
+            comptime for e3 in range(W):
+                val[e3] = batch[bv3 * W + e3]
+            _ = _fold_push_lanes[W, FS](stack, occ, val)
+        q += VB
+    while q < groups:
+        var val1 = SIMD[DType.float32, W](0.0)
+        if full:
+            val1 = ws.unsafe_load[width=W](q * mn + base)
+        else:
+            comptime for e4 in range(W):
+                if base + e4 < mn:
+                    val1[e4] = ws.unsafe_load(q * mn + base + e4)
+        _ = _fold_push_lanes[W, FS](stack, occ, val1)
+        q += 1
+
+    var root = _fold_drain_lanes[W, FS](stack, occ)
+    var outv = SIMD[DType.float32, W](0.0)
+    comptime for e5 in range(W):
+        # 5g: the output cell as stored.
+        outv[e5] = ftz(root[e5])
+    comptime if SAB:
+        if tid == 0:
+            outv[0] = _gemm_step_arm_sabotage(outv[0])
+    if full:
+        c.unsafe_store(base, outv)
+    else:
+        comptime for e6 in range(W):
+            if base + e6 < mn:
+                c.unsafe_store(base + e6, outv[e6])
+
+
+def gemm_kfold_blocks(mn: Int) -> Int:
+    """Blocks the lane fold launches over `mn` cells (`ceil(ceil(mn / W) /
+    TPB)`), and the cells its sabotage moves."""
+    if mn <= 0:
+        return 0
+    var threads = (mn + GEMM_KFOLD_W - 1) // GEMM_KFOLD_W
+    return (threads + GEMM_KFOLD_TPB - 1) // GEMM_KFOLD_TPB
+
+
+def _kfold_fold_launch[
+    SAB: Bool
+](
+    ctx: DeviceContext,
+    mut c: DeviceBuffer[DType.float32],
+    mut ws: DeviceBuffer[DType.float32],
+    m: Int,
+    n: Int,
+    groups: Int,
+) raises:
+    """DEVIATION 2640, launch two: the lane fold over `m n` cells and `groups`
+    nodes per cell. RAISES outside `1 .. GEMM_KFOLD_MAX_GROUPS`."""
+    comptime kern = identical_gemm_kfold_lanes_kernel[
+        GEMM_KFOLD_W, GEMM_KFOLD_FS, GEMM_KFOLD_VB, SAB
+    ]
+    if groups < 1 or groups > GEMM_KFOLD_MAX_GROUPS:
+        raise Error(
+            "_kfold_fold_launch: " + String(groups) + " groups is outside 1 .. "
+            + String(GEMM_KFOLD_MAX_GROUPS)
+        )
+    var mn = m * n
+    step_count_launch()
+    ctx.enqueue_function[kern](
+        c.unsafe_ptr(),
+        ws.unsafe_ptr(),
+        Int32(mn),
+        Int32(groups),
+        grid_dim=(gemm_kfold_blocks(mn), 1, 1),
+        block_dim=(GEMM_KFOLD_TPB, 1, 1),
+    )
+
+
+def _kfold_run[
+    SAB: Bool
+](
+    ctx: DeviceContext,
+    mut c: DeviceBuffer[DType.float32],
+    mut a: DeviceBuffer[DType.float32],
+    mut b: DeviceBuffer[DType.float32],
+    m: Int,
+    n: Int,
+    k: Int,
+    op: Int,
+    group_leaves: Int,
+) raises:
+    """DEVIATIONS 2640 and 2641: one call. `_ksplit_run`'s lines (allocate
+    `m n G`, synchronize, the shipped group launch, fold, synchronize, keep the
+    buffer, `[[mojo-buffer-freed-at-last-use]]`) with the lane fold where
+    `G <= GEMM_KFOLD_MAX_GROUPS` and the shipped `_ksplit_fold_launch` above it.
+    `k == 0` takes `identical_gemm_step_ksplit_into`'s own line: the step arm
+    kernel at the shipped geometry stores `+0.0` per cell (brief 5.6)."""
+    if m <= 0 or n <= 0:
+        return
+    var part = contract_partition(k)
+    var leaf = part[0]
+    var p_count = part[1]
+    var st = gemm_operand_strides(op, m, n, k)
+    if p_count <= 0:
+        _launch_step_arm[
+            GEMM_KSPLIT_RPT, GEMM_KSPLIT_CPT, TUNED_TC, GEMM_KSPLIT_KS, False, SAB
+        ](ctx, c, a, b, m, n, k, leaf, p_count, st)
+        step_count_sync()
+        ctx.synchronize()
+        return
+    var rg = _ksplit_resolve_leaves(group_leaves, p_count)
+    step_count_device_alloc()
+    var gws = ctx.enqueue_create_buffer[DType.float32](m * n * rg[1])
+    # DEVIATION 2721: the wait between this allocation and the launch that
+    # consumes it is gone, same in-order argument as `identical_gemm`. The
+    # trailing wait before `_ = gws` stays, and has to.
+    _ksplit_groups_launch[
+        GEMM_KSPLIT_RPT, GEMM_KSPLIT_CPT, TUNED_TC, GEMM_KSPLIT_KS, SAB
+    ](ctx, gws, a, b, m, n, k, leaf, p_count, st, rg[0], rg[1])
+    if rg[1] <= GEMM_KFOLD_MAX_GROUPS:
+        _kfold_fold_launch[SAB](ctx, c, gws, m, n, rg[1])
+    else:
+        _ksplit_fold_launch(ctx, c, gws, m, n, rg[1])
+    step_count_sync()
+    ctx.synchronize()
+    _ = gws
+
+
+def identical_gemm_step_kfold_into(
+    ctx: DeviceContext,
+    mut c: DeviceBuffer[DType.float32],
+    mut a: DeviceBuffer[DType.float32],
+    mut b: DeviceBuffer[DType.float32],
+    mut ws: DeviceBuffer[DType.float32],
+    m: Int,
+    n: Int,
+    k: Int,
+    op: Int,
+    geom: Int,
+    sabotage: Bool,
+) raises:
+    """DEVIATIONS 2640 and 2641. `C = op(A) . op(B)` on `kfoldv` or
+    `kfoldv_leaf` at the group size `gemm_step_geometry_group_leaves` names
+    (the arm's rule, or its forced fallback). SYNCHRONIZES. `ws` is untouched
+    on a trial build.
+
+    Without `-D ANONLIB_GEMM_ARM_TRIAL=1` the lane fold is not compiled and
+    this runs the shipped dispatch, which READS `ws` (size it with
+    `identical_gemm_workspace_max_floats`), and ignores `sabotage`."""
+    _ = _kfold_ksplit_geometry(geom)
+    if m <= 0 or n <= 0:
+        return
+    comptime if GEMM_ARM_TRIAL:
+        var gl = gemm_step_geometry_group_leaves(geom, m, n, k)
+        if sabotage:
+            _kfold_run[True](ctx, c, a, b, m, n, k, op, gl)
+        else:
+            _kfold_run[False](ctx, c, a, b, m, n, k, op, gl)
+        return
+    identical_gemm_shipped_into(ctx, c, a, b, ws, m, n, k, op)
+    step_count_sync()
+    ctx.synchronize()
+
+
+def identical_gemm_step_kfold_phase_into(
+    ctx: DeviceContext,
+    mut c: DeviceBuffer[DType.float32],
+    mut a: DeviceBuffer[DType.float32],
+    mut b: DeviceBuffer[DType.float32],
+    mut ws: DeviceBuffer[DType.float32],
+    m: Int,
+    n: Int,
+    k: Int,
+    op: Int,
+    geom: Int,
+) raises -> Tuple[Int, Int, Int]:
+    """`identical_gemm_step_kfold_into` (clean) with a host synchronize after
+    each phase: `(alloc_ns, group_ns, fold_ns)`, the price harness's PHASE line
+    for the arms (`phase_of=arm_kfold`). `k == 0` reports its one launch as
+    `group_ns`. A non-trial build runs the shipped dispatch and reports it all
+    as `group_ns`."""
+    _ = _kfold_ksplit_geometry(geom)
+    if m <= 0 or n <= 0:
+        return (0, 0, 0)
+    comptime if GEMM_ARM_TRIAL:
+        var gl = gemm_step_geometry_group_leaves(geom, m, n, k)
+        var part = contract_partition(k)
+        var leaf = part[0]
+        var p_count = part[1]
+        var st = gemm_operand_strides(op, m, n, k)
+        if p_count <= 0:
+            var tz = perf_counter_ns()
+            _kfold_run[False](ctx, c, a, b, m, n, k, op, gl)
+            return (0, Int(perf_counter_ns() - tz), 0)
+        var rg = _ksplit_resolve_leaves(gl, p_count)
+        var t0 = perf_counter_ns()
+        step_count_device_alloc()
+        var gws = ctx.enqueue_create_buffer[DType.float32](m * n * rg[1])
+        step_count_sync()
+        ctx.synchronize()
+        var t1 = perf_counter_ns()
+        _ksplit_groups_launch[
+            GEMM_KSPLIT_RPT, GEMM_KSPLIT_CPT, TUNED_TC, GEMM_KSPLIT_KS, False
+        ](ctx, gws, a, b, m, n, k, leaf, p_count, st, rg[0], rg[1])
+        step_count_sync()
+        ctx.synchronize()
+        var t2 = perf_counter_ns()
+        if rg[1] <= GEMM_KFOLD_MAX_GROUPS:
+            _kfold_fold_launch[False](ctx, c, gws, m, n, rg[1])
+        else:
+            _ksplit_fold_launch(ctx, c, gws, m, n, rg[1])
+        step_count_sync()
+        ctx.synchronize()
+        var t3 = perf_counter_ns()
+        _ = gws
+        return (Int(t1 - t0), Int(t2 - t1), Int(t3 - t2))
+    var ts = perf_counter_ns()
+    identical_gemm_shipped_into(ctx, c, a, b, ws, m, n, k, op)
+    step_count_sync()
+    ctx.synchronize()
+    return (0, Int(perf_counter_ns() - ts), 0)
+
+
+def _kfold_ksplit_geometry(geom: Int) raises -> Int:
+    """The ksplit geometry whose rule a lane fold geometry runs: `kfoldv` the
+    shipped rule's (`ksplit`), `kfoldv_leaf` `ksplit_leaf`'s."""
+    if geom == GEMM_GEOM_KFOLDV:
+        return GEMM_GEOM_KSPLIT
+    if geom == GEMM_GEOM_KFOLDV_LEAF:
+        return GEMM_GEOM_KSPLIT_LEAF
+    raise Error("geometry " + String(geom) + " is not a lane fold geometry")
+
+
+def gemm_step_kfold_rule(geom: Int, m: Int, n: Int, k: Int, s: Int) raises -> Int:
+    """Leaves per group the arm's rule gives at a reading `s`, 0 when it
+    declines: `kfoldv` is `gemm_step_ksplit_rule(m, n, k, s, True)`,
+    `kfoldv_leaf` is `gemm_step_ksplit_rule(m, n, k, 0, False)` (reads no `s`).
+    `s` is an argument so a host check holds the hand counts on every column."""
+    if _kfold_ksplit_geometry(geom) == GEMM_GEOM_KSPLIT:
+        return gemm_step_ksplit_rule(m, n, k, s, True)
+    return gemm_step_ksplit_rule(m, n, k, 0, False)
+
+
+def gemm_step_kfold_leaves(geom: Int, m: Int, n: Int, k: Int) raises -> Int:
+    """The arm's rule at this column's trial row `GEMM_KSPLIT_S` (on NVIDIA the
+    shipped default's 132)."""
+    return gemm_step_kfold_rule(geom, m, n, k, GEMM_KSPLIT_S)
+
+
+def gemm_step_kfold_reach(geom: Int, m: Int, n: Int, k: Int) raises -> Int:
+    """Cells a sabotage launch of `identical_gemm_step_kfold_into` moves (brief
+    5.6): one per tile at `k == 0`; otherwise the group launch's cells (one per
+    `(tile, q)` whose cell, thread `q mod NTH` at register cell `q // NTH`,
+    lies in the output) plus one per lane fold block (cell
+    `b * TPB * W`), minus the cells in both. Where the group count exceeds
+    `GEMM_KFOLD_MAX_GROUPS` the shipped fold runs and only the group cells
+    move."""
+    comptime NTH = TUNED_TPB
+    comptime TR = NTH // TUNED_TC
+    comptime BM = GEMM_KSPLIT_RPT * TR
+    comptime BN = GEMM_KSPLIT_CPT * TUNED_TC
+    comptime NCELL = GEMM_KSPLIT_RPT * GEMM_KSPLIT_CPT
+    comptime FOLD_STRIDE = GEMM_KFOLD_TPB * GEMM_KFOLD_W
+    _ = _kfold_ksplit_geometry(geom)
+    if m <= 0 or n <= 0:
+        return 0
+    var tt = _ksplit_tiles(m, n)
+    var p_count = contract_partition(k)[1]
+    if p_count <= 0:
+        return tt[0] * tt[1]
+    var rg = _ksplit_resolve_leaves(gemm_step_geometry_group_leaves(geom, m, n, k), p_count)
+    var group_cells = 0
+    var both = 0
+    for ti in range(tt[0]):
+        for tj in range(tt[1]):
+            for q in range(rg[1]):
+                var reg = q // NTH
+                if reg >= NCELL:
+                    continue
+                var th = q - reg * NTH
+                var arow = th // TUNED_TC
+                var acol = th - arow * TUNED_TC
+                var gi = ti * BM + arow + (reg // GEMM_KSPLIT_CPT) * TR
+                var gj = tj * BN + acol + (reg % GEMM_KSPLIT_CPT) * TUNED_TC
+                if gi < m and gj < n:
+                    group_cells += 1
+                    if (gi * n + gj) % FOLD_STRIDE == 0:
+                        both += 1
+    if rg[1] > GEMM_KFOLD_MAX_GROUPS:
+        return group_cells
+    return group_cells + gemm_kfold_blocks(m * n) - both
+
+
+def _kfold_geometry_name(label: String, reads_s: Bool) -> String:
+    """Built from the constants the launchers bind, never a literal."""
+    var s = _step_arm_geometry_name[
+        GEMM_KSPLIT_RPT, GEMM_KSPLIT_CPT, TUNED_TC, GEMM_KSPLIT_KS, False
+    ](label)
+    s += " leaf groups on grid.y -> node workspace -> LANE fold (" + String(GEMM_KFOLD_W)
+    s += " cells per thread, register stack " + String(GEMM_KFOLD_FS) + " levels, "
+    s += String(GEMM_KFOLD_VB) + " group loads a batch, tpb=" + String(GEMM_KFOLD_TPB)
+    s += ", groups <= " + String(GEMM_KFOLD_MAX_GROUPS) + ", else the shipped fold)"
+    if reads_s:
+        s += " group rule S=" + String(GEMM_KSPLIT_S) + " slack=" + String(GEMM_KSPLIT_SLACK)
+    else:
+        s += " group rule finest under the cap"
+    return s
+
+
+def _fast_vendor_gemm(
+    ctx: DeviceContext,
+    mut c: DeviceBuffer[DType.float32],
+    mut a: DeviceBuffer[DType.float32],
+    mut b: DeviceBuffer[DType.float32],
+    m: Int,
+    n: Int,
+    k: Int,
+    op: Int,
+) raises -> Bool:
+    """MAX's tuned matmul for the FAST arm. True if it served the shape.
+
+    DEVIATION 1876 -- **THE FAST ARM HAD NO FAST PATH, AND THAT IS WHAT THE
+    SEQUENCE LANES WERE PAYING.**
+
+    `identical_gemm` had NO MODE BRANCH AT ALL. It ran the pinned
+    balanced-tree kernel in both modes, and FAST only stripped `ftz` and the
+    FMA pins from inside it. `core/gemm.mojo` DOES branch -- under FAST it
+    calls `linalg.matmul` -- but `transformer/` and `mamba/` do not go
+    through `core/gemm.mojo`; they import this file directly. So every
+    projection, every score and every MLP matmul in those two lanes ran the
+    hand-written kernel even when nobody had asked for identity.
+
+    MEASURED ON AN H100, 2026-08-25, ONE RUN, SAME BOX, SAME SHAPES:
+
+        our MLP block, llama8b t512                  51.07 ms
+        the same three GEMMs via linalg.matmul   0.23 + 0.23 + 0.24 ms
+
+    Seventy times, and not one instruction of it is the algorithm. It is the
+    same three matrix products handed to the wrong kernel.
+
+    WHAT THIS DOES NOT DO, and the boundaries are the point:
+
+    * **NOTHING UNDER `NUMERIC_IDENTICAL`.** The caller of this function is
+      comptime-gated, so under IDENTICAL this code is not compiled in. A
+      vendor kernel's tile shape and k-split are per-vendor and a k-split IS
+      a summation order; routing identity through a closed library is the
+      one thing this whole profile exists to refuse.
+    * **NOT `OP_TN`.** The vendor kernel expresses `transpose_b` and not
+      `transpose_a`, so a TN shape would need a materialized transpose. That
+      is a real cost with a real tradeoff and neither sequence lane asks for
+      it -- `modeling_llama.mojo:282` imports `OP_NN` and `OP_NT` and
+      nothing else. TN returns False here and falls through to the pinned
+      kernel, which is correct, just not fast.
+    * **NOT `n == 1` UNDER `OP_NT`.** `core/gemm.mojo` records what happens
+      there and it is not an edge case to wave at: measured 2026-08-19 at
+      m=64, n=1, k=32 with the output poisoned first, **63 of the 64 rows
+      still held the poison afterwards.** `transpose_b=True` does not write
+      them. A caller reusing a buffer reads whatever was in it last time,
+      which is worse than zeros. The same product with `transpose_b=False`
+      is correct at the identical shape, so the fault is the flag and not
+      the shape. At `n == 1` this IS a matrix-vector product and it goes to
+      `gemv_gpu`, which is what RAFT does for the same case.
+
+    DEVIATION 1877 -- **THIS PATH DOES NOT SYNCHRONIZE AND DOES NOT NEED TO.**
+
+    `identical_gemm`'s docstring says "THIS FORM SYNCHRONIZES BEFORE IT
+    RETURNS, and it has to", and the reason it gives is specific: it
+    ALLOCATES ITS OWN WORKSPACE, and `[[mojo-buffer-freed-at-last-use]]`
+    means a buffer created in that function is dead at its `.unsafe_ptr()`,
+    so returning without waiting would free it out from under a kernel that
+    had not run yet.
+
+    NONE OF THAT APPLIES HERE. This path allocates nothing. Every buffer it
+    touches -- `a`, `b`, `c` -- is the caller's and outlives the call, and
+    the enqueue is stream-ordered, so anything the caller enqueues next
+    already sees the result. A caller that reads `c` on the host does it
+    with `enqueue_copy` followed by a synchronize, which is ordered on the
+    same stream.
+
+    WHY IT IS WORTH REMOVING RATHER THAN LEAVING ALONE. A Llama block issues
+    roughly thirty of these, and a sync per call turns a pipeline into thirty
+    serialized round trips. The shape of that cost is visible in the numbers
+    already taken: `mlp` at ONE token costs 1.446 ms while its three GEMMs
+    measure about 0.27 ms in the gemm lane, a floor of over a millisecond
+    that does not scale with work. `rmsnorm`, `mlp` and `attention` all sit
+    within a factor of two of each other at t1 despite doing wildly
+    different amounts of arithmetic, which is what a fixed per-call overhead
+    looks like rather than a slow kernel.
+
+    THIS CHANGES A DOCUMENTED POSTCONDITION and that is not something to do
+    on reasoning alone. It is why the gemmseq leg runs `transformer_check`
+    and `mamba_check` on the box: if any in-tree caller depended on the
+    implicit wait, those gates are where it shows.
+
+    FAST IS NOT BIT-STABLE AND NEVER WAS. This changes which bits FAST
+    produces for the sequence lanes. The profile's promise lives entirely on
+    the IDENTICAL side and is untouched here: the whole entry is gated behind
+    `comptime if GLOBAL_NUMERIC_MODE != NUMERIC_IDENTICAL`.
+
+    **AND IT IS NOT ONLY A SUMMATION ORDER. IT IS A SHORTER MANTISSA.**
+    DEVIATION 1885. The sentence that stood here said the bits move "because
+    a different kernel sums in a different order", which is true and is not
+    the whole truth, and being almost right is exactly why nobody re-derived
+    it. `matmul` on an NVIDIA target is a TENSOR-CORE PATH: on the H100 it
+    measured 200 TFLOP/s against `cublas-fp32`'s 44.4 and `cublas-tf32`'s
+    207.5. It is on the TF32 line. **TF32 carries 10 explicit mantissa bits
+    against fp32's 23.**
+
+    THE CONTROL THAT PROVES IT, measured 2026-08-26 on one H100, agreement
+    against the SAME torch fp32 reference before and after this entry landed:
+
+        rmsnorm     (NO GEMM)   4.77e-06 -> 4.77e-06     UNCHANGED
+        attention   (GEMM)        0.0183 -> 0.859         47x worse
+        transformer (GEMM)        0.0889 -> 4.334         49x worse
+        mlp         (GEMM)        0.0163 -> 3.888        239x worse
+
+    A reordered summation does not move an absolute error by two orders of
+    magnitude. `rmsnorm` routes no GEMM and did not move by one bit.
+
+    SO THE CALLER OWES ITS READER A SENTENCE. A FAST path may be
+    non-deterministic and may take the vendor's fastest kernel; it may NOT
+    take a precision cut silently. Every lane that reaches this entry must
+    say so beside its number, and its fair vendor opponent is a TF32 arm --
+    `torch-gpu-tf32`, `cublas-tf32` -- not an fp32 one, for the same reason
+    `bench/speed/gemm_speed_main.mojo`'s docstring already gives for the
+    gemm lane. That reasoning was written down for `gemm` and then this
+    entry let the identical cut into `transformer`, `attention` and `mlp`
+    through the back door without anyone re-deriving it.
+
+    Any FAST-mode tolerance gate downstream has to be RE-RUN rather than
+    assumed. `verify.mamba_block.fast` FAILED on the leg that landed this
+    (15 stages differ from the oracle, first at `norm.out`) while
+    `verify.mamba_block.identical` PASSED -- the comptime gate held, and
+    that failure is this precision cut arriving at a bit-exactness
+    assertion, not a regression in the block.
+    """
+    # lane/identical-gemm-ktail (2026-10-15), ANONLIB_GEMM_FAST_RAGGED_K
+    # (default OFF, A/B owed; reasoning and evidence at the define in
+    # gemm/afn_apple_fast.mojo): on a FAST Apple build, a `k` that is not
+    # whole simdgroup-kernel windows leaves MAX's matmul for that kernel,
+    # which costs a ragged `k` one padded window. NN and NT only (the two
+    # ops this route already serves); the NT matrix-vector case keeps
+    # `gemv_gpu`. Compiles to nothing when the define is off.
+    if (op == OP_NN or op == OP_NT) and not (op == OP_NT and n == 1):
+        if afn_gemm_fp32_ragged_k_ptr_into(
+            ctx, c.unsafe_ptr().unsafe_origin_cast[MutAnyOrigin](),
+            a.unsafe_ptr().unsafe_origin_cast[MutAnyOrigin](), b.unsafe_ptr().unsafe_origin_cast[MutAnyOrigin](),
+            m, n, k, op,
+        ):
+            return True
+    if op == OP_NT:
+        if n == 1:
+            # `z[m] = a[m x k] . b[k]`: b is a contiguous k-vector whether
+            # it is read as (1, k) or (k, 1), and c is a contiguous m-vector.
+            var vz = TileTensor(c, row_major(m, 1))
+            var vx = TileTensor(a, row_major(m, k))
+            var vy = TileTensor(b, row_major(k, 1))
+            gemv_gpu(vz, vx, vy, ctx)
+            return True
+        if try_scoped_gemm[False, 1](
+            ctx, c.unsafe_ptr().unsafe_origin_cast[MutAnyOrigin](),
+            a.unsafe_ptr().unsafe_origin_cast[MutAnyOrigin](), b.unsafe_ptr().unsafe_origin_cast[MutAnyOrigin](),
+            m, n, k, k, 1, 1, k, 1, k,
+        ):
+            return True
+        var tc = TileTensor(c, row_major(m, n))
+        var ta = TileTensor(a, row_major(m, k))
+        var tb = TileTensor(b, row_major(n, k))
+        matmul[transpose_b=True, target="gpu"](tc, ta, tb, ctx)
+        return True
+    if op == OP_NN:
+        if try_scoped_gemm[False, 1](
+            ctx, c.unsafe_ptr().unsafe_origin_cast[MutAnyOrigin](),
+            a.unsafe_ptr().unsafe_origin_cast[MutAnyOrigin](), b.unsafe_ptr().unsafe_origin_cast[MutAnyOrigin](),
+            m, n, k, k, 1, n, 1, 1, k,
+        ):
+            return True
+        var tc2 = TileTensor(c, row_major(m, n))
+        var ta2 = TileTensor(a, row_major(m, k))
+        var tb2 = TileTensor(b, row_major(k, n))
+        matmul[transpose_b=False, target="gpu"](tc2, ta2, tb2, ctx)
+        return True
+    return False
+
+
+def identical_gemm[allow_vendor: Bool = True](
+    ctx: DeviceContext,
+    mut c: DeviceBuffer[DType.float32],
+    mut a: DeviceBuffer[DType.float32],
+    mut b: DeviceBuffer[DType.float32],
+    m: Int,
+    n: Int,
+    k: Int,
+    op: Int,
+) raises:
+    """**THE HOST-VISIBLE ENTRY POINT.** `C[m x n] = op(A) . op(B)`,
+    row-major and contiguous throughout (contract section 2), under profile
+    `anonlib.identical.gemm.fp32.v1`.
+
+    `op` is `OP_NN`, `OP_NT` or `OP_TN` from `gemm_oracle.mojo`. **The caller
+    does not name a plan, does not size a workspace and does not know
+    whether one was used** -- that is the point of the profile, and Phase 3
+    and Phase 4 call this form.
+
+    `allow_vendor=False` selects the existing full-FP32 kernel plans in
+    every mode. Mamba's public tolerance contract requires this: NVIDIA's
+    default vendor matmul reduces operand precision to TF32. This argument
+    is propagated to the workspace entry so fallback cannot re-enter the
+    vendor route. Other callers keep their existing default dispatch.
+
+    **THIS FORM SYNCHRONIZES BEFORE IT RETURNS, and it has to.**
+    `[[mojo-buffer-freed-at-last-use]]`: a `DeviceBuffer` created here is
+    dead at its `.unsafe_ptr()`, so a scratch buffer allocated inside this
+    function and handed to an enqueued kernel would be FREED BEFORE THE
+    KERNEL RAN if the function returned without waiting. A caller that wants
+    to stay asynchronous owns the workspace itself and calls
+    `identical_gemm_into`; the `_ = ws` below is what keeps this one's alive
+    past the wait.
+    """
+    # DEVIATION 1876: under FAST, hand the shape to the vendor kernel. Under
+    # IDENTICAL this branch is not compiled at all. Read `_fast_vendor_gemm`
+    # before changing anything here; the `n == 1` clause in it is a
+    # correctness requirement and not an optimization.
+    # lane/apple-fast-neural-gemm (2026-10-03): the Apple FAST simdgroup
+    # route (gemm/afn_apple_fast.mojo), ahead of the vendor route and of the
+    # pinned plans. Full fp32 products and f32 accumulation, so it also
+    # serves the callers that closed the vendor route for its precision cut
+    # (`allow_vendor=False`). Compiled only under FAST on an Apple build with
+    # a ANONLIB_AFN_GEMM_* define; IDENTICAL compiles the lines below
+    # unchanged.
+    comptime if AFN_GEMM_FP32_MMA:
+        if afn_gemm_fp32_into(ctx, c, a, b, m, n, k, op):
+            return
+    comptime if allow_vendor and GLOBAL_NUMERIC_MODE != NUMERIC_IDENTICAL:
+        if _fast_vendor_gemm(ctx, c, a, b, m, n, k, op):
+            return
+    var nws = identical_gemm_workspace_max_floats(m, n, k)
+    step_count_device_alloc()
+    var ws = ctx.enqueue_create_buffer[DType.float32](nws)
+    # DEVIATION 2721 (lane/wait-removal, 2026-09-16). THE WAIT THAT USED TO
+    # SIT HERE IS GONE. It waited for an allocation that the very next
+    # submission on the SAME in-order context consumes, so it ordered
+    # nothing. The host does not touch `ws`, only the kernel does. This is
+    # the pattern `core/gram_splitk.mojo:1029-1030` and
+    # `gemm_identical._kpack_run` already ship: enqueue the workspace,
+    # enqueue the kernel that writes it, wait once at the end.
+    #
+    # THIS IS THE LARGEST SINGLE BLOCK OF WAITS ON THE STEP PATH. The byte
+    # LM launch census records 391
+    # GEMM launches and 782 GEMM waits per instrumented run, exactly 2.0
+    # per launch, and these two lines were both of them.
+    identical_gemm_into[allow_vendor](ctx, c, a, b, ws, m, n, k, op)
+    # LOAD-BEARING, category (c) and NOT removable. `[[mojo-buffer-freed-
+    # at-last-use]]`: `_ = ws` below is `ws`'s last use, so the runtime is
+    # free to release it there. Without this wait the kernel that is still
+    # reading and writing `ws` reads freed memory. Removing this one on
+    # purpose moves the identity fingerprints.
+    step_count_sync()
+    ctx.synchronize()
+    _ = ws
+
+
+def identical_gemm_workspace_max_floats(m: Int, n: Int, k: Int) -> Int:
+    """Scratch for the actual dispatcher, including enabled grouped reuse.
+
+    Phase 3 and Phase 4 allocate with this. Never less than 1, so the buffer
+    is always constructible. Older smaller buffers take the allocating path.
+    """
+    var w = identical_gemm_workspace_floats(
+        m, n, k, choose_gemm_plan(m, n, k)
+    )
+    comptime if APPLE_MMA_AUTO_SPLIT_BLOCKS > 0:
+        # lane/neural-apple2: the matrix plan's leaf-group nodes.
+        if choose_gemm_plan(m, n, k) == PLAN_APPLE_MMA:
+            var sg = apple_mma_auto_split_groups(m, n, k)
+            if sg[1] > 1 and m * n * sg[1] > w:
+                w = m * n * sg[1]
+    comptime if GEMM_REUSE_GROUP_WS and GEMM_BODY_KPACK_HG:
+        if choose_gemm_plan(m, n, k) == PLAN_TUNED_128_8X8:
+            var gl = gemm_default_ksplit_leaves(m, n, k)
+            var p = contract_partition(k)[1]
+            if gl > 0 and p > 0:
+                var required = m * n * ((p + gl - 1) // gl)
+                if required > w:
+                    w = required
+    comptime if IDN_GEMM_MFMA_REUSE_WS and GEMM_IDENTICAL_MFMA:
+        # lane/fam-lm: the matrix-core group launch's node partials
+        # (`_mfma_run_ws`), at the group size the dispatch resolves.
+        if choose_gemm_plan(m, n, k) == PLAN_TUNED_128_8X8:
+            var mgl = _mfma_group_leaves(m, n, k)
+            var mp = contract_partition(k)[1]
+            if mgl > 0 and mp > 1:
+                var mreq = m * n * ((mp + mgl - 1) // mgl)
+                if mreq > w:
+                    w = mreq
+    comptime if (
+        IDN_GEMM_MFMA_REUSE_WS
+        and GEMM_IDENTICAL_MFMA
+        and IDN_GEMM_AMD_BAND_MFMA
+        and TARGET_COLUMN == COLUMN_AMD
+        and not is_defined["ANONLIB_GEMM_AMD_NO_K768_TUNED"]()
+        and not is_defined["ANONLIB_GEMM_AMD_K768_PLAN64"]()
+    ):
+        # lane/nr-gemm: the AMD band's matrix-core group nodes, where the
+        # dispatch reaches the band (not TUNED_128 under `choose_gemm_plan`).
+        if (
+            choose_gemm_plan(m, n, k) != PLAN_TUNED_128_8X8
+            and amd_short_contract_large_output(m, n, k)
+        ):
+            var bgl = _mfma_group_leaves(m, n, k)
+            var bp = contract_partition(k)[1]
+            if bgl > 0 and bp > 1:
+                var breq = m * n * ((bp + bgl - 1) // bgl)
+                if breq > w:
+                    w = breq
+    if w < 1:
+        return 1
+    return w
+
+
+struct GemmWorkspace(Movable):
+    """Reusable scratch for GEMMs on ONE in-order context/stream.
+
+    The owner must keep this object and all operands alive through its final
+    synchronize. Each call sizes against the actual dispatcher, including
+    decode shapes that grow across calls. Growth drains the old workspace
+    before replacing it; reuse adds no host wait. Do not share across streams.
+    The dispatched GEMM may still wait for its own plan-specific scratch.
+    """
+
+    var buffer: DeviceBuffer[DType.float32]
+
+    def __init__(out self, ctx: DeviceContext) raises:
+        step_count_device_alloc()
+        self.buffer = ctx.enqueue_create_buffer[DType.float32](1)
+
+    def run[allow_vendor: Bool = True](
+        mut self, ctx: DeviceContext,
+        mut c: DeviceBuffer[DType.float32],
+        mut a: DeviceBuffer[DType.float32],
+        mut b: DeviceBuffer[DType.float32],
+        m: Int, n: Int, k: Int, op: Int,
+    ) raises:
+        var required = identical_gemm_workspace_max_floats(m, n, k)
+        if required > len(self.buffer):
+            # Previous enqueued GEMMs may still use the allocation being
+            # replaced. This wait protects its lifetime, not its contents.
+            step_count_sync()
+            ctx.synchronize()
+            step_count_device_alloc()
+            var capacity = required
+            comptime if NI01_GEOMETRIC_WORKSPACE:
+                # Amortize monotone decode/shape growth by retaining the
+                # next power-of-two capacity. Less than 2x requested bytes;
+                # only scratch is retained, never mutable operand contents.
+                capacity = max(1, len(self.buffer))
+                while capacity < required:
+                    capacity *= 2
+            self.buffer = ctx.enqueue_create_buffer[DType.float32](capacity)
+        identical_gemm_into[allow_vendor](
+            ctx, c, a, b, self.buffer, m, n, k, op
+        )

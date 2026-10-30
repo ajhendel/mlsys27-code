@@ -1,0 +1,486 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 the authors. Part of anonlib.
+from std.math import isfinite
+from std.gpu import block_idx, thread_idx
+from max.gpu.host import DeviceBuffer, DeviceContext
+from core.neural_context import process_ctx
+from checks.numerics import GLOBAL_NUMERIC_MODE as _DEVCTX_MODE, NUMERIC_IDENTICAL as _DEVCTX_IDENTICAL
+from checks.numerics import NUMERIC_FAST
+from std.sys.compile import is_defined
+from std.sys.info import has_apple_gpu_accelerator
+
+#: This binding's ONE process-lifetime DeviceContext (core/neural_context.mojo,
+#: lane/devctx-lifetime): a context per call exhausts Metal command queues.
+comptime _DEVCTX_SLOT = "MojoPreprocessingContextIdentical" if _DEVCTX_MODE == _DEVCTX_IDENTICAL else "MojoPreprocessingContextFast"
+
+from metrics.checks.device_io import upload_f32
+from core.device_scan import device_first_nonfinite
+from core.device_pool import pool_give, pool_take
+from preprocessing.minmax import PREP_CLS2_MINMAX_FUSED, PREP_CLS2_MINMAX_POOL, minmax_fit_flagged
+from preprocessing.minmax import minmax_fit_fast_dev, minmax_fit_flagged_dev
+from preprocessing.standard import standard_fit_dev
+from preprocessing.minmax import PREP_FAST_MINMAX, minmax_fit, minmax_fit_fast, minmax_transform, minmax_transform_into
+from preprocessing.standard import standard_fit, standard_transform, standard_transform_into
+
+
+def validate_dimensions(n: Int, d: Int, lower: Float32, upper: Float32) raises:
+    if n <= 0 or d <= 0 or d > 2147483647 or n > 2147483647 // d:
+        raise Error("MinMaxScaler: positive dimensions with n*d<=Int32.max required")
+    if not isfinite(lower) or not isfinite(upper) or lower >= upper:
+        raise Error("MinMaxScaler: finite increasing Float32 feature range required")
+
+
+def validate_standard(n: Int, d: Int, with_mean: Int, with_std: Int) raises:
+    if n <= 0 or d <= 0 or d > 2147483647 or n > 2147483647 // d:
+        raise Error("StandardScaler: positive dimensions with n*d<=Int32.max required")
+    if with_mean < 0 or with_mean > 1 or with_std < 0 or with_std > 1:
+        raise Error("StandardScaler: flags must be 0 or 1")
+
+
+# ---- the direct fits (lane gap-prep2, 2026-10-02) ---------------------------------------------
+# `minmax_fit_host` / `standard_fit_host` take X as a host List: the binding
+# copied the caller's buffer into it (read_f32), walked every word on the host
+# for a nonfinite one, and `upload_f32` copied it once more before the upload.
+# At the board's istella shape (1M x 220, 880 MB) that is three host passes
+# over X around a ~1 ms kernel, plus the Python side's own `all_finite` pass.
+# Here X goes up from the caller's own buffer, the nonfinite scan is a device
+# pass (`device_first_nonfinite`), and the kernels are the same ones on the
+# same words: no bit moves. A NaN or an infinity returns 0 with nothing
+# written, and the caller takes its NaN route (which refuses an infinity).
+
+
+def _upload_direct(
+    ctx: DeviceContext, x: MutPointer[Float32, MutUntrackedOrigin], count: Int
+) raises -> DeviceBuffer[DType.float32]:
+    """count floats from the caller's host buffer straight into a new device
+    buffer (one copy, no host staging List)."""
+    var buf = ctx.enqueue_create_buffer[DType.float32](count)
+    ctx.enqueue_copy(dst_buf=buf, src_ptr=x)
+    return buf^
+
+
+# ---- device checks of the fitted rows (lane cpu3-core) --------------------
+# The direct fits used to download the fitted rows, walk them on the host for
+# a nonfinite value and a bad scale or variance, and copy them into the
+# caller's buffer word by word. The walk is a kernel now: one flag vector
+# comes back, then the rows go to the caller in one copy.
+
+
+def prep_rows_check_kernel(
+    res: MutPointer[Float32, MutAnyOrigin], n_fin: Int32,
+    pos_lo: Int32, pos_n: Int32, nonneg_lo: Int32, nonneg_n: Int32,
+    zero_lo: Int32, zero_n: Int32, flag: MutPointer[Int32, MutAnyOrigin],
+):
+    """One thread a value of the fitted rows. flag[0]: a nonfinite value in
+    [0, n_fin); flag[1]: a value <= 0 in the positive span or < 0 in the
+    nonnegative span; flag[2]: a nonzero value in the zero span (the FUSED
+    fit's nonfinite-input row). Every writer stores the same 1."""
+    var i = Int(block_idx.x) * 256 + Int(thread_idx.x)
+    var end = max(Int(n_fin), max(Int(zero_lo) + Int(zero_n), 0))
+    if i >= end:
+        return
+    var v = res.unsafe_load(i)
+    if i < Int(n_fin) and not isfinite(v):
+        flag.unsafe_store(0, Int32(1))
+    if i >= Int(pos_lo) and i < Int(pos_lo) + Int(pos_n) and v <= Float32(0):
+        flag.unsafe_store(1, Int32(1))
+    if i >= Int(nonneg_lo) and i < Int(nonneg_lo) + Int(nonneg_n) and v < Float32(0):
+        flag.unsafe_store(1, Int32(1))
+    if i >= Int(zero_lo) and i < Int(zero_lo) + Int(zero_n) and v != Float32(0):
+        flag.unsafe_store(2, Int32(1))
+
+
+def _prep_rows_check(
+    ctx: DeviceContext, mut res: DeviceBuffer[DType.float32], n_fin: Int,
+    pos_lo: Int, pos_n: Int, nonneg_lo: Int, nonneg_n: Int, zero_lo: Int, zero_n: Int,
+) raises -> SIMD[DType.int32, 4]:
+    """`prep_rows_check_kernel` over the fitted rows; the three flags home."""
+    var total = max(n_fin, zero_lo + zero_n)
+    var flag = ctx.enqueue_create_buffer[DType.int32](4)
+    ctx.enqueue_memset(flag, Int32(0))
+    ctx.enqueue_function[prep_rows_check_kernel](
+        res.unsafe_ptr().unsafe_origin_cast[MutAnyOrigin](), Int32(n_fin),
+        Int32(pos_lo), Int32(pos_n), Int32(nonneg_lo), Int32(nonneg_n),
+        Int32(zero_lo), Int32(zero_n), flag.unsafe_ptr().unsafe_origin_cast[MutAnyOrigin](),
+        grid_dim=(total + 255) // 256, block_dim=256,
+    )
+    var h = ctx.enqueue_create_host_buffer[DType.int32](4)
+    ctx.enqueue_copy(dst_ptr=h.unsafe_ptr(), src_buf=flag)
+    ctx.synchronize()
+    var out = SIMD[DType.int32, 4](
+        h.unsafe_ptr().unsafe_load(0), h.unsafe_ptr().unsafe_load(1), h.unsafe_ptr().unsafe_load(2), 0,
+    )
+    _ = h^
+    _ = flag^
+    return out
+
+
+def _prep_rows_check_emit(
+    ctx: DeviceContext, mut res: DeviceBuffer[DType.float32], n_fin: Int,
+    pos_lo: Int, pos_n: Int, nonneg_lo: Int, nonneg_n: Int,
+    count: Int, output: MutPointer[Float32, MutUntrackedOrigin],
+) raises -> SIMD[DType.int32, 4]:
+    """`_prep_rows_check` and `_prep_rows_emit` behind ONE wait (lane
+    idn-regress, 2026-10-05): the flags and the first `count` fitted values
+    come home together. The caller raises on a flag, so the rows it got are
+    then dropped with its fresh output buffer (the fits' only callers pass
+    one). The check took its own synchronize before the emit's; the same
+    kernel, the same words."""
+    var flag = ctx.enqueue_create_buffer[DType.int32](4)
+    ctx.enqueue_memset(flag, Int32(0))
+    ctx.enqueue_function[prep_rows_check_kernel](
+        res.unsafe_ptr().unsafe_origin_cast[MutAnyOrigin](), Int32(n_fin),
+        Int32(pos_lo), Int32(pos_n), Int32(nonneg_lo), Int32(nonneg_n),
+        Int32(0), Int32(0), flag.unsafe_ptr().unsafe_origin_cast[MutAnyOrigin](),
+        grid_dim=(n_fin + 255) // 256, block_dim=256,
+    )
+    var h = ctx.enqueue_create_host_buffer[DType.int32](4)
+    ctx.enqueue_copy(dst_ptr=h.unsafe_ptr(), src_buf=flag)
+    var head = res.create_sub_buffer[DType.float32](0, count)
+    ctx.enqueue_copy(dst_ptr=output, src_buf=head)
+    ctx.synchronize()
+    var out = SIMD[DType.int32, 4](
+        h.unsafe_ptr().unsafe_load(0), h.unsafe_ptr().unsafe_load(1), h.unsafe_ptr().unsafe_load(2), 0,
+    )
+    _ = head^
+    _ = h^
+    _ = flag^
+    return out
+
+
+def _prep_rows_emit(
+    ctx: DeviceContext, mut res: DeviceBuffer[DType.float32], count: Int,
+    output: MutPointer[Float32, MutUntrackedOrigin],
+) raises:
+    """The first `count` fitted values into the caller's buffer, one copy."""
+    var head = res.create_sub_buffer[DType.float32](0, count)
+    ctx.enqueue_copy(dst_ptr=output, src_buf=head)
+    ctx.synchronize()
+    _ = head^
+
+
+def minmax_fit_direct(
+    x: MutPointer[Float32, MutUntrackedOrigin], n: Int, d: Int, lower: Float32, upper: Float32,
+    output: MutPointer[Float32, MutUntrackedOrigin],
+) raises -> Int:
+    """`minmax_fit_host`'s five rows of d into `output`, X read from the
+    caller's buffer; 0 (nothing written) when X holds a NaN or an infinity."""
+    validate_dimensions(n,d,lower,upper)
+    comptime if PREP_CLS2_MINMAX_FUSED or PREP_CLS2_MINMAX_POOL:
+        return _minmax_fit_direct_cls2(x,n,d,lower,upper,output)
+    var ctx = process_ctx[_DEVCTX_SLOT]()
+    var dx = _upload_direct(ctx,x,n*d)
+    if device_first_nonfinite(ctx,dx,n*d) >= 0:
+        _ = dx^
+        return 0
+    # lane/apple-fast-prep: under PREP_FAST_MINMAX the extrema pass is the
+    # row-tiled kernel (minmax_fit_fast); otherwise minmax_fit itself
+    # the five rows stay on the device, are checked there, and go to the
+    # caller in one copy (lane cpu3-core)
+    var res = minmax_fit_fast_dev(ctx,dx,n,d,lower,upper)
+    var f = _prep_rows_check_emit(ctx,res,5*d,3*d,d,0,0,5*d,output)
+    _ = dx^
+    _ = res^
+    if f[0] != 0:
+        raise Error("MinMaxScaler: nonfinite input or Float32 arithmetic overflow")
+    if f[1] != 0:
+        raise Error("MinMaxScaler: Float32 scale underflow")
+    _ = ctx^
+    return 1
+
+
+def _minmax_fit_direct_cls2(
+    x: MutPointer[Float32, MutUntrackedOrigin], n: Int, d: Int, lower: Float32, upper: Float32,
+    output: MutPointer[Float32, MutUntrackedOrigin],
+) raises -> Int:
+    """lane/apple-fast-gap-cls2: `minmax_fit_direct` with X's device buffer
+    from a pool kept between fits (PREP_CLS2_MINMAX_POOL) and/or the
+    nonfinite scan folded into the extrema pass (PREP_CLS2_MINMAX_FUSED).
+    The same kernels' keys and finalize: the same five rows."""
+    var ctx = process_ctx[_DEVCTX_SLOT]()
+    var dx: DeviceBuffer[DType.float32]
+    comptime if PREP_CLS2_MINMAX_POOL:
+        dx = pool_take["MojoPrepCls2MinmaxX"](ctx,n*d)
+        ctx.enqueue_copy(dst_buf=dx, src_ptr=x)
+    else:
+        dx = _upload_direct(ctx,x,n*d)
+    var res: DeviceBuffer[DType.float32]
+    var ok = True
+    var f: SIMD[DType.int32, 4]
+    comptime if PREP_CLS2_MINMAX_FUSED:
+        # the sixth row holds the per-column nonfinite-input flags
+        res = minmax_fit_flagged_dev(ctx,dx,n,d,lower,upper)
+        f = _prep_rows_check(ctx,res,5*d,3*d,d,0,0,5*d,d)
+        if f[2] != 0:
+            ok = False
+    else:
+        if device_first_nonfinite(ctx,dx,n*d) >= 0:
+            ok = False
+            res = ctx.enqueue_create_buffer[DType.float32](1)
+            f = SIMD[DType.int32, 4](0)
+        else:
+            res = minmax_fit_fast_dev(ctx,dx,n,d,lower,upper)
+            f = _prep_rows_check(ctx,res,5*d,3*d,d,0,0,0,0)
+    comptime if PREP_CLS2_MINMAX_POOL:
+        pool_give["MojoPrepCls2MinmaxX"](dx^)
+    else:
+        _ = dx^
+    if not ok:
+        _ = res^
+        _ = ctx^
+        return 0
+    if f[0] != 0:
+        raise Error("MinMaxScaler: nonfinite input or Float32 arithmetic overflow")
+    if f[1] != 0:
+        raise Error("MinMaxScaler: Float32 scale underflow")
+    _prep_rows_emit(ctx,res,5*d,output)
+    _ = res^
+    _ = ctx^
+    return 1
+
+
+def standard_fit_direct(
+    x: MutPointer[Float32, MutUntrackedOrigin], n: Int, d: Int, with_mean: Int, with_std: Int,
+    output: MutPointer[Float32, MutUntrackedOrigin],
+) raises -> Int:
+    """`standard_fit_host`'s three rows of d into `output`, X read from the
+    caller's buffer; 0 (nothing written) when X holds a NaN or an infinity."""
+    validate_standard(n,d,with_mean,with_std)
+    var ctx = process_ctx[_DEVCTX_SLOT]()
+    var dx = _upload_direct(ctx,x,n*d)
+    if device_first_nonfinite(ctx,dx,n*d) >= 0:
+        _ = dx^
+        return 0
+    # the three rows stay on the device, are checked there, and go to the
+    # caller in one copy (lane cpu3-core)
+    var res = standard_fit_dev(ctx,dx,n,d,with_mean,with_std)
+    var f = _prep_rows_check_emit(ctx,res,3*d,2*d,d,d,d,3*d,output)
+    _ = dx^
+    _ = res^
+    if f[0] != 0:
+        raise Error("StandardScaler: nonfinite input or Float32 arithmetic overflow")
+    if f[1] != 0:
+        raise Error("StandardScaler: invalid variance or scale")
+    _ = ctx^
+    return 1
+
+
+def minmax_transform_direct(
+    x: MutPointer[Float32, MutUntrackedOrigin], scale: MutPointer[Float32, MutUntrackedOrigin],
+    offset: MutPointer[Float32, MutUntrackedOrigin], output: MutPointer[Float32, MutUntrackedOrigin],
+    n: Int, d: Int, inverse: Int, clip: Int, lower: Float32, upper: Float32,
+) raises -> Int:
+    """`minmax_transform_host_into` from the caller's own buffers (lane
+    apple-fast-prep; lane cpu2-l3-prep: every tier and vendor, no longer FAST
+    Apple only). The List route copies the n*d words into a List, walks them
+    on one thread (`finite_values`) and copies them again before the device
+    copy, and the Python side walked X and the output (`all_finite`). Here X,
+    scale and offset go up from their addresses and the only scans are the
+    device's: 1 when the n*d words were written; when the output holds a
+    nonfinite word nothing is written and the device scans X too: 0 (X
+    finite: a Float32 overflow) or -1 (X holds a NaN or an infinity: the
+    caller's NaN route). The caller holds scale and offset finite and scale
+    positive. Same kernel, same words."""
+    validate_dimensions(n,d,lower,upper)
+    if inverse < 0 or inverse > 1 or clip < 0 or clip > 1:
+        raise Error("MinMaxScaler: invalid transform parameters")
+    var ctx = process_ctx[_DEVCTX_SLOT]()
+    var dx = _upload_direct(ctx,x,n*d)
+    var ds = _upload_direct(ctx,scale,d)
+    var dm = _upload_direct(ctx,offset,d)
+    var dout = ctx.enqueue_create_buffer[DType.float32](n*d)
+    minmax_transform_into(ctx,dx,ds,dm,dout,n,d,inverse,clip,lower,upper)
+    var ok = 1
+    if device_first_nonfinite(ctx,dout,n*d) >= 0:
+        ok = -1 if device_first_nonfinite(ctx,dx,n*d) >= 0 else 0
+    else:
+        ctx.enqueue_copy(dst_ptr=output,src_buf=dout)
+        ctx.synchronize()
+    _ = dout^; _ = dm^; _ = ds^; _ = dx^; _ = ctx^
+    return ok
+
+
+def standard_transform_direct(
+    x: MutPointer[Float32, MutUntrackedOrigin], mean: MutPointer[Float32, MutUntrackedOrigin],
+    scale: MutPointer[Float32, MutUntrackedOrigin], output: MutPointer[Float32, MutUntrackedOrigin],
+    n: Int, d: Int, inverse: Int, with_mean: Int, with_std: Int,
+) raises -> Int:
+    """Lane cpu2-l3-prep: `standard_transform_host_into` from the caller's
+    own buffers, every tier and vendor (`minmax_transform_direct`'s form: no
+    host List copies, no host finiteness walks). 1 when the n*d words were
+    written; else nothing is written and 0 (X finite: a Float32 overflow) or
+    -1 (X holds a NaN or an infinity). The caller holds mean and scale
+    finite and scale positive. Same kernel, same words."""
+    validate_standard(n,d,with_mean,with_std)
+    if inverse < 0 or inverse > 1:
+        raise Error("StandardScaler: invalid transform parameters")
+    var ctx = process_ctx[_DEVCTX_SLOT]()
+    var dx = _upload_direct(ctx,x,n*d)
+    var dm = _upload_direct(ctx,mean,d)
+    var ds = _upload_direct(ctx,scale,d)
+    var dout = ctx.enqueue_create_buffer[DType.float32](n*d)
+    standard_transform_into(ctx,dx,dm,ds,dout,n,d,inverse,with_mean,with_std)
+    var ok = 1
+    if device_first_nonfinite(ctx,dout,n*d) >= 0:
+        ok = -1 if device_first_nonfinite(ctx,dx,n*d) >= 0 else 0
+    else:
+        ctx.enqueue_copy(dst_ptr=output,src_buf=dout)
+        ctx.synchronize()
+    _ = dout^; _ = ds^; _ = dm^; _ = dx^; _ = ctx^
+    return ok
+
+
+# ---- ANONLIB_X_PREP_FAST_FIT_TRANSFORM_FUSED (lane apple-fast-round2) ----
+# FAST + Apple experiment, default off. StandardScaler.fit_transform(X) was
+# fit (X up, scan, stats, rows home) then transform (the SAME X up again,
+# the stats up, kernel, scans, output home): two n*d uploads of one array.
+# Here X goes up once and the transform kernel reads the resident copy and
+# the fitted rows where the fit left them. The reuse is by construction (the
+# one buffer fit_transform was handed), never by matching a size, so a
+# different array can never take a stale copy. Cost: one n*d host-to-device
+# copy and one host round trip saved (on Apple, shared-memory uploads of
+# ~1-2 ms per 64 MB, so a 10^9-byte X saves tens of ms against a ~1 ms
+# kernel). Same kernels on the same words as fit + transform: no bit moves.
+comptime PREP_FAST_FIT_TRANSFORM_FUSED = (
+    _DEVCTX_MODE == NUMERIC_FAST and has_apple_gpu_accelerator()
+    and is_defined["ANONLIB_X_PREP_FAST_FIT_TRANSFORM_FUSED"]()
+)
+
+
+def standard_fit_transform_direct(
+    x: MutPointer[Float32, MutUntrackedOrigin], n: Int, d: Int, with_mean: Int, with_std: Int,
+    stats: MutPointer[Float32, MutUntrackedOrigin], output: MutPointer[Float32, MutUntrackedOrigin],
+) raises -> Int:
+    """`standard_fit_direct` then `standard_transform_direct` (inverse 0) on
+    ONE upload of X: the three fitted rows into `stats` (3 d) and the n*d
+    transformed words into `output`. 1 when both were written; 0 (nothing
+    written) when X holds a NaN or an infinity (the caller's two-step NaN
+    route); -1 (the rows written, the output not) on a Float32 overflow in
+    the transform. A nonfinite or invalid fitted row raises as the fit does."""
+    validate_standard(n,d,with_mean,with_std)
+    var ctx = process_ctx[_DEVCTX_SLOT]()
+    var dx = _upload_direct(ctx,x,n*d)
+    if device_first_nonfinite(ctx,dx,n*d) >= 0:
+        _ = dx^
+        return 0
+    var res = standard_fit_dev(ctx,dx,n,d,with_mean,with_std)
+    var f = _prep_rows_check_emit(ctx,res,3*d,2*d,d,d,d,3*d,stats)
+    if f[0] != 0:
+        _ = dx^; _ = res^
+        raise Error("StandardScaler: nonfinite input or Float32 arithmetic overflow")
+    if f[1] != 0:
+        _ = dx^; _ = res^
+        raise Error("StandardScaler: invalid variance or scale")
+    # row 0 the mean, row 2 the scale (the rows fit keeps as mean_ / scale_;
+    # the kernel reads each only when its flag is set, as transform passes)
+    var dm = res.create_sub_buffer[DType.float32](0, d)
+    var ds = res.create_sub_buffer[DType.float32](2*d, d)
+    var dout = ctx.enqueue_create_buffer[DType.float32](n*d)
+    standard_transform_into(ctx,dx,dm,ds,dout,n,d,0,with_mean,with_std)
+    var ok = 1
+    if device_first_nonfinite(ctx,dout,n*d) >= 0:
+        ok = -1
+    else:
+        ctx.enqueue_copy(dst_ptr=output,src_buf=dout)
+        ctx.synchronize()
+    _ = dout^; _ = ds^; _ = dm^; _ = res^; _ = dx^; _ = ctx^
+    return ok
+
+
+# ---- the refusing entries of the GPU binding (lane cpu4-python) ----------
+# `minmax_fit` / `standard_fit` / `minmax_transform` / `standard_transform`
+# of the GPU binding used to copy X into a host List, walk every word (and
+# the fitted or given rows) on the host for a nonfinite one, and upload the
+# List: the `*_host` routes, named like the host column but serving the GPU
+# binding. They are the direct entries now (X straight from the caller's
+# buffer, every scan a device pass, the same kernels and words: no bit
+# moves) with the old refusals kept: a nonfinite X, a nonfinite or
+# nonpositive parameter row and a Float32 overflow raise as before. The
+# host column is `bindings/_anonlib_preprocessing_host.mojo`.
+
+
+def _prep_params_check(
+    ctx: DeviceContext, pos: MutPointer[Float32, MutUntrackedOrigin], pos_on: Bool,
+    fin: MutPointer[Float32, MutUntrackedOrigin], fin_on: Bool, d: Int,
+) raises -> SIMD[DType.int32, 4]:
+    """The d-word parameter rows checked on the device: `pos` (when
+    `pos_on`) finite and > 0, `fin` (when `fin_on`) finite. Both go up into
+    one 2d buffer; `prep_rows_check_kernel` returns the flags."""
+    var k = (1 if pos_on else 0) + (1 if fin_on else 0)
+    if k == 0:
+        return SIMD[DType.int32, 4](0)
+    var buf = ctx.enqueue_create_buffer[DType.float32](k * d)
+    var at = 0
+    if pos_on:
+        var head = buf.create_sub_buffer[DType.float32](0, d)
+        ctx.enqueue_copy(dst_buf=head, src_ptr=pos)
+        _ = head^
+        at = d
+    if fin_on:
+        var tail = buf.create_sub_buffer[DType.float32](at, d)
+        ctx.enqueue_copy(dst_buf=tail, src_ptr=fin)
+        _ = tail^
+    var f = _prep_rows_check(ctx,buf,k*d,0,d if pos_on else 0,0,0,0,0)
+    _ = buf^
+    return f
+
+
+def minmax_fit_refusing(
+    x: MutPointer[Float32, MutUntrackedOrigin], n: Int, d: Int, lower: Float32, upper: Float32,
+    output: MutPointer[Float32, MutUntrackedOrigin],
+) raises:
+    """`minmax_fit_direct`, a nonfinite X refused (the old binding's error)."""
+    if minmax_fit_direct(x,n,d,lower,upper,output) == 0:
+        raise Error("MinMaxScaler: nonfinite input or Float32 arithmetic overflow")
+
+
+def standard_fit_refusing(
+    x: MutPointer[Float32, MutUntrackedOrigin], n: Int, d: Int, with_mean: Int, with_std: Int,
+    output: MutPointer[Float32, MutUntrackedOrigin],
+) raises:
+    """`standard_fit_direct`, a nonfinite X refused (the old binding's error)."""
+    if standard_fit_direct(x,n,d,with_mean,with_std,output) == 0:
+        raise Error("StandardScaler: nonfinite input or Float32 arithmetic overflow")
+
+
+def minmax_transform_refusing(
+    x: MutPointer[Float32, MutUntrackedOrigin], scale: MutPointer[Float32, MutUntrackedOrigin],
+    offset: MutPointer[Float32, MutUntrackedOrigin], output: MutPointer[Float32, MutUntrackedOrigin],
+    n: Int, d: Int, inverse: Int, clip: Int, lower: Float32, upper: Float32,
+) raises:
+    """`minmax_transform_direct` after a device check of scale (finite,
+    positive) and offset (finite); a nonfinite X or output refused."""
+    validate_dimensions(n,d,lower,upper)
+    if inverse < 0 or inverse > 1 or clip < 0 or clip > 1:
+        raise Error("MinMaxScaler: invalid transform parameters")
+    var ctx = process_ctx[_DEVCTX_SLOT]()
+    var f = _prep_params_check(ctx,scale,True,offset,True,d)
+    _ = ctx^
+    if f[0] != 0:
+        raise Error("MinMaxScaler: nonfinite input or Float32 arithmetic overflow")
+    if f[1] != 0:
+        raise Error("MinMaxScaler: scale must be positive")
+    if minmax_transform_direct(x,scale,offset,output,n,d,inverse,clip,lower,upper) != 1:
+        raise Error("MinMaxScaler: nonfinite input or Float32 arithmetic overflow")
+
+
+def standard_transform_refusing(
+    x: MutPointer[Float32, MutUntrackedOrigin], mean: MutPointer[Float32, MutUntrackedOrigin],
+    scale: MutPointer[Float32, MutUntrackedOrigin], output: MutPointer[Float32, MutUntrackedOrigin],
+    n: Int, d: Int, inverse: Int, with_mean: Int, with_std: Int,
+) raises:
+    """`standard_transform_direct` after a device check of scale (finite,
+    positive; with_std) and mean (finite; with_mean); a nonfinite X or
+    output refused."""
+    validate_standard(n,d,with_mean,with_std)
+    if inverse < 0 or inverse > 1:
+        raise Error("StandardScaler: invalid transform parameters")
+    var ctx = process_ctx[_DEVCTX_SLOT]()
+    var f = _prep_params_check(ctx,scale,with_std != 0,mean,with_mean != 0,d)
+    _ = ctx^
+    if f[0] != 0:
+        raise Error("StandardScaler: nonfinite input or Float32 arithmetic overflow")
+    if f[1] != 0:
+        raise Error("StandardScaler: scale must be positive")
+    if standard_transform_direct(x,mean,scale,output,n,d,inverse,with_mean,with_std) != 1:
+        raise Error("StandardScaler: nonfinite input or Float32 arithmetic overflow")

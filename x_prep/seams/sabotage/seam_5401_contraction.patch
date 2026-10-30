@@ -1,0 +1,12 @@
+--- a/x_prep/prims.mojo
++++ b/x_prep/prims.mojo
+@@ -367,7 +367,8 @@
+ def mm_step(acc: Float32, a: Float32, b: Float32) -> Float32:
+     """One term of matmul's contraction: the product rounded, then added
+     (DEVIATION 5401: never contracted into an FMA)."""
+-    return add(acc, mul(a, b))
++    from std.math import fma  # SABOTAGE 5401
++    return ftz(fma(a, b, acc))
+ 
+ 
+ def matmul_unit(t: Int, f: FP, q: IP):

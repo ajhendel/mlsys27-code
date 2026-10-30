@@ -1,0 +1,1803 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 the authors. Part of anonlib, DOI-WITHHELD
+"""Isolation Forest: the model, `fit`, `score_samples`, `predict`.
+
+Reference: `cpp/include/cuml/ensemble/isolation_forest.hpp` (`IF_params`
+`:27-34`, `IsolationForestModel` `:38-50`, the `fit` / `score_samples` /
+`predict` entries `:114-200`), `cpp/src/isolation_forest/isolation_forest.cuh`
+(`compute_global_max_nodes_per_tree` `:29-44`, `IsolationForest::
+error_checking` `:50-56`, `::fit` `:70-140`, `::compute_path_lengths`
+`:143-162`, `::compute_anomaly_scores` `:165-184`) and
+`cpp/src/isolation_forest/isolation_forest.cu` (`compute_c_normalization`
+`:27-36`, `score_samples` `:161-177`, `predict` `:201-224`), all at
+rapidsai/cuml v26.08.00. Float32 only (their `IsolationForestD` arm is the
+same code at T = double; no float64 on device here).
+
+The pair of Thrust transforms (`std::pow(T(2), -path_length / c_n)` and
+`score > threshold ? 1 : -1`) are two one-thread-per-row kernels here
+(`anomaly_score_kernel`, `predict_labels_kernel`), which is what
+`thrust::transform` launches. `get_compact_trees` / Treelite export are
+NOT implemented (NOT_IMPLEMENTED.tsv).
+
+================= DEVIATION BLOCK =================
+DEVIATION 680. NON-FINITE INPUTS ARE REFUSED BY NAME ON THE HOST. Theirs:
+`error_checking` asserts `n_rows > 0`, `n_cols > 0`, `n_estimators > 0`
+and that the pointer is a device pointer (`isolation_forest.cuh:50-56`),
+and nothing rejects NaN or infinity (cuML's Python `check_inputs` does not
+either). A NaN row reaches the builder, where `val < candidate_min` is
+false for it and a node whose min/max straddle it splits on a threshold
+that may itself be NaN; a NaN query traverses by `NaN < thr == false`
+(always right). Under IDENTICAL the certified stages (`if.treeNNN.
+structure.thr`, `if.pathlen`, `if.scores`) may not carry a computed NaN
+(IDENTITY_PATHS row 39: the payload is the vendor's). Ours: `fit` and
+`score_samples` scan the host input before any upload and raise naming
+the argument (`X`, `X_query`) and the first offending (row, column) in
+scikit-learn's wording ("contains NaN" / "contains infinity"). Measured by
+`check_if_refusals` (README). The brief's clause (5).
+
+DEVIATION 681. THE SCORE'S `pow(2, y)` IS `identical_pow(2, y)`. Theirs:
+`std::pow(T(2), -path_length / c_n)` in a Thrust functor (CUDA libm pow,
+not correctly rounded, vendor bits). Ours: `identical_pow(Float32(2), y)`
+(`checks/numerics.mojo`, row 12's seam: IDENTICAL is the portable
+`exp(p * log(x))` through fma-only polynomials, FAST is the stdlib `**`).
+`c_n = T(model->c_normalization)` is the double `compute_c_normalization`
+rounded to float32 exactly as theirs; the double itself is
+`identical_log64` under IDENTICAL (row 18's class: a host libm log). The
+README's std-exp sabotage moves scores device-vs-oracle, so the seam is
+reached.
+
+DEVIATION 684. `max_depth` AUTO IS AN INTEGER `ceil(log2(n))`. Theirs:
+`static_cast<int>(std::ceil(std::log2(static_cast<double>(n_sampled_rows))))`
+then `max(., 1)` (`isolation_forest.cuh:86-89`). Ours: the smallest k
+with `2^k >= n` (bit arithmetic). Same integer for every n >= 1 when
+`log2` is exact at powers of two (every libm is; glibc's `log2(8.0)` is
+3.0), and ours cannot be off by one on a platform whose `log2` is not.
+Spelling only; gated by `check_if_refusals` over n = 1..4097.
+===================================================
+"""
+
+from std.math import fma, log2
+from std.memory import bitcast, memcpy, stack_allocation
+from max.gpu.memory import AddressSpace
+from max.gpu.sync import barrier
+from std.sys import is_defined
+from std.sys.info import has_apple_gpu_accelerator
+
+from std.gpu import block_dim, block_idx, thread_idx
+from max.gpu.host import DeviceBuffer, DeviceContext
+
+from core.identity_trace import IdentityTrace
+from isolation_forest.impl.rng.xorwow import (
+    XorwowTables,
+    build_xorwow_tables,
+    curand,
+    curand_init,
+    curandStateXORWOW,
+    XORWOW_TABLE_WORDS,
+)
+from isolation_forest.impl.isolation_tree_builder import (
+    IF_BUILD_TPB,
+    IF_BUILD_TPB_MAX,
+    IF_DECISION_WORDS,
+    IF_PATH_TPB,
+    AFT_IF_PATH_ROWS,
+    IF_RNG_STATE_WORDS,
+    IF_SCRATCH_WORDS_PER_NODE,
+    IF_STACK_WORDS,
+    IF_FAST_ROWMAJOR, IF_T41_TREE_BATCH, IF_T42_CORRECTION_CACHE, IF_WORK_PLANES, if_correction_table_kernel,
+    build_isolation_trees_global_kernel,
+    if_finite_scan_kernel,
+    if_finite_scan_ftz_kernel,
+    compute_path_lengths_global_kernel,
+    compute_path_lengths_range_kernel,
+)
+#: DIAGNOSTIC (2026-08-29, the RTX 4090 hang): flushed prints on either side
+#: of the two launches so a hang is placed at "enqueue" (MAX compiles the
+#: kernel there) or at "synchronize" (the kernel is resident). A no-op in
+#: every build that does not name it. See isolation_tree_builder.mojo.
+comptime DIAG_TRACE = is_defined["ANONLIB_IF_DIAG_TRACE"]()
+
+from checks.numerics import (
+    GLOBAL_NUMERIC_MODE,
+    NUMERIC_IDENTICAL,
+    ftz,
+    identical_log64,
+    identical_pow,
+)
+from std.os import getenv
+from core.host_parallel import host_parallelize
+from core.segmented_sort import SORT_BLOCK, segmented_sort_keys_f32, float_to_sortable, sortable_to_float
+from core.device_scan import device_classify_nonfinite, device_first_nonfinite
+from metrics.checks.device_io import upload_i32
+
+
+# C50 / T31: exact IF vector nodes, independent of the RF/ET packed control.
+# Default OFF. NOT COMPILED — NOT TESTED — IDENTITY NOT VERIFIED — QUALITY NOT VERIFIED — NOT MEASURED.
+comptime IF_C50_PACKED = GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL and is_defined["ANONLIB_TREES_C50_IF_PACKED"]()
+
+
+def if_pack_nodes_kernel(feature: MutPointer[Int32, MutAnyOrigin], threshold: MutPointer[Float32, MutAnyOrigin],
+    left: MutPointer[Int32, MutAnyOrigin], right: MutPointer[Int32, MutAnyOrigin], packed: MutPointer[Int32, MutAnyOrigin], nodes: Int32):
+    var i = Int(block_idx.x)*Int(block_dim.x)+Int(thread_idx.x)
+    if i < Int(nodes):
+        packed.unsafe_store(4*i, feature.unsafe_load(i))
+        packed.unsafe_store(4*i+1, bitcast[DType.int32](threshold.unsafe_load(i)))
+        packed.unsafe_store(4*i+2, left.unsafe_load(i))
+        packed.unsafe_store(4*i+3, right.unsafe_load(i))
+
+
+def if_packed_paths_kernel(x: MutPointer[Float32, MutAnyOrigin], packed: MutPointer[Int32, MutAnyOrigin],
+    offsets: MutPointer[Int32, MutAnyOrigin], result: MutPointer[Float32, MutAnyOrigin], rows: Int32, features: Int32, trees: Int32):
+    var row = Int(block_idx.x)*Int(block_dim.x)+Int(thread_idx.x)
+    if row >= Int(rows):
+        return
+    var total = Float32(0)
+    for t in range(Int(trees)):
+        var base = Int(offsets.unsafe_load(t))
+        var node = 0
+        var words = packed.unsafe_load[width=4](4*base)
+        while words[0] >= 0:
+            var value = x.unsafe_load(row*Int(features)+Int(words[0]))
+            node = Int(words[2] if value < bitcast[DType.float32](words[1]) else words[3])
+            words = packed.unsafe_load[width=4](4*(base+node))
+        total = ftz(total+bitcast[DType.float32](words[1]))
+    result.unsafe_store(row, ftz(total/Float32(trees)))
+
+
+# ---------------------------------------------------------------------------
+# isolation_forest.hpp:27-34
+# ---------------------------------------------------------------------------
+
+
+@fieldwise_init
+struct IF_params(Copyable, Movable):
+    """`struct IF_params` with their defaults."""
+
+    var n_estimators: Int
+    var max_samples: Int
+    var max_depth: Int
+    var max_features: Int
+    var bootstrap: Bool
+    var seed: UInt64
+
+    @staticmethod
+    def default() -> Self:
+        return Self(100, 256, -1, -1, False, 0)
+
+
+@fieldwise_init
+struct IFLaunchKnobs(Copyable, Movable):
+    """SCHEDULING knobs (never numeric), here so the gates can vary them:
+    `build_tpb` (theirs 128), `path_tpb` (theirs 256), `pad` extra
+    elements on every scratch and node buffer, `poison` the value every
+    buffer is filled with before use (a launch-invariance gate runs two
+    poisons and two paddings and asks for the same bytes)."""
+
+    var build_tpb: Int
+    var path_tpb: Int
+    var pad: Int
+    var poison: Float32
+
+    @staticmethod
+    def default() -> Self:
+        return Self(IF_BUILD_TPB, IF_PATH_TPB, 0, Float32(0.0))
+
+
+# ---------------------------------------------------------------------------
+# isolation_forest.hpp:38-50 (+ DEVIATION 685's four node arrays)
+# ---------------------------------------------------------------------------
+
+
+@fieldwise_init
+struct IFModelShard(Movable):
+    """Resident whole-tree buffers, with their owning context destroyed last."""
+    var ctx: DeviceContext
+    var global_feature_indices: DeviceBuffer[DType.int32]
+    var node_feature: DeviceBuffer[DType.int32]
+    var node_threshold: DeviceBuffer[DType.float32]
+    var node_left: DeviceBuffer[DType.int32]
+    var node_right: DeviceBuffer[DType.int32]
+    var global_tree_offsets: DeviceBuffer[DType.int32]
+    var global_tree_n_nodes: DeviceBuffer[DType.int32]
+    var global_tree_max_depth: DeviceBuffer[DType.int32]
+    var first: Int
+    var count: Int
+    var tree_n_nodes_host: List[Int32]
+    var tree_max_depth_host: List[Int32]
+
+    def __deinit__(deinit self):
+        _ = self.global_feature_indices^
+        _ = self.node_feature^
+        _ = self.node_threshold^
+        _ = self.node_left^
+        _ = self.node_right^
+        _ = self.global_tree_offsets^
+        _ = self.global_tree_n_nodes^
+        _ = self.global_tree_max_depth^
+        try:
+            self.ctx.synchronize()
+        except:
+            pass
+        _ = self.ctx^
+
+
+struct IsolationForestModel(Movable):
+    """`IsolationForestModel<float>`. The node storage is DEVIATION 685's
+    four arrays; `tree_n_nodes_host` is a host copy of
+    `global_tree_n_nodes` (read once after `fit`) so the card can hash
+    each tree's USED nodes and nothing else."""
+
+    var params: IF_params
+    var n_features: Int
+    var n_features_per_tree: Int
+    var n_samples_per_tree: Int
+    var c_normalization: Float64
+    var max_nodes_per_tree: Int
+    var has_feature_indices: Bool
+    var global_feature_indices: DeviceBuffer[DType.int32]
+    var node_feature: DeviceBuffer[DType.int32]
+    var node_threshold: DeviceBuffer[DType.float32]
+    var node_left: DeviceBuffer[DType.int32]
+    var node_right: DeviceBuffer[DType.int32]
+    var global_tree_offsets: DeviceBuffer[DType.int32]
+    var global_tree_n_nodes: DeviceBuffer[DType.int32]
+    var global_tree_max_depth: DeviceBuffer[DType.int32]
+    var tree_n_nodes_host: List[Int32]
+    var tree_max_depth_host: List[Int32]
+    var packed_nodes: Optional[DeviceBuffer[DType.int32]]
+    var fitted: Bool
+    var shards: List[IFModelShard]
+
+    def __init__(out self, ctx: DeviceContext) raises:
+        self.params = IF_params.default()
+        self.n_features = 0
+        self.n_features_per_tree = 0
+        self.n_samples_per_tree = 0
+        self.c_normalization = 0.0
+        self.max_nodes_per_tree = 0
+        self.has_feature_indices = False
+        self.global_feature_indices = ctx.enqueue_create_buffer[DType.int32](1)
+        self.node_feature = ctx.enqueue_create_buffer[DType.int32](1)
+        self.node_threshold = ctx.enqueue_create_buffer[DType.float32](1)
+        self.node_left = ctx.enqueue_create_buffer[DType.int32](1)
+        self.node_right = ctx.enqueue_create_buffer[DType.int32](1)
+        self.global_tree_offsets = ctx.enqueue_create_buffer[DType.int32](1)
+        self.global_tree_n_nodes = ctx.enqueue_create_buffer[DType.int32](1)
+        self.global_tree_max_depth = ctx.enqueue_create_buffer[DType.int32](1)
+        self.tree_n_nodes_host = List[Int32]()
+        self.tree_max_depth_host = List[Int32]()
+        self.packed_nodes = Optional[DeviceBuffer[DType.int32]]()
+        self.fitted = False
+        self.shards = List[IFModelShard]()
+        ctx.synchronize()
+
+
+# ---------------------------------------------------------------------------
+# isolation_forest.cu:27-36
+# ---------------------------------------------------------------------------
+
+
+def compute_c_normalization(n: Int) -> Float64:
+    """`compute_c_normalization(int n)`: host double, `2H(n-1) - 2(n-1)/n`
+    with `H(n-1) = log(n-1) + euler_mascheroni`. The `log` is
+    `identical_log64` under IDENTICAL (DEVIATION 681)."""
+    if n <= 1:
+        return 0.0
+    if n == 2:
+        return 1.0
+    var euler_mascheroni = Float64(0.5772156649015329)
+    var harmonic_n_minus_1 = identical_log64(Float64(n - 1)) + euler_mascheroni
+    return 2.0 * harmonic_n_minus_1 - 2.0 * Float64(n - 1) / Float64(n)
+
+
+# ---------------------------------------------------------------------------
+# isolation_forest.cuh:29-44
+# ---------------------------------------------------------------------------
+
+
+def compute_global_max_nodes_per_tree(max_depth: Int, max_samples: Int) raises -> Int:
+    if max_depth < 0:
+        raise Error(
+            "max_depth must be non-negative, got " + String(max_depth)
+        )
+    if max_samples <= 0:
+        raise Error(
+            "max_samples must be positive, got " + String(max_samples)
+        )
+    var sample_bound = 2 * max_samples - 1
+    var depth_bound = sample_bound
+    if max_depth < 30:
+        depth_bound = (1 << (max_depth + 1)) - 1
+    var bounded = sample_bound if sample_bound < depth_bound else depth_bound
+    if bounded > 2147483647:
+        raise Error(
+            "Global-memory Isolation Forest node capacity exceeds int range."
+        )
+    return bounded
+
+
+def ceil_log2_int(n: Int) -> Int:
+    """DEVIATION 684: the smallest k >= 0 with 2^k >= n (n >= 1)."""
+    var k = 0
+    while (1 << k) < n:
+        k += 1
+    return k
+
+
+# ---------------------------------------------------------------------------
+# DEVIATION 680: the host finite scan.
+# ---------------------------------------------------------------------------
+
+
+def check_finite_by_name_host(
+    name: String, x: List[Float32], n_rows: Int, n_cols: Int
+) raises:
+    """Raise naming `name` and the first non-finite cell. `x` is read as
+    `n_rows * n_cols` cells in either layout; the (row, col) printed
+    assumes row-major and is labelled `flat` as well."""
+    if len(x) < n_rows * n_cols:
+        raise Error(
+            name
+            + " holds "
+            + String(len(x))
+            + " values, expected n_rows * n_cols = "
+            + String(n_rows * n_cols)
+        )
+    for i in range(n_rows * n_cols):
+        var v = x[i]
+        var bits = bitcast[DType.uint32](v)
+        if (bits & 0x7F800000) == 0x7F800000:
+            var what = String("infinity")
+            if (bits & 0x007FFFFF) != 0:
+                what = String("NaN")
+            raise Error(
+                "Input "
+                + name
+                + " contains "
+                + what
+                + " at flat index "
+                + String(i)
+                + " (row "
+                + String(i // n_cols)
+                + ", column "
+                + String(i % n_cols)
+                + " row-major); Isolation Forest does not accept non-finite"
+                + " values (DEVIATION 680)"
+            )
+
+
+# ---------------------------------------------------------------------------
+# Host <-> device helpers (padding and poison are IFLaunchKnobs')
+# ---------------------------------------------------------------------------
+
+
+def _upload_f32(
+    ctx: DeviceContext, values: List[Float32], n: Int, pad: Int, poison: Float32
+) raises -> DeviceBuffer[DType.float32]:
+    var buf = ctx.enqueue_create_buffer[DType.float32](n + pad)
+    var host = ctx.enqueue_create_host_buffer[DType.float32](n + pad)
+    for i in range(n + pad):
+        host.unsafe_ptr().unsafe_store(i, poison)
+    # DEVIATION 1942, row 10: `_upload_f32` is the ONE seam every feature
+    # value crosses onto the device (the fit input, the query input for
+    # path lengths and predict). Flushed here, under the pin, so the
+    # per-node min/max, the `val < threshold` partition, the
+    # `threshold = max_val` fallback and the traversal all read the same
+    # value on a flush-to-zero backend and on a denormal-honoring one.
+    # `ftz` is a comptime no-op under FAST.
+    for i in range(n):
+        host.unsafe_ptr().unsafe_store(i, ftz(values[i]))
+    ctx.enqueue_copy(dst_buf=buf, src_ptr=host.unsafe_ptr())
+    ctx.synchronize()
+    _ = host^
+    return buf^
+
+
+def _raise_first_nonfinite_device(
+    ctx: DeviceContext,
+    name: String,
+    mut flat: DeviceBuffer[DType.float32],
+    n_rows: Int,
+    n_cols: Int,
+) raises:
+    """`check_finite_by_name_host`'s refusal for a block already on the
+    device (cpu4-forest): the first non-finite flat index of `flat[0:n)`
+    (`device_first_nonfinite`) and its kind (`device_classify_nonfinite`),
+    one index and one word read back, the same message at the same index
+    as the named host scan over the same cell order. Call it only after a
+    device scan raised its flag."""
+    var i = device_first_nonfinite(ctx, flat, n_rows * n_cols)
+    if i < 0:
+        raise Error(
+            "Input " + name + ": the device finite scan and the named scan disagree"
+        )
+    var what = String("infinity")
+    if device_classify_nonfinite(ctx, flat, i):
+        what = String("NaN")
+    raise Error(
+        "Input "
+        + name
+        + " contains "
+        + what
+        + " at flat index "
+        + String(i)
+        + " (row "
+        + String(i // n_cols)
+        + ", column "
+        + String(i % n_cols)
+        + " row-major); Isolation Forest does not accept non-finite"
+        + " values (DEVIATION 680)"
+    )
+
+
+def _colmajor_copy_device(
+    ctx: DeviceContext,
+    mut src_rowmajor: DeviceBuffer[DType.float32],
+    n_rows: Int,
+    n_cols: Int,
+) raises -> DeviceBuffer[DType.float32]:
+    """A column-major copy (`ftz` per cell, which keeps NaN and infinity
+    as they are) of a row-major device block: the cell order a column-major
+    refusal names. Error path only."""
+    var n = n_rows * n_cols
+    var out = ctx.enqueue_create_buffer[DType.float32](max(n, 1))
+    var bad = ctx.enqueue_create_buffer[DType.int32](1)
+    bad.enqueue_fill(Int32(0))
+    ctx.enqueue_function[_if_transpose_ftz_kernel](
+        src_rowmajor.unsafe_ptr(),
+        out.unsafe_ptr(),
+        Int64(n_rows),
+        Int32(n_cols),
+        bad.unsafe_ptr(),
+        grid_dim=((n_rows + 255) // 256, 1, 1),
+        block_dim=(256, 1, 1),
+    )
+    ctx.synchronize()
+    _ = bad^
+    return out^
+
+
+#: Lane gap-trees-nv: the fit's training matrix goes to the device as the
+#: caller's ROW-major bytes, straight from the borrowed address, and one
+#: kernel writes the column-major plane (`ftz` per cell, the same function
+#: the host pass applied, so the same words) and raises a flag on a
+#: non-finite cell. The refusal's message still comes from the named host
+#: scan, which runs only after the flag is up (an error path, not the fit).
+#: cpu-gpu-cleanup t-forest: this is the only route on every vendor; the
+#: pinned-stage host transpose (`ensemble/host_layout.mojo`) and its
+#: `ANONLIB_IFOREST_DEVICE_TRANSPOSE` opt-in are gone. The name stays
+#: True for `iforest_device_scan` (bindings/_anonlib_svm.mojo), which tells
+#: the Python layer that the fit's device scan refuses a non-finite X.
+comptime IF_DEVICE_TRANSPOSE = True
+
+
+def _if_transpose_ftz_kernel(
+    src: MutPointer[Float32, MutAnyOrigin],
+    dst: MutPointer[Float32, MutAnyOrigin],
+    n_rows: Int64,
+    n_cols: Int32,
+    bad: MutPointer[Int32, MutAnyOrigin],
+):
+    """`dst[c * n_rows + r] = ftz(src[r * n_cols + c])`, one thread per row;
+    `bad[0] = 1` when any cell of the row is NaN or infinity."""
+    var r = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    var nr = Int(n_rows)
+    if r >= nr:
+        return
+    var nc = Int(n_cols)
+    var flag = False
+    for c in range(nc):
+        var v = src.unsafe_load(r * nc + c)
+        if (bitcast[DType.uint32](v) & UInt32(0x7F800000)) == UInt32(0x7F800000):
+            flag = True
+        dst.unsafe_store(c * nr + r, ftz(v))
+    if flag:
+        bad.unsafe_store(0, Int32(1))
+
+
+def _upload_rowmajor_as_colmajor_device(
+    ctx: DeviceContext, src_addr: Int, n_rows: Int, n_cols: Int, pad: Int, poison: Float32
+) raises -> DeviceBuffer[DType.float32]:
+    """`_upload_f32` of the column-major transpose of a borrowed ROW-major
+    block (the same words: `ftz` per cell, `poison` in the `pad` tail),
+    transposed on the device. DEVIATION 680's scan rides the same kernel; a
+    non-finite cell raises `check_finite_by_name`'s message."""
+    var n = n_rows * n_cols
+    var src = MutPointer[Float32, MutUntrackedOrigin](unsafe_from_address=src_addr)
+    var raw = ctx.enqueue_create_buffer[DType.float32](n)
+    ctx.enqueue_copy(dst_buf=raw, src_ptr=src)
+    var buf = ctx.enqueue_create_buffer[DType.float32](n + pad)
+    if pad > 0:
+        buf.enqueue_fill(poison)
+    var bad = ctx.enqueue_create_buffer[DType.int32](1)
+    bad.enqueue_fill(Int32(0))
+    ctx.enqueue_function[_if_transpose_ftz_kernel](
+        raw.unsafe_ptr(),
+        buf.unsafe_ptr(),
+        Int64(n_rows),
+        Int32(n_cols),
+        bad.unsafe_ptr(),
+        grid_dim=((n_rows + 255) // 256, 1, 1),
+        block_dim=(256, 1, 1),
+    )
+    var hb = ctx.enqueue_create_host_buffer[DType.int32](1)
+    ctx.enqueue_copy(dst_ptr=hb.unsafe_ptr(), src_buf=bad)
+    ctx.synchronize()
+    if hb.unsafe_ptr().unsafe_load(0) != Int32(0):
+        _raise_first_nonfinite_device(ctx, "X", buf, n_rows, n_cols)
+    _ = raw^
+    _ = bad^
+    _ = hb^
+    return buf^
+
+
+def _upload_rowmajor_fast(
+    ctx: DeviceContext, src_addr: Int, n_rows: Int, n_cols: Int, pad: Int, poison: Float32
+) raises -> DeviceBuffer[DType.float32]:
+    """IF_FAST_ROWMAJOR: the borrowed ROW-major block copied to the device
+    as it is (one raw host-pointer copy, no host pass over the cells), the
+    `pad` tail poisoned and DEVIATION 680's scan run on the device. A
+    non-finite cell raises `_upload_rowmajor_as_colmajor_device`'s message (the
+    named host scan runs only then, to find the index)."""
+    var n = n_rows * n_cols
+    var src = MutPointer[Float32, MutUntrackedOrigin](unsafe_from_address=src_addr)
+    var buf = ctx.enqueue_create_buffer[DType.float32](n + pad)
+    var flag = ctx.enqueue_create_buffer[DType.int32](1)
+    flag.enqueue_fill(Int32(0))
+    ctx.enqueue_copy(dst_buf=buf.create_sub_buffer[DType.float32](0, n), src_ptr=src)
+    comptime tpb = 256
+    var blocks = min((n + tpb * 16 - 1) // (tpb * 16), 65535)
+    blocks = max(blocks, (pad + tpb - 1) // tpb)
+    ctx.enqueue_function[if_finite_scan_ftz_kernel](
+        buf.unsafe_ptr(),
+        Int64(n),
+        Int64(pad),
+        poison,
+        flag.unsafe_ptr(),
+        grid_dim=(blocks, 1, 1),
+        block_dim=(tpb, 1, 1),
+    )
+    var bad = read_i32(ctx, flag, 1)
+    if bad[0] != 0:
+        var cm = _colmajor_copy_device(ctx, buf, n_rows, n_cols)
+        _raise_first_nonfinite_device(ctx, "X", cm, n_rows, n_cols)
+    _ = flag^
+    return buf^
+
+
+#: Lane fam-forests (2026-10-04), IDENTICAL on every vendor: the QUERY matrix
+#: of `score_samples` / `decision_function` / `predict` (and the training
+#: matrix the contamination quantile scores) goes to the device as the
+#: caller's ROW-major bytes, straight from the borrowed address, and one
+#: kernel flushes each cell (`ftz`, the function `_upload_f32` applies on
+#: the host) and runs DEVIATION 680's finiteness scan. Before it the binding
+#: appended every cell to a List under the GIL, `check_finite_by_name`
+#: walked the List, and `_upload_f32` stored `ftz` of every cell into the
+#: stage on one thread: three serial host passes over n x d cells inside
+#: every scoring call. The device buffer holds the same words (`ftz` per
+#: cell, `poison` in the tail), so no bit moves and the host column is
+#: untouched; a non-finite cell raises `check_finite_by_name`'s message.
+#: `-D ANONLIB_IDN_IF_QUERY_DEVICE_OFF` restores the List route.
+#: cpu2-l6-bindings (2026-10-04): the device route is the default on EVERY
+#: tier and vendor (FAST included); the FAST List route was a host copy of
+#: the query on a GPU route. Same words (`ftz` per cell) either way.
+comptime IDN_IF_QUERY_DEVICE = not (
+    is_defined["ANONLIB_IDN_IF_QUERY_DEVICE_OFF"]()
+    or (
+        GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL
+        and is_defined["ANONLIB_IDN_ALL_OFF"]()
+    )
+)
+
+#: Lane fam2-forests (IDENTICAL speed wave 3): the fitted forest stays
+#: RESIDENT between binding calls (`isolation_forest/estimator.mojo`,
+#: "THE RESIDENT ENTRY"). Before it DEVIATION 874 refitted the whole forest
+#: inside every `score_samples` / `decision_function` / `predict` call (and
+#: re-ran the contamination quantile over the training rows). The resident
+#: forest is the one `fit` built, so the scores are the refit's bit for bit
+#: (the forest is a pure function of the seed and the X bits) and the host
+#: column is untouched. `-D ANONLIB_IDN_IF_RESIDENT_OFF` restores the
+#: refit-per-call form.
+comptime IDN_IF_RESIDENT = GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL and not (
+    is_defined["ANONLIB_IDN_IF_RESIDENT_OFF"]()
+    or is_defined["ANONLIB_IDN_ALL_OFF"]()
+)
+
+#: Lane fam2-forests: the scoring epilogue of the resident entry runs on the
+#: device and the result is downloaded straight into the caller's buffer.
+#: Before it the scores came back into a List (one cell at a time), the
+#: Python layer's sign flip / `- offset_` / label flip ran over that List on
+#: the host into a second List, and the binding stored that List cell by
+#: cell under the GIL: three serial host passes over n values per scoring
+#: call. The kernels do one exact float32 negation (and one float32
+#: subtraction, the operation the host loop did), so no bit moves.
+#: Applies inside the resident entry only. `-D
+#: ANONLIB_IDN_IF_EPILOGUE_DEVICE_OFF` restores the host epilogue.
+comptime IDN_IF_EPILOGUE_DEVICE = GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL and not (
+    is_defined["ANONLIB_IDN_IF_EPILOGUE_DEVICE_OFF"]()
+    or is_defined["ANONLIB_IDN_ALL_OFF"]()
+)
+
+
+def _upload_colmajor_as_rowmajor_device(
+    ctx: DeviceContext, src_addr: Int, n_rows: Int, n_cols: Int, pad: Int,
+    poison: Float32,
+) raises -> DeviceBuffer[DType.float32]:
+    """`IF_FAST_ROWMAJOR` for a COLUMN-major host block (cpu4-forest): one
+    raw copy, then `_if_transpose_ftz_kernel` on the transposed shape (a
+    column-major `n_rows x n_cols` block is the row-major `n_cols x n_rows`
+    one) writes the row-major plane, `ftz` per cell as `_upload_f32` stored
+    it, and DEVIATION 680's flag. A non-finite cell raises
+    `check_finite_by_name_host`'s message over the block's own cell order."""
+    var n = n_rows * n_cols
+    var src = MutPointer[Float32, MutUntrackedOrigin](unsafe_from_address=src_addr)
+    var raw = ctx.enqueue_create_buffer[DType.float32](max(n, 1))
+    ctx.enqueue_copy(dst_buf=raw.create_sub_buffer[DType.float32](0, n), src_ptr=src)
+    var buf = ctx.enqueue_create_buffer[DType.float32](n + pad)
+    if pad > 0:
+        buf.enqueue_fill(poison)
+    var bad = ctx.enqueue_create_buffer[DType.int32](1)
+    bad.enqueue_fill(Int32(0))
+    ctx.enqueue_function[_if_transpose_ftz_kernel](
+        raw.unsafe_ptr(),
+        buf.unsafe_ptr(),
+        Int64(n_cols),
+        Int32(n_rows),
+        bad.unsafe_ptr(),
+        grid_dim=((n_cols + 255) // 256, 1, 1),
+        block_dim=(256, 1, 1),
+    )
+    var flag = read_i32(ctx, bad, 1)
+    if flag[0] != 0:
+        _raise_first_nonfinite_device(ctx, "X", raw, n_rows, n_cols)
+    _ = raw^
+    _ = bad^
+    return buf^
+
+
+def _upload_rowmajor_query_device(
+    ctx: DeviceContext, name: String, src_addr: Int, n_rows: Int, n_cols: Int, pad: Int,
+    poison: Float32,
+) raises -> DeviceBuffer[DType.float32]:
+    """`IDN_IF_QUERY_DEVICE`: `check_finite_by_name` + `_upload_f32` of a
+    borrowed ROW-major block, on the device (one raw host-pointer copy, then
+    `if_finite_scan_ftz_kernel`). The same words as `_upload_f32` stages."""
+    var n = n_rows * n_cols
+    var src = MutPointer[Float32, MutUntrackedOrigin](unsafe_from_address=src_addr)
+    var buf = ctx.enqueue_create_buffer[DType.float32](n + pad)
+    var flag = ctx.enqueue_create_buffer[DType.int32](1)
+    flag.enqueue_fill(Int32(0))
+    ctx.enqueue_copy(dst_buf=buf.create_sub_buffer[DType.float32](0, n), src_ptr=src)
+    comptime tpb = 256
+    var blocks = min((n + tpb * 16 - 1) // (tpb * 16), 65535)
+    blocks = max(blocks, (pad + tpb - 1) // tpb)
+    ctx.enqueue_function[if_finite_scan_ftz_kernel](
+        buf.unsafe_ptr(),
+        Int64(n),
+        Int64(pad),
+        poison,
+        flag.unsafe_ptr(),
+        grid_dim=(blocks, 1, 1),
+        block_dim=(tpb, 1, 1),
+    )
+    var bad = read_i32(ctx, flag, 1)
+    if bad[0] != 0:
+        _raise_first_nonfinite_device(ctx, name, buf, n_rows, n_cols)
+    _ = flag^
+    return buf^
+
+
+def _upload_u32(
+    ctx: DeviceContext, values: List[UInt32], n: Int
+) raises -> DeviceBuffer[DType.uint32]:
+    var buf = ctx.enqueue_create_buffer[DType.uint32](n)
+    var host = ctx.enqueue_create_host_buffer[DType.uint32](n)
+    for i in range(n):
+        host.unsafe_ptr().unsafe_store(i, values[i])
+    ctx.enqueue_copy(dst_buf=buf, src_ptr=host.unsafe_ptr())
+    ctx.synchronize()
+    _ = host^
+    return buf^
+
+
+def _poisoned_f32(
+    ctx: DeviceContext, n: Int, pad: Int, poison: Float32
+) raises -> DeviceBuffer[DType.float32]:
+    var buf = ctx.enqueue_create_buffer[DType.float32](n + pad)
+    buf.enqueue_fill(poison)
+    ctx.synchronize()
+    return buf^
+
+
+def _poisoned_i32(
+    ctx: DeviceContext, n: Int, pad: Int, poison: Float32
+) raises -> DeviceBuffer[DType.int32]:
+    var buf = ctx.enqueue_create_buffer[DType.int32](n + pad)
+    buf.enqueue_fill(Int32(bitcast[DType.int32](poison)))
+    ctx.synchronize()
+    return buf^
+
+
+def _poisoned_i64(
+    ctx: DeviceContext, n: Int, pad: Int, poison: Float32
+) raises -> DeviceBuffer[DType.int64]:
+    var buf = ctx.enqueue_create_buffer[DType.int64](n + pad)
+    buf.enqueue_fill(Int64(bitcast[DType.int32](poison)))
+    ctx.synchronize()
+    return buf^
+
+
+def read_f32(
+    ctx: DeviceContext, buf: DeviceBuffer[DType.float32], n: Int
+) raises -> List[Float32]:
+    var h = ctx.enqueue_create_host_buffer[DType.float32](len(buf))
+    ctx.enqueue_copy(dst_ptr=h.unsafe_ptr(), src_buf=buf)
+    ctx.synchronize()
+    # one bulk copy into the returned List (no host pass)
+    var out = List[Float32](length=n, fill=Float32(0))
+    memcpy(dest=out.unsafe_ptr(), src=h.unsafe_ptr(), count=n)
+    _ = h^
+    return out^
+
+
+def read_i32(
+    ctx: DeviceContext, buf: DeviceBuffer[DType.int32], n: Int
+) raises -> List[Int32]:
+    var h = ctx.enqueue_create_host_buffer[DType.int32](len(buf))
+    ctx.enqueue_copy(dst_ptr=h.unsafe_ptr(), src_buf=buf)
+    ctx.synchronize()
+    # one bulk copy into the returned List (no host pass)
+    var out = List[Int32](length=n, fill=Int32(0))
+    memcpy(dest=out.unsafe_ptr(), src=h.unsafe_ptr(), count=n)
+    _ = h^
+    return out^
+
+
+def read_i64(
+    ctx: DeviceContext, buf: DeviceBuffer[DType.int64], n: Int
+) raises -> List[Int64]:
+    var h = ctx.enqueue_create_host_buffer[DType.int64](len(buf))
+    ctx.enqueue_copy(dst_ptr=h.unsafe_ptr(), src_buf=buf)
+    ctx.synchronize()
+    # one bulk copy into the returned List (no host pass)
+    var out = List[Int64](length=n, fill=Int64(0))
+    memcpy(dest=out.unsafe_ptr(), src=h.unsafe_ptr(), count=n)
+    _ = h^
+    return out^
+
+
+
+
+def _mp_f32(buf: DeviceBuffer[DType.float32]) -> MutPointer[Float32, MutAnyOrigin]:
+    """A kernel-argument pointer from a buffer bound immutably (the model's
+    node arrays are READ by the scorer; the origin cast says so)."""
+    return buf.unsafe_ptr().unsafe_mut_cast[True]().unsafe_origin_cast[MutAnyOrigin]()
+
+
+def _mp_i32(buf: DeviceBuffer[DType.int32]) -> MutPointer[Int32, MutAnyOrigin]:
+    return buf.unsafe_ptr().unsafe_mut_cast[True]().unsafe_origin_cast[MutAnyOrigin]()
+
+
+def _mp_u32(buf: DeviceBuffer[DType.uint32]) -> MutPointer[UInt32, MutAnyOrigin]:
+    return buf.unsafe_ptr().unsafe_mut_cast[True]().unsafe_origin_cast[MutAnyOrigin]()
+
+
+def _mp_i64(buf: DeviceBuffer[DType.int64]) -> MutPointer[Int64, MutAnyOrigin]:
+    return buf.unsafe_ptr().unsafe_mut_cast[True]().unsafe_origin_cast[MutAnyOrigin]()
+
+
+# ---------------------------------------------------------------------------
+# The XORWOW tables on the device (DEVIATION 683), built once per context use.
+# ---------------------------------------------------------------------------
+
+
+struct XorwowDeviceTables(Movable):
+    var sequence: DeviceBuffer[DType.uint32]
+    var offset: DeviceBuffer[DType.uint32]
+    var host: XorwowTables
+
+    def __init__(out self, ctx: DeviceContext) raises:
+        self.host = build_xorwow_tables()
+        self.sequence = _upload_u32(ctx, self.host.sequence, XORWOW_TABLE_WORDS)
+        self.offset = _upload_u32(ctx, self.host.offset, XORWOW_TABLE_WORDS)
+
+
+# ---------------------------------------------------------------------------
+# The Thrust transforms of score_samples / predict as kernels.
+# ---------------------------------------------------------------------------
+
+
+def anomaly_score_kernel(
+    path_lengths: MutPointer[Float32, MutAnyOrigin],
+    scores: MutPointer[Float32, MutAnyOrigin],
+    n_in: Int32,
+    c_n: Float32,
+):
+    """`[c_n] __device__(T path_length) { return std::pow(T(2),
+    -path_length / c_n); }` (`isolation_forest.cuh:177-181`); DEVIATION
+    681's `identical_pow`."""
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if i >= Int(n_in):
+        return
+    var y = ftz(-path_lengths.unsafe_load(i) / c_n)
+    scores.unsafe_store(i, ftz(identical_pow(Float32(2.0), y)))
+
+
+def predict_labels_kernel(
+    scores: MutPointer[Float32, MutAnyOrigin],
+    predictions: MutPointer[Int32, MutAnyOrigin],
+    n_in: Int32,
+    threshold: Float32,
+):
+    """`[threshold] __device__(float score) { return score > threshold ? 1
+    : -1; }` (`isolation_forest.cu:212-217`): 1 = anomaly, -1 = normal."""
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if i >= Int(n_in):
+        return
+    var s = scores.unsafe_load(i)
+    predictions.unsafe_store(i, Int32(1) if s > threshold else Int32(-1))
+
+
+def if_score_epilogue_kernel(
+    scores: MutPointer[Float32, MutAnyOrigin],
+    n_in: Int32,
+    subtract: Int32,
+    offset: Float32,
+):
+    """`IDN_IF_EPILOGUE_DEVICE`: the Python layer's `score_samples = -paper`
+    (`isolation_forest.pyx:959`) and, when `subtract` is nonzero,
+    `decision_function = score_samples - offset_` (`:978`), in place. The
+    same two float32 operations `IsolationForestEstimator.score_samples` /
+    `decision_function` do on the host."""
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if i >= Int(n_in):
+        return
+    var v = -scores.unsafe_load(i)
+    if subtract != 0:
+        v = v - offset
+    scores.unsafe_store(i, v)
+
+
+def if_predict_epilogue_kernel(
+    scores: MutPointer[Float32, MutAnyOrigin],
+    predictions: MutPointer[Int32, MutAnyOrigin],
+    n_in: Int32,
+    threshold: Float32,
+):
+    """`IDN_IF_EPILOGUE_DEVICE`: `predict_labels_kernel` and the Python
+    layer's label flip in one launch: -1 = anomaly (`score > threshold`),
+    1 = inlier."""
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if i >= Int(n_in):
+        return
+    var s = scores.unsafe_load(i)
+    predictions.unsafe_store(i, Int32(-1) if s > threshold else Int32(1))
+
+
+# ---------------------------------------------------------------------------
+# isolation_forest.cuh:46-185: class IsolationForest<T>
+# ---------------------------------------------------------------------------
+
+
+struct IsolationForest(Movable):
+    """`IsolationForest<float>`: the params and the three methods."""
+
+    var params: IF_params
+
+    def __init__(out self, cfg_params: IF_params):
+        self.params = cfg_params.copy()
+
+    def error_checking(self, n_rows: Int, n_cols: Int) raises:
+        """`:50-56` plus DEVIATION 680's finite scan (done by `fit`, which
+        holds the host data). The `is_dev_ptr` assert has no object: the
+        input is a host List that `fit` uploads itself."""
+        if n_rows <= 0:
+            raise Error("Invalid n_rows " + String(n_rows))
+        if n_cols <= 0:
+            raise Error("Invalid n_cols " + String(n_cols))
+        if self.params.n_estimators <= 0:
+            raise Error(
+                "n_estimators must be > 0, got " + String(self.params.n_estimators)
+            )
+
+    def fit(
+        self,
+        ctx: DeviceContext,
+        input_colmajor: List[Float32],
+        n_rows: Int,
+        n_cols: Int,
+        mut model: IsolationForestModel,
+        mut trace: IdentityTrace,
+        knobs: IFLaunchKnobs = IFLaunchKnobs.default(),
+        src_addr: Int = 0,
+        global_tree_start: Int = 0,
+        distribute: Bool = True,
+        colmajor_addr: Int = 0,
+    ) raises:
+        """`IsolationForest::fit` (`:70-140`): resolve `n_sampled_rows`,
+        `max_depth`, `n_sampled_features`, `c_normalization`,
+        `max_nodes_per_tree`; allocate; `build_isolation_forest_global`;
+        sync. `input_colmajor` is column-major `n_rows x n_cols` as theirs
+        (`isolation_forest.hpp:118`)."""
+        self.error_checking(n_rows, n_cols)
+        # DEVIATION 2638: with `src_addr` (a borrowed ROW-major X, the binding's
+        # path) `input_colmajor` is empty and the scan rides the threaded upload.
+        # cpu4-forest: a column-major block (`input_colmajor`, or one lent
+        # at `colmajor_addr`) goes to the device as its raw bytes too; the
+        # `ftz`, the finite scan and the refusal's index run there.
+        var cm_addr = colmajor_addr
+        if src_addr == 0 and cm_addr == 0:
+            if len(input_colmajor) < n_rows * n_cols:
+                raise Error(
+                    "X holds "
+                    + String(len(input_colmajor))
+                    + " values, expected n_rows * n_cols = "
+                    + String(n_rows * n_cols)
+                )
+            cm_addr = Int(input_colmajor.unsafe_ptr())
+
+        var n_sampled_rows = self.params.max_samples
+        if n_rows < n_sampled_rows:
+            n_sampled_rows = n_rows
+        if n_sampled_rows <= 0:
+            raise Error(
+                "max_samples must be positive, got " + String(self.params.max_samples)
+            )
+        var max_depth = self.params.max_depth
+        if max_depth <= 0:
+            max_depth = ceil_log2_int(n_sampled_rows)
+            if max_depth < 1:
+                max_depth = 1
+
+        var n_sampled_features = self.params.max_features
+        if n_sampled_features <= 0 or n_sampled_features > n_cols:
+            n_sampled_features = n_cols
+
+        model.params = self.params.copy()
+        model.n_features = n_cols
+        model.n_features_per_tree = n_sampled_features
+        model.n_samples_per_tree = n_sampled_rows
+        model.c_normalization = compute_c_normalization(n_sampled_rows)
+        model.max_nodes_per_tree = compute_global_max_nodes_per_tree(
+            max_depth, n_sampled_rows
+        )
+        var n_trees = self.params.n_estimators
+        var total_nodes = n_trees * model.max_nodes_per_tree
+        if total_nodes > 2147483647:
+            raise Error("Isolation Forest node offsets exceed int range.")
+        model.has_feature_indices = n_sampled_features < n_cols
+
+        if distribute:
+            var setting = String(getenv("ANONLIB_IFOREST_DEVICE_COUNT"))
+            if setting != "" and setting != "1":
+                var count = Int(setting)
+                if count < 1 or count > 64:
+                    raise Error("parallel IsolationForest requires 1..64 devices")
+                if trace.enabled:
+                    raise Error("parallel IsolationForest does not export diagnostic traces")
+                comptime if IF_C50_PACKED:
+                    raise Error("C50 IF packed model requires one device; pooled packed models remain pending")
+                _fit_tree_shards(ctx, input_colmajor, src_addr, n_rows, n_cols,
+                                 self.params, model, knobs, count)
+                return
+
+        var pad = knobs.pad
+        var poison = knobs.poison
+        model.node_feature = _poisoned_i32(ctx, total_nodes, pad, poison)
+        model.node_threshold = _poisoned_f32(ctx, total_nodes, pad, poison)
+        model.node_left = _poisoned_i32(ctx, total_nodes, pad, poison)
+        model.node_right = _poisoned_i32(ctx, total_nodes, pad, poison)
+        model.global_tree_offsets = _poisoned_i32(ctx, n_trees, pad, poison)
+        model.global_tree_n_nodes = _poisoned_i32(ctx, n_trees, pad, poison)
+        model.global_tree_max_depth = _poisoned_i32(ctx, n_trees, pad, poison)
+        # Theirs allocates the feature-index buffer only when sampling
+        # features; ours always (a null pointer has no portable spelling as
+        # a kernel argument), and the kernel reads it only when
+        # `has_feature_indices`.
+        model.global_feature_indices = _poisoned_i32(
+            ctx, n_trees * n_sampled_features, pad, poison
+        )
+
+        # build_isolation_forest_global (isolation_tree_builder.cuh:377-420)
+        var data: DeviceBuffer[DType.float32]
+        # lane apple-fast-trees2: IF_FAST_ROWMAJOR (FAST on Apple) keeps X
+        # row-major on the device; every other build transposes on the
+        # device (lane gap-trees-nv, the default since cpu-gpu-cleanup).
+        comptime if IF_FAST_ROWMAJOR:
+            if src_addr != 0:
+                data = _upload_rowmajor_fast(ctx, src_addr, n_rows, n_cols, pad, poison)
+            else:
+                # A column-major block (the List callers and the tree-shard
+                # owners, never the binding): row-major on the device.
+                data = _upload_colmajor_as_rowmajor_device(
+                    ctx, cm_addr, n_rows, n_cols, pad, poison
+                )
+        else:
+            if src_addr != 0:
+                data = _upload_rowmajor_as_colmajor_device(
+                    ctx, src_addr, n_rows, n_cols, pad, poison
+                )
+            else:
+                # the column-major block flat as it is: `_upload_f32`'s
+                # words (`ftz` per cell, `poison` in the tail), on the device
+                data = _upload_rowmajor_query_device(
+                    ctx, "X", cm_addr, n_rows, n_cols, pad, poison
+                )
+        # T41/C49: live scratch, not forest width, determines batch capacity.
+        # Keep diagnostics' full-tree archive when explicitly requested.
+        var scratch_stride = model.max_nodes_per_tree*IF_SCRATCH_WORDS_PER_NODE+IF_RNG_STATE_WORDS
+        var batch_trees = n_trees
+        comptime if IF_T41_TREE_BATCH:
+            if not trace.enabled:
+                var live_bytes = 4*n_sampled_rows*n_sampled_features + 8*n_sampled_rows + 4*IF_WORK_PLANES*n_sampled_rows + 4*scratch_stride
+                batch_trees = max(1, min(n_trees, (128*1024*1024)//max(1, live_bytes)))
+        var corrections = ctx.enqueue_create_buffer[DType.float32](n_sampled_rows+1 if IF_T42_CORRECTION_CACHE else 1)
+        comptime if IF_T42_CORRECTION_CACHE:
+            ctx.enqueue_function[if_correction_table_kernel](corrections.unsafe_ptr(), Int32(n_sampled_rows+1),
+                grid_dim=(n_sampled_rows+256)//256, block_dim=256)
+        var subsample_buffer = _poisoned_f32(
+            ctx, batch_trees * n_sampled_rows * n_sampled_features, pad, poison
+        )
+        var sample_indices = _poisoned_i64(ctx, batch_trees * n_sampled_rows, pad, poison)
+        # two halves per tree: the partition order and its scratch (the
+        # block-parallel stable partition, `isolation_tree_builder.mojo`)
+        var work_indices = _poisoned_i32(ctx, IF_WORK_PLANES * batch_trees * n_sampled_rows, pad, poison)
+        if knobs.build_tpb < 1 or knobs.build_tpb > IF_BUILD_TPB_MAX:
+            raise Error(
+                "isolation forest: build_tpb must be in [1, "
+                + String(IF_BUILD_TPB_MAX) + "], got " + String(knobs.build_tpb)
+            )
+        # One scratch buffer per tree carved into three disjoint slices
+        # (stack, per-node decisions, final RNG state). ONE kernel argument:
+        # Metal caps a kernel at 31 and this one stands at 25.
+        var stack = _poisoned_i32(ctx, batch_trees * scratch_stride, pad, poison)
+        var tables = XorwowDeviceTables(ctx)
+
+        # The card's RNG probe: the first 16 draws of tree 0's state, on the
+        # host through the same implementation (a pure function of (seed, 0)).
+        if trace.enabled:
+            var st = curandStateXORWOW.zero()
+            curand_init(
+                self.params.seed,
+                UInt64(0),
+                UInt64(0),
+                st,
+                tables.host.sequence.unsafe_ptr().unsafe_origin_cast[MutAnyOrigin](),
+                tables.host.offset.unsafe_ptr().unsafe_origin_cast[MutAnyOrigin](),
+            )
+            var probe = List[Int32]()
+            for _ in range(16):
+                probe.append(Int32(bitcast[DType.int32](curand(st))))
+            trace.record_list_i32("if.rng.probe", probe)
+
+        comptime if DIAG_TRACE:
+            print("if_diag: build kernel enqueue begin", flush=True)
+        var batch_start = 0
+        while batch_start < n_trees:
+            ctx.enqueue_function[build_isolation_trees_global_kernel](
+                data.unsafe_ptr(),
+                Int64(n_rows),
+                Int32(n_cols),
+                Int32(n_trees),
+                Int32(n_sampled_rows),
+                Int32(n_sampled_features),
+                Int32(max_depth),
+                Int32(model.max_nodes_per_tree),
+                Int32(1) if self.params.bootstrap else Int32(0),
+                self.params.seed,
+                Int32(1) if model.has_feature_indices else Int32(0),
+                model.global_feature_indices.unsafe_ptr(),
+                model.node_feature.unsafe_ptr(),
+                model.node_threshold.unsafe_ptr(),
+                model.node_left.unsafe_ptr(),
+                model.node_right.unsafe_ptr(),
+                model.global_tree_offsets.unsafe_ptr(),
+                model.global_tree_n_nodes.unsafe_ptr(),
+                model.global_tree_max_depth.unsafe_ptr(),
+                subsample_buffer.unsafe_ptr(),
+                sample_indices.unsafe_ptr(),
+                work_indices.unsafe_ptr(),
+                stack.unsafe_ptr(),
+                tables.sequence.unsafe_ptr(),
+                tables.offset.unsafe_ptr(),
+                Int32(global_tree_start),
+                Int32(batch_start),
+                corrections.unsafe_ptr(),
+                grid_dim=(min(batch_trees, n_trees-batch_start), 1, 1),
+                block_dim=(knobs.build_tpb, 1, 1),
+            )
+            batch_start += batch_trees
+        comptime if DIAG_TRACE:
+            print("if_diag: build kernel enqueue returned, synchronize begin", flush=True)
+        ctx.synchronize()
+        comptime if DIAG_TRACE:
+            print("if_diag: build kernel synchronize returned", flush=True)
+
+        comptime if IF_C50_PACKED:
+            model.packed_nodes = ctx.enqueue_create_buffer[DType.int32](4*total_nodes)
+            ctx.enqueue_function[if_pack_nodes_kernel](model.node_feature.unsafe_ptr(), model.node_threshold.unsafe_ptr(),
+                model.node_left.unsafe_ptr(), model.node_right.unsafe_ptr(), model.packed_nodes.value().unsafe_ptr(), Int32(total_nodes),
+                grid_dim=(total_nodes+255)//256, block_dim=256)
+        model.tree_n_nodes_host = read_i32(ctx, model.global_tree_n_nodes, n_trees)
+        model.tree_max_depth_host = read_i32(ctx, model.global_tree_max_depth, n_trees)
+        model.shards = List[IFModelShard]()
+        model.fitted = True
+
+        if trace.enabled:
+            var rows = read_i64(ctx, sample_indices, n_trees * n_sampled_rows)
+            var feats = read_i32(ctx, model.global_feature_indices, n_trees * n_sampled_features)
+            var h_scratch = read_i32(ctx, stack, n_trees * scratch_stride)
+            var h_feat = read_i32(ctx, model.node_feature, total_nodes)
+            var h_thr = read_f32(ctx, model.node_threshold, total_nodes)
+            var h_left = read_i32(ctx, model.node_left, total_nodes)
+            var h_right = read_i32(ctx, model.node_right, total_nodes)
+            for t in range(n_trees):
+                var tag = "if.tree" + _tree_tag(t)
+                var n_used = Int(model.tree_n_nodes_host[t])
+                var off = t * model.max_nodes_per_tree
+                var rows_t = List[Int32]()
+                for i in range(n_sampled_rows):
+                    rows_t.append(Int32(rows[t * n_sampled_rows + i]))
+                trace.record_list_i32(tag + ".rows", rows_t)
+                if model.has_feature_indices:
+                    var f_t = List[Int32]()
+                    for i in range(n_sampled_features):
+                        f_t.append(feats[t * n_sampled_features + i])
+                    trace.record_list_i32(tag + ".features", f_t)
+                var meta = List[Int32]()
+                meta.append(model.tree_n_nodes_host[t])
+                meta.append(model.tree_max_depth_host[t])
+                trace.record_list_i32(tag + ".meta", meta)
+                var sf = List[Int32]()
+                var sthr = List[Float32]()
+                var sl = List[Int32]()
+                var sr = List[Int32]()
+                for i in range(n_used):
+                    sf.append(h_feat[off + i])
+                    sthr.append(h_thr[off + i])
+                    sl.append(h_left[off + i])
+                    sr.append(h_right[off + i])
+                trace.record_list_i32(tag + ".structure.feat", sf)
+                trace.record_list_f32(tag + ".structure.thr", sthr)
+                trace.record_list_i32(tag + ".structure.left", sl)
+                trace.record_list_i32(tag + ".structure.right", sr)
+                # archive/plans/CARD_GAPS.md items 1-4 for this lane. `structure.thr` is a
+                # hash taken on the far side of two washers: the mul-add
+                # ABSORBS a divergence in either bound whenever (max - min)
+                # is small against |min|, and the repartition fallback
+                # OVERWRITES the drawn threshold with max_val. These three
+                # stages record the decisions themselves.
+                var dbase = t * scratch_stride + (
+                    model.max_nodes_per_tree * IF_STACK_WORDS
+                )
+                var bounds = List[Float32]()
+                var choice = List[Int32]()
+                for i in range(n_used):
+                    var w = dbase + IF_DECISION_WORDS * i
+                    bounds.append(bitcast[DType.float32](h_scratch[w + 0]))
+                    bounds.append(bitcast[DType.float32](h_scratch[w + 1]))
+                    bounds.append(bitcast[DType.float32](h_scratch[w + 2]))
+                    choice.append(h_scratch[w + 3])
+                    choice.append(h_scratch[w + 4])
+                    choice.append(h_scratch[w + 5])
+                trace.record_list_f32(tag + ".split.bounds", bounds)
+                trace.record_list_i32(tag + ".split.choice", choice)
+                var rng_final = List[Int32]()
+                var rbase = t * scratch_stride + (
+                    model.max_nodes_per_tree * IF_SCRATCH_WORDS_PER_NODE
+                )
+                for i in range(IF_RNG_STATE_WORDS):
+                    rng_final.append(h_scratch[rbase + i])
+                trace.record_list_i32(tag + ".rng.final", rng_final)
+
+        _ = data^
+        _ = subsample_buffer^
+        _ = sample_indices^
+        _ = work_indices^
+        _ = stack^
+        _ = tables^
+        _ = corrections^
+
+    def compute_path_lengths(
+        self,
+        ctx: DeviceContext,
+        model: IsolationForestModel,
+        input_rowmajor: DeviceBuffer[DType.float32],
+        n_rows: Int,
+        n_cols: Int,
+        mut avg_path_lengths: DeviceBuffer[DType.float32],
+        path_tpb: Int,
+    ) raises:
+        """`IsolationForest::compute_path_lengths` (`:143-162`): `threads =
+        256`, one thread per row-major sample."""
+        if len(model.shards) != 0:
+            var host_input = read_f32(ctx, input_rowmajor, n_rows * n_cols)
+            var pooled = _pooled_path_lengths(ctx, model, host_input,
+                n_rows, n_cols, path_tpb)
+            pooled.enqueue_copy_to(avg_path_lengths)
+            ctx.synchronize()
+            _ = pooled^
+            return
+        var threads = path_tpb
+        var path_rows_per_block = threads * AFT_IF_PATH_ROWS
+        var blocks = (n_rows + path_rows_per_block - 1) // path_rows_per_block
+        comptime if IF_C50_PACKED:
+            ctx.enqueue_function[if_packed_paths_kernel](_mp_f32(input_rowmajor), _mp_i32(model.packed_nodes.value()),
+                _mp_i32(model.global_tree_offsets), avg_path_lengths.unsafe_ptr(), Int32(n_rows), Int32(n_cols),
+                Int32(self.params.n_estimators), grid_dim=(blocks,1,1), block_dim=(threads,1,1))
+            ctx.synchronize()
+            return
+        comptime if DIAG_TRACE:
+            print("if_diag: path kernel enqueue begin", flush=True)
+        ctx.enqueue_function[compute_path_lengths_global_kernel](
+            _mp_f32(input_rowmajor),
+            Int64(n_rows),
+            Int32(n_cols),
+            _mp_i32(model.node_feature),
+            _mp_f32(model.node_threshold),
+            _mp_i32(model.node_left),
+            _mp_i32(model.node_right),
+            _mp_i32(model.global_tree_offsets),
+            Int32(self.params.n_estimators),
+            avg_path_lengths.unsafe_ptr(),
+            grid_dim=(blocks, 1, 1),
+            block_dim=(threads, 1, 1),
+        )
+        comptime if DIAG_TRACE:
+            print("if_diag: path kernel enqueue returned, synchronize begin", flush=True)
+        ctx.synchronize()
+        comptime if DIAG_TRACE:
+            print("if_diag: path kernel synchronize returned", flush=True)
+
+    def compute_anomaly_scores(
+        self,
+        ctx: DeviceContext,
+        model: IsolationForestModel,
+        avg_path_lengths: DeviceBuffer[DType.float32],
+        n_rows: Int,
+        mut scores: DeviceBuffer[DType.float32],
+        path_tpb: Int,
+    ) raises:
+        """`IsolationForest::compute_anomaly_scores` (`:165-184`): `c_n =
+        T(model->c_normalization)`; `c_n <= 0` fills 0.5, else the pow
+        transform (DEVIATION 681)."""
+        var c_n = Float32(model.c_normalization)
+        if c_n <= Float32(0.0):
+            scores.enqueue_fill(Float32(0.5))
+        else:
+            var blocks = (n_rows + path_tpb - 1) // path_tpb
+            ctx.enqueue_function[anomaly_score_kernel](
+                _mp_f32(avg_path_lengths),
+                scores.unsafe_ptr(),
+                Int32(n_rows),
+                c_n,
+                grid_dim=(blocks, 1, 1),
+                block_dim=(path_tpb, 1, 1),
+            )
+        ctx.synchronize()
+
+
+def _tree_tag(t: Int) -> String:
+    var s = String(t)
+    while s.byte_length() < 3:
+        s = "0" + s
+    return s
+
+
+# ---------------------------------------------------------------------------
+# isolation_forest.cu:161-224: the C entries
+# ---------------------------------------------------------------------------
+
+
+def fit(
+    ctx: DeviceContext,
+    mut forest: IsolationForestModel,
+    input_colmajor: List[Float32],
+    n_rows: Int,
+    n_cols: Int,
+    params: IF_params,
+    mut trace: IdentityTrace,
+    knobs: IFLaunchKnobs = IFLaunchKnobs.default(),
+    src_addr: Int = 0,
+) raises:
+    """`ML::fit(handle, IsolationForestF*, const float*, n_rows, n_cols,
+    params)` (`isolation_forest.cu:119-130`). `src_addr` nonzero lends a
+    ROW-major X instead of `input_colmajor` (DEVIATION 2638)."""
+    var if_model = IsolationForest(params)
+    if_model.fit(ctx, input_colmajor, n_rows, n_cols, forest, trace, knobs, src_addr)
+
+
+def _score_samples_device(
+    ctx: DeviceContext,
+    forest: IsolationForestModel,
+    input_rowmajor: List[Float32],
+    n_rows: Int,
+    n_cols: Int,
+    mut trace: IdentityTrace,
+    knobs: IFLaunchKnobs,
+    src_addr: Int = 0,
+) raises -> DeviceBuffer[DType.float32]:
+    """The device half of `ML::score_samples` (`isolation_forest.cu:
+    161-177`): path lengths, then scores, both left on the device (so
+    `predict` thresholds them there as theirs does). A nonzero `src_addr`
+    (`IDN_IF_QUERY_DEVICE`) lends the ROW-major query block instead of
+    `input_rowmajor`."""
+    if not forest.fitted:
+        raise Error("Model has not been fitted. Call fit() first.")
+    if n_rows <= 0:
+        raise Error("Invalid n_rows " + String(n_rows))
+    if n_cols != forest.n_features:
+        raise Error(
+            "X_query has "
+            + String(n_cols)
+            + " features, the model was fitted with "
+            + String(forest.n_features)
+        )
+    # cpu4-forest: a List query goes to the device from its own address,
+    # the same words and the same refusal as a lent block.
+    var q_addr = src_addr
+    if q_addr == 0:
+        if len(input_rowmajor) < n_rows * n_cols:
+            raise Error(
+                "X_query holds "
+                + String(len(input_rowmajor))
+                + " values, expected n_rows * n_cols = "
+                + String(n_rows * n_cols)
+            )
+        q_addr = Int(input_rowmajor.unsafe_ptr())
+    var data = _upload_rowmajor_query_device(
+        ctx, "X_query", q_addr, n_rows, n_cols, knobs.pad, knobs.poison
+    )
+    var if_model = IsolationForest(forest.params)
+    var avg_path_lengths = _poisoned_f32(ctx, n_rows, knobs.pad, knobs.poison)
+    var scores = _poisoned_f32(ctx, n_rows, knobs.pad, knobs.poison)
+    if_model.compute_path_lengths(
+        ctx, forest, data, n_rows, n_cols, avg_path_lengths, knobs.path_tpb
+    )
+    trace.record_device[DType.float32](ctx, "if.pathlen", avg_path_lengths, n_rows)
+    if_model.compute_anomaly_scores(
+        ctx, forest, avg_path_lengths, n_rows, scores, knobs.path_tpb
+    )
+    trace.record_device[DType.float32](ctx, "if.scores", scores, n_rows)
+    _ = data^
+    _ = avg_path_lengths^
+    return scores^
+
+
+def score_samples(
+    ctx: DeviceContext,
+    forest: IsolationForestModel,
+    input_rowmajor: List[Float32],
+    n_rows: Int,
+    n_cols: Int,
+    mut trace: IdentityTrace,
+    knobs: IFLaunchKnobs = IFLaunchKnobs.default(),
+    src_addr: Int = 0,
+) raises -> List[Float32]:
+    """`ML::score_samples` (`isolation_forest.cu:161-177`), PAPER
+    convention (1 = anomaly, 0.5 = normal). The Python layer negates
+    (`isolation_forest.pyx:959`). The card records `if.pathlen` and
+    `if.scores`."""
+    var scores = _score_samples_device(
+        ctx, forest, input_rowmajor, n_rows, n_cols, trace, knobs, src_addr
+    )
+    var out = read_f32(ctx, scores, n_rows)
+    _ = scores^
+    return out^
+
+
+def path_lengths(
+    ctx: DeviceContext,
+    forest: IsolationForestModel,
+    input_rowmajor: List[Float32],
+    n_rows: Int,
+    n_cols: Int,
+    knobs: IFLaunchKnobs = IFLaunchKnobs.default(),
+) raises -> List[Float32]:
+    """The average path lengths alone (their `compute_path_lengths`
+    output, what the Treelite export predicts)."""
+    if not forest.fitted:
+        raise Error("Model has not been fitted. Call fit() first.")
+    if len(input_rowmajor) < n_rows * n_cols:
+        raise Error(
+            "X_query holds "
+            + String(len(input_rowmajor))
+            + " values, expected n_rows * n_cols = "
+            + String(n_rows * n_cols)
+        )
+    var if_model = IsolationForest(forest.params)
+    var data = _upload_rowmajor_query_device(
+        ctx, "X_query", Int(input_rowmajor.unsafe_ptr()), n_rows, n_cols,
+        knobs.pad, knobs.poison,
+    )
+    var avg_path_lengths = _poisoned_f32(ctx, n_rows, knobs.pad, knobs.poison)
+    if_model.compute_path_lengths(
+        ctx, forest, data, n_rows, n_cols, avg_path_lengths, knobs.path_tpb
+    )
+    var out = read_f32(ctx, avg_path_lengths, n_rows)
+    _ = data^
+    _ = avg_path_lengths^
+    return out^
+
+
+def predict(
+    ctx: DeviceContext,
+    forest: IsolationForestModel,
+    input_rowmajor: List[Float32],
+    n_rows: Int,
+    n_cols: Int,
+    threshold: Float32 = Float32(0.5),
+    knobs: IFLaunchKnobs = IFLaunchKnobs.default(),
+    src_addr: Int = 0,
+) raises -> List[Int32]:
+    """`ML::predict` (`isolation_forest.cu:201-224`): scores, then `score
+    > threshold ? 1 : -1` (1 = anomaly). The Python layer negates."""
+    var trace = IdentityTrace.disabled()
+    var scores = _score_samples_device(
+        ctx, forest, input_rowmajor, n_rows, n_cols, trace, knobs, src_addr
+    )
+    var preds = _poisoned_i32(ctx, n_rows, knobs.pad, knobs.poison)
+    var blocks = (n_rows + knobs.path_tpb - 1) // knobs.path_tpb
+    ctx.enqueue_function[predict_labels_kernel](
+        _mp_f32(scores),
+        preds.unsafe_ptr(),
+        Int32(n_rows),
+        threshold,
+        grid_dim=(blocks, 1, 1),
+        block_dim=(knobs.path_tpb, 1, 1),
+    )
+    ctx.synchronize()
+    var out = read_i32(ctx, preds, n_rows)
+    _ = scores^
+    _ = preds^
+    return out^
+
+
+def score_samples_into(
+    ctx: DeviceContext,
+    forest: IsolationForestModel,
+    input_rowmajor: List[Float32],
+    n_rows: Int,
+    n_cols: Int,
+    knobs: IFLaunchKnobs,
+    src_addr: Int,
+    out_addr: Int,
+    subtract_offset: Bool,
+    offset: Float32,
+) raises:
+    """`IDN_IF_EPILOGUE_DEVICE`: the sklearn-convention `score_samples`
+    (`-paper`) or `decision_function` (`-paper - offset`) of `n_rows` query
+    rows, written as `n_rows` float32 at the host address `out_addr`. The
+    epilogue is `if_score_epilogue_kernel`; the download lands in the
+    caller's buffer with no List in between."""
+    if out_addr == 0:
+        raise Error("score_samples_into: the output address is null")
+    var trace = IdentityTrace.disabled()
+    var scores = _score_samples_device(
+        ctx, forest, input_rowmajor, n_rows, n_cols, trace, knobs, src_addr
+    )
+    var blocks = (n_rows + knobs.path_tpb - 1) // knobs.path_tpb
+    ctx.enqueue_function[if_score_epilogue_kernel](
+        scores.unsafe_ptr(),
+        Int32(n_rows),
+        Int32(1) if subtract_offset else Int32(0),
+        offset,
+        grid_dim=(blocks, 1, 1),
+        block_dim=(knobs.path_tpb, 1, 1),
+    )
+    var dst = MutPointer[Float32, MutUntrackedOrigin](unsafe_from_address=out_addr)
+    ctx.enqueue_copy(dst_ptr=dst, src_buf=scores.create_sub_buffer[DType.float32](0, n_rows))
+    ctx.synchronize()
+    _ = scores^
+
+
+# T43: exact 32-bit radix selection, two independent order statistics.
+# Default OFF. NOT COMPILED — NOT TESTED — IDENTITY NOT VERIFIED — QUALITY NOT VERIFIED — NOT MEASURED.
+comptime IF_T43_RADIX_SELECT = GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL and is_defined["ANONLIB_TREES_T43_RADIX_SELECT"]()
+
+def if_select_two_kernel(scores: MutPointer[Float32, MutAnyOrigin], selected: MutPointer[Float32, MutAnyOrigin],
+                         n: Int32, lo: Int32, hi: Int32):
+    var tid = Int(thread_idx.x)
+    var rank = Int(lo if Int(block_idx.x) == 0 else hi)
+    var counts = stack_allocation[256, Int32, address_space=AddressSpace.SHARED]()
+    var prefix = UInt32(0)
+    var mask = UInt32(0)
+    var bit = 31
+    while bit >= 0:
+        var flag = UInt32(1) << UInt32(bit)
+        var count = 0
+        var r = tid
+        while r < Int(n):
+            var key = float_to_sortable(bitcast[DType.uint32](scores.unsafe_load(r)))
+            if (key & mask) == prefix and (key & flag) == 0:
+                count += 1
+            r += 256
+        counts.unsafe_store(tid, Int32(count))
+        barrier()
+        var stride = 128
+        while stride > 0:
+            if tid < stride:
+                counts.unsafe_store(tid, counts.unsafe_load(tid)+counts.unsafe_load(tid+stride))
+            barrier()
+            stride //= 2
+        var zeros = Int(counts.unsafe_load(0))
+        if rank >= zeros:
+            prefix |= flag
+            rank -= zeros
+        mask |= flag
+        barrier()
+        bit -= 1
+    if tid == 0:
+        selected.unsafe_store(Int(block_idx.x), bitcast[DType.float32](sortable_to_float(prefix)))
+
+
+def contamination_offset(
+    ctx: DeviceContext,
+    forest: IsolationForestModel,
+    n_rows: Int,
+    n_cols: Int,
+    knobs: IFLaunchKnobs,
+    src_addr: Int,
+    q: Float64,
+) raises -> Float64:
+    """`offset_ = np.percentile(score_samples(X), q)` (`isolation_forest.pyx:
+    778-785`) ON THE DEVICE (cpu4-forest): the training rows (ROW-major,
+    lent at `src_addr`) are scored and negated there
+    (`if_score_epilogue_kernel`, the exact float32 negation), sorted there
+    (`segmented_sort_keys_f32`, one segment), and only the two order
+    statistics the linear interpolation reads come back. The rank
+    `index = q / 100 * (n - 1)` and its split into `lo` / `frac` depend on
+    `q` and `n` alone; the result is `fma(b - a, frac, a)` in Float64, the
+    host column's `percentile_linear_host` word for word (the sort puts
+    the same values at `lo` and `hi`; scores are never zero, so the order
+    of signed zeros never matters)."""
+    if n_rows <= 0:
+        return 0.0
+    var trace = IdentityTrace.disabled()
+    var scores = _score_samples_device(
+        ctx, forest, List[Float32](), n_rows, n_cols, trace, knobs, src_addr
+    )
+    var blocks = (n_rows + knobs.path_tpb - 1) // knobs.path_tpb
+    ctx.enqueue_function[if_score_epilogue_kernel](
+        scores.unsafe_ptr(),
+        Int32(n_rows),
+        Int32(0),
+        Float32(0.0),
+        grid_dim=(blocks, 1, 1),
+        block_dim=(knobs.path_tpb, 1, 1),
+    )
+    comptime if IF_T43_RADIX_SELECT:
+        var index = q/100.0*Float64(n_rows-1)
+        var lo = max(0, min(n_rows-1, Int(index)))
+        var hi = min(lo+1, n_rows-1)
+        var selected = ctx.enqueue_create_buffer[DType.float32](2)
+        var h = ctx.enqueue_create_host_buffer[DType.float32](2)
+        ctx.enqueue_function[if_select_two_kernel](scores.unsafe_ptr(), selected.unsafe_ptr(), Int32(n_rows), Int32(lo), Int32(hi),
+            grid_dim=2, block_dim=256)
+        ctx.enqueue_copy(dst_ptr=h.unsafe_ptr(), src_buf=selected)
+        ctx.synchronize()
+        var a = Float64(h.unsafe_ptr().unsafe_load(0))
+        var b = Float64(h.unsafe_ptr().unsafe_load(1))
+        var result = fma(b-a, index-Float64(lo), a)
+        _ = h^
+        _ = selected^
+        _ = scores^
+        return result
+    var src = scores.create_sub_buffer[DType.float32](0, n_rows)
+    var dst = ctx.enqueue_create_buffer[DType.float32](n_rows)
+    var work_a = ctx.enqueue_create_buffer[DType.uint32](n_rows)
+    var work_b = ctx.enqueue_create_buffer[DType.uint32](n_rows)
+    var offsets = ctx.enqueue_create_buffer[DType.int32](n_rows)
+    var block_sums = ctx.enqueue_create_buffer[DType.int32](
+        (n_rows + SORT_BLOCK - 1) // SORT_BLOCK
+    )
+    segmented_sort_keys_f32(
+        ctx, 1, n_rows, src, dst, work_a, work_b, offsets, block_sums
+    )
+    var index = q / 100.0 * Float64(n_rows - 1)
+    var lo = Int(index)
+    if lo < 0:
+        lo = 0
+    if lo > n_rows - 1:
+        lo = n_rows - 1
+    var hi = lo + 1 if lo + 1 < n_rows else lo
+    var frac = index - Float64(lo)
+    var h = ctx.enqueue_create_host_buffer[DType.float32](2)
+    ctx.enqueue_copy(
+        dst_ptr=h.unsafe_ptr(), src_buf=dst.create_sub_buffer[DType.float32](lo, 1)
+    )
+    ctx.enqueue_copy(
+        dst_ptr=h.unsafe_ptr().unsafe_offset(1),
+        src_buf=dst.create_sub_buffer[DType.float32](hi, 1),
+    )
+    ctx.synchronize()
+    var a = Float64(h.unsafe_ptr().unsafe_load(0))
+    var b = Float64(h.unsafe_ptr().unsafe_load(1))
+    _ = scores^
+    _ = src^
+    _ = dst^
+    _ = work_a^
+    _ = work_b^
+    _ = offsets^
+    _ = block_sums^
+    _ = h^
+    return fma(b - a, frac, a)  # the default build's fused op, as the host column
+
+
+def predict_into(
+    ctx: DeviceContext,
+    forest: IsolationForestModel,
+    input_rowmajor: List[Float32],
+    n_rows: Int,
+    n_cols: Int,
+    threshold: Float32,
+    knobs: IFLaunchKnobs,
+    src_addr: Int,
+    out_addr: Int,
+) raises:
+    """`IDN_IF_EPILOGUE_DEVICE`: the sklearn-convention labels (-1 =
+    anomaly, 1 = inlier) of `n_rows` query rows, written as `n_rows` int32
+    at the host address `out_addr`."""
+    if out_addr == 0:
+        raise Error("predict_into: the output address is null")
+    var trace = IdentityTrace.disabled()
+    var scores = _score_samples_device(
+        ctx, forest, input_rowmajor, n_rows, n_cols, trace, knobs, src_addr
+    )
+    var preds = _poisoned_i32(ctx, n_rows, knobs.pad, knobs.poison)
+    var blocks = (n_rows + knobs.path_tpb - 1) // knobs.path_tpb
+    ctx.enqueue_function[if_predict_epilogue_kernel](
+        _mp_f32(scores),
+        preds.unsafe_ptr(),
+        Int32(n_rows),
+        threshold,
+        grid_dim=(blocks, 1, 1),
+        block_dim=(knobs.path_tpb, 1, 1),
+    )
+    var dst = MutPointer[Int32, MutUntrackedOrigin](unsafe_from_address=out_addr)
+    ctx.enqueue_copy(dst_ptr=dst, src_buf=preds.create_sub_buffer[DType.int32](0, n_rows))
+    ctx.synchronize()
+    _ = scores^
+    _ = preds^
+
+
+def _fit_tree_shards(ctx: DeviceContext, input_colmajor: List[Float32],
+    src_addr: Int, rows: Int, columns: Int, params: IF_params,
+    mut model: IsolationForestModel, knobs: IFLaunchKnobs, count: Int,
+) raises:
+    """Build canonical whole-tree ranges and retain each owner's model buffers.
+
+    Training data remains replicated. No complete forest is allocated on the
+    root; only successful owners are published after every worker joins.
+
+    THE NEGATIVE CONTROL is `-D ANONLIB_ISOLATION_FOREST_PARALLEL_SABOTAGE=1`
+    below. Unlike the other `par-*` arms it perturbs an RNG STREAM rather than a
+    row offset, because `first` is a curand subsequence base and nothing else:
+    every buffer is indexed by the LOCAL tree id. The shard's trees are then
+    entirely different rather than slightly shifted, so expect a large delta.
+    Owed a two-device column (`ANONLIB_PAR_DEVICES=0,1`); no host binding
+    restates this driver, so no CPU column can watch it fire.
+    """
+    if GLOBAL_NUMERIC_MODE != NUMERIC_IDENTICAL:
+        raise Error("parallel IsolationForest requires IDENTICAL")
+    var active = min(count, params.n_estimators)
+    ctx.synchronize()
+    var shards = List[IFModelShard]()
+    for rank in range(active):
+        var first = params.n_estimators * rank // active
+        var width = params.n_estimators * (rank + 1) // active - first
+        var device = DeviceContext(device_id=rank)
+        var feature_indices = device.enqueue_create_buffer[DType.int32](1)
+        var feature = device.enqueue_create_buffer[DType.int32](1)
+        var threshold = device.enqueue_create_buffer[DType.float32](1)
+        var left = device.enqueue_create_buffer[DType.int32](1)
+        var right = device.enqueue_create_buffer[DType.int32](1)
+        var offsets = device.enqueue_create_buffer[DType.int32](1)
+        var nodes = device.enqueue_create_buffer[DType.int32](1)
+        var depths = device.enqueue_create_buffer[DType.int32](1)
+        shards.append(IFModelShard(device^, feature_indices^, feature^,
+            threshold^, left^, right^, offsets^, nodes^, depths^, first, width,
+            List[Int32](), List[Int32]()))
+    var failures = List[Int](length=active, fill=0)
+    var sp = rebind[MutPointer[IFModelShard, MutUntrackedOrigin]](shards.unsafe_ptr())
+    var fp = rebind[MutPointer[Int, MutUntrackedOrigin]](failures.unsafe_ptr())
+    var xp = rebind[MutPointer[Float32, MutUntrackedOrigin]](input_colmajor.unsafe_ptr())
+    var size = len(input_colmajor)
+    var config = params.copy()
+    def task(rank: Int) {imm sp, imm fp, imm xp, imm size, imm src_addr,
+                         imm rows, imm columns, imm knobs, imm config}:
+        try:
+            ref shard = sp[rank]
+            # cpu4-forest: the owner uploads the shared column-major block
+            # from its address (no per-owner host copy)
+            var data = List[Float32]()
+            var cm_addr = 0
+            if src_addr == 0:
+                cm_addr = Int(xp)
+            var local_config = config.copy()
+            local_config.n_estimators = shard.count
+            var forest = IsolationForest(local_config)
+            var local = IsolationForestModel(shard.ctx)
+            var trace = IdentityTrace.disabled()
+            var tree_base = shard.first
+            comptime if is_defined["ANONLIB_ISOLATION_FOREST_PARALLEL_SABOTAGE"]():
+                # Check-only arm: later owners seed their trees one RNG stream
+                # early. `shard.first` is the curand subsequence base and has
+                # exactly one consumer -- this call -- so no allocation, no
+                # length and no validation can see it; `shard.count` still
+                # sizes every buffer and every published tree. INERT AT ONE
+                # DEVICE (`active` is 1, only rank 0 runs), which is what makes
+                # a moved `par-iforest` cell attributable to the define rather
+                # than to the second device.
+                if rank > 0:
+                    tree_base = shard.first - 1
+            forest.fit(shard.ctx, data, rows, columns, local, trace,
+                       knobs, src_addr, tree_base, False, cm_addr)
+            swap(shard.global_feature_indices, local.global_feature_indices)
+            swap(shard.node_feature, local.node_feature)
+            swap(shard.node_threshold, local.node_threshold)
+            swap(shard.node_left, local.node_left)
+            swap(shard.node_right, local.node_right)
+            swap(shard.global_tree_offsets, local.global_tree_offsets)
+            swap(shard.global_tree_n_nodes, local.global_tree_n_nodes)
+            swap(shard.global_tree_max_depth, local.global_tree_max_depth)
+            swap(shard.tree_n_nodes_host, local.tree_n_nodes_host)
+            swap(shard.tree_max_depth_host, local.tree_max_depth_host)
+            _ = local^
+            shard.ctx.synchronize()
+        except:
+            fp[rank] = 1
+    if active == 1:
+        task(0)
+    else:
+        host_parallelize(task, active)
+    for rank in range(active):  # small-loop(active: tree-shard owners): one entry per device owner, per-tree metadata words
+        if failures[rank] != 0:
+            raise Error("IsolationForest tree shard failed: " + String(rank))
+    var node_counts = List[Int32]()
+    var max_depths = List[Int32]()
+    for rank in range(active):  # small-loop(active: tree-shard owners): one entry per device owner, per-tree metadata words
+        for tree in range(shards[rank].count):  # small-loop(shards[rank].count: trees of one owner): two metadata words per tree, no rows
+            node_counts.append(shards[rank].tree_n_nodes_host[tree])
+            max_depths.append(shards[rank].tree_max_depth_host[tree])
+    model.tree_n_nodes_host = node_counts^
+    model.tree_max_depth_host = max_depths^
+    # A model previously fitted on one device must also release its old full
+    # root arrays. Allocate every placeholder before replacing any storage.
+    var empty_root = IsolationForestModel(ctx)
+    swap(model.global_feature_indices, empty_root.global_feature_indices)
+    swap(model.node_feature, empty_root.node_feature)
+    swap(model.node_threshold, empty_root.node_threshold)
+    swap(model.node_left, empty_root.node_left)
+    swap(model.node_right, empty_root.node_right)
+    swap(model.global_tree_offsets, empty_root.global_tree_offsets)
+    swap(model.global_tree_n_nodes, empty_root.global_tree_n_nodes)
+    swap(model.global_tree_max_depth, empty_root.global_tree_max_depth)
+    model.shards = shards^
+    _ = empty_root^
+    model.fitted = True
+
+
+def _pooled_path_lengths(ctx: DeviceContext, model: IsolationForestModel,
+    input_rowmajor: List[Float32], rows: Int, columns: Int, threads: Int,
+) raises -> DeviceBuffer[DType.float32]:
+    """Carry the FP32 accumulator through global tree order, never shard sums."""
+    var carry = List[Float32](length=rows, fill=Float32(0.0))
+    for rank in range(len(model.shards)):
+        ref shard = model.shards[rank]
+        var data = _upload_f32(shard.ctx, input_rowmajor, rows * columns, 0, Float32(0.0))
+        var total = _upload_f32(shard.ctx, carry, rows, 0, Float32(0.0))
+        shard.ctx.enqueue_function[compute_path_lengths_range_kernel](
+            _mp_f32(data), Int64(rows), Int32(columns),
+            _mp_i32(shard.node_feature), _mp_f32(shard.node_threshold),
+            _mp_i32(shard.node_left), _mp_i32(shard.node_right),
+            _mp_i32(shard.global_tree_offsets), Int32(shard.count),
+            Int32(model.params.n_estimators),
+            Int32(1) if rank + 1 == len(model.shards) else Int32(0),
+            total.unsafe_ptr(), grid_dim=((rows + threads * AFT_IF_PATH_ROWS - 1) // (threads * AFT_IF_PATH_ROWS), 1, 1),
+            block_dim=(threads, 1, 1))
+        shard.ctx.synchronize()
+        carry = read_f32(shard.ctx, total, rows)
+        _ = data^
+        _ = total^
+    return _upload_f32(ctx, carry, rows, 0, Float32(0.0))

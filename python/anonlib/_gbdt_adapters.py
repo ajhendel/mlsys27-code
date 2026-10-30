@@ -1,0 +1,445 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Bounded sklearn adapters around the existing GPU GBDT learner.
+
+Legacy GradientBoosting.predict remains raw prediction. These adapters support
+binary Logloss classification and RMSE regression, numeric features, and pickle
+state. Evaluation features must already have the same preprocessing as X;
+sklearn Pipeline does not automatically transform a supplied eval_set.
+"""
+import inspect
+
+from ._array import Array
+from ._buffer import all_finite, empty, as_f32_c
+from ._labels import decode_labels, encode_labels
+
+from . import _backend, _metrics_impl as metrics
+from ._arrays import _addr, _addr_ro
+from .ensemble import GradientBoosting
+from ._mode import PublicOutputsMixin
+
+
+# One NotFittedError for the package; an instance of scikit-learn's too when
+# scikit-learn is imported (see anonlib.exceptions).
+from .exceptions import NotFittedError, not_fitted_error  # noqa: F401
+
+
+class _GBDTAdapter(PublicOutputsMixin):
+    _loss = None
+    # NaN in X takes the learner's nan_mode branch ('Min' by default)
+    _sklearn_input_tags = {"allow_nan": True}
+
+    def __init_subclass__(cls, **kw):
+        # scikit-learn's input and target validation and NotFittedError, as
+        # every other estimator gets them (`_mode.install_fit_tracking`)
+        super().__init_subclass__(**kw)
+        from ._mode import install_fit_tracking
+        install_fit_tracking(cls)
+
+    # Every default is GradientBoosting's own, so a default adapter is the
+    # default learner: None defers to CatBoost's GPU defaults under
+    # SymmetricTree (n_estimators 1000, the auto learning rate, l2 3.0,
+    # random_strength 1.0, the Bayesian bootstrap) and to the earlier ones
+    # under Depthwise and Lossguide (lane/catboost-parity, 2026-09-19; see
+    # GradientBoosting). l2_leaf_reg is None rather than 3.0 because an
+    # explicit l2 turns CatBoost's learning-rate auto-selection off.
+    def __init__(self, *, n_estimators=None, max_depth=6, learning_rate=None,
+                 l2_leaf_reg=None, border_count=128, random_state=0,
+                 leaf_estimation_method=None, leaf_estimation_iterations=None,
+                 bootstrap_type=None, bagging_temperature=1.0, subsample=None,
+                 od_type=None, od_pvalue=None, od_wait=None, use_best_model=None,
+                 best_model_min_trees=1, score_function=None, nan_mode='Min',
+                 random_strength=None, use_pointwise_searcher=False,
+                 boost_from_average=None, border_build_max_samples=200000,
+                 class_weights=None, grow_policy='SymmetricTree', max_leaves=None,
+                 min_data_in_leaf=1, min_split_gain=None, min_child_hessian=None,
+                 feature_fraction=1.0, feature_border_type='GreedyLogSum',
+                 boosting_type=None, fold_len_multiplier=2.0,
+                 fold_permutation_block=None, numeric_mode=None):
+        values = locals().copy()
+        values.pop('self')
+        for name, value in values.items():  # glue: stores constructor keyword arguments
+            setattr(self, name, value)
+
+    def _validate_params(self):
+        """The parameter checks, run at fit (scikit-learn's convention): the
+        learner's constructor refuses what it does not accept."""
+        self._new_learner(self.numeric_mode)
+
+    def _new_learner(self, mode):
+        if mode is not None and (not isinstance(mode, str) or
+                mode.strip().lower() not in ('fast', 'identical')):
+            raise ValueError('numeric_mode must be fast, identical or None')
+        if self._loss == 'RMSE' and self.class_weights is not None:
+            raise NotImplementedError('GradientBoostingRegressor does not support class_weights')
+        parameters = self.get_params()
+        parameters['numeric_mode'] = mode
+        return GradientBoosting(loss=self._loss, **parameters)
+
+    def get_params(self, deep=True):
+        """Return the constructor parameters as a dict."""
+        if type(self).__init__ is not _GBDTAdapter.__init__:
+            raise TypeError('GBDT adapter subclasses with custom constructors need their own parameter protocol')
+        names = inspect.signature(_GBDTAdapter.__init__).parameters
+        return {name: getattr(self, name) for name in names if name != 'self'}  # glue: returns constructor parameters by name
+
+    def set_params(self, **params):
+        """Set constructor parameters and return ``self``; unknown names raise ``ValueError``."""
+        if not params:
+            return self
+        values = self.get_params()
+        unknown = sorted(set(params) - values.keys())  # glue: names unknown keyword parameters
+        if unknown:
+            raise ValueError(f'Invalid {type(self).__name__} parameters: {unknown}')
+        values.update(params)
+        replacement = type(self)(**values)
+        self.__dict__.clear()
+        self.__dict__.update(replacement.__dict__)
+        return self
+
+    def _clear_fit(self):
+        for name in list(self.__dict__):  # glue: clears fitted attribute names
+            if name.endswith('_'):
+                del self.__dict__[name]
+
+    def _check_fitted(self):
+        if not self.__sklearn_is_fitted__():
+            raise not_fitted_error(f'{type(self).__name__} is not fitted')
+
+    def __sklearn_is_fitted__(self):
+        return getattr(getattr(self, '_learner_', None), 'model_', None) is not None
+
+    def __sklearn_tags__(self):
+        """scikit-learn's tag protocol, read only by scikit-learn: the shared
+        `_mode.ParamsMixin` answer, with the classifier marked binary-only
+        (these adapters fit binary Logloss)."""
+        from ._mode import ParamsMixin
+        tags = ParamsMixin.__sklearn_tags__(self)
+        if tags.classifier_tags is not None:
+            tags.classifier_tags.multi_class = False
+        return tags
+
+    def _fit_native(self, X, y, sample_weight, eval_set):
+        raw_mode = self.numeric_mode if self.numeric_mode is not None else _backend.default_mode()
+        learner = self._new_learner(raw_mode)
+        mode = raw_mode.strip().lower()
+        learner.numeric_mode = mode
+        binding = _backend.binding('_anonlib_gbdt', mode)
+        if binding.gbdt_numeric_mode() != {'fast': 0, 'identical': 1}[mode]:
+            raise RuntimeError('GBDT adapter native numeric mode disagrees with requested mode')
+        learner.fit(X, y, sample_weight=sample_weight, eval_set=eval_set)
+        self._learner_ = learner
+        self.numeric_mode_ = mode
+        self.n_features_in_ = learner.n_features_in_
+        self.model_ = learner.model_
+        for name in ('loss_curve_', 'test_loss_curve_', 'best_iteration_', 'stopped_early_',  # glue: copies five learner attributes
+                     'learning_rate_'):
+            setattr(self, name, getattr(learner, name))
+        return self
+
+    def save(self, path):
+        """Not available for this estimator; raises ``NotImplementedError``. Use pickle."""
+        raise NotImplementedError('GBDT adapter archives are not implemented; pickle retains adapter state')
+
+    @classmethod
+    def load(cls, path):
+        """Not available for this estimator; raises ``NotImplementedError``. Use pickle."""
+        raise NotImplementedError('Legacy raw GBDT archives have no adapter vocabulary/parameters')
+
+
+class GradientBoostingClassifier(_GBDTAdapter):
+    """Binary gradient-boosted tree classifier with a scikit-learn interface.
+
+    Fits :class:`GradientBoosting` with ``loss='Logloss'`` on numeric
+    features and keeps the original class labels. Exactly two classes are
+    required; the positive class is the larger of the two sorted labels.
+    Supports sample weights in ``fit`` and ``score``, and pickling. ``save``
+    and ``load`` are not available; use pickle.
+
+    Parameters
+    ----------
+    n_estimators, max_depth, learning_rate, l2_leaf_reg, border_count, random_state
+        As in :class:`GradientBoosting`; every default is that class's
+        default, so ``n_estimators=None`` means 1000 iterations and an
+        automatically chosen learning rate under ``grow_policy='SymmetricTree'``.
+    leaf_estimation_method, leaf_estimation_iterations, bootstrap_type, bagging_temperature, subsample
+        As in :class:`GradientBoosting`.
+    od_type, od_pvalue, od_wait, use_best_model, best_model_min_trees
+        Overfitting detector and best-model truncation, as in
+        :class:`GradientBoosting`; they need ``eval_set`` in ``fit``.
+    score_function, nan_mode, random_strength, use_pointwise_searcher
+        As in :class:`GradientBoosting`.
+    boost_from_average, border_build_max_samples, class_weights
+        As in :class:`GradientBoosting`.
+    grow_policy, max_leaves, min_data_in_leaf, min_split_gain, min_child_hessian
+        As in :class:`GradientBoosting`.
+    feature_fraction, feature_border_type, boosting_type, fold_len_multiplier, fold_permutation_block
+        As in :class:`GradientBoosting`.
+    numeric_mode : {'identical', 'fast'} or None, default None
+        Numeric mode for this estimator (``'fast'`` on Apple GPUs); None uses
+        the process default. Any other value raises ``ValueError``.
+
+    All parameters are keyword-only.
+
+    Attributes
+    ----------
+    classes_ : list
+        The two class labels, sorted.
+    n_classes_ : int
+        Always 2.
+    n_features_in_ : int
+    model_ : str
+        The fitted model text.
+    loss_curve_, test_loss_curve_, best_iteration_, stopped_early_, learning_rate_
+        As on :class:`GradientBoosting`.
+    numeric_mode_ : str
+        The numeric mode the fit used.
+
+    Examples
+    --------
+    >>> import numpy as np, anonlib
+    >>> rng = np.random.default_rng(0)
+    >>> X = rng.random((1000, 8), dtype=np.float32)
+    >>> y = np.where(X[:, 0] > 0.5, "yes", "no")
+    >>> clf = anonlib.GradientBoostingClassifier(n_estimators=100).fit(X, y)
+    >>> labels = clf.predict(X)
+    """
+    _loss = 'Logloss'
+    _estimator_type = 'classifier'
+
+    def fit(self, X, y, sample_weight=None, eval_set=None):
+        """Fit the classifier.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+            Numeric features.
+        y : array-like of shape (n_samples,)
+            Labels with exactly two distinct values; otherwise ``ValueError``.
+        sample_weight : array-like of shape (n_samples,), optional
+        eval_set : tuple (X_eval, y_eval) or list of one such tuple, optional
+            Held-out data for the overfitting detector and ``use_best_model``. Its
+            labels must be among the training labels, and ``X_eval`` must already
+            have the same preprocessing as ``X`` (a scikit-learn ``Pipeline`` does
+            not transform it for you).
+
+        Returns
+        -------
+        self
+        """
+        self._validate_params()
+        self._clear_fit()
+        # scikit-learn's class-count refusals and words, before the label
+        # vocabulary below (whose type rules are stricter): the native
+        # encoder counts the distinct labels of any numeric or str y.
+        n_seen = len(encode_labels(y)[0])
+        if n_seen < 2:
+            raise ValueError("Classifier can't train when only one class is present.")
+        if n_seen > 2:
+            raise ValueError('Only binary classification is supported. The type of the target '
+                             'is multiclass.')
+        target, kind = metrics._classification_encoded(y, 'y')
+        classes = sorted(metrics._label_set(target))  # glue: orders the binary class labels (two expected)
+        if len(classes) != 2:
+            raise ValueError('Only binary classification is supported. The type of the target '
+                             'is multiclass.')
+        vocabulary = {label: i for i, label in enumerate(classes)}  # glue: two-label binary vocabulary
+        encoded = metrics._label_map(target, vocabulary.__getitem__).astype('<f4')
+        if eval_set is not None:
+            if isinstance(eval_set, list):
+                if len(eval_set) != 1:
+                    raise ValueError('eval_set accepts one (X, y) pair')
+                eval_set = eval_set[0]
+            if not isinstance(eval_set, tuple) or len(eval_set) != 2:
+                raise ValueError('eval_set must be (X_eval, y_eval) or a one-pair list')
+            eval_X, eval_y = eval_set
+            eval_labels, eval_kind = metrics._classification_encoded(eval_y, 'eval_set y')
+            if eval_kind != kind or any(label not in vocabulary for label in metrics._label_set(eval_labels)):  # glue: validates eval_set labels against the binary vocabulary
+                raise ValueError('eval_set contains labels outside the training vocabulary')
+            eval_set = (eval_X, metrics._label_map(eval_labels, vocabulary.__getitem__).astype('<f4'))
+        self._fit_native(X, encoded, sample_weight, eval_set)
+        self.classes_ = classes
+        self.n_classes_ = 2
+        self._label_kind_ = kind
+        return self
+
+    def decision_function(self, X):
+        """Return the raw float32 margin for each row.
+
+        A positive margin favors the positive (larger) class; a zero margin
+        predicts the negative class.
+        """
+        self._check_fitted()
+        return self._learner_.predict(X)
+
+    def _binary_output(self, X, probabilities):
+        if not probabilities and self.numeric_mode_ == 'fast':
+            return self._learner_.predict_classes(X)
+        margins = as_f32_c(self.decision_function(X), ndim=1, name="margins")[0]
+        if margins.ndim != 1 or not all_finite(margins):
+            raise ValueError('Classifier margins must be finite scalar Float32 values')
+        n = len(margins)
+        binding = _backend.binding('_anonlib_gbdt', self.numeric_mode_)
+        if probabilities:
+            output = empty((n, 2), '<f4')
+            wrote = binding.gbdt_binary_probabilities(_addr_ro(margins), _addr(output), [n])
+        else:
+            output = empty(n, '<i4')
+            wrote = binding.gbdt_binary_classes(_addr_ro(margins), _addr(output), [n])
+        if wrote != (2 * n if probabilities else n):
+            raise RuntimeError('GBDT binary output returned an unexpected row count')
+        return output
+
+    def predict_proba(self, X):
+        """Return float32 probabilities of shape ``(n_samples, 2)``.
+
+        Columns are ``[negative, positive]`` in ``classes_`` order.
+        """
+        return self._binary_output(X, True)
+
+    def predict(self, X):
+        """Return the predicted class labels, using the original label values."""
+        self._check_fitted()
+        return decode_labels(self.classes_, self._binary_output(X, False))
+
+    # The accuracy is metrics.accuracy_score on the pinned-sum path.
+    def score(self, X, y, sample_weight=None):
+        """Return the accuracy on ``X`` and ``y``, weighted by ``sample_weight`` when given.
+
+        Follows scikit-learn's weighted accuracy. ``y`` must have the same label
+        type as the training labels; otherwise ``TypeError``.
+        """
+        self._check_fitted()
+        target, kind = metrics._classification_encoded(y, 'y')
+        if kind != self._label_kind_:
+            raise TypeError('score labels must have the training label type')
+        vocabulary = {label: i for i, label in enumerate(self.classes_)}  # glue: two-label binary vocabulary
+        encoded = metrics._label_map(target, lambda label: vocabulary.get(label, -1))
+        return metrics.accuracy_score(encoded, self._binary_output(X, False),
+                                      sample_weight=sample_weight,
+                                      numeric_mode=self.numeric_mode_)
+
+
+class GradientBoostingRegressor(_GBDTAdapter):
+    """Gradient-boosted tree regressor with a scikit-learn interface.
+
+    Fits :class:`GradientBoosting` with ``loss='RMSE'`` on numeric features.
+    Predictions are float32. Supports sample weights in ``fit`` and
+    ``score``, and pickling. ``class_weights`` raises
+    ``NotImplementedError``. ``save`` and ``load`` are not available; use
+    pickle.
+
+    Parameters
+    ----------
+    n_estimators, max_depth, learning_rate, l2_leaf_reg, border_count, random_state
+        As in :class:`GradientBoosting`; every default is that class's
+        default, so ``n_estimators=None`` means 1000 iterations and an
+        automatically chosen learning rate under ``grow_policy='SymmetricTree'``.
+    leaf_estimation_method, leaf_estimation_iterations, bootstrap_type, bagging_temperature, subsample
+        As in :class:`GradientBoosting`.
+    od_type, od_pvalue, od_wait, use_best_model, best_model_min_trees
+        Overfitting detector and best-model truncation, as in
+        :class:`GradientBoosting`; they need ``eval_set`` in ``fit``.
+    score_function, nan_mode, random_strength, use_pointwise_searcher
+        As in :class:`GradientBoosting`.
+    boost_from_average, border_build_max_samples, class_weights
+        As in :class:`GradientBoosting`.
+    grow_policy, max_leaves, min_data_in_leaf, min_split_gain, min_child_hessian
+        As in :class:`GradientBoosting`.
+    feature_fraction, feature_border_type, boosting_type, fold_len_multiplier, fold_permutation_block
+        As in :class:`GradientBoosting`.
+    numeric_mode : {'identical', 'fast'} or None, default None
+        Numeric mode for this estimator (``'fast'`` on Apple GPUs); None uses
+        the process default. Any other value raises ``ValueError``.
+
+    All parameters are keyword-only.
+
+    Attributes
+    ----------
+    n_features_in_ : int
+    model_ : str
+        The fitted model text.
+    loss_curve_, test_loss_curve_, best_iteration_, stopped_early_, learning_rate_
+        As on :class:`GradientBoosting`.
+    numeric_mode_ : str
+        The numeric mode the fit used.
+
+    Examples
+    --------
+    >>> import numpy as np, anonlib
+    >>> rng = np.random.default_rng(0)
+    >>> X = rng.random((1000, 8), dtype=np.float32)
+    >>> y = (X[:, 0] * 2 + X[:, 1]).astype(np.float32)
+    >>> reg = anonlib.GradientBoostingRegressor(n_estimators=100).fit(X, y)
+    >>> r2 = reg.score(X, y)
+    """
+    _loss = 'RMSE'
+    _estimator_type = 'regressor'
+
+    def fit(self, X, y, sample_weight=None, eval_set=None):
+        """Fit the regressor.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+            Numeric features.
+        y : array-like of shape (n_samples,)
+            Finite, nonempty float32 targets.
+        sample_weight : array-like of shape (n_samples,), optional
+        eval_set : tuple (X_eval, y_eval) or list of one such tuple, optional
+            Held-out data for the overfitting detector and ``use_best_model``.
+            ``X_eval`` must already have the same preprocessing as ``X``.
+
+        Returns
+        -------
+        self
+        """
+        self._validate_params()
+        self._clear_fit()
+        # float64 and integer targets are cast to float32 once, natively
+        # (`as_f32_c`), as scikit-learn's callers pass them
+        target = as_f32_c(y, ndim=None, name="y")[0]
+        self._regression_target(target, 'y')
+        if eval_set is not None:
+            if isinstance(eval_set, list):
+                if len(eval_set) != 1:
+                    raise ValueError('eval_set accepts one (X, y) pair')
+                eval_set = eval_set[0]
+            if not isinstance(eval_set, tuple) or len(eval_set) != 2:
+                raise ValueError('eval_set must be (X_eval, y_eval) or a one-pair list')
+            eval_X, eval_y = eval_set
+            eval_target = as_f32_c(eval_y, ndim=None, name="eval_set y")[0]
+            self._regression_target(eval_target, 'eval_set y')
+            eval_set = (eval_X, eval_target)
+        return self._fit_native(X, target, sample_weight, eval_set)
+
+    @staticmethod
+    def _regression_target(target, name):
+        # `target` comes from as_f32_c: an integer or float64 y is cast to
+        # float32 once by the base binding's converters (scikit-learn takes
+        # any numeric y), so the dtype test below only guards the contract.
+        if target.ndim != 1 or target.size == 0:
+            raise ValueError(f'{name} must be nonempty one-dimensional targets')
+        if target.dtype != "<f4":
+            raise TypeError(f'{name} must have dtype float32')
+        if not all_finite(target):
+            raise ValueError(f'{name} must be finite')
+
+    def predict(self, X):
+        """Return float32 predictions of shape ``(n_samples,)``."""
+        self._check_fitted()
+        return self._learner_.predict(X)
+
+    # R2 is metrics.r2_score on the pinned-sum path.
+    def score(self, X, y, sample_weight=None):
+        """Return the R² score on ``X`` and ``y``, weighted by ``sample_weight`` when given.
+
+        Follows scikit-learn's weighted ``r2_score``.
+        """
+        self._check_fitted()
+        # float64 and integer targets are cast to float32 once, natively
+        # (`as_f32_c`), as scikit-learn's callers pass them
+        target = as_f32_c(y, ndim=None, name="y")[0]
+        self._regression_target(target, 'y')
+        return metrics.r2_score(target, self.predict(X),
+                                sample_weight=sample_weight,
+                                numeric_mode=self.numeric_mode_)

@@ -1,0 +1,585 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 the authors. Part of anonlib, DOI-WITHHELD
+"""DEVIATION 2514, step 1 (2026-09-11): the device refusal scans, in one
+place any lane may import.
+
+`NONFINITE_NONE`, `nonfinite_partial_kernel` and `device_first_nonfinite`
+MOVED here from `transformer/impl/llama/fused_attention.mojo` (which
+re-imports them, so every existing caller resolves as before) because the
+training lane must not import the transformer implementation
+(`DESIGN_lm_device_owned_step_2026-09-11.md` section 9 item 2). The
+kernel, its geometry (256 threads, at most 512 blocks) and the host fold
+are the ones that were already on an IDENTICAL path
+(`modeling_llama._refuse_nonfinite_device`, measured 2026-09-09); nothing
+about them changed in the move.
+
+WHAT A SCAN IS, AND WHY IT IS NOT A FOLD THAT FEEDS AN OUTPUT. Each
+kernel reads a Float32 buffer and writes ONE `Int32` per block: the
+smallest flat index in that block's grid-stride slice at which the
+predicate holds, or `NONFINITE_NONE`. The host takes the minimum over the
+partials. An integer minimum is exact and order-free, so "first index"
+means THE SMALLEST INDEX on every vendor and at every grid size, and no
+float is produced anywhere. These are bounds in the sense of
+`device_absmax`'s docstring: nothing here reaches a card.
+
+THE TWO PREDICATES, BOTH BY BITS (contract section 8, row 49: never by a
+compare, because Metal flushes compare operands):
+
+    nonfinite   `(bits & 0x7FFFFFFF) >= 0x7F800000`    NaN or infinity
+    negative    `(bits & 0x80000000) != 0 and (bits & 0x7FFFFFFF) != 0`
+                which equals `x < 0` for every non-NaN float; `-0.0` is
+                NOT negative (as `x < 0` says), and a NaN with the sign
+                bit set is reported. A caller that wants `x < 0` on a
+                buffer that may hold NaN runs the finite scan first, as
+                every host loop this replaces did (`byte_validate_state`).
+
+`device_classify_nonfinite` is the tail of `_refuse_nonfinite_device`:
+one 4 B readback of the offending element so the same message the host
+oracle builds ("NaN in" or "infinity in") can be built from a device
+result. It is the only download these helpers perform.
+
+`DeviceScanScratch` holds the partials buffer and its pinned host mirror
+so a step that runs ten scans allocates nothing per scan. DEVIATION 2721
+(2026-09-16) took every scan here down to ONE wait, the one that feeds the
+host fold, so the scratch now saves the two allocations and not a wait.
+The free functions keep the allocate-per-call form for callers that scan
+once.
+"""
+
+from std.gpu import block_dim, block_idx, grid_dim, thread_idx
+from std.memory import bitcast, stack_allocation
+from max.gpu.host import DeviceBuffer, DeviceContext, HostBuffer
+# DEVIATION 2630: the step phase timers and counters (core/step_phase.mojo;
+# compiled only under -D ANONLIB_STEP_PHASE_TIMERS=1).
+# fix-r1-rescue: the scratch pool (default-OFF candidate
+# `ANONLIB_IDN_SCRATCH_POOL`; off, take = allocate and give = free).
+from core.scratch_pool import (
+    IDN_SCRATCH_POOL,
+    give_dev_i32,
+    give_host_f32,
+    give_host_i32,
+    take_dev_i32,
+    take_host_f32,
+    take_host_i32,
+)
+from core.step_phase import (
+    step_count_d2h,
+    step_count_device_alloc,
+    step_count_host_alloc,
+    step_count_launch,
+    step_count_sync,
+)
+from max.gpu.memory import AddressSpace
+from max.gpu.sync import barrier
+
+
+comptime SCAN_TPB = 256
+"""Threads per block. The value `fused_attention.ABSMAX_TPB` had when the
+kernel lived there; the block-level fold below is a halving tree over it."""
+comptime SCAN_BLOCKS = 512
+"""The grid cap, `fused_attention.ABSMAX_BLOCKS`'s value. Above this many
+blocks' worth of elements every thread grid-strides."""
+
+comptime NONFINITE_NONE: Int32 = 2147483647
+"""The partial a block writes when its slice holds no hit. Larger than any
+index a `DeviceBuffer` can hold (`Int32` indices), so the minimum over the
+partials is the first hit or this."""
+
+
+def _scan_blocks(n: Int) -> Int:
+    """Blocks for `n` elements: one per `SCAN_TPB`, capped at `SCAN_BLOCKS`."""
+    var blocks = (n + SCAN_TPB - 1) // SCAN_TPB
+    if blocks > SCAN_BLOCKS:
+        blocks = SCAN_BLOCKS
+    return blocks
+
+
+def nonfinite_partial_kernel(
+    part: MutPointer[Int32, MutAnyOrigin],
+    buf: MutPointer[Float32, MutAnyOrigin],
+    n_in: Int32,
+):
+    """One partial per block: the SMALLEST flat index at which `|bits| >=
+    0x7F800000` (NaN or infinity, BY BITS, contract section 8), or
+    `NONFINITE_NONE`. The host takes the minimum, so the index reported is
+    the first one, exactly as the host loop it replaces reported it."""
+    var n = Int(n_in)
+    var red = stack_allocation[
+        SCAN_TPB,
+        Scalar[DType.int32],
+        address_space = AddressSpace.SHARED,
+    ]()
+    var tid = Int(thread_idx.x)
+    var stride = Int(grid_dim.x) * SCAN_TPB
+    var i = Int(block_idx.x) * SCAN_TPB + tid
+    var best = NONFINITE_NONE
+    while i < n:
+        var au = bitcast[DType.uint32](buf.unsafe_load(i)) & UInt32(0x7FFFFFFF)
+        if au >= UInt32(0x7F800000):
+            best = Int32(i)
+            break
+        i += stride
+    red.unsafe_store(tid, best)
+    barrier()
+    var active = SCAN_TPB // 2
+    while active > 0:
+        if tid < active:
+            var o = red.unsafe_load(tid + active)
+            if o < red.unsafe_load(tid):
+                red.unsafe_store(tid, o)
+        barrier()
+        active = active // 2
+    if tid == 0:
+        part.unsafe_store(Int(block_idx.x), red.unsafe_load(0))
+
+
+def negative_partial_kernel(
+    part: MutPointer[Int32, MutAnyOrigin],
+    buf: MutPointer[Float32, MutAnyOrigin],
+    n_in: Int32,
+):
+    """`nonfinite_partial_kernel` with the predicate `(bits & 0x80000000)
+    != 0 and (bits & 0x7FFFFFFF) != 0`, which is `x < 0` for every non-NaN
+    float (design 2.3). Same partial shape, same fold, so "first" means
+    the smallest index here too."""
+    var n = Int(n_in)
+    var red = stack_allocation[
+        SCAN_TPB,
+        Scalar[DType.int32],
+        address_space = AddressSpace.SHARED,
+    ]()
+    var tid = Int(thread_idx.x)
+    var stride = Int(grid_dim.x) * SCAN_TPB
+    var i = Int(block_idx.x) * SCAN_TPB + tid
+    var best = NONFINITE_NONE
+    while i < n:
+        var bits = bitcast[DType.uint32](buf.unsafe_load(i))
+        if (bits & UInt32(0x80000000)) != UInt32(0) and (
+            bits & UInt32(0x7FFFFFFF)
+        ) != UInt32(0):
+            best = Int32(i)
+            break
+        i += stride
+    red.unsafe_store(tid, best)
+    barrier()
+    var active = SCAN_TPB // 2
+    while active > 0:
+        if tid < active:
+            var o = red.unsafe_load(tid + active)
+            if o < red.unsafe_load(tid):
+                red.unsafe_store(tid, o)
+        barrier()
+        active = active // 2
+    if tid == 0:
+        part.unsafe_store(Int(block_idx.x), red.unsafe_load(0))
+
+
+def min_partials_kernel(
+    dst: MutPointer[Int32, MutAnyOrigin],
+    part: MutPointer[Int32, MutAnyOrigin],
+    n_in: Int32,
+):
+    """ONE block: the minimum of the block partials `part[0:n]` (n <=
+    SCAN_BLOCKS), written to `dst[0]`; `NONFINITE_NONE` when none hit (and
+    when n is 0). An integer minimum, so the first index on every vendor."""
+    var n = Int(n_in)
+    var red = stack_allocation[
+        SCAN_TPB,
+        Scalar[DType.int32],
+        address_space = AddressSpace.SHARED,
+    ]()
+    var tid = Int(thread_idx.x)
+    var best = NONFINITE_NONE
+    var i = tid
+    while i < n:
+        var v = part.unsafe_load(i)
+        if v < best:
+            best = v
+        i += SCAN_TPB
+    red.unsafe_store(tid, best)
+    barrier()
+    var active = SCAN_TPB // 2
+    while active > 0:
+        if tid < active:
+            var o = red.unsafe_load(tid + active)
+            if o < red.unsafe_load(tid):
+                red.unsafe_store(tid, o)
+        barrier()
+        active = active // 2
+    if tid == 0:
+        dst.unsafe_store(0, red.unsafe_load(0))
+
+
+def _fold_partials(mut host: HostBuffer[DType.int32], blocks: Int) -> Int:
+    """The host half of every scan: the minimum over the block partials, in
+    ascending block order (the order the moved code used; an integer
+    minimum does not depend on it). -1 when no block hit."""
+    var best = NONFINITE_NONE
+    for i in range(blocks):
+        var v = host.unsafe_ptr().unsafe_load(i)
+        if v < best:
+            best = v
+    if best == NONFINITE_NONE:
+        return -1
+    return Int(best)
+
+
+def device_first_nonfinite(
+    ctx: DeviceContext, mut buf: DeviceBuffer[DType.float32], n: Int
+) raises -> Int:
+    """The first flat index of a NaN or infinity in `buf[0:n]`, or -1.
+    ONE read of the buffer on the device, where the host loop it replaces
+    downloaded the buffer and walked it (65 ms for one block input at the
+    Samba shape, measured 2026-09-09)."""
+    if n <= 0:
+        return -1
+    var blocks = _scan_blocks(n)
+    var part = take_dev_i32(ctx, blocks)
+    # DEVIATION 2721 (lane/wait-removal, 2026-09-16). THREE WAITS REMOVED
+    # HERE, one after the allocation, one after the launch and one after
+    # the host allocation. `ctx` is ONE in-order context: the allocation,
+    # the kernel and the copy are submitted to it in program order and it
+    # runs them in that order, so none of those three waits ordered
+    # anything the queue was not already ordering. The ONLY host read in
+    # this function is `_fold_partials`, and the wait below the copy is
+    # the one that feeds it. The shape is `arima/impl/batched_arima.mojo`
+    # :194-196, which has shipped a host allocation followed straight by
+    # its copy and a single wait since before this file existed.
+    step_count_launch()
+    ctx.enqueue_function[nonfinite_partial_kernel](
+        part.unsafe_ptr(),
+        buf.unsafe_ptr(),
+        Int32(n),
+        grid_dim=(blocks, 1, 1),
+        block_dim=(SCAN_TPB, 1, 1),
+    )
+    var host = take_host_i32(ctx, blocks)
+    step_count_d2h()
+    comptime if IDN_SCRATCH_POOL:
+        # A pooled `part` may be longer than `blocks` (and than `host`):
+        # copy only the words the kernel wrote.
+        var head = part.create_sub_buffer[DType.int32](0, blocks)
+        ctx.enqueue_copy(dst_ptr=host.unsafe_ptr(), src_buf=head)
+        _ = head^
+    else:
+        ctx.enqueue_copy(dst_ptr=host.unsafe_ptr(), src_buf=part)
+    # LOAD-BEARING, category (a). `_fold_partials` reads `host` on the
+    # host on the next line. Removing this one is a sabotage that moves
+    # the result.
+    step_count_sync()
+    ctx.synchronize()
+    var best = _fold_partials(host, blocks)
+    give_host_i32(ctx, host^)
+    give_dev_i32(ctx, part^)
+    return best
+
+
+def device_first_negative(
+    ctx: DeviceContext, mut buf: DeviceBuffer[DType.float32], n: Int
+) raises -> Int:
+    """The first flat index `i < n` with `buf[i] < 0` (by bits: sign set
+    and magnitude nonzero), or -1. Same launch shape and same host fold as
+    `device_first_nonfinite`. Run the finite scan first on a buffer that
+    may hold NaN; see the module docstring."""
+    if n <= 0:
+        return -1
+    var blocks = _scan_blocks(n)
+    var part = take_dev_i32(ctx, blocks)
+    # DEVIATION 2721 (lane/wait-removal, 2026-09-16). THREE WAITS REMOVED
+    # HERE, one after the allocation, one after the launch and one after
+    # the host allocation. `ctx` is ONE in-order context: the allocation,
+    # the kernel and the copy are submitted to it in program order and it
+    # runs them in that order, so none of those three waits ordered
+    # anything the queue was not already ordering. The ONLY host read in
+    # this function is `_fold_partials`, and the wait below the copy is
+    # the one that feeds it. The shape is `arima/impl/batched_arima.mojo`
+    # :194-196, which has shipped a host allocation followed straight by
+    # its copy and a single wait since before this file existed.
+    step_count_launch()
+    ctx.enqueue_function[negative_partial_kernel](
+        part.unsafe_ptr(),
+        buf.unsafe_ptr(),
+        Int32(n),
+        grid_dim=(blocks, 1, 1),
+        block_dim=(SCAN_TPB, 1, 1),
+    )
+    var host = take_host_i32(ctx, blocks)
+    step_count_d2h()
+    comptime if IDN_SCRATCH_POOL:
+        # A pooled `part` may be longer than `blocks` (and than `host`):
+        # copy only the words the kernel wrote.
+        var head = part.create_sub_buffer[DType.int32](0, blocks)
+        ctx.enqueue_copy(dst_ptr=host.unsafe_ptr(), src_buf=head)
+        _ = head^
+    else:
+        ctx.enqueue_copy(dst_ptr=host.unsafe_ptr(), src_buf=part)
+    # LOAD-BEARING, category (a). `_fold_partials` reads `host` on the
+    # host on the next line. Removing this one is a sabotage that moves
+    # the result.
+    step_count_sync()
+    ctx.synchronize()
+    var best = _fold_partials(host, blocks)
+    give_host_i32(ctx, host^)
+    give_dev_i32(ctx, part^)
+    return best
+
+
+def device_classify_nonfinite(
+    ctx: DeviceContext, mut buf: DeviceBuffer[DType.float32], idx: Int
+) raises -> Bool:
+    """True if `buf[idx]` is a NaN, False if it is an infinity (either
+    sign). One 4 B readback, the tail of
+    `modeling_llama._refuse_nonfinite_device`; call it only with an index
+    `device_first_nonfinite` returned. A finite element (a caller bug) is
+    reported as an infinity rather than raising, so the refusal it feeds
+    still fires."""
+    var one = buf.create_sub_buffer[DType.float32](idx, 1)
+    var host = take_host_f32(ctx, 1)
+    # DEVIATION 2721. ONE WAIT REMOVED, the one between the host
+    # allocation and its copy; same in-order argument as above.
+    step_count_d2h()
+    ctx.enqueue_copy(dst_ptr=host.unsafe_ptr(), src_buf=one)
+    # LOAD-BEARING, category (a): the host loads `host[0]` next.
+    step_count_sync()
+    ctx.synchronize()
+    var v = host.unsafe_ptr().unsafe_load(0)
+    give_host_f32(ctx, host^)
+    _ = one^
+    var au = bitcast[DType.uint32](v) & UInt32(0x7FFFFFFF)
+    return au > UInt32(0x7F800000)
+
+
+struct DeviceScanScratch(Movable):
+    """The partials buffer and its pinned host mirror, allocated ONCE, for
+    a caller that scans many buffers per step (design section 0: ten scans
+    per LM step). Each scan is one launch, one 2 KB copy and ONE wait
+    (DEVIATION 2721). The answers are the free functions' answers: same
+    kernels, same geometry, same fold.
+
+    `[[mojo-buffer-freed-at-last-use]]`: both buffers are fields, alive as
+    long as the scratch is, so nothing here hands out a pointer to a
+    buffer that could be dead at the wait."""
+
+    var part: DeviceBuffer[DType.int32]
+    var host: HostBuffer[DType.int32]
+
+    def __init__(out self, ctx: DeviceContext) raises:
+        step_count_device_alloc()
+        self.part = ctx.enqueue_create_buffer[DType.int32](SCAN_BLOCKS)
+        step_count_host_alloc()
+        self.host = ctx.enqueue_create_host_buffer[DType.int32](SCAN_BLOCKS)
+        step_count_sync()
+        ctx.synchronize()
+
+    def _finish(mut self, ctx: DeviceContext, blocks: Int) raises -> Int:
+        # DEVIATION 2721. ONE WAIT REMOVED, the one that stood between the
+        # caller's launch and this copy. Both are on `ctx`, which is
+        # in-order, so the copy already reads what the kernel wrote.
+        var view = self.part.create_sub_buffer[DType.int32](0, blocks)
+        step_count_d2h()
+        ctx.enqueue_copy(dst_ptr=self.host.unsafe_ptr(), src_buf=view)
+        # LOAD-BEARING, category (a): `_fold_partials` reads `self.host`.
+        step_count_sync()
+        ctx.synchronize()
+        _ = view^
+        return _fold_partials(self.host, blocks)
+
+    def first_nonfinite(
+        mut self,
+        ctx: DeviceContext,
+        mut buf: DeviceBuffer[DType.float32],
+        n: Int,
+    ) raises -> Int:
+        """`device_first_nonfinite` through this scratch."""
+        if n <= 0:
+            return -1
+        var blocks = _scan_blocks(n)
+        step_count_launch()
+        ctx.enqueue_function[nonfinite_partial_kernel](
+            self.part.unsafe_ptr(),
+            buf.unsafe_ptr(),
+            Int32(n),
+            grid_dim=(blocks, 1, 1),
+            block_dim=(SCAN_TPB, 1, 1),
+        )
+        return self._finish(ctx, blocks)
+
+    def first_negative(
+        mut self,
+        ctx: DeviceContext,
+        mut buf: DeviceBuffer[DType.float32],
+        n: Int,
+    ) raises -> Int:
+        """`device_first_negative` through this scratch."""
+        if n <= 0:
+            return -1
+        var blocks = _scan_blocks(n)
+        step_count_launch()
+        ctx.enqueue_function[negative_partial_kernel](
+            self.part.unsafe_ptr(),
+            buf.unsafe_ptr(),
+            Int32(n),
+            grid_dim=(blocks, 1, 1),
+            block_dim=(SCAN_TPB, 1, 1),
+        )
+        return self._finish(ctx, blocks)
+
+
+struct DeviceNonfiniteBatch(Movable):
+    """Independent scans sharing packed scratch and one completion wait.
+
+    Enqueue every slot, then finish before reading results or releasing any
+    source buffer. The batch and all sources must use the same live context.
+    A completed batch can be reused with the same lengths; enqueue rereads
+    every source. Kernel geometry and first-index reduction are unchanged.
+    """
+    var lengths: List[Int]
+    var offsets: List[Int]
+    var queued: List[Bool]
+    var part: DeviceBuffer[DType.int32]
+    var res: DeviceBuffer[DType.int32]
+    var host: HostBuffer[DType.int32]
+
+    def __init__(out self, ctx: DeviceContext, lengths: List[Int]) raises:
+        var offsets = List[Int]()
+        var total = 0
+        for slot in range(len(lengths)):  # small-loop(lengths: batch slots): one entry per scanned buffer, a handful
+            var n = lengths[slot]
+            if n < 0 or n > Int(NONFINITE_NONE):
+                raise Error("nonfinite batch: length outside Int32 index range")
+            offsets.append(total)
+            total += _scan_blocks(n)
+        self.lengths = lengths.copy()
+        self.offsets = offsets^
+        self.queued = List[Bool](length=len(lengths), fill=False)
+        step_count_device_alloc()
+        self.part = ctx.enqueue_create_buffer[DType.int32](max(total, 1))
+        # one finished word per slot (the device folds each slot's partials)
+        step_count_device_alloc()
+        self.res = ctx.enqueue_create_buffer[DType.int32](max(len(lengths), 1))
+        step_count_host_alloc()
+        self.host = ctx.enqueue_create_host_buffer[DType.int32](max(len(lengths), 1))
+
+    def enqueue(
+        mut self, ctx: DeviceContext, slot: Int,
+        mut buf: DeviceBuffer[DType.float32],
+    ) raises:
+        if slot < 0 or slot >= len(self.lengths):
+            ctx.synchronize()
+            raise Error("nonfinite batch: slot out of range")
+        var n = self.lengths[slot]
+        if self.queued[slot] or n > len(buf):
+            ctx.synchronize()
+            raise Error("nonfinite batch: duplicate slot or short source")
+        var blocks = 0
+        if n > 0:
+            blocks = _scan_blocks(n)
+            step_count_launch()
+            ctx.enqueue_function[nonfinite_partial_kernel](
+                self.part.unsafe_ptr() + self.offsets[slot], buf.unsafe_ptr(),
+                Int32(n), grid_dim=(blocks, 1, 1),
+                block_dim=(SCAN_TPB, 1, 1),
+            )
+        # the slot's partials fold on the device into one word (n = 0 writes
+        # NONFINITE_NONE)
+        step_count_launch()
+        ctx.enqueue_function[min_partials_kernel](
+            self.res.unsafe_ptr() + slot, self.part.unsafe_ptr() + self.offsets[slot],
+            Int32(blocks), grid_dim=(1, 1, 1), block_dim=(SCAN_TPB, 1, 1),
+        )
+        self.queued[slot] = True
+
+    def finish(mut self, ctx: DeviceContext) raises -> List[Int]:
+        # Even an incomplete batch drains before raising; its sources must
+        # remain live through this method. Never read unfinished host data.
+        step_count_d2h()
+        ctx.enqueue_copy(dst_ptr=self.host.unsafe_ptr(), src_buf=self.res)
+        step_count_sync()
+        ctx.synchronize()
+        for slot in range(len(self.queued)):  # small-loop(queued: batch slots): one flag per scanned buffer, a handful
+            if not self.queued[slot]:
+                raise Error("nonfinite batch: missing slot")
+        # one finished word per slot, folded on the device at enqueue
+        var results = List[Int]()
+        for slot in range(len(self.lengths)):  # small-loop(lengths: batch slots): one answer word per scanned buffer
+            var best = self.host.unsafe_ptr().unsafe_load(slot)
+            results.append(-1 if best == NONFINITE_NONE else Int(best))
+            self.queued[slot] = False
+        return results^
+
+
+def token_oob_partial_kernel(
+    part: MutPointer[Int32, MutAnyOrigin],
+    ids: MutPointer[Int32, MutAnyOrigin],
+    n_in: Int32,
+    vocab: Int32,
+):
+    """cpu3-seq (2026-10-04): `nonfinite_partial_kernel` with the integer
+    predicate `id < 0 or id >= vocab` over an Int32 token buffer. Same
+    partial shape and fold, so "first" means the smallest index, exactly
+    as the host walk over the token List it replaces reported it."""
+    var n = Int(n_in)
+    var red = stack_allocation[
+        SCAN_TPB,
+        Scalar[DType.int32],
+        address_space = AddressSpace.SHARED,
+    ]()
+    var tid = Int(thread_idx.x)
+    var stride = Int(grid_dim.x) * SCAN_TPB
+    var i = Int(block_idx.x) * SCAN_TPB + tid
+    var best = NONFINITE_NONE
+    while i < n:
+        var v = ids.unsafe_load(i)
+        if v < Int32(0) or v >= vocab:
+            best = Int32(i)
+            break
+        i += stride
+    red.unsafe_store(tid, best)
+    barrier()
+    var active = SCAN_TPB // 2
+    while active > 0:
+        if tid < active:
+            var o = red.unsafe_load(tid + active)
+            if o < red.unsafe_load(tid):
+                red.unsafe_store(tid, o)
+        barrier()
+        active = active // 2
+    if tid == 0:
+        part.unsafe_store(Int(block_idx.x), red.unsafe_load(0))
+
+
+def device_first_token_oob(
+    ctx: DeviceContext, mut ids: DeviceBuffer[DType.int32], n: Int, vocab: Int
+) raises -> Int:
+    """cpu3-seq: the first flat index `i < n` with `ids[i]` outside
+    `[0, vocab)`, or -1. Same launch shape, ONE partials copy and ONE wait
+    as `device_first_nonfinite`; replaces the host token-range walks in the
+    byte-LM GPU routes (the ids are on the device already)."""
+    if n <= 0:
+        return -1
+    var blocks = _scan_blocks(n)
+    var part = take_dev_i32(ctx, blocks)
+    step_count_launch()
+    ctx.enqueue_function[token_oob_partial_kernel](
+        part.unsafe_ptr(),
+        ids.unsafe_ptr(),
+        Int32(n),
+        Int32(vocab),
+        grid_dim=(blocks, 1, 1),
+        block_dim=(SCAN_TPB, 1, 1),
+    )
+    var host = take_host_i32(ctx, blocks)
+    step_count_d2h()
+    comptime if IDN_SCRATCH_POOL:
+        var head = part.create_sub_buffer[DType.int32](0, blocks)
+        ctx.enqueue_copy(dst_ptr=host.unsafe_ptr(), src_buf=head)
+        _ = head^
+    else:
+        ctx.enqueue_copy(dst_ptr=host.unsafe_ptr(), src_buf=part)
+    # LOAD-BEARING: `_fold_partials` reads `host` on the next line.
+    step_count_sync()
+    ctx.synchronize()
+    var best = _fold_partials(host, blocks)
+    give_host_i32(ctx, host^)
+    give_dev_i32(ctx, part^)
+    return best

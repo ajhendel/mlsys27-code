@@ -1,0 +1,2113 @@
+"""Initialization and the Lloyd iteration.
+
+Reference: `cuvs/src/cluster/detail/kmeans.cuh` (cuVS `94c2819`). Partial.
+
+The reference file is 1242 lines and most of it is host bookkeeping for cases this
+tree does not have: multi-GPU partitioned fits, `kmeans_transform`, and the
+`kmeans_auto_find_k` driver. What is implemented is the algorithm: the three
+initializations (random, classic k-means++, scalable k-means||) and the
+iteration.
+
+THE ITERATION, THE REFERENCE ORDER, WHICH IS NOT THE TEXTBOOK ORDER
+-------------------------------------------------------------------
+The textbook writes assign, update, test. `kmeans_fit_main`
+(`detail/kmeans.cuh:407-497`) is
+
+    assign  ->  accumulate  ->  finalize  ->  measure shift  ->  COPY BACK
+            ->  sync  ->  test on the host  ->  break
+
+and the copy-back sitting where it does (`:464-465`, a device-to-device
+`raft::copy`) is what makes the shift measurement free: the shift is computed
+between the buffer that was just consumed and the one just produced
+(`mapThenSumReduce` with `sqdiff_op`, `:454-459`), before either is recycled,
+so no third copy of the centroids ever exists.
+
+THE TEST RUNS ON THE HOST AND STOPS THE FIT IN THE SAME ITERATION
+----------------------------------------------------------------
+`:461-462` copies the shift scalar to the host, `:491` is the loop body's ONE
+`raft::resource::sync_stream`, `:492` is `if (sqrdNormError < params.tol)
+done = true;`, and `:494-497` breaks. There is no device-side convergence
+kernel and no flag in flight.
+
+An earlier version of this implementation ran the test in a one-thread kernel, read the
+flag one iteration late, and attributed both to cuVS. Neither is in their
+source: `check_convergence` does not exist anywhere in cuVS, cuML or RAFT.
+That version paid for both control planes at once -- it still synced every
+iteration -- and it always ran one Lloyd iteration more than cuVS would.
+
+WHAT THE DEFAULT FIT DOES NOT DO
+--------------------------------
+`params.inertia_check` is FALSE by default (`cuvs/cluster/kmeans.hpp:120`).
+With it off, the loop never reduces the cluster cost and never applies the
+`delta > 1 - tol` ratio test (`:468-489` is all inside that `if`). The cost
+is computed ONCE per restart, after the loop, over a fresh assignment against
+the final centroids (`:500-537`) -- so the reported inertia belongs to the
+centroids that are returned, not to the ones from the last iteration.
+
+WHAT `n_init` ACTUALLY COSTS
+----------------------------
+`n_init` restarts are FULLY SEQUENTIAL here, as they are in cuVS: the whole
+fit runs, its inertia is compared, and the best is kept (`:888-949`). Nothing
+about restarts is inherently serial, and they are the most obviously
+parallel thing in k-means, so this is the first place to look when the
+control plane becomes the cost. Copied as-is because it is theirs.
+"""
+# Tried 2026-10-08 (ANONLIB_C37_FUSED_ACCUMULATE + ANONLIB_C37_FUSED_ROWS, run ge123e6f9): fused Lloyd assignment + Int32
+# row-block centroid accumulation in shared memory, X read once per iteration. NV/AMD kmeans istella 104.8x/0.841x,
+# taxi 68.6x/0.895x (vendor split); combined 9.4x/7.8x SLOWER; inertia SAME -> deleted. Recoverable at main 42d1e42c6;
+# row in docs/apple-fast/EXPERIMENTS.md.
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 the authors. Part of anonlib, DOI-WITHHELD
+
+
+from std.math import fma
+from std.math import ceil, log
+from max.gpu.host import DeviceBuffer, DeviceContext
+
+from core.gemm import gemm_nt
+from cluster.checks.plus_plus import (
+    PLUS_PLUS_TPB,
+    adopt_candidate_min_kernel,
+    binary_search_kernel,
+    candidate_cost_kernel,
+    chunk_sums_kernel,
+    gather_rows_kernel,
+    scan_chunk_offsets_kernel,
+    write_inclusive_scan_kernel,
+)
+from std.sys.compile import is_defined
+from std.sys.defines import get_defined_int
+from std.os import getenv
+from std.time import perf_counter_ns
+from std.sys.info import has_apple_gpu_accelerator
+from std.gpu import block_dim, block_idx, thread_idx
+from checks.numerics import GLOBAL_NUMERIC_MODE, NUMERIC_FAST, NUMERIC_IDENTICAL, ftz, identical_mul_add
+from cluster.checks.reduce_by_key import (
+    blocked_acc_table_cells,
+    launch_accumulate_centroid_sums_blocked,
+    launch_accumulate_weight_per_cluster_blocked,
+    REDUCE_BY_KEY_TPB,
+    SUM_MODE_PLAIN,
+    SUM_MODE_PRODUCT,
+    SUM_MODE_SQDIFF,
+    copy_f32_gated_kernel,
+    copy_f32_kernel,
+    kmeans_conv_step_kernel,
+    launch_accumulate_centroid_sums_blocked_gated,
+    launch_accumulate_weight_per_cluster_blocked_gated,
+    finish_sum_kernel,
+    finalize_centroids_kernel,
+    launch_accumulate_centroid_sums,
+    launch_accumulate_weight_per_cluster,
+    sum_partials_kernel,
+    zero_i32_kernel,
+)
+from cluster.checks.scalable_init import (
+    count_labels_kernel,
+    sample_flags_dev_kernel,
+    sample_flags_kernel,
+    select_scatter_kernel,
+    set_flag_kernel,
+    zero_f32_kernel,
+)
+from core.row_norms import NORM_TPB, row_norm_kernel, enqueue_row_norms
+from cluster.impl.detail.kmeans_common import (
+    check_convergence,
+    metric_is_sqrt,
+)
+from core.identity_trace import IdentityTrace
+from checks.fixed_point import choose_scale
+from checks.kernel_matrix import COLUMN_AMD, COLUMN_NVIDIA, TARGET_COLUMN
+from cluster.impl.detail.min_cluster_distance_compute import (
+    compute_centroid_norms,
+    min_cluster_and_distance_compute,
+    min_cluster_and_distance_compute_gated,
+)
+from cluster.multi_gpu import assignment_device_count
+from std.memory import bitcast
+from cluster.impl.kmeans_params import (
+    INIT_ARRAY,
+    INIT_KMEANS_PLUS_PLUS,
+    INIT_RANDOM,
+    KMEANS_LAZY_EVERY,
+    KMEANS_LAZY_SHIFT_IDN,
+    KMeansParams,
+    get_centroids_batch_size,
+    get_data_batch_size,
+)
+
+
+#: DEVIATION 3080 (2026-09-17, lane kmeans-linear-speed): the row-block
+#: accumulator of `cluster/checks/reduce_by_key.mojo`, in place of the two
+#: atomic reductions of `update_centroids`. Same Int32 totals by construction
+#: (see the banner there). ON for NVIDIA since 2026-09-18 (RTX 4090,
+#: bench/results/kmeans_linear_2026-09-18/: kmeans taxi 4M x 11 1216 to 100
+#: ms, Istella-S 2M x 220 14167 to 460 ms with 3081, digests equal to main's
+#: and to the H100 record's on every cell, the sabotage arm divergent on 75
+#: of 90 fitting cells); `-D ANONLIB_EXPERIMENTAL_KMEANS_BLOCK_ACC=1` forces
+#: it on any column for an A/B, `-D ANONLIB_KMEANS_BLOCK_ACC_OFF=1` forces
+#: it off. Apple and AMD are untimed and keep the atomic reductions.
+#: fam-cluster (2026-10-04), IDENTICAL: the row-block accumulator on the AMD
+#: column too. The kernels are vendor neutral (plain Int32 loads and stores,
+#: no shared memory, no atomics) and the Int32 totals are the atomic arms'
+#: totals by the associativity argument in `reduce_by_key.mojo`, so no bit
+#: moves. `-D ANONLIB_IDN_KMEANS_BLOCK_ACC_AMD_OFF=1` restores the atomic
+#: reductions on AMD.
+comptime IDN_KMEANS_BLOCK_ACC_AMD = (
+    GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL
+    and TARGET_COLUMN == COLUMN_AMD
+    and not (
+        is_defined["ANONLIB_IDN_KMEANS_BLOCK_ACC_AMD_OFF"]()
+        or is_defined["ANONLIB_IDN_ALL_OFF"]()
+    )
+)
+comptime KMEANS_BLOCK_ACC = (
+    not is_defined["ANONLIB_KMEANS_BLOCK_ACC_OFF"]()
+    and (
+        is_defined["ANONLIB_EXPERIMENTAL_KMEANS_BLOCK_ACC"]()
+        or TARGET_COLUMN == COLUMN_NVIDIA
+        or IDN_KMEANS_BLOCK_ACC_AMD
+    )
+)
+#: fam-cluster (2026-10-04), IDENTICAL, with the row-block accumulator: the
+#: fold of the block tables STORES each output cell instead of adding into a
+#: buffer zeroed by two extra launches per Lloyd iteration. `0 + total` is
+#: `total` in Int32, so no bit moves. `-D ANONLIB_IDN_KMEANS_FOLD_STORE_OFF=1`
+#: restores the two zero launches and the adding fold.
+comptime IDN_KMEANS_FOLD_STORE = (
+    KMEANS_BLOCK_ACC
+    and GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL
+    and not (
+        is_defined["ANONLIB_IDN_KMEANS_FOLD_STORE_OFF"]()
+        or is_defined["ANONLIB_IDN_ALL_OFF"]()
+    )
+)
+#: fam2-cluster (2026-10-04), IDENTICAL, with the row-block accumulator: THE
+#: STOPPING RULE ON THE DEVICE. The Lloyd loop no longer drains once per
+#: iteration to read the shift scalar. `kmeans_conv_step_kernel` compares the
+#: device shift with the tolerance and sets a device flag; the two heavy
+#: kernels of an iteration (the fused assignment, `n x k x d`, and the
+#: row-block accumulate, `n x d`) and the centroid copy-back return at once
+#: when the flag is set, so the host enqueues `KMEANS_CONV_CHUNK` iterations
+#: at a time and reads the flag once per chunk. Iterations enqueued past
+#: convergence cost a handful of empty or `k x d` launches and leave every
+#: buffer as the converging iteration left it: labels, centroids, inertia and
+#: `n_iter` are the per-iteration loop's, bit for bit. The loop keeps the
+#: per-iteration form when `inertia_check` is on, when the identity trace is
+#: recording, and when the assignment is split across devices.
+#: `-D ANONLIB_IDN_KMEANS_DEVICE_CONV_OFF=1` restores the per-iteration
+#: drain everywhere.
+comptime IDN_KMEANS_DEVICE_CONV = (
+    KMEANS_BLOCK_ACC
+    and GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL
+    and not (
+        is_defined["ANONLIB_IDN_KMEANS_DEVICE_CONV_OFF"]()
+        or is_defined["ANONLIB_IDN_ALL_OFF"]()
+    )
+)
+#: Iterations enqueued per flag read: ONE int sweep define (lane
+#: classical-fixes, 2026-10-07), `-D ANONLIB_IDN_KMEANS_CONV_CHUNK=1|2|4|16|32`,
+#: default 8 when absent. It replaces the five mutually overriding defines
+#: `ANONLIB_IDN_KMEANS_CONV_CHUNK_1|_2|_4|_16|_32` (refused in
+#: core/six_lane_experiment_guards.mojo); each value keeps that arm's loop.
+#: Cost reasoning: a chunk trades one host flag read (a sync) per chunk
+#: against up to chunk-1 near-empty launches enqueued past convergence; it
+#: does not depend on the data shape. No bit depends on the chunk (labels,
+#: centroids, inertia and n_iter are the per-iteration loop's), and the host
+#: column has no chunked loop, so it is unaffected.
+# A08 partial AMD WINNER,2026-10-06:poll1/current8=0.833,0.839,0.988 on
+# generated full fits100000x32,100001x33,65537x17 with32 clusters. One in-process
+# warmup+one score,MI325X,timing source4252d8155. NVIDIA/full named-dataset
+# evidence pending; keep OFF until the combined-vendor promotion contract holds.
+# Evidence:anonlib-evidence/overnight-ab-20261006/amd/live/repair-summary.json.
+# A08 NVIDIA L40S 2026-10-06 convpoll1 at256rows is mixed WIN/LOSS:
+# candidate0.887/1.077/1.517 ms vs1.086/1.272/1.503 ms on
+# 100000x32,100001x33,65537x17,k32. One warmup/score; default8 retained.
+# Evidence: overnight-ab-20261006/nvidia/default-repair-normalized-measurements.json.
+comptime KMEANS_CONV_CHUNK = get_defined_int["ANONLIB_IDN_KMEANS_CONV_CHUNK", 8]()
+
+
+def kmeans_shift_threshold(tol: Float64) -> Float32:
+    """The Float32 `t` with `s < t` exactly when `Float64(s) < tol`, for
+    every Float32 `s` (the shift is a Float32 sum of squares; Apple has no
+    Float64 on the device, so the comparison is carried in Float32).
+
+    `t` is `tol` rounded UP to Float32. If `tol` is a Float32 value the two
+    tests are the same test. Otherwise `Float64(s) < tol` holds exactly for
+    the Float32 values at or below the Float32 just under `tol`, which are
+    the values strictly below the Float32 just above it. For `tol <= 0`
+    neither test passes for a non-negative `s`; NaN fails both."""
+    var t = Float32(tol)
+    if tol > 0.0 and Float64(t) < tol:
+        # Positive and finite here: the next Float32 up is the next bit
+        # pattern (zero steps to the smallest subnormal).
+        t = bitcast[DType.float32](bitcast[DType.uint32](t) + UInt32(1))
+    return t
+
+
+#: The reach control for 3080: the row-block arm with the first row of every
+#: block dropped. NEVER a shipping define.
+comptime KMEANS_BLOCK_ACC_SABOTAGE = is_defined[
+    "ANONLIB_KMEANS_BLOCK_ACC_SABOTAGE"
+]()
+
+
+@fieldwise_init
+struct HostRng(Copyable, Movable):
+    """A documented LCG, because cuVS's `std::mt19937` is not reproducible here.
+
+    DEVIATION. Their host RNG picks the first k-means++
+    centroid (`detail/kmeans.cuh:152-157`) and the per-restart seeds
+    (`:885`, `:890`), and
+    their device RNG (`raft::random::discrete`) draws the k-means||
+    candidates. Neither has a Mojo counterpart that would produce the same
+    stream, so matching cuVS draw for draw is impossible and pretending
+    otherwise would be worse than saying so.
+
+    What IS preserved is the property that matters for validation: the same
+    seed gives the same fit, so a disagreement with scikit-learn is an
+    algorithm disagreement and not a coin flip. Cross-implementation
+    comparison has to be over several seeds, which is what
+    `cluster/tools/sklearn_reference.py` does.
+    """
+
+    var state: UInt64
+
+    def next_u64(mut self) -> UInt64:
+        # splitmix64, chosen because it is short enough to audit here.
+        self.state += 0x9E3779B97F4A7C15
+        var z = self.state
+        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9
+        z = (z ^ (z >> 27)) * 0x94D049BB133111EB
+        return z ^ (z >> 31)
+
+    def next_index(mut self, n: Int) -> Int:
+        return Int(self.next_u64() % UInt64(n))
+
+    def next_unit(mut self) -> Float64:
+        return Float64(self.next_u64() >> 11) * (1.0 / 9007199254740992.0)
+
+
+@fieldwise_init
+struct FitResult(Copyable, ImplicitlyCopyable, Movable):
+    var inertia: Float64
+    var n_iter: Int
+
+
+def _km_stage(ctx: DeviceContext, on: Bool, mut t: Int, name: String) raises:
+    """ANONLIB_KMEANS_STAGES=1 (a diagnostic, lane cluster-apple2): drain
+    and print the wall time since the last stage. Off, it does nothing, so
+    the default program is unchanged."""
+    if not on:
+        return
+    ctx.synchronize()
+    var now = Int(perf_counter_ns())
+    print("KMSTAGE " + name + " " + String(Float64(now - t) / 1.0e6))
+    t = now
+
+
+def _sum_device(
+    ctx: DeviceContext,
+    mut a: DeviceBuffer[DType.float32],
+    mut b: DeviceBuffer[DType.float32],
+    mut partials: DeviceBuffer[DType.float32],
+    mut out_scalar: DeviceBuffer[DType.float32],
+    n: Int,
+    mode: Int,
+) raises:
+    """Two enqueued stages into a DEVICE scalar, with the map folded in.
+
+    `mode` selects the map, which cuVS keeps inside the reduction rather than
+    materializing: `SUM_MODE_SQDIFF` is `raft::linalg::mapThenSumReduce` with
+    `raft::sqdiff_op` (`detail/kmeans.cuh:454-459`), `SUM_MODE_PLAIN` and
+    `SUM_MODE_PRODUCT` are `computeClusterCost` with `raft::value_op` over an
+    unweighted and a weight-multiplied distance vector respectively
+    (`:470-476` and `:516-535`).
+
+    The result lands in a DEVICE scalar. Whether it then comes to the host is
+    the caller's business and is where cuVS's control plane is decided: the
+    shift scalar does cross every iteration (`:462`), the cost scalar crosses
+    only when `inertia_check` is on, and once more after the loop.
+    """
+    var blocks = (n + REDUCE_BY_KEY_TPB - 1) // REDUCE_BY_KEY_TPB
+    if blocks > 256:
+        blocks = 256
+    if blocks < 1:
+        blocks = 1
+
+    ctx.enqueue_function[sum_partials_kernel](
+        partials.unsafe_ptr(),
+        a.unsafe_ptr(),
+        b.unsafe_ptr(),
+        Int32(n),
+        Int32(mode),
+        grid_dim=(blocks, 1, 1),
+        block_dim=(REDUCE_BY_KEY_TPB, 1, 1),
+    )
+    ctx.enqueue_function[finish_sum_kernel](
+        out_scalar.unsafe_ptr(),
+        partials.unsafe_ptr(),
+        Int32(blocks),
+        grid_dim=(1, 1, 1),
+        block_dim=(REDUCE_BY_KEY_TPB, 1, 1),
+    )
+
+
+def init_random(
+    ctx: DeviceContext,
+    mut x: DeviceBuffer[DType.float32],
+    mut centroids: DeviceBuffer[DType.float32],
+    n_samples: Int,
+    n_features: Int,
+    n_clusters: Int,
+    mut rng: HostRng,
+) raises:
+    """`initRandom` -> `shuffleAndGather` -> `raft::matrix::sample_rows`.
+
+    Theirs permutes an index vector on device and gathers the first k rows.
+    Ours draws k indices on the host and issues k row copies, which is the
+    same distribution and a different mechanism, chosen because k is at most
+    a few hundred and a device permutation of `n_samples` to select `k` of
+    them is the more expensive way to spend a launch.
+
+    DEVIATION: theirs samples WITHOUT replacement by construction (it is a
+    permutation). This draws with replacement, so two centroids can start
+    identical. That is not benign: duplicate initial centroids give an empty
+    cluster on iteration one, and the empty-cluster rule keeps the old
+    centroid, so the duplicate persists. Rejected duplicates are the fix and
+    are done below.
+    """
+    var chosen = List[Int]()
+    while len(chosen) < n_clusters:
+        var candidate = rng.next_index(n_samples)
+        var seen = False
+        for i in range(len(chosen)):
+            if chosen[i] == candidate:
+                seen = True
+        if not seen:
+            chosen.append(candidate)
+
+    for j in range(n_clusters):
+        ctx.enqueue_function[copy_f32_kernel](
+            centroids.unsafe_ptr().unsafe_offset(j * n_features),
+            x.unsafe_ptr().unsafe_offset(chosen[j] * n_features),
+            Int32(n_features),
+            grid_dim=((n_features + 255) // 256, 1, 1),
+            block_dim=(256, 1, 1),
+        )
+    ctx.synchronize()
+
+
+#: lane/gap-nv-classical2: NVIDIA and AMD too (the name kept). Off Apple the
+#: k - 1 picks each synchronized and read the costs back (ivf's 1024-list
+#: coarse quantizer: ~3,000 syncs; IVF-PQ's 55 codebooks: ~42,000). The same
+#: draws and the same first-strict-minimum pick on the device.
+#: -D ANONLIB_KMEANS_PP_NOSYNC_APPLE_ONLY=1 restores the Apple-only gate.
+comptime KMEANS_FAST_PP_NOSYNC = (
+    (GLOBAL_NUMERIC_MODE == NUMERIC_FAST or GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL)
+    and (
+        has_apple_gpu_accelerator()
+        or (
+            (TARGET_COLUMN == COLUMN_NVIDIA or TARGET_COLUMN == COLUMN_AMD)
+            and not is_defined["ANONLIB_KMEANS_PP_NOSYNC_APPLE_ONLY"]()
+        )
+    )
+    and not is_defined["ANONLIB_KMEANS_FAST_PP_NOSYNC_OFF"]()
+)
+"""FAST on Apple: the greedy k-means++ loop draws every pick's uniforms up
+front and chooses the best candidate on the device, so the `k - 1` picks
+are enqueued without a synchronize. Same draws, same picks."""
+
+
+def pp_best_kernel(
+    best: MutPointer[Int32, MutAnyOrigin],
+    cost: MutPointer[Float32, MutAnyOrigin],
+    n_trials_in: Int32,
+):
+    """The host loop's argmin: the FIRST strictly smallest cost."""
+    if Int(thread_idx.x) != 0:
+        return
+    var b = 0
+    var bc = cost[0]
+    for t in range(1, Int(n_trials_in)):
+        var c = cost[t]
+        if c < bc:
+            bc = c
+            b = t
+    best[0] = Int32(b)
+
+
+def pp_adopt_dev_kernel(
+    current_min: MutPointer[Float32, MutAnyOrigin],
+    z: MutPointer[Float32, MutAnyOrigin],
+    x_norm: MutPointer[Float32, MutAnyOrigin],
+    cand_norm: MutPointer[Float32, MutAnyOrigin],
+    best: MutPointer[Int32, MutAnyOrigin],
+    n_samples_in: Int32,
+    n_trials_in: Int32,
+):
+    """`adopt_candidate_min_kernel` with the trial read from the device."""
+    var n_samples = Int(n_samples_in)
+    var n_trials = Int(n_trials_in)
+    var trial = Int(best[0])
+    var cn = cand_norm[trial]
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if i < n_samples:
+        var d = ftz(
+            identical_mul_add(
+                Float32(-2.0),
+                ftz(z[i * n_trials + trial]),
+                ftz(ftz(x_norm[i]) + ftz(cn)),
+            )
+        )
+        # Tried 2026-10-08 (ANONLIB_KMEANS_DIRECT_DISTANCE, arm direct4 of kmeans_assign, run ge123e6f9): (x-c)^2 distances in
+        # place of the expansion; NV/AMD kmeans istella 12.7x/6.2x, taxi 1.78x/1.96x SLOWER; inertia SAME -> deleted (both direct
+        # arms). Recoverable at main 42d1e42c6; row in docs/apple-fast/EXPERIMENTS.md.
+        if d <= Float32(0.0):
+            d = Float32(0.0)
+        if d < current_min[i]:
+            current_min[i] = d
+
+
+def pp_copy_best_kernel(
+    dst: MutPointer[Float32, MutAnyOrigin],
+    candidates: MutPointer[Float32, MutAnyOrigin],
+    best: MutPointer[Int32, MutAnyOrigin],
+    n_features_in: Int32,
+):
+    var j = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    var nf = Int(n_features_in)
+    if j < nf:
+        dst[j] = candidates[Int(best[0]) * nf + j]
+
+
+# Tried 2026-10-08 (ANONLIB_KMEANS_DIRECT_DISTANCE, arm direct4 of kmeans_assign, run ge123e6f9): (x-c)^2 distances in
+# place of the expansion; NV/AMD kmeans istella 12.7x/6.2x, taxi 1.78x/1.96x SLOWER; inertia SAME -> deleted (both direct
+# arms). Recoverable at main 42d1e42c6; row in docs/apple-fast/EXPERIMENTS.md.
+
+
+def kmeans_plus_plus(
+    ctx: DeviceContext,
+    mut x: DeviceBuffer[DType.float32],
+    mut x_norm: DeviceBuffer[DType.float32],
+    mut centroids: DeviceBuffer[DType.float32],
+    mut centroid_norm: DeviceBuffer[DType.float32],
+    mut dist_buf: DeviceBuffer[DType.float32],
+    mut min_dist: DeviceBuffer[DType.float32],
+    mut labels: DeviceBuffer[DType.uint32],
+    mut partials: DeviceBuffer[DType.float32],
+    params: KMeansParams,
+    n_samples: Int,
+    n_features: Int,
+    mut rng: HostRng,
+) raises:
+    """`kmeansPlusPlus`, the classic sequential variant, copied step for step.
+
+    Their comment block numbers the steps and so does this:
+
+        1  C = one point uniformly at random
+        2  while |C| < k
+        3      draw n_trials candidates with probability d^2(x, C) / phi
+        4      keep the candidate that MINIMIZES the resulting cluster cost
+        5  end
+
+    Step 4 is the part people get wrong when reimplementing from the paper.
+    Arthur and Vassilvitskii's algorithm draws ONE point and accepts it.
+    cuVS, like scikit-learn, draws `n_trials = 2 + ceil(log(k))` and keeps
+    the greedily best of them (`detail/kmeans.cuh:109`). That greedy variant
+    is strictly better in practice and is what both implementations ship, so
+    an accuracy comparison against scikit-learn is comparing two greedy
+    k-means++ and not greedy against vanilla.
+
+    This is the `oversampling_factor == 0` arm. The DEFAULT arm is scalable
+    k-means|| (`init_scalable_kmeans_plus_plus` below), selected exactly as
+    theirs selects it: `oversampling_factor == 0` picks this one, anything
+    else picks the scalable one (`detail/kmeans.cuh:910-915`).
+    """
+    var n_trials = 2 + Int(ceil(log(Float64(params.n_clusters))))
+
+    # Step 1.
+    var first = rng.next_index(n_samples)
+    ctx.enqueue_function[copy_f32_kernel](
+        centroids.unsafe_ptr(),
+        x.unsafe_ptr().unsafe_offset(first * n_features),
+        Int32(n_features),
+        grid_dim=((n_features + 255) // 256, 1, 1),
+        block_dim=(256, 1, 1),
+    )
+    ctx.synchronize()
+
+    # d^2(x, C) for the single centroid so far.
+    compute_centroid_norms(
+        ctx, centroids, centroid_norm, 1, n_features, params.metric
+    )
+    min_cluster_and_distance_compute(
+        ctx,
+        x,
+        x_norm,
+        centroids,
+        centroid_norm,
+        dist_buf,
+        labels,
+        min_dist,
+        n_samples,
+        n_features,
+        1,
+        params.metric,
+        params.batch_samples,
+        params.batch_centroids,
+    )
+    ctx.synchronize()
+
+    var candidates = ctx.enqueue_create_buffer[DType.float32](
+        n_trials * n_features
+    )
+    var candidate_norm = ctx.enqueue_create_buffer[DType.float32](n_trials)
+    var candidate_z = ctx.enqueue_create_buffer[DType.float32](
+        n_samples * n_trials
+    )
+    var candidate_cost = ctx.enqueue_create_buffer[DType.float32](n_trials)
+    var host_cost = ctx.enqueue_create_host_buffer[DType.float32](n_trials)
+
+    # Two-level device draw. `n_chunks` is capped so the serial walk inside a
+    # chunk is `n / n_chunks` steps rather than `n`.
+    # One chunk per block of threads, and NO cap on the chunk count: the
+    # second stage scans the chunk totals with a per-thread slice derived
+    # from their number. Capping it is exactly the trapdoor that silently
+    # truncated DBSCAN's CSR.
+    var chunk = PLUS_PLUS_TPB
+    var n_chunks = (n_samples + chunk - 1) // chunk
+
+    var chunk_totals = ctx.enqueue_create_buffer[DType.float32](n_chunks)
+    var chunk_offsets = ctx.enqueue_create_buffer[DType.float32](n_chunks)
+    var csum = ctx.enqueue_create_buffer[DType.float32](n_samples)
+    var sel_index = ctx.enqueue_create_buffer[DType.uint32](n_trials)
+    var d_u01 = ctx.enqueue_create_buffer[DType.float32](n_trials)
+    var h_u01 = ctx.enqueue_create_host_buffer[DType.float32](n_trials)
+    ctx.synchronize()
+
+    var picked = 1
+    comptime if KMEANS_FAST_PP_NOSYNC:
+        var n_picks = params.n_clusters - 1
+        if n_picks > 0:
+            var h_all = ctx.enqueue_create_host_buffer[DType.float32](
+                n_picks * n_trials
+            )
+            for t in range(n_picks * n_trials):
+                h_all.unsafe_ptr()[t] = Float32(rng.next_unit())
+            var d_all = ctx.enqueue_create_buffer[DType.float32](
+                n_picks * n_trials
+            )
+            var d_best = ctx.enqueue_create_buffer[DType.int32](1)
+            ctx.enqueue_copy(dst_buf=d_all, src_ptr=h_all.unsafe_ptr())
+            for pk in range(n_picks):
+                ctx.enqueue_function[chunk_sums_kernel](
+                    chunk_totals.unsafe_ptr(), min_dist.unsafe_ptr(),
+                    Int32(n_samples), Int32(chunk),
+                    grid_dim=(n_chunks, 1, 1), block_dim=(PLUS_PLUS_TPB, 1, 1),
+                )
+                ctx.enqueue_function[scan_chunk_offsets_kernel](
+                    chunk_offsets.unsafe_ptr(), chunk_totals.unsafe_ptr(),
+                    Int32(n_chunks),
+                    grid_dim=(1, 1, 1), block_dim=(PLUS_PLUS_TPB, 1, 1),
+                )
+                ctx.enqueue_function[write_inclusive_scan_kernel](
+                    csum.unsafe_ptr(), min_dist.unsafe_ptr(),
+                    chunk_offsets.unsafe_ptr(), Int32(n_samples), Int32(chunk),
+                    grid_dim=(n_chunks, 1, 1), block_dim=(PLUS_PLUS_TPB, 1, 1),
+                )
+                ctx.enqueue_function[binary_search_kernel](  # small-launch(n_trials: k-means++ candidate trials): one thread per trial, each a binary search of log n steps
+                    sel_index.unsafe_ptr(), csum.unsafe_ptr(),
+                    d_all.unsafe_ptr().unsafe_offset(pk * n_trials),
+                    Int32(n_samples), Int32(n_trials),
+                    grid_dim=(1, 1, 1), block_dim=(max(n_trials, 1), 1, 1),
+                )
+                ctx.enqueue_function[gather_rows_kernel](
+                    candidates.unsafe_ptr(), x.unsafe_ptr(),
+                    sel_index.unsafe_ptr(), Int32(n_features),
+                    grid_dim=(n_trials, 1, 1), block_dim=(PLUS_PLUS_TPB, 1, 1),
+                )
+                # Tried 2026-10-08 (ANONLIB_KMEANS_DIRECT_DISTANCE, arm direct4 of kmeans_assign, run ge123e6f9): (x-c)^2 distances in
+                # place of the expansion; NV/AMD kmeans istella 12.7x/6.2x, taxi 1.78x/1.96x SLOWER; inertia SAME -> deleted (both direct
+                # arms). Recoverable at main 42d1e42c6; row in docs/apple-fast/EXPERIMENTS.md.
+                enqueue_row_norms(ctx, candidate_norm, candidates, n_trials, n_features)
+                # Tried 2026-10-08 (ANONLIB_KMEANS_DIRECT_DISTANCE, arm direct4 of kmeans_assign, run ge123e6f9): (x-c)^2 distances in
+                # place of the expansion; NV/AMD kmeans istella 12.7x/6.2x, taxi 1.78x/1.96x SLOWER; inertia SAME -> deleted (both direct
+                # arms). Recoverable at main 42d1e42c6; row in docs/apple-fast/EXPERIMENTS.md.
+                gemm_nt(
+                    ctx, candidate_z, x, candidates, n_samples, n_trials,
+                    n_features,
+                )
+                ctx.enqueue_function[candidate_cost_kernel](
+                    candidate_cost.unsafe_ptr(), candidate_z.unsafe_ptr(),
+                    x_norm.unsafe_ptr(), candidate_norm.unsafe_ptr(),
+                    min_dist.unsafe_ptr(), Int32(n_samples), Int32(n_trials),
+                    grid_dim=(n_trials, 1, 1), block_dim=(PLUS_PLUS_TPB, 1, 1),
+                )
+                ctx.enqueue_function[pp_best_kernel](
+                    d_best.unsafe_ptr(), candidate_cost.unsafe_ptr(),
+                    Int32(n_trials), grid_dim=(1, 1, 1), block_dim=(32, 1, 1),
+                )
+                ctx.enqueue_function[pp_adopt_dev_kernel](
+                    min_dist.unsafe_ptr(), candidate_z.unsafe_ptr(),
+                    x_norm.unsafe_ptr(), candidate_norm.unsafe_ptr(),
+                    d_best.unsafe_ptr(), Int32(n_samples), Int32(n_trials),
+                    grid_dim=((n_samples + 255) // 256, 1, 1),
+                    block_dim=(256, 1, 1),
+                )
+                ctx.enqueue_function[pp_copy_best_kernel](
+                    centroids.unsafe_ptr().unsafe_offset((pk + 1) * n_features),
+                    candidates.unsafe_ptr(), d_best.unsafe_ptr(),
+                    Int32(n_features),
+                    grid_dim=((n_features + 255) // 256, 1, 1),
+                    block_dim=(256, 1, 1),
+                )
+            ctx.synchronize()
+            _ = h_all^
+            _ = d_all^
+            _ = d_best^
+        picked = params.n_clusters
+    while picked < params.n_clusters:
+        # Step 3. `raft::random::discrete` over the d^2 weights, ON DEVICE.
+        # The host contributes only `n_trials` uniforms, which is
+        # O(candidates) and is what archive/reference/HOST_AND_DEVICE.md permits.
+        for t in range(n_trials):
+            h_u01.unsafe_ptr().unsafe_store(t, Float32(rng.next_unit()))
+        ctx.enqueue_copy(dst_buf=d_u01, src_ptr=h_u01.unsafe_ptr())
+
+        ctx.enqueue_function[chunk_sums_kernel](
+            chunk_totals.unsafe_ptr(),
+            min_dist.unsafe_ptr(),
+            Int32(n_samples),
+            Int32(chunk),
+            grid_dim=(n_chunks, 1, 1),
+            block_dim=(PLUS_PLUS_TPB, 1, 1),
+        )
+        ctx.enqueue_function[scan_chunk_offsets_kernel](
+            chunk_offsets.unsafe_ptr(),
+            chunk_totals.unsafe_ptr(),
+            Int32(n_chunks),
+            grid_dim=(1, 1, 1),
+            block_dim=(PLUS_PLUS_TPB, 1, 1),
+        )
+        ctx.enqueue_function[write_inclusive_scan_kernel](
+            csum.unsafe_ptr(),
+            min_dist.unsafe_ptr(),
+            chunk_offsets.unsafe_ptr(),
+            Int32(n_samples),
+            Int32(chunk),
+            grid_dim=(n_chunks, 1, 1),
+            block_dim=(PLUS_PLUS_TPB, 1, 1),
+        )
+        ctx.enqueue_function[binary_search_kernel](  # small-launch(n_trials: k-means++ candidate trials): one thread per trial, each a binary search of log n steps
+            sel_index.unsafe_ptr(),
+            csum.unsafe_ptr(),
+            d_u01.unsafe_ptr(),
+            Int32(n_samples),
+            Int32(n_trials),
+            grid_dim=(1, 1, 1),
+            block_dim=(max(n_trials, 1), 1, 1),
+        )
+        ctx.enqueue_function[gather_rows_kernel](
+            candidates.unsafe_ptr(),
+            x.unsafe_ptr(),
+            sel_index.unsafe_ptr(),
+            Int32(n_features),
+            grid_dim=(n_trials, 1, 1),
+            block_dim=(PLUS_PLUS_TPB, 1, 1),
+        )
+
+        # Tried 2026-10-08 (ANONLIB_KMEANS_DIRECT_DISTANCE, arm direct4 of kmeans_assign, run ge123e6f9): (x-c)^2 distances in
+        # place of the expansion; NV/AMD kmeans istella 12.7x/6.2x, taxi 1.78x/1.96x SLOWER; inertia SAME -> deleted (both direct
+        # arms). Recoverable at main 42d1e42c6; row in docs/apple-fast/EXPERIMENTS.md.
+        enqueue_row_norms(ctx, candidate_norm, candidates, n_trials, n_features)
+        # Tried 2026-10-08 (ANONLIB_KMEANS_DIRECT_DISTANCE, arm direct4 of kmeans_assign, run ge123e6f9): (x-c)^2 distances in
+        # place of the expansion; NV/AMD kmeans istella 12.7x/6.2x, taxi 1.78x/1.96x SLOWER; inertia SAME -> deleted (both direct
+        # arms). Recoverable at main 42d1e42c6; row in docs/apple-fast/EXPERIMENTS.md.
+        gemm_nt(
+            ctx,
+            candidate_z,
+            x,
+            candidates,
+            n_samples,
+            n_trials,
+            n_features,
+        )
+        ctx.enqueue_function[candidate_cost_kernel](
+            candidate_cost.unsafe_ptr(),
+            candidate_z.unsafe_ptr(),
+            x_norm.unsafe_ptr(),
+            candidate_norm.unsafe_ptr(),
+            min_dist.unsafe_ptr(),
+            Int32(n_samples),
+            Int32(n_trials),
+            grid_dim=(n_trials, 1, 1),
+            block_dim=(PLUS_PLUS_TPB, 1, 1),
+        )
+        ctx.synchronize()
+
+        # Step 4, the greedy argmin over candidates. THIS READBACK STAYS.
+        # It is `n_trials` floats, which is O(candidates), and cuVS brings
+        # `bestCandidateIdx` to the host every accepted centroid too, and
+        # syncs the stream for it (`detail/kmeans.cuh:242-244`). Host deciding
+        # was never the problem. Theirs argmins on the device first
+        # (`cub::DeviceReduce::ArgMin`, `:224-240`) and brings back one int
+        # where this brings back `n_trials` floats and argmins on the host;
+        # both are O(candidates) and one drain.
+        ctx.enqueue_copy(dst_ptr=host_cost.unsafe_ptr(), src_buf=candidate_cost)
+        ctx.synchronize()
+        var best = 0
+        var best_cost = Float64(host_cost.unsafe_ptr().unsafe_load(0))
+        for t in range(1, n_trials):
+            var c = Float64(host_cost.unsafe_ptr().unsafe_load(t))
+            if c < best_cost:
+                best_cost = c
+                best = t
+
+        ctx.enqueue_function[adopt_candidate_min_kernel](
+            min_dist.unsafe_ptr(),
+            candidate_z.unsafe_ptr(),
+            x_norm.unsafe_ptr(),
+            candidate_norm.unsafe_ptr(),
+            Int32(n_samples),
+            Int32(n_trials),
+            Int32(best),
+            grid_dim=((n_samples + 255) // 256, 1, 1),
+            block_dim=(256, 1, 1),
+        )
+        ctx.enqueue_function[copy_f32_kernel](
+            centroids.unsafe_ptr().unsafe_offset(picked * n_features),
+            candidates.unsafe_ptr().unsafe_offset(best * n_features),
+            Int32(n_features),
+            grid_dim=((n_features + 255) // 256, 1, 1),
+            block_dim=(256, 1, 1),
+        )
+        ctx.synchronize()
+        picked += 1
+
+
+def _assign_to_candidates(
+    ctx: DeviceContext,
+    mut x: DeviceBuffer[DType.float32],
+    mut x_norm: DeviceBuffer[DType.float32],
+    mut cand: DeviceBuffer[DType.float32],
+    mut dist_buf: DeviceBuffer[DType.float32],
+    mut labels: DeviceBuffer[DType.uint32],
+    mut min_dist: DeviceBuffer[DType.float32],
+    params: KMeansParams,
+    n_samples: Int,
+    n_features: Int,
+    cand_count: Int,
+) raises:
+    """One `minClusterDistanceCompute` round against the candidate set.
+
+    Theirs (`detail/kmeans.cuh:629-640`, `:664-676`) computes distances only;
+    the fused assignment this tree already ships computes the label too, at
+    no extra traffic, so the label lands in `labels` and step 7 reads it
+    instead of running their separate `minClusterAndDistanceCompute`
+    (`countSamplesInCluster`, `kmeans_common.cuh:615-668`, whose assignment
+    is this exact computation). The candidate norms are recomputed each call
+    because the candidate set grew.
+    """
+    var cand_norm = ctx.enqueue_create_buffer[DType.float32](cand_count)
+    ctx.synchronize()
+    compute_centroid_norms(
+        ctx, cand, cand_norm, cand_count, n_features, params.metric
+    )
+    min_cluster_and_distance_compute(
+        ctx,
+        x,
+        x_norm,
+        cand,
+        cand_norm,
+        dist_buf,
+        labels,
+        min_dist,
+        n_samples,
+        n_features,
+        cand_count,
+        params.metric,
+        params.batch_samples,
+        params.batch_centroids,
+    )
+
+
+#: FAST on Apple: k-means|| folds only the candidates each round ADDED into
+#: the running (min_dist, label) instead of reassigning every sample against
+#: every candidate so far (`fold_new_candidates_kernel`; a strict `<` keeps
+#: the earlier candidate on a tie, as the full argmin does).
+#: `-D ANONLIB_KMEANS_FAST_INCR_INIT_OFF` reassigns in full.
+#: IDENTICAL on Apple takes it too (lane/apple-identical-neural,
+#: 2026-09-27): each (point, candidate) distance comes from the same
+#: `_assign_to_candidates` (its bits do not depend on which candidates share
+#: the launch), and the fold's strict `<` returns the full argmin's
+#: (value, lowest index). `-D ANONLIB_KMEANS_ID_INCR_INIT_OFF` reassigns in
+#: full there.
+#: fam-cluster (2026-10-04): IDENTICAL on the NVIDIA and AMD columns takes
+#: it too. Same argument as Apple IDENTICAL above (per-pair distance bits do
+#: not depend on the launch's candidate set; strict `<` keeps the lowest
+#: index), so no bit moves; the eight rounds plus step 7 stop paying
+#: `n * |C so far| * d` each. `-D ANONLIB_IDN_KMEANS_INCR_INIT_OFF=1`
+#: reassigns in full there.
+comptime IDN_KMEANS_INCR_INIT = (
+    GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL
+    and (TARGET_COLUMN == COLUMN_NVIDIA or TARGET_COLUMN == COLUMN_AMD)
+    and not (
+        is_defined["ANONLIB_IDN_KMEANS_INCR_INIT_OFF"]()
+        or is_defined["ANONLIB_IDN_ALL_OFF"]()
+    )
+)
+comptime KMEANS_FAST_INCR_INIT = IDN_KMEANS_INCR_INIT or (
+    has_apple_gpu_accelerator() and (
+        (
+            GLOBAL_NUMERIC_MODE == NUMERIC_FAST
+            and not is_defined["ANONLIB_KMEANS_FAST_INCR_INIT_OFF"]()
+        )
+        or (
+            GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL
+            and not (
+                is_defined["ANONLIB_KMEANS_ID_INCR_INIT_OFF"]()
+                or is_defined["ANONLIB_IDN_ALL_OFF"]()
+            )
+        )
+    )
+)
+
+
+#: fam2-cluster (2026-10-04), IDENTICAL: each k-means|| round's cost `psi`
+#: stays on the device. `sample_flags_dev_kernel` reads it from the device
+#: scalar the reduction wrote, so the round drops its drain-and-read of psi
+#: (one of the round's drains; the selected COUNT still comes back, because
+#: it sizes the next allocation). Same Float32 psi, so the same flags.
+#: `-D ANONLIB_IDN_KMEANS_INIT_PSI_DEVICE_OFF=1` restores the readback.
+comptime IDN_KMEANS_INIT_PSI_DEVICE = (
+    GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL
+    and not (
+        is_defined["ANONLIB_IDN_KMEANS_INIT_PSI_DEVICE_OFF"]()
+        or is_defined["ANONLIB_IDN_ALL_OFF"]()
+    )
+)
+
+
+def fold_new_candidates_kernel(
+    min_dist: MutPointer[Float32, MutAnyOrigin],
+    labels: MutPointer[UInt32, MutAnyOrigin],
+    new_dist: MutPointer[Float32, MutAnyOrigin],
+    new_labels: MutPointer[UInt32, MutAnyOrigin],
+    offset: UInt32,
+    n_in: Int32,
+):
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if i >= Int(n_in):
+        return
+    var nd = new_dist.unsafe_load(i)
+    if nd < min_dist.unsafe_load(i):
+        min_dist.unsafe_store(i, nd)
+        labels.unsafe_store(i, new_labels.unsafe_load(i) + offset)
+
+
+def _assign_to_candidates_fast(
+    ctx: DeviceContext,
+    mut x: DeviceBuffer[DType.float32],
+    mut x_norm: DeviceBuffer[DType.float32],
+    mut cand: DeviceBuffer[DType.float32],
+    mut dist_buf: DeviceBuffer[DType.float32],
+    mut labels: DeviceBuffer[DType.uint32],
+    mut min_dist: DeviceBuffer[DType.float32],
+    mut new_labels: DeviceBuffer[DType.uint32],
+    mut new_dist: DeviceBuffer[DType.float32],
+    params: KMeansParams,
+    n_samples: Int,
+    n_features: Int,
+    assigned: Int,
+    cand_count: Int,
+) raises -> Int:
+    """KMEANS_FAST_INCR_INIT: fold candidates `[assigned, cand_count)` into
+    (min_dist, labels); a full `_assign_to_candidates` when nothing is
+    assigned yet. Returns the new assigned count."""
+    if assigned == 0:
+        _assign_to_candidates(
+            ctx, x, x_norm, cand, dist_buf, labels, min_dist,
+            params, n_samples, n_features, cand_count,
+        )
+        return cand_count
+    var n_new = cand_count - assigned
+    if n_new <= 0:
+        return assigned
+    var sub = cand.create_sub_buffer[DType.float32](
+        assigned * n_features, n_new * n_features
+    )
+    _assign_to_candidates(
+        ctx, x, x_norm, sub, dist_buf, new_labels, new_dist,
+        params, n_samples, n_features, n_new,
+    )
+    ctx.enqueue_function[fold_new_candidates_kernel](
+        min_dist.unsafe_ptr(), labels.unsafe_ptr(), new_dist.unsafe_ptr(),
+        new_labels.unsafe_ptr(), UInt32(assigned), Int32(n_samples),
+        grid_dim=((n_samples + 255) // 256, 1, 1),
+        block_dim=(256, 1, 1),
+    )
+    _ = sub^
+    return cand_count
+
+
+def init_scalable_kmeans_plus_plus(
+    ctx: DeviceContext,
+    mut x: DeviceBuffer[DType.float32],
+    mut x_norm: DeviceBuffer[DType.float32],
+    mut centroids: DeviceBuffer[DType.float32],
+    mut dist_buf: DeviceBuffer[DType.float32],
+    mut min_dist: DeviceBuffer[DType.float32],
+    mut labels: DeviceBuffer[DType.uint32],
+    mut partials: DeviceBuffer[DType.float32],
+    params: KMeansParams,
+    n_samples: Int,
+    n_features: Int,
+    mut rng: HostRng,
+    mut trace: IdentityTrace,
+    tag_prefix: String,
+) raises:
+    """`initScalableKMeansPlusPlus`, `detail/kmeans.cuh:568-785`. The DEFAULT
+    initialization (`oversampling_factor = 2.0` selects it, `:910-915`).
+
+    `trace` / `tag_prefix` (DEVIATION 518, 2026-08-23): step 8's recluster
+    is a FULL `kmeans_fit_main` on the candidate set, and until this round
+    that inner fit constructed its OWN `IdentityTrace()` -- a second card
+    with its own `seq 0` APPENDED INTO the outer fit's file, between the
+    outer `seq 0` and `seq 1`. Every k-means++ card the Python surface
+    produced was therefore unreadable by `tools/identity_trace_diff.py`
+    ("seq out of order"), and nothing had noticed because every traced
+    k-means run before `tools/e2u_matrix_fit.py` used `INIT_ARRAY`
+    (archive/evidence/E1U_RESULTS.md names that gap). The inner fit now writes into the
+    OUTER trace under `<restart>.init.par.` -- one sequence, unique tags --
+    so the recluster's stages are in the card and aligned like any other.
+
+    Bahmani et al.'s k-means|| (arXiv:1203.6402), their numbering:
+
+        1  C = one point uniformly at random          (`:585-609`)
+        2  psi = phi_X(C)                             (`:629-650`)
+        3  for min(8, ceil(log psi)) rounds           (`:656`, `:660`)
+        4      draw each x with prob l*k*d2(x,C)/phi  (`:689-707`)
+        5      C = C u C'                             (`:713-719`)
+        7  w_x = |points nearest x| for x in C        (`:730-733`)
+        8  recluster the weighted C into k            (`:738-753`)
+
+    Two things about their step 8 that a from-the-paper reimplementation
+    gets wrong and this copies exactly:
+
+    - The k-means++ over the candidate set is UNWEIGHTED: `kmeansPlusPlus`
+      takes no weight argument (`:738-739`). The weights enter only in the
+      Lloyd pass that follows.
+    - That Lloyd pass runs under FRESH DEFAULT params with only `n_clusters`
+      copied (`:743-744`), so its metric is L2Expanded and its stopping rule
+      is the default even when the outer fit's are not. Their call goes
+      straight to the Lloyd loop with the k-means++ result already in place;
+      this tree's flattened `kmeans_fit_main` expresses exactly that as
+      `INIT_ARRAY` (start from the given centroids, `n_init` collapses to 1).
+
+    And one thing about the tail: FEWER than k candidates is not an error.
+    Their `< n_clusters` arm fills the FIRST `k - |C|` centroid rows with
+    random init and copies the candidates after them (`:755-777`); `== k`
+    copies the candidates straight out (`:778-784`).
+
+    The per-round buffer churn is theirs: `rmm::device_uvector::resize` on
+    the append (`:713`) allocates and copies too, and the per-round `CpRaw`
+    and candidate-norm buffers are fresh in their loop as well.
+
+    Fixed-point scales for the step-8 Lloyd pass cannot be the caller's: the
+    inner data are the candidates WEIGHTED BY COUNTS up to `n_samples`, a
+    different magnitude bound than the outer fit's. They are chosen by
+    `choose_scale` over an O(candidates) readback of the candidate matrix
+    and weights, which is host traffic the rule permits.
+
+    DEVIATIONS: counter-hash uniforms with an f32 probability, and
+    selection (as flags + f32 scan + scatter, exact below 2^24 rows,
+    guarded here; float-histogram counts share the bound).
+    """
+    if n_samples >= (1 << 24):
+        raise Error(
+            "scalable k-means++ selection scan counts in Float32 and is"
+            " exact only below 2^24 rows; got "
+            + String(n_samples)
+        )
+
+    var k = params.n_clusters
+    var d = n_features
+    var km_on = getenv("ANONLIB_KMEANS_STAGES") == "1"
+    var km_t = Int(perf_counter_ns())
+
+    # <<< Step-1 >>> (`:585-609`): one uniform point, flagged so no round
+    # can re-draw it.
+    var c_idx = rng.next_index(n_samples)
+    var is_centroid = ctx.enqueue_create_buffer[DType.int32](n_samples)
+    var cand_buf = ctx.enqueue_create_buffer[DType.float32](d)
+
+    var flags = ctx.enqueue_create_buffer[DType.float32](n_samples)
+    var chunk = PLUS_PLUS_TPB
+    var n_chunks = (n_samples + chunk - 1) // chunk
+    var chunk_totals = ctx.enqueue_create_buffer[DType.float32](n_chunks)
+    var chunk_offsets = ctx.enqueue_create_buffer[DType.float32](n_chunks)
+    var csum = ctx.enqueue_create_buffer[DType.float32](n_samples)
+    # A distinct one-element buffer for `sum_partials_kernel`'s unused arm
+    # as in `kmeans_fit_main`.
+    var ones = ctx.enqueue_create_buffer[DType.float32](1)
+    var d_psi = ctx.enqueue_create_buffer[DType.float32](1)
+    var h_psi = ctx.enqueue_create_host_buffer[DType.float32](1)
+    var h_count = ctx.enqueue_create_host_buffer[DType.float32](1)
+    ctx.synchronize()
+
+    ctx.enqueue_function[zero_i32_kernel](
+        is_centroid.unsafe_ptr(),
+        Int32(n_samples),
+        grid_dim=((n_samples + 255) // 256, 1, 1),
+        block_dim=(256, 1, 1),
+    )
+    ctx.enqueue_function[set_flag_kernel](
+        is_centroid.unsafe_ptr(),
+        Int32(c_idx),
+        grid_dim=(1, 1, 1),
+        block_dim=(1, 1, 1),
+    )
+    ctx.enqueue_function[copy_f32_kernel](
+        cand_buf.unsafe_ptr(),
+        x.unsafe_ptr().unsafe_offset(c_idx * d),
+        Int32(d),
+        grid_dim=((d + 255) // 256, 1, 1),
+        block_dim=(256, 1, 1),
+    )
+    ctx.synchronize()
+    var cand_count = 1
+
+    # <<< Step-2 >>> (`:629-650`): psi = phi_X(C), one full assignment plus
+    # `computeClusterCost` with `identity_op` -- an UNWEIGHTED sum -- and the
+    # scalar comes to the host exactly as their `clusterCost.value(stream)`
+    # does.
+    _assign_to_candidates(
+        ctx, x, x_norm, cand_buf, dist_buf, labels, min_dist,
+        params, n_samples, d, cand_count,
+    )
+    _sum_device(
+        ctx, min_dist, ones, partials, d_psi, n_samples, SUM_MODE_PLAIN
+    )
+    ctx.enqueue_copy(dst_ptr=h_psi.unsafe_ptr(), src_buf=d_psi)
+    ctx.synchronize()
+    var psi = Float64(h_psi.unsafe_ptr().unsafe_load(0))
+
+    # `:656`: `min(8, (int)ceil(log(psi)))`. For psi in (0, 1) theirs goes
+    # negative and the loop body never runs; same here. psi == 0 is UB in
+    # their cast and zero rounds here, which is the only reading that
+    # terminates.
+    var niter = 0
+    if psi > 0.0:
+        var lp = ceil(log(psi))
+        if lp >= 8.0:
+            niter = 8
+        elif lp > 0.0:
+            niter = Int(lp)
+
+    # <<< Step-3 >>> (`:660-720`): each round recomputes the distances and
+    # the cost against the WHOLE current candidate set -- theirs is not
+    # incremental across rounds and neither is this.
+    # KMEANS_FAST_INCR_INIT: the one candidate is already folded in above
+    var incr_assigned = cand_count
+    var incr_labels = ctx.enqueue_create_buffer[DType.uint32](
+        n_samples if KMEANS_FAST_INCR_INIT else 1
+    )
+    var incr_dist = ctx.enqueue_create_buffer[DType.float32](
+        n_samples if KMEANS_FAST_INCR_INIT else 1
+    )
+    for _iter in range(niter):
+        comptime if KMEANS_FAST_INCR_INIT:
+            incr_assigned = _assign_to_candidates_fast(
+                ctx, x, x_norm, cand_buf, dist_buf, labels, min_dist,
+                incr_labels, incr_dist, params, n_samples, d,
+                incr_assigned, cand_count,
+            )
+        else:
+            _assign_to_candidates(
+                ctx, x, x_norm, cand_buf, dist_buf, labels, min_dist,
+                params, n_samples, d, cand_count,
+            )
+        _sum_device(
+            ctx, min_dist, ones, partials, d_psi, n_samples, SUM_MODE_PLAIN
+        )
+        comptime if not IDN_KMEANS_INIT_PSI_DEVICE:
+            ctx.enqueue_copy(dst_ptr=h_psi.unsafe_ptr(), src_buf=d_psi)
+            ctx.synchronize()
+            psi = Float64(h_psi.unsafe_ptr().unsafe_load(0))
+
+        # <<< Step-4 >>> (`:689-707`): one 64-bit round seed from the host
+        # (O(1), where theirs advances a device Philox state), hashed per
+        # sample on device; then `DeviceSelect::If` as flags + the existing
+        # three-stage scan + a rank scatter.
+        var round_seed = rng.next_u64()
+        var seed_lo = round_seed.cast[DType.uint32]().cast[DType.int32]()
+        var seed_hi = (round_seed >> 32).cast[
+            DType.uint32
+        ]().cast[DType.int32]()
+        var lk = Float32(params.oversampling_factor * Float64(k))
+
+        comptime if IDN_KMEANS_INIT_PSI_DEVICE:
+            ctx.enqueue_function[sample_flags_dev_kernel](
+                flags.unsafe_ptr(),
+                min_dist.unsafe_ptr(),
+                is_centroid.unsafe_ptr(),
+                d_psi.unsafe_ptr(),
+                Int32(n_samples),
+                lk,
+                seed_lo,
+                seed_hi,
+                grid_dim=((n_samples + 255) // 256, 1, 1),
+                block_dim=(256, 1, 1),
+            )
+        else:
+            ctx.enqueue_function[sample_flags_kernel](
+                flags.unsafe_ptr(),
+                min_dist.unsafe_ptr(),
+                is_centroid.unsafe_ptr(),
+                Int32(n_samples),
+                Float32(psi),
+                lk,
+                seed_lo,
+                seed_hi,
+                grid_dim=((n_samples + 255) // 256, 1, 1),
+                block_dim=(256, 1, 1),
+            )
+        ctx.enqueue_function[chunk_sums_kernel](
+            chunk_totals.unsafe_ptr(),
+            flags.unsafe_ptr(),
+            Int32(n_samples),
+            Int32(chunk),
+            grid_dim=(n_chunks, 1, 1),
+            block_dim=(PLUS_PLUS_TPB, 1, 1),
+        )
+        ctx.enqueue_function[scan_chunk_offsets_kernel](
+            chunk_offsets.unsafe_ptr(),
+            chunk_totals.unsafe_ptr(),
+            Int32(n_chunks),
+            grid_dim=(1, 1, 1),
+            block_dim=(PLUS_PLUS_TPB, 1, 1),
+        )
+        ctx.enqueue_function[write_inclusive_scan_kernel](
+            csum.unsafe_ptr(),
+            flags.unsafe_ptr(),
+            chunk_offsets.unsafe_ptr(),
+            Int32(n_samples),
+            Int32(chunk),
+            grid_dim=(n_chunks, 1, 1),
+            block_dim=(PLUS_PLUS_TPB, 1, 1),
+        )
+        # The selected count, ONE float, is their `nPtsSampledInRank`
+        # readback-and-sync (`kmeans_common.cuh:267-269`).
+        var count_tail = csum.create_sub_buffer[DType.float32](
+            n_samples - 1, 1
+        )
+        ctx.enqueue_copy(dst_ptr=h_count.unsafe_ptr(), src_buf=count_tail)
+        ctx.synchronize()
+        var n_selected = Int(h_count.unsafe_ptr().unsafe_load(0))
+
+        if n_selected > 0:
+            # <<< Step-5 >>> (`:713-719`): append, preserving index order,
+            # which is `DeviceSelect::If`'s stability.
+            var sel_index = ctx.enqueue_create_buffer[DType.uint32](
+                n_selected
+            )
+            var grown = ctx.enqueue_create_buffer[DType.float32](
+                (cand_count + n_selected) * d
+            )
+            # lane gap-ivf (2026-10-08): on NVIDIA and AMD the allocations are
+            # stream-ordered, so the launches below already follow them; the
+            # wait was one synchronize per k-means|| round (8 per IVF coarse
+            # fit). Ordering only: no value moves. Apple keeps it (its command
+            # buffers are split at waits).
+            comptime if not (TARGET_COLUMN == COLUMN_NVIDIA or TARGET_COLUMN == COLUMN_AMD):
+                ctx.synchronize()
+            ctx.enqueue_function[select_scatter_kernel](
+                sel_index.unsafe_ptr(),
+                is_centroid.unsafe_ptr(),
+                flags.unsafe_ptr(),
+                csum.unsafe_ptr(),
+                Int32(n_samples),
+                grid_dim=((n_samples + 255) // 256, 1, 1),
+                block_dim=(256, 1, 1),
+            )
+            ctx.enqueue_function[copy_f32_kernel](
+                grown.unsafe_ptr(),
+                cand_buf.unsafe_ptr(),
+                Int32(cand_count * d),
+                grid_dim=((cand_count * d + 255) // 256, 1, 1),
+                block_dim=(256, 1, 1),
+            )
+            ctx.enqueue_function[gather_rows_kernel](
+                grown.unsafe_ptr().unsafe_offset(cand_count * d),
+                x.unsafe_ptr(),
+                sel_index.unsafe_ptr(),
+                Int32(d),
+                grid_dim=(n_selected, 1, 1),
+                block_dim=(PLUS_PLUS_TPB, 1, 1),
+            )
+            ctx.synchronize()
+            cand_buf = grown^
+            cand_count += n_selected
+
+    _km_stage(ctx, km_on, km_t, "init.rounds n=" + String(niter) + " cand=" + String(cand_count))
+    if cand_count > k:
+        # <<< Step-7 >>> (`:730-733`): w_x = points nearest each candidate.
+        # `countSamplesInCluster`'s own assignment is the same fused pass,
+        # then `countLabels` becomes the float histogram.
+        var weight = ctx.enqueue_create_buffer[DType.float32](cand_count)
+        ctx.synchronize()
+        ctx.enqueue_function[zero_f32_kernel](
+            weight.unsafe_ptr(),
+            Int32(cand_count),
+            grid_dim=((cand_count + 255) // 256, 1, 1),
+            block_dim=(256, 1, 1),
+        )
+        comptime if KMEANS_FAST_INCR_INIT:
+            incr_assigned = _assign_to_candidates_fast(
+                ctx, x, x_norm, cand_buf, dist_buf, labels, min_dist,
+                incr_labels, incr_dist, params, n_samples, d,
+                incr_assigned, cand_count,
+            )
+        else:
+            _assign_to_candidates(
+                ctx, x, x_norm, cand_buf, dist_buf, labels, min_dist,
+                params, n_samples, d, cand_count,
+            )
+        ctx.enqueue_function[count_labels_kernel](
+            weight.unsafe_ptr(),
+            labels.unsafe_ptr(),
+            Int32(n_samples),
+            grid_dim=((n_samples + 255) // 256, 1, 1),
+            block_dim=(256, 1, 1),
+        )
+        ctx.synchronize()
+
+        # <<< Step-8 >>> (`:738-753`): UNWEIGHTED classic k-means++ over the
+        # candidates, under the OUTER params (theirs passes `params` there),
+        # then Lloyd over the weighted candidates under fresh defaults.
+        var cand_norm_rows = ctx.enqueue_create_buffer[DType.float32](
+            cand_count
+        )
+        var cand_labels = ctx.enqueue_create_buffer[DType.uint32](cand_count)
+        var cand_min = ctx.enqueue_create_buffer[DType.float32](cand_count)
+        var cand_dist = ctx.enqueue_create_buffer[DType.float32](
+            cand_count * k
+        )
+        var kpp_centroid_norm = ctx.enqueue_create_buffer[DType.float32](k)
+        var h_cand = ctx.enqueue_create_host_buffer[DType.float32](
+            cand_count * d
+        )
+        var h_weight = ctx.enqueue_create_host_buffer[DType.float32](
+            cand_count
+        )
+        ctx.synchronize()
+
+        _km_stage(ctx, km_on, km_t, "init.step7")
+        # Tried 2026-10-08 (ANONLIB_KMEANS_DIRECT_DISTANCE, arm direct4 of kmeans_assign, run ge123e6f9): (x-c)^2 distances in
+        # place of the expansion; NV/AMD kmeans istella 12.7x/6.2x, taxi 1.78x/1.96x SLOWER; inertia SAME -> deleted (both direct
+        # arms). Recoverable at main 42d1e42c6; row in docs/apple-fast/EXPERIMENTS.md.
+        enqueue_row_norms(ctx, cand_norm_rows, cand_buf, cand_count, d)
+        ctx.synchronize()
+        kmeans_plus_plus(
+            ctx,
+            cand_buf,
+            cand_norm_rows,
+            centroids,
+            kpp_centroid_norm,
+            cand_dist,
+            cand_min,
+            cand_labels,
+            partials,
+            params,
+            cand_count,
+            d,
+            rng,
+        )
+
+        _km_stage(ctx, km_on, km_t, "init.kpp k=" + String(k))
+        # The step-8 Lloyd scales: sum over candidates of |value| * weight
+        # per feature bounds every fixed-point cell, and the weights sum to
+        # n_samples exactly. O(candidates) readback.
+        ctx.enqueue_copy(dst_ptr=h_cand.unsafe_ptr(), src_buf=cand_buf)
+        ctx.enqueue_copy(dst_ptr=h_weight.unsafe_ptr(), src_buf=weight)
+        ctx.synchronize()
+        var worst = Float64(0.0)
+        for f in range(d):
+            var column = Float64(0.0)
+            for c in range(cand_count):
+                # explicit fma: the default build fused this product into the sum (lane/pinned-mul-contract-free)
+                column = fma(
+                    Float64(abs(h_cand.unsafe_ptr().unsafe_load(c * d + f))),
+                    Float64(h_weight.unsafe_ptr().unsafe_load(c)),
+                    column,
+                )
+            if column > worst:
+                worst = column
+        var inner_sum_scale = Float32(choose_scale(worst))
+        var inner_weight_scale = Float32(choose_scale(Float64(n_samples)))
+
+        # `:743-753`: fresh defaults, only `n_clusters` copied; `INIT_ARRAY`
+        # is this tree's spelling of "no init, start from centroidsRawData".
+        var inner = KMeansParams.default()
+        inner.n_clusters = k
+        inner.init = INIT_ARRAY
+        # not a cuVS field: the caller's lazy-shift request reaches the recluster
+        inner.lazy_shift = params.lazy_shift
+        # not a cuVS field (lane fg-ivf B2): the caller's recluster cap
+        if params.recluster_max_iter > 0:
+            inner.max_iter = params.recluster_max_iter
+        var inner_res = kmeans_fit_main_traced(
+            ctx,
+            cand_buf,
+            weight,
+            centroids,
+            cand_labels,
+            inner,
+            cand_count,
+            d,
+            inner_sum_scale,
+            inner_weight_scale,
+            trace,
+            tag_prefix + "init.par.",
+        )
+        _km_stage(ctx, km_on, km_t, "init.lloyd iters=" + String(inner_res.n_iter))
+    elif cand_count < k:
+        # `:755-777`: supplement with random into the FIRST `k - |C|` rows,
+        # candidates after them. Their warning log is a debug line; the
+        # arithmetic is what matters.
+        var n_random = k - cand_count
+        init_random(ctx, x, centroids, n_samples, d, n_random, rng)
+        ctx.enqueue_function[copy_f32_kernel](
+            centroids.unsafe_ptr().unsafe_offset(n_random * d),
+            cand_buf.unsafe_ptr(),
+            Int32(cand_count * d),
+            grid_dim=((cand_count * d + 255) // 256, 1, 1),
+            block_dim=(256, 1, 1),
+        )
+        ctx.synchronize()
+    else:
+        # `:778-784`: exactly k candidates ARE the centroids.
+        ctx.enqueue_function[copy_f32_kernel](
+            centroids.unsafe_ptr(),
+            cand_buf.unsafe_ptr(),
+            Int32(k * d),
+            grid_dim=((k * d + 255) // 256, 1, 1),
+            block_dim=(256, 1, 1),
+        )
+        ctx.synchronize()
+
+
+def _pad2(v: Int) -> String:
+    """Two digits, zero padded, for a trace tag.
+
+    Tags are compared by ALIGNING SEQUENCES (`core/identity_trace.mojo`
+    rule 2), so `iter9` and `iter10` sorting out of order in a reader is a
+    real hazard and one this costs nothing to remove. Values above 99 are
+    written in full; the tag stays unique, which is the invariant that
+    matters.
+    """
+    if v < 10:
+        return String("0") + String(v)
+    return String(v)
+
+
+def kmeans_fit_main(
+    ctx: DeviceContext,
+    mut x: DeviceBuffer[DType.float32],
+    mut weights: DeviceBuffer[DType.float32],
+    mut centroids: DeviceBuffer[DType.float32],
+    mut labels: DeviceBuffer[DType.uint32],
+    params: KMeansParams,
+    n_samples: Int,
+    n_features: Int,
+    sum_scale: Float32,
+    weight_scale: Float32,
+) raises -> FitResult:
+    """`kmeans_fit` plus `kmeans_fit_main`, `detail/kmeans.cuh:352-542` and
+    `:811-951`, flattened into one function because the split in theirs exists
+    to give the multi-GPU driver a re-entry point this tree does not have.
+
+    `sum_scale` and `weight_scale` come from `checks/fixed_point.mojo` and
+    are the caller's responsibility because the bound they satisfy is a
+    property of the DATA, not of the fit: see `cluster/checks/
+    reduce_by_key.mojo` for why a global bound is enough for every cluster.
+
+    `centroids` is in-out. On `INIT_ARRAY` it is read as the starting set,
+    which is theirs (`:916-924`), and on return it holds the best restart.
+
+    THE STAGE HASHES (`core/identity_trace.mojo`). Off unless
+    `ANONLIB_IDENTITY_TRACE` is set, one `getenv` for the whole fit, and
+    every `record_*` sits behind `trace.enabled` so a shipping run does not
+    even build the tag strings. This entry constructs the trace and hands
+    it to `kmeans_fit_main_traced`, which is the whole fit; the k-means||
+    init re-enters THAT function with the same trace and a tag prefix
+    (DEVIATION 518), so one caller-facing fit is one card however many
+    inner fits the init runs.
+    """
+    var trace = IdentityTrace()
+    return kmeans_fit_main_traced(
+        ctx, x, weights, centroids, labels, params, n_samples, n_features,
+        sum_scale, weight_scale, trace, String(""),
+    )
+
+
+comptime KMEANS_LAZY_SHIFT = (
+    (
+        (GLOBAL_NUMERIC_MODE == NUMERIC_FAST and has_apple_gpu_accelerator())
+        # lane gap-ivf (2026-10-08): FAST on NVIDIA and AMD too (FAST is judged on
+        # speed and quality only; a fit to max_iter is unchanged), and IDENTICAL
+        # on every column with the host restatement following
+        # (`KMEANS_LAZY_SHIFT_IDN`, cluster/impl/kmeans_params.mojo). Off Apple the
+        # read was one synchronize per Lloyd iteration: 20 per IVF coarse fit on
+        # the L40S stage log (bench/results/ivf-stages-l40s-20261001.log), 20 per
+        # k-means|| recluster and per IVF-PQ codebook.
+        or (
+            GLOBAL_NUMERIC_MODE == NUMERIC_FAST
+            and (TARGET_COLUMN == COLUMN_NVIDIA or TARGET_COLUMN == COLUMN_AMD)
+        )
+        or KMEANS_LAZY_SHIFT_IDN
+    )
+    and not is_defined["ANONLIB_IVF_KMEANS_LAZY_SHIFT_OFF"]()
+)
+#: DEFAULT (FAST + Apple) since 2026-10-04: VSEARCH_ALL A/B on the M3 (afc_ab_def, full board size, 1 run per arm,
+#: 2026-10-04, source ad265a028; x_ann/vsearch_fast.mojo has every row): 9/9
+#: IVF-family rows faster, recall_at_10 identical. ACCEPT;
+#: rollback `-D ANONLIB_IVF_KMEANS_LAZY_SHIFT_OFF` (shift read every iteration).
+#: SCOPE (2026-10-04): a fit takes the lazy read only when its caller sets
+#: `KMeansParams.lazy_shift` (IVF's coarse quantizer in ivf_flat_build.mojo,
+#: its k-means|| recluster through the propagated params, and IVF-PQ's
+#: subspace codebooks in x_ann/ivf_pq_device.mojo); every other caller keeps
+#: the per-iteration read.
+"""FAST on Apple, DEFAULT since 2026-10-04 (lane af-vsearch, 2026-10-03;
+rollback `-D ANONLIB_IVF_KMEANS_LAZY_SHIFT_OFF`): the Lloyd loop reads the centroid shift
+back and tests convergence every KMEANS_LAZY_SHIFT_EVERY iterations and at
+max_iter, instead of every iteration (one synchronize and one host round
+trip per iteration: 20 waits per IVF coarse fit, per k-means|| recluster and
+per IVF-PQ subspace codebook). The iterations between enqueue the same
+launches with no wait and no shift reduction. A fit that would have stopped
+at iteration i stops at the next tested iteration (at most
+KMEANS_LAZY_SHIFT_EVERY - 1 more Lloyd steps, which never raise the
+objective); a fit that runs to max_iter is unchanged bit for bit. Untraced
+fits without the inertia check, with `params.lazy_shift` set, only."""
+# TOMBSTONE: ANONLIB_KMEANS_FAST_LAZY_SHIFT (DROPPED-slower) deleted 2026-10-09 by lane/owed-deletions-D3; code recoverable at b639a2bd2.
+# Tried: the lazy convergence read (shift tested every KMEANS_LAZY_EVERY iterations) on the KMeans estimator's fits; kmeans istella 1451.5 -> 1527.7 ms, taxi 977.6 -> 974.8, inertia equal.
+# Restore: git apply experiments/removed/ANONLIB_KMEANS_FAST_LAZY_SHIFT.patch; record in docs/TOMBSTONES.md.
+comptime KMEANS_LAZY_SHIFT_EVERY = KMEANS_LAZY_EVERY  # shared with the host restatement
+
+
+def kmeans_fit_main_traced(
+    ctx: DeviceContext,
+    mut x: DeviceBuffer[DType.float32],
+    mut weights: DeviceBuffer[DType.float32],
+    mut centroids: DeviceBuffer[DType.float32],
+    mut labels: DeviceBuffer[DType.uint32],
+    params: KMeansParams,
+    n_samples: Int,
+    n_features: Int,
+    sum_scale: Float32,
+    weight_scale: Float32,
+    mut trace: IdentityTrace,
+    tag_prefix: String,
+) raises -> FitResult:
+    """`kmeans_fit_main` with the card it writes into passed in. See there.
+
+    WHY A FIT IS THE UNIT. The tags carry `restartNN.iterMM.` prefixes,
+    which are ALGORITHM positions and identical on every machine (rule 2
+    in `core/identity_trace.mojo`). Two caller-facing fits in one process
+    would collide on those tags and the writer RAISES on a duplicate, which
+    is the instrument stating its contract rather than producing a file the
+    differ would misalign: a traced run is one fit, exactly as E1_RUNBOOK
+    already requires. The k-means|| recluster is the one sanctioned
+    re-entry and it arrives with `tag_prefix = "<restart>.init.par."`.
+    """
+    params.validate()
+
+    if trace.enabled and tag_prefix == "":
+        trace.header(
+            String("kmeans n=") + String(n_samples) + " d="
+            + String(n_features) + " k=" + String(params.n_clusters)
+            + " metric=" + String(params.metric) + " seed="
+            + String(params.seed) + " n_init=" + String(params.n_init)
+            + " max_iter=" + String(params.max_iter)
+        )
+
+    var n_clusters = params.n_clusters
+    var cd = n_clusters * n_features
+
+    var data_batch = get_data_batch_size(params.batch_samples, n_samples)
+    var centroid_batch = get_centroids_batch_size(
+        params.batch_centroids, n_clusters
+    )
+
+    var x_norm = ctx.enqueue_create_buffer[DType.float32](n_samples)
+    var centroid_norm = ctx.enqueue_create_buffer[DType.float32](n_clusters)
+    var dist_buf = ctx.enqueue_create_buffer[DType.float32](
+        data_batch * centroid_batch
+    )
+    var min_dist = ctx.enqueue_create_buffer[DType.float32](n_samples)
+    var sums_i32 = ctx.enqueue_create_buffer[DType.int32](cd)
+    var weight_i32 = ctx.enqueue_create_buffer[DType.int32](n_clusters)
+    # DEVIATION 3080: the two row-block tables, once per fit. One cell each
+    # when the arm is compiled out.
+    var acc_table_cells = 1
+    var acc_table_w_cells = 1
+    comptime if KMEANS_BLOCK_ACC:
+        acc_table_cells = blocked_acc_table_cells(
+            n_samples, n_features, n_clusters
+        )
+        acc_table_w_cells = blocked_acc_table_cells(n_samples, 1, n_clusters)
+    # Tried 2026-10-08 (ANONLIB_C37_FUSED_ACCUMULATE + ANONLIB_C37_FUSED_ROWS, run ge123e6f9): fused Lloyd assignment + Int32
+    # row-block centroid accumulation in shared memory, X read once per iteration. NV/AMD kmeans istella 104.8x/0.841x,
+    # taxi 68.6x/0.895x (vendor split); combined 9.4x/7.8x SLOWER; inertia SAME -> deleted. Recoverable at main 42d1e42c6;
+    # row in docs/apple-fast/EXPERIMENTS.md.
+    var acc_table = ctx.enqueue_create_buffer[DType.int32](acc_table_cells)
+    var acc_table_w = ctx.enqueue_create_buffer[DType.int32](acc_table_w_cells)
+    var cur_centroids = ctx.enqueue_create_buffer[DType.float32](cd)
+    var new_centroids = ctx.enqueue_create_buffer[DType.float32](cd)
+    var partials = ctx.enqueue_create_buffer[DType.float32](256)
+    # A distinct one-element buffer so `sum_partials_kernel` never receives the
+    # same buffer as both of its mutable arguments. Its
+    # contents are never read on the modes that pass it.
+    var ones = ctx.enqueue_create_buffer[DType.float32](1)
+    var d_cost = ctx.enqueue_create_buffer[DType.float32](1)
+    var d_shift = ctx.enqueue_create_buffer[DType.float32](1)
+    var h_shift = ctx.enqueue_create_host_buffer[DType.float32](1)
+    var h_cost = ctx.enqueue_create_host_buffer[DType.float32](1)
+    # `IDN_KMEANS_DEVICE_CONV`: [0] the done flag, [1] the iteration that
+    # converged. Zeroed at the start of every restart.
+    var d_conv = ctx.enqueue_create_buffer[DType.int32](2)
+    var h_conv = ctx.enqueue_create_host_buffer[DType.int32](2)
+    var dev_conv = False
+    comptime if IDN_KMEANS_DEVICE_CONV:
+        dev_conv = (
+            (not params.inertia_check)
+            and (not trace.enabled)
+            and assignment_device_count() == 1
+        )
+    var conv_thresh = kmeans_shift_threshold(params.tol)
+    ctx.synchronize()
+
+    # X's norms, ONCE for the whole fit (`:394-399`). This is the single
+    # biggest reason the assignment step is cheap: the sample side of the
+    # expanded identity never has to be recomputed, only the centroid side.
+    # The KMEANS_ASSIGN direct arms never read X's norms (assignment,
+    # k-means++ and k-means|| all take the direct chain), so they are not
+    # computed there; the identity trace still records them.
+    var x_norm_live = params.needs_row_norms()
+    # Tried 2026-10-08 (ANONLIB_KMEANS_DIRECT_DISTANCE, arm direct4 of kmeans_assign, run ge123e6f9): (x-c)^2 distances in
+    # place of the expansion; NV/AMD kmeans istella 12.7x/6.2x, taxi 1.78x/1.96x SLOWER; inertia SAME -> deleted (both direct
+    # arms). Recoverable at main 42d1e42c6; row in docs/apple-fast/EXPERIMENTS.md.
+    if x_norm_live:
+        enqueue_row_norms(ctx, x_norm, x, n_samples, n_features)
+        ctx.synchronize()
+        if trace.enabled:
+            trace.record_device(
+                ctx, tag_prefix + "fit.x_norm", x_norm, n_samples
+            )
+
+    var rng = HostRng(params.seed)
+    var best_inertia = Float64(1.0e308)
+    var best_iter = 0
+
+    # `detail/kmeans.cuh:877-883`. An explicit initial centroid set makes
+    # every restart identical, so theirs collapses `n_init` to 1 rather than
+    # running the same fit repeatedly. It is a debug log there and a silent
+    # correction; it is the same correction here.
+    var n_init = params.n_init
+    if params.init == INIT_ARRAY:
+        n_init = 1
+
+    var km_on = getenv("ANONLIB_KMEANS_STAGES") == "1" and not tag_prefix.endswith("init.par.")
+    var km_t = Int(perf_counter_ns())
+    _km_stage(ctx, km_on, km_t, "fit.setup")
+    for _seed_iter in range(n_init):
+        var restart_tag = tag_prefix + "restart" + _pad2(_seed_iter) + "."
+        if params.init == INIT_ARRAY:
+            ctx.enqueue_function[copy_f32_kernel](
+                cur_centroids.unsafe_ptr(),
+                centroids.unsafe_ptr(),
+                Int32(cd),
+                grid_dim=((cd + 255) // 256, 1, 1),
+                block_dim=(256, 1, 1),
+            )
+            ctx.synchronize()
+        elif params.init == INIT_RANDOM:
+            init_random(
+                ctx, x, cur_centroids, n_samples, n_features, n_clusters, rng
+            )
+        elif params.uses_scalable_plus_plus():
+            # `detail/kmeans.cuh:910-915`: `oversampling_factor == 0` picks
+            # the classic sequential variant, anything else -- including the
+            # DEFAULT 2.0 -- picks scalable k-means||.
+            init_scalable_kmeans_plus_plus(
+                ctx,
+                x,
+                x_norm,
+                cur_centroids,
+                dist_buf,
+                min_dist,
+                labels,
+                partials,
+                params,
+                n_samples,
+                n_features,
+                rng,
+                trace,
+                restart_tag,
+            )
+        else:
+            kmeans_plus_plus(
+                ctx,
+                x,
+                x_norm,
+                cur_centroids,
+                centroid_norm,
+                dist_buf,
+                min_dist,
+                labels,
+                partials,
+                params,
+                n_samples,
+                n_features,
+                rng,
+            )
+
+        if trace.enabled:
+            trace.record_device(
+                ctx, restart_tag + "init.centroids", cur_centroids, cd
+            )
+        _km_stage(ctx, km_on, km_t, "fit.init")
+
+        # `for (n_iter[0] = 1; n_iter[0] <= params.max_iter; ++n_iter[0])`,
+        # `detail/kmeans.cuh:407`. On a break `n_current_iter` is the
+        # iteration that converged; on exhaustion theirs leaves it at
+        # `max_iter + 1`, which is why their own log line subtracts one
+        # (`:540`). Not clamped, because theirs is not.
+        var prior_cost = Float64(0.0)
+        var n_current_iter = params.max_iter + 1
+        var it = 1
+        comptime if IDN_KMEANS_DEVICE_CONV:
+            if dev_conv:
+                ctx.enqueue_function[zero_i32_kernel](
+                    d_conv.unsafe_ptr(),
+                    Int32(2),
+                    grid_dim=(1, 1, 1),
+                    block_dim=(256, 1, 1),
+                )
+                var conv_seen = False
+                while it <= params.max_iter and not conv_seen:
+                    var chunk_end = it + KMEANS_CONV_CHUNK - 1
+                    if chunk_end > params.max_iter:
+                        chunk_end = params.max_iter
+                    while it <= chunk_end:
+                        comptime if not IDN_KMEANS_FOLD_STORE:
+                            ctx.enqueue_function[zero_i32_kernel](
+                                sums_i32.unsafe_ptr(),
+                                Int32(cd),
+                                grid_dim=((cd + 255) // 256, 1, 1),
+                                block_dim=(256, 1, 1),
+                            )
+                            ctx.enqueue_function[zero_i32_kernel](
+                                weight_i32.unsafe_ptr(),
+                                Int32(n_clusters),
+                                grid_dim=((n_clusters + 255) // 256, 1, 1),
+                                block_dim=(256, 1, 1),
+                            )
+                        compute_centroid_norms(
+                            ctx, cur_centroids, centroid_norm, n_clusters,
+                            n_features, params.metric,
+                        )
+                        # Tried 2026-10-08 (ANONLIB_C37_FUSED_ACCUMULATE + ANONLIB_C37_FUSED_ROWS, run ge123e6f9): fused Lloyd assignment + Int32
+                        # row-block centroid accumulation in shared memory, X read once per iteration. NV/AMD kmeans istella 104.8x/0.841x,
+                        # taxi 68.6x/0.895x (vendor split); combined 9.4x/7.8x SLOWER; inertia SAME -> deleted. Recoverable at main 42d1e42c6;
+                        # row in docs/apple-fast/EXPERIMENTS.md.
+                        min_cluster_and_distance_compute_gated(
+                            ctx, d_conv, x, x_norm, cur_centroids,
+                            centroid_norm, labels, min_dist, n_samples,
+                            n_features, n_clusters, params.metric,
+                        )
+                        launch_accumulate_centroid_sums_blocked_gated[
+                            KMEANS_BLOCK_ACC_SABOTAGE, IDN_KMEANS_FOLD_STORE
+                        ](
+                            ctx, d_conv, sums_i32, acc_table, x, labels,
+                            weights, n_samples, n_features, n_clusters,
+                            sum_scale,
+                        )
+                        launch_accumulate_weight_per_cluster_blocked_gated[
+                            IDN_KMEANS_FOLD_STORE
+                        ](
+                            ctx, d_conv, weight_i32, acc_table_w, labels,
+                            weights, n_samples, n_clusters, weight_scale,
+                        )
+                        ctx.enqueue_function[finalize_centroids_kernel](
+                            new_centroids.unsafe_ptr(),
+                            cur_centroids.unsafe_ptr(),
+                            sums_i32.unsafe_ptr(),
+                            weight_i32.unsafe_ptr(),
+                            Int32(n_clusters),
+                            Int32(n_features),
+                            sum_scale,
+                            weight_scale,
+                            grid_dim=((cd + 255) // 256, 1, 1),
+                            block_dim=(256, 1, 1),
+                        )
+                        _sum_device(
+                            ctx, cur_centroids, new_centroids, partials,
+                            d_shift, cd, SUM_MODE_SQDIFF,
+                        )
+                        # The copy back reads the flag BEFORE this
+                        # iteration's test sets it, so the converging
+                        # iteration still copies, as the host loop does.
+                        ctx.enqueue_function[copy_f32_gated_kernel](
+                            d_conv.unsafe_ptr(),
+                            cur_centroids.unsafe_ptr(),
+                            new_centroids.unsafe_ptr(),
+                            Int32(cd),
+                            grid_dim=((cd + 255) // 256, 1, 1),
+                            block_dim=(256, 1, 1),
+                        )
+                        ctx.enqueue_function[kmeans_conv_step_kernel](
+                            d_conv.unsafe_ptr(),
+                            d_shift.unsafe_ptr(),
+                            conv_thresh,
+                            Int32(it),
+                            grid_dim=(1, 1, 1),
+                            block_dim=(1, 1, 1),
+                        )
+                        it += 1
+                    # ONE read per chunk.
+                    ctx.enqueue_copy(
+                        dst_ptr=h_conv.unsafe_ptr(), src_buf=d_conv
+                    )
+                    ctx.synchronize()
+                    if Int(h_conv.unsafe_ptr().unsafe_load(0)) != 0:
+                        conv_seen = True
+                        n_current_iter = Int(
+                            h_conv.unsafe_ptr().unsafe_load(1)
+                        )
+                        it = n_current_iter
+        while (not dev_conv) and it <= params.max_iter:
+            comptime if not IDN_KMEANS_FOLD_STORE:
+                ctx.enqueue_function[zero_i32_kernel](
+                    sums_i32.unsafe_ptr(),
+                    Int32(cd),
+                    grid_dim=((cd + 255) // 256, 1, 1),
+                    block_dim=(256, 1, 1),
+                )
+                ctx.enqueue_function[zero_i32_kernel](
+                    weight_i32.unsafe_ptr(),
+                    Int32(n_clusters),
+                    grid_dim=((n_clusters + 255) // 256, 1, 1),
+                    block_dim=(256, 1, 1),
+                )
+
+            compute_centroid_norms(
+                ctx,
+                cur_centroids,
+                centroid_norm,
+                n_clusters,
+                n_features,
+                params.metric,
+            )
+            # Tried 2026-10-08 (ANONLIB_C37_FUSED_ACCUMULATE + ANONLIB_C37_FUSED_ROWS, run ge123e6f9): fused Lloyd assignment + Int32
+            # row-block centroid accumulation in shared memory, X read once per iteration. NV/AMD kmeans istella 104.8x/0.841x,
+            # taxi 68.6x/0.895x (vendor split); combined 9.4x/7.8x SLOWER; inertia SAME -> deleted. Recoverable at main 42d1e42c6;
+            # row in docs/apple-fast/EXPERIMENTS.md.
+            min_cluster_and_distance_compute(
+                ctx,
+                x,
+                x_norm,
+                cur_centroids,
+                centroid_norm,
+                dist_buf,
+                labels,
+                min_dist,
+                n_samples,
+                n_features,
+                n_clusters,
+                params.metric,
+                params.batch_samples,
+                params.batch_centroids,
+            )
+
+            if trace.enabled:
+                var it_tag = restart_tag + "iter" + _pad2(it) + "."
+                trace.record_device(
+                    ctx, it_tag + "centroid_norm", centroid_norm, n_clusters
+                )
+                trace.record_device(ctx, it_tag + "labels", labels, n_samples)
+                trace.record_device(
+                    ctx, it_tag + "min_dist", min_dist, n_samples
+                )
+
+            # `update_centroids`' two reductions, `detail/kmeans.cuh:300-318`.
+            # The dispatch (privatized block-local partials when they fit
+            # and the input is large, direct scatter-add otherwise), the
+            # grids (from the hardware matrix, replacing a magic 1024-block
+            # cap that lived here) and the bit-identity argument between the
+            # arms all live in `cluster/checks/reduce_by_key.mojo`.
+            # Tried 2026-10-08 (ANONLIB_C37_FUSED_ACCUMULATE + ANONLIB_C37_FUSED_ROWS, run ge123e6f9): fused Lloyd assignment + Int32
+            # row-block centroid accumulation in shared memory, X read once per iteration. NV/AMD kmeans istella 104.8x/0.841x,
+            # taxi 68.6x/0.895x (vendor split); combined 9.4x/7.8x SLOWER; inertia SAME -> deleted. Recoverable at main 42d1e42c6;
+            # row in docs/apple-fast/EXPERIMENTS.md.
+            comptime if KMEANS_BLOCK_ACC:
+                # DEVIATION 3080: row-block tables, no atomics. The Int32
+                # totals are the atomic arms' totals (associative adds of
+                # the same addends, bounded inside Int32 by `choose_scale`).
+                launch_accumulate_centroid_sums_blocked[
+                    KMEANS_BLOCK_ACC_SABOTAGE, IDN_KMEANS_FOLD_STORE
+                ](
+                    ctx, sums_i32, acc_table, x, labels, weights,
+                    n_samples, n_features, n_clusters, sum_scale,
+                )
+                launch_accumulate_weight_per_cluster_blocked[
+                    IDN_KMEANS_FOLD_STORE
+                ](
+                    ctx, weight_i32, acc_table_w, labels, weights,
+                    n_samples, n_clusters, weight_scale,
+                )
+            else:
+                launch_accumulate_centroid_sums(
+                    ctx,
+                    sums_i32,
+                    x,
+                    labels,
+                    weights,
+                    n_samples,
+                    n_features,
+                    n_clusters,
+                    sum_scale,
+                )
+                launch_accumulate_weight_per_cluster(
+                    ctx,
+                    weight_i32,
+                    labels,
+                    weights,
+                    n_samples,
+                    n_clusters,
+                    weight_scale,
+                )
+
+            ctx.enqueue_function[finalize_centroids_kernel](
+                new_centroids.unsafe_ptr(),
+                cur_centroids.unsafe_ptr(),
+                sums_i32.unsafe_ptr(),
+                weight_i32.unsafe_ptr(),
+                Int32(n_clusters),
+                Int32(n_features),
+                sum_scale,
+                weight_scale,
+                grid_dim=((cd + 255) // 256, 1, 1),
+                block_dim=(256, 1, 1),
+            )
+
+            if trace.enabled:
+                var acc_tag = restart_tag + "iter" + _pad2(it) + "."
+                # The fixed-point accumulators, not the float centroids they
+                # become: an Int32 sum is the thing IDENTICAL guarantees is
+                # order independent, so a divergence HERE and a divergence
+                # one kernel later mean different things.
+                trace.record_device(ctx, acc_tag + "sums_i32", sums_i32, cd)
+                trace.record_device(
+                    ctx, acc_tag + "weight_i32", weight_i32, n_clusters
+                )
+                trace.record_device(
+                    ctx, acc_tag + "new_centroids", new_centroids, cd
+                )
+
+            comptime if KMEANS_LAZY_SHIFT:
+                # lane af-vsearch: the shift crosses to the host every
+                # KMEANS_LAZY_SHIFT_EVERY iterations and at the last one; the
+                # other iterations enqueue the copy back and go on
+                var lazy_skip = (
+                    params.lazy_shift and (not params.inertia_check) and (not trace.enabled)
+                    and it % KMEANS_LAZY_SHIFT_EVERY != 0 and it != params.max_iter
+                )
+                if not lazy_skip:
+                    _sum_device(ctx, cur_centroids, new_centroids, partials, d_shift, cd, SUM_MODE_SQDIFF)
+                    ctx.enqueue_copy(dst_ptr=h_shift.unsafe_ptr(), src_buf=d_shift)
+                ctx.enqueue_function[copy_f32_kernel](
+                    cur_centroids.unsafe_ptr(),
+                    new_centroids.unsafe_ptr(),
+                    Int32(cd),
+                    grid_dim=((cd + 255) // 256, 1, 1),
+                    block_dim=(256, 1, 1),
+                )
+                if not lazy_skip:
+                    var cur_cost = Float64(0.0)
+                    if params.inertia_check:
+                        _sum_device(ctx, min_dist, ones, partials, d_cost, n_samples, SUM_MODE_PLAIN)
+                        ctx.enqueue_copy(dst_ptr=h_cost.unsafe_ptr(), src_buf=d_cost)
+                        ctx.synchronize()
+                        cur_cost = Float64(h_cost.unsafe_ptr().unsafe_load(0))
+                        if cur_cost == 0.0:
+                            raise Error(
+                                "Too few points and centroids being found is getting"
+                                " 0 cost from centers"
+                            )
+                    ctx.synchronize()
+                    var shift = Float64(h_shift.unsafe_ptr().unsafe_load(0))
+                    if trace.enabled:
+                        trace.record_scalar_f32(
+                            restart_tag + "iter" + _pad2(it) + ".shift",
+                            h_shift.unsafe_ptr().unsafe_load(0),
+                        )
+                    var done = check_convergence(
+                        cur_cost, prior_cost, shift, params.tol, it, params.inertia_check
+                    )
+                    if params.inertia_check:
+                        prior_cost = cur_cost
+                    if done:
+                        n_current_iter = it
+                        break
+            else:
+                # The shift, `:453-459`. `mapThenSumReduce` with `sqdiff_op`: the
+                # squared difference is applied INSIDE the reduction, between the
+                # buffer about to be overwritten and the one just produced, so
+                # nothing of size `n_clusters * n_features` is materialized.
+                _sum_device(
+                    ctx,
+                    cur_centroids,
+                    new_centroids,
+                    partials,
+                    d_shift,
+                    cd,
+                    SUM_MODE_SQDIFF,
+                )
+                # `:461-462`, the scalar starts its trip to the host.
+                ctx.enqueue_copy(dst_ptr=h_shift.unsafe_ptr(), src_buf=d_shift)
+
+                # `:464-465`, the copy back over the working set, AFTER the shift
+                # has been measured against it.
+                ctx.enqueue_function[copy_f32_kernel](
+                    cur_centroids.unsafe_ptr(),
+                    new_centroids.unsafe_ptr(),
+                    Int32(cd),
+                    grid_dim=((cd + 255) // 256, 1, 1),
+                    block_dim=(256, 1, 1),
+                )
+
+                # `:468-489`, the whole cost half of the stopping rule, and it is
+                # OFF by default. Note their in-loop cost is UNWEIGHTED
+                # (`raft::value_op` straight over `minClusterAndDistance`); only
+                # the post-loop inertia at `:516-535` multiplies by the weights.
+                var cur_cost = Float64(0.0)
+                if params.inertia_check:
+                    _sum_device(
+                        ctx,
+                        min_dist,
+                        ones,
+                        partials,
+                        d_cost,
+                        n_samples,
+                        SUM_MODE_PLAIN,
+                    )
+                    ctx.enqueue_copy(dst_ptr=h_cost.unsafe_ptr(), src_buf=d_cost)
+                    # `clusterCostD.value(stream)` at `:478` is `rmm`'s blocking
+                    # scalar read: a copy AND a stream sync. Turning
+                    # `inertia_check` on therefore costs a SECOND drain per
+                    # iteration, which is a reason it is off by default.
+                    ctx.synchronize()
+                    cur_cost = Float64(h_cost.unsafe_ptr().unsafe_load(0))
+                    # `ASSERT` at `:480-482`, message included.
+                    if cur_cost == 0.0:
+                        raise Error(
+                            "Too few points and centroids being found is getting"
+                            " 0 cost from centers"
+                        )
+
+                # `:491`. THE one stream sync of the loop body.
+                ctx.synchronize()
+                var shift = Float64(h_shift.unsafe_ptr().unsafe_load(0))
+
+                # `:492`, on the host, in this iteration.
+                if trace.enabled:
+                    # The SHIFT is what the loop stops on, so a fit that takes a
+                    # different number of iterations on two machines diverged
+                    # HERE first, whatever the centroids look like afterwards.
+                    trace.record_scalar_f32(
+                        restart_tag + "iter" + _pad2(it) + ".shift",
+                        h_shift.unsafe_ptr().unsafe_load(0),
+                    )
+
+                var done = check_convergence(
+                    cur_cost, prior_cost, shift, params.tol, it, params.inertia_check
+                )
+                if params.inertia_check:
+                    prior_cost = cur_cost  # `:488`
+
+                # `:494-497`.
+                if done:
+                    n_current_iter = it
+                    break
+            it += 1
+        _km_stage(ctx, km_on, km_t, "fit.lloyd iters=" + String(min(it, params.max_iter)))
+
+        # `:500-537`. The fit's inertia is ONE fresh assignment against the
+        # FINAL centroids, weighted, after the loop -- not the last
+        # iteration's cost, which belongs to the centroids from before the
+        # final update. This also leaves `labels` consistent with the
+        # centroids that are returned.
+        compute_centroid_norms(
+            ctx,
+            cur_centroids,
+            centroid_norm,
+            n_clusters,
+            n_features,
+            params.metric,
+        )
+        min_cluster_and_distance_compute(
+            ctx,
+            x,
+            x_norm,
+            cur_centroids,
+            centroid_norm,
+            dist_buf,
+            labels,
+            min_dist,
+            n_samples,
+            n_features,
+            n_clusters,
+            params.metric,
+            params.batch_samples,
+            params.batch_centroids,
+        )
+        _sum_device(
+            ctx, min_dist, weights, partials, d_cost, n_samples,
+            SUM_MODE_PRODUCT,
+        )
+        ctx.enqueue_copy(dst_ptr=h_cost.unsafe_ptr(), src_buf=d_cost)
+        ctx.synchronize()
+        var iter_cost = Float64(h_cost.unsafe_ptr().unsafe_load(0))
+        if trace.enabled:
+            trace.record_device(
+                ctx, restart_tag + "final.labels", labels, n_samples
+            )
+            trace.record_device(
+                ctx, restart_tag + "final.centroids", cur_centroids, cd
+            )
+            trace.record_device(ctx, restart_tag + "final.inertia", d_cost, 1)
+
+        # `:938-943`, and `n_iter` is NOT clamped there.
+        if iter_cost < best_inertia:
+            best_inertia = iter_cost
+            best_iter = n_current_iter
+            ctx.enqueue_function[copy_f32_kernel](
+                centroids.unsafe_ptr(),
+                cur_centroids.unsafe_ptr(),
+                Int32(cd),
+                grid_dim=((cd + 255) // 256, 1, 1),
+                block_dim=(256, 1, 1),
+            )
+            ctx.synchronize()
+
+    # Launches hold raw pointers: keep the tables alive past the last sync.
+    _ = acc_table^
+    _ = acc_table_w^
+    _ = d_conv^
+    if trace.enabled:
+        trace.record_device(ctx, tag_prefix + "fit.centroids", centroids, cd)
+        trace.record_device(ctx, tag_prefix + "fit.labels", labels, n_samples)
+
+    return FitResult(best_inertia, best_iter)

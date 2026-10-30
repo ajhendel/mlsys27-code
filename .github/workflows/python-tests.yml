@@ -1,0 +1,131 @@
+# The Python test suites, which until 2026-09-13 nothing ran.
+#
+# WHAT WAS WRONG. There are two shapes of test under python/anonlib/tests/
+# and neither had a workflow:
+#
+#   - 37 pytest files (978 tests). pytest was DECLARED NOWHERE -- not in
+#     pixi.toml, not in any environment, and this repo has no pyproject.toml.
+#     byte-lm-cpu-gate.yml pip-installs it ad hoc for two files; every other
+#     one died locally on ModuleNotFoundError.
+#   - 13 GATE-STYLE files. They define no test functions, so pytest collects
+#     nothing from them -- correct, and exactly why they were invisible. ONE
+#     pixi task ran ONE of them (check-arima-surface).
+#
+# That is not hypothetical rot. test_samba_surface and test_transformer_hd128
+# sat RED for days after the numpy-free migration took `.view`/`.mean` off
+# Array; test_linalg_identity sat RED because nobody generated the 15-second
+# oracle card it asks for; test_rf_class_weight carried a stale double after
+# _fit_arrays grew an argument. Same disease as the packaging tests that
+# 88c0c33b wired up after one of them sat RED on main while 0.8.4 was cut.
+#
+# WHY A SELF-HOSTED MAC AND NOT macos-15. These suites need REAL BINARIES: all
+# 17 identical/*.so, one per bindings/build*.sh, and on Darwin each script
+# compiles Metal AOT with no architecture flag. A GitHub-hosted macOS runner
+# cannot do that compile: the first version of this workflow (5ae1c8ab) ran on
+# macos-15 and died three times in a row on the first script with
+#
+#     mojo: error: failed to run the pass manager
+#
+# on "Apple M1 (Virtual)" (runs 34776442643, 34776679213, 34777296013). That
+# is the same wall release-provenance.yml's header records: a hosted runner
+# builds 0 AIR/metallib markers, and naming the architecture with
+# --target-accelerator makes the compile succeed while embedding no kernels
+# (bindings/build_arima.sh's header measured it). wheel-ci.yml runs on
+# macos-15 because it builds a METADATA-ONLY wheel; it never compiles a
+# binding. On Linux a build wants ANONLIB_GPU_ARCHS naming EXACTLY ONE GPU
+# architecture (bindings/build_rf.sh:60-73), which a GPU-less hosted runner
+# has no sensible value for either.
+#
+# So this job runs where the release wheel is built: the ephemeral runner
+# tools/release_runner.sh brings up on a real Apple GPU, under the labels
+# release-provenance.yml uses. That runner's security argument requires every
+# job targeting those labels to be workflow_dispatch ONLY (no push, no
+# pull_request; tools/release_runner.sh header), so this workflow has no push
+# trigger. It is dispatched by hand, and the same two commands run locally on
+# the Mac before a release (docs/RELEASE_CHECKLIST.md step 1):
+#
+#     tools/release_runner.sh &                     # one ephemeral runner
+#     gh workflow run python-tests.yml --ref main
+#
+# The build is the cost here: the release checklist measures the full binding
+# set at about 8 minutes of compile (docs/RELEASE_CHECKLIST.md:19), to
+# protect suites that run in 7 s and 34 s.
+name: Python tests
+
+on:
+  # LIGHT TOUCH: this workflow never starts by itself. Every job
+  # is skipped unless the dispatch input confirm is RUN-HEAVY, so a wrong trigger costs nothing.
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: "Heavy run on paid or queued runners. Type RUN-HEAVY to really run it; anything else skips every job"
+        required: true
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  python-tests:
+    if: inputs.confirm == 'RUN-HEAVY'
+    name: pytest suite and explicit release gates
+    runs-on: [self-hosted, macos, arm64, metal, real-gpu]
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      # bench/results is 2.6 GB and nothing here reads it.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /*
+            !/bench/results/*
+
+      # NOT setup-pixi: on the self-hosted Mac pixi is already installed and
+      # the action would fetch its own (release-provenance.yml:171).
+      - name: pixi is present
+        run: |
+          command -v pixi
+          pixi install --locked
+          pixi install --locked -e test
+
+      - name: Runner facts
+        run: |
+          uname -a
+          sw_vers -productVersion
+          sysctl -n machdep.cpu.brand_string
+          pixi run mojo --version
+
+      # ANONLIB_NUMERIC_MODE defaults to identical in every build script, so
+      # one pass per script lands python/anonlib/identical/*.so. A MISSING
+      # binary is not a silent downgrade: _backend.py raises rather than let a
+      # plain import resolve to the fast binary sitting beside it and return
+      # fast arithmetic under the identical label (_backend.py:139-143).
+      - name: Build the bindings (IDENTICAL)
+        run: |
+          set -o pipefail
+          for s in bindings/build*.sh; do
+            echo "== $s =="
+            sh "$s" 2>&1 | tail -3
+          done
+          echo "== built =="
+          ls python/anonlib/identical/*.so | wc -l
+
+      - name: Import check, before anything claims to have tested
+        run: |
+          cd python
+          ANONLIB_NUMERIC_MODE=identical python3 -c \
+            "import anonlib; print('import OK', anonlib.__version__)"
+
+      # 978 tests, about 7 s. Every one imports anonlib, so this is the first
+      # thing the build above is good for.
+      - name: pytest suite
+        run: pixi run -e test test-python
+
+      # The 13 module-style gates, about 34 s including the oracle card the
+      # linalg gate needs. Exits non-zero naming any that go RED.
+      - name: Gate-style tests
+        run: pixi run check-python-gates-release

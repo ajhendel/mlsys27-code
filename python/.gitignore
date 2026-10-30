@@ -1,0 +1,80 @@
+LICENSE
+NOTICE
+README.md
+anonlib/CITATION.cff
+anonlib/_anonlib.so
+anonlib/_anonlib_gbdt.so
+anonlib/_anonlib_estimators.so
+anonlib/_anonlib_rf.so
+anonlib/_anonlib_trees.so
+# The 2026-08-24 bindings. Listed BY NAME rather than as `anonlib/*.so`,
+# keeping this file's existing shape: a glob would also swallow a .so that
+# someone genuinely meant to track, and the explicit list is what makes a
+# forgotten binding show up as untracked instead of vanishing silently.
+anonlib/_anonlib_svm.so
+anonlib/_anonlib_solver.so
+anonlib/_anonlib_metrics.so
+anonlib/_anonlib_preprocessing.so
+anonlib/_anonlib_tsa.so
+anonlib/_anonlib_linalg.so
+# The 2026-09-01 bindings. BOTH WERE MISSING and the older one had already
+# been COMMITTED as a 625K binary in `cc269dca` before anybody noticed --
+# which is this file's own comment above coming true. The explicit list makes
+# a forgotten binding show up as untracked; it only works if somebody adds
+# the line when the binding lands, and twice in a row nobody did. Untracked
+# forward in the commit that added these lines, not rewritten out of history.
+anonlib/_anonlib_arima.so
+anonlib/_anonlib_training.so
+# The gp binding (2026-09-01, the thirteenth). Third instance of the same
+# omission this file's comments predict: the binding shipped green and the
+# .so sat untracked until the phase-8 rent pre-flight refused the dirty
+# tree. Added the same day, forward.
+anonlib/_anonlib_gp.so
+# The mamba binding (2026-09-01, the fourteenth). FOURTH instance: the
+# surface lane shipped green the same evening the gp line above was added
+# for the third instance, and still forgot its own line. Found the next
+# morning by the same signal as always -- the .so untracked in status.
+anonlib/_anonlib_mamba.so
+# The transformer binding (2026-09-02, the fifteenth). FIFTH instance of the
+# same omission: the binding landed on 2026-09-02 and this line did not, so
+# the first build left `python/anonlib/_anonlib_transformer.so` sitting
+# untracked in `git status` where a careless add would have committed a
+# 12 MB Mach-O. Added the day the binding first compiled.
+anonlib/_anonlib_transformer.so
+# Build outputs copied in by packaging/macos/build_release_wheel.sh so that
+# `python -m anonlib verify` has a comparator inside the wheel and
+# `python -m anonlib identity` has the harness, the three training GPU
+# columns and the commit witness. The single sources stay in git:
+# tools/identity_trace_diff.py, tools/identity_break.py and the columns
+# python/anonlib/host_surface.py names under bench/results/identity_break/.
+anonlib/_identity_trace_diff.py
+anonlib/_identity_break.py
+anonlib/_identity_lane_*.py
+anonlib/identity_columns/
+anonlib/identical/
+anonlib/.dylibs/
+dist/
+build/
+*.egg-info/
+
+# the byte LM host build writes its .so here (bindings/build_byte_lm_host.sh);
+# the sibling identical/ directory is already ignored above
+anonlib/host/*.so
+
+# Copies of the checked-in GPU-trained CTR verification fixtures.
+anonlib/verify_reference/ctr_models/
+# The Expose D bindings (2026-09-14). Fourth instance: they built IDENTICAL
+# only, under anonlib/identical/, until classical FAST (2026-09-25) put the
+# FAST builds in the package directory, where the 0.8.19 release-check saw
+# them as changed paths it could not attribute. Embedding stays IDENTICAL only
+# and is listed so a future FAST build cannot repeat this.
+anonlib/_anonlib_kernel_methods.so
+anonlib/_anonlib_mixture.so
+anonlib/_anonlib_hdbscan.so
+anonlib/_anonlib_resample.so
+anonlib/_anonlib_ivf.so
+anonlib/_anonlib_embedding.so
+# The algorithm expansion's GPU bindings (lane/algos-prep, 2026-09-27): one per
+# lane, named `_anonlib_x_<lane>` by host_surface.expansion_gpu_binding.
+anonlib/_anonlib_x_*.so
+anonlib/_anonlib_byte_lm.so

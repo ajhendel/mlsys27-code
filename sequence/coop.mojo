@@ -1,0 +1,632 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 the authors. Part of anonlib, DOI-WITHHELD
+"""A LONG ONE-THREAD FOLD WITH A SIMDGROUP'S LOADS (lane/sequence-apple2,
+2026-09-28; Apple only). The IDENTICAL reductions of this lane are one
+thread's ascending chain (a 4M-float norm in LAMB and Adafactor, VAR's
+million-term GEMM cells), and one thread could keep only a few loads in
+flight: the fold waited on memory. Here the 32 lanes of a simdgroup load
+the next 32 R elements together (coalesced), and EVERY lane then runs the
+same chain over them in order, element k broadcast from its lane
+(`shuffle_idx`): the same fmas on the same values in the same order as the
+one-thread fold, so the bits are those of `sumsq_fold` / `gemm_dot`. Lane 0
+stores. Launched by `DeviceExec` (`coop_kernel`, one simdgroup per cell)
+for the ops below on an Apple GPU, and (nr-small D1/D11, IDENTICAL,
+`ANONLIB_IDN_SEQ_COOP_NVAMD`) on NVIDIA and AMD; the host runs the
+one-thread op, the same chain."""
+from std.gpu.primitives.id import lane_id
+from std.gpu.primitives.warp import shuffle_idx
+from checks.kernel_matrix import TARGET_COLUMN, lib_lane_width_for
+
+from sequence.coop_lane import COOP_CELL_W, coop_src
+
+from sequence.ops import (
+    FP,
+    Args,
+    OP_AF_ALPHA,
+    OP_AF_BLK_SUMSQ,
+    OP_AF_DENOM,
+    OP_GEMM,
+    OP_LAMB_RATIO,
+    OP_SEG_SUMSQ,
+    fma3,
+    ld,
+    st,
+)
+from sequence.ops import OP_THETA, OP_COLSCALE, OP_VAR_SIGMA
+from sequence.ops import OP_LN_BWD_X, OP_LN_FWD, add, mul, sub
+from sequence.vecar import pow2_scale
+from sequence.layernorm import div as ln_div
+from sequence.layernorm import LN_ROW_WARP, LN_RW_LANES, ln_bwd_g
+from sequence.layernorm import ln_bwd_x_rw_one_pass, ln_fwd_rw_one_pass, ln_one_pass_on
+from std.gpu.primitives.warp import shuffle_xor
+from checks.numerics import ftz, identical_rsqrt
+from sequence.theta_spec import THETA_SPEC, op_theta_spec
+from sequence.ops import OP_AF_RMEAN, OP_AF_ROW
+from sequence.adafactor import af_rmean_tail, af_row_tail
+from sequence.adafactor import af_alpha_tail, af_denom_tail, lamb_ratio_tail, op_af_alpha, op_af_denom, op_lamb_ratio, op_seg_sumsq
+# lane ag-pass6-rows (idea C): the softmax family's rows on a cell
+from std.math import nan
+from checks.numerics import identical_log
+from autograd.ops import OP_AG_SOFTMAX_FWD, OP_AG_SOFTMAX_VJP
+from autograd.loss_ops import OP_LS_CE_FWD, OP_LS_CE_VJP, OP_LS_METRIC_TERM
+from autograd.pass1_ops import OP_P1_SCE_VJP
+from autograd.row_ops import (
+    ROW_COOP, ROW_L, row_best_takes, row_div, row_exp, row_lane_takes, row_softmax_vjp_out,
+    row_softmax_vjp_term,
+)
+
+#: the Apple simdgroup; shuffles go through `coop_src` so a 64-lane wave
+#: (two cells) stays correct (sequence/coop_lane.mojo)
+comptime COOP_W = COOP_CELL_W
+#: blocks of COOP_W each lane loads ahead of the fold
+comptime COOP_R = 8
+#: nr-small D1/D11 (2026-10-04): on a 64-lane CDNA wavefront one wave holds
+#: TWO cells of COOP_W lanes, and `shuffle_idx` names a PHYSICAL source
+#: lane, so lane j of the upper cell must read physical lane 32 + j (the
+#: `neighbors/impl/topk/logical_warp32.mojo` form, masked to the half).
+#: Communication scope only: the fold is the same chain on the same values.
+comptime COOP_ON64 = lib_lane_width_for[TARGET_COLUMN]() == 64
+
+
+@always_inline
+def coop_bcast(v: Float32, j: Int) -> Float32:
+    """Element j of the cell's COOP_W lanes, on every lane of the cell."""
+    comptime if COOP_ON64:
+        var half = UInt32(lane_id()) & UInt32(0xffffffe0)
+        var mask = UInt(0xffffffff) << UInt(half)
+        return shuffle_idx(mask, v, half | UInt32(j))
+    return shuffle_idx(v, UInt32(j))
+
+
+@always_inline
+def coop_sumsq(p: FP, start: Int, n: Int, lane: Int) -> Float32:
+    """sum_{k < n} p[start + k]^2, k ascending, one fma per term, on every lane."""
+    var acc = Float32(0.0)
+    var k = 0
+    while k + COOP_W * COOP_R <= n:
+        var v = SIMD[DType.float32, COOP_R]()
+        comptime for r in range(COOP_R):
+            v[r] = ld(p, start + k + r * COOP_W + lane)
+        comptime for r in range(COOP_R):
+            comptime for j in range(COOP_W):
+                var x = coop_bcast(v[r], j)
+                acc = fma3(x, x, acc)
+        k += COOP_W * COOP_R
+    while k < n:
+        var m = min(COOP_W, n - k)
+        var x0 = ld(p, start + k + lane) if lane < m else Float32(0.0)
+        for j in range(m):
+            var x = coop_bcast(x0, j)
+            acc = fma3(x, x, acc)
+        k += COOP_W
+    return acc
+
+
+@always_inline
+def coop_sum(p: FP, start: Int, n: Int, lane: Int) -> Float32:
+    """sum_{k < n} p[start + k], k ascending from +0.0, one add per term
+    (`add`), on every lane (nr-small D11: op_af_rmean's chain)."""
+    var acc = Float32(0.0)
+    var k = 0
+    while k < n:
+        var m = min(COOP_W, n - k)
+        var x0 = ld(p, start + k + lane) if lane < m else Float32(0.0)
+        for j in range(m):
+            acc = add(acc, coop_bcast(x0, j))
+        k += COOP_W
+    return acc
+
+
+@always_inline
+def coop_dot(pa: FP, abase: Int, sak: Int, pb: FP, bbase: Int, sbk: Int, K: Int, acc0: Float32,
+             lane: Int) -> Float32:
+    """gemm_dot's chain: acc0 + sum_k pa[abase + k sak] pb[k sbk + bbase], k
+    ascending, on every lane."""
+    var acc = acc0
+    var k = 0
+    while k + COOP_W * COOP_R <= K:
+        var va = SIMD[DType.float32, COOP_R]()
+        var vb = SIMD[DType.float32, COOP_R]()
+        comptime for r in range(COOP_R):
+            var kk = k + r * COOP_W + lane
+            va[r] = ld(pa, abase + kk * sak)
+            vb[r] = ld(pb, kk * sbk + bbase)
+        comptime for r in range(COOP_R):
+            comptime for j in range(COOP_W):
+                acc = fma3(coop_bcast(va[r], j), coop_bcast(vb[r], j), acc)
+        k += COOP_W * COOP_R
+    while k < K:
+        var m = min(COOP_W, K - k)
+        var kk = k + lane
+        var x0 = ld(pa, abase + kk * sak) if lane < m else Float32(0.0)
+        var y0 = ld(pb, kk * sbk + bbase) if lane < m else Float32(0.0)
+        for j in range(m):
+            acc = fma3(coop_bcast(x0, j), coop_bcast(y0, j), acc)
+        k += COOP_W
+    return acc
+
+
+@always_inline
+def coop_ln_fwd(row: Int, lane: Int, a: Args):
+    """nr-small D10: `op_ln_fwd`'s row on a simdgroup. The mean and variance
+    chains are `_stats`'s (adds, then fmas of (x - mean)^2, c ascending, on
+    every lane over broadcast words); the outputs are elementwise, lane c
+    writes columns c, c + COOP_W, ... Same words as the one-thread row."""
+    var D = a.i0
+    var base = row * D
+    var s = Float32(0.0)
+    var k = 0
+    while k < D:
+        var m = min(COOP_W, D - k)
+        var x0 = ld(a.p0, base + k + lane) if lane < m else Float32(0.0)
+        for j in range(m):
+            s = add(s, coop_bcast(x0, j))
+        k += COOP_W
+    var mean = ln_div(s, Float32(D))
+    var q = Float32(0.0)
+    k = 0
+    while k < D:
+        var m = min(COOP_W, D - k)
+        var d0 = sub(ld(a.p0, base + k + lane), mean) if lane < m else Float32(0.0)
+        for j in range(m):
+            var d = coop_bcast(d0, j)
+            q = fma3(d, d, q)
+        k += COOP_W
+    var rstd = ftz(identical_rsqrt(add(ln_div(q, Float32(D)), a.f0)))
+    if lane == 0:
+        st(a.p4, row, mean)
+        st(a.p5, row, rstd)
+    var c = lane
+    while c < D:
+        var y = mul(sub(ld(a.p0, base + c), mean), rstd)
+        if a.i1 != 0:
+            y = mul(y, ld(a.p1, c))
+        if a.i2 != 0:
+            y = add(y, ld(a.p2, c))
+        st(a.p3, base + c, y)
+        c += COOP_W
+
+
+@always_inline
+def coop_ln_bwd_x(row: Int, lane: Int, a: Args):
+    """nr-small D10: `op_ln_bwd_x`'s row on a simdgroup: g and xhat of column
+    c are computed by its lane (the one-thread row's expressions), broadcast,
+    and the sum(g) / sum(g xhat) chains run c ascending on every lane; the
+    outputs are elementwise. Same words as the one-thread row."""
+    var D = a.i0
+    var base = row * D
+    var mean = ld(a.p4, row)
+    var rstd = ld(a.p5, row)
+    var sg = Float32(0.0)
+    var sgx = Float32(0.0)
+    var k = 0
+    while k < D:
+        var m = min(COOP_W, D - k)
+        var g0 = Float32(0.0)
+        var xh0 = Float32(0.0)
+        if lane < m:
+            var c = k + lane
+            g0 = ld(a.p0, base + c)
+            if a.i1 != 0:
+                g0 = mul(g0, ld(a.p2, c))
+            xh0 = mul(sub(ld(a.p1, base + c), mean), rstd)
+        for j in range(m):
+            var g = coop_bcast(g0, j)
+            var xh = coop_bcast(xh0, j)
+            sg = add(sg, g)
+            sgx = fma3(g, xh, sgx)
+        k += COOP_W
+    var mg = ln_div(sg, Float32(D))
+    var mgx = ln_div(sgx, Float32(D))
+    var c = lane
+    while c < D:
+        var g = ld(a.p0, base + c)
+        if a.i1 != 0:
+            g = mul(g, ld(a.p2, c))
+        var xh = mul(sub(ld(a.p1, base + c), mean), rstd)
+        st(a.p3, base + c, mul(rstd, sub(sub(g, mg), mul(xh, mgx))))
+        c += COOP_W
+
+
+#: lane layernorm-idn N3 (2026-10-09), ANONLIB_IDN_LN_ROW_WARP, the IDENTICAL
+#: default since 2026-10-10 (`_OFF` restores the one-chain row; the
+#: define and the cost reasoning: sequence/layernorm.mojo LN_ROW_WARP). The
+#: row's reductions on the cell's 32 lanes: lane j folds c = j, j + 32, ...
+#: ascending from +0.0 (coalesced: consecutive lanes read consecutive
+#: words), then `coop_rw_total` runs the five-level tree of fold32's `tree32`. Same
+#: partials, same tree, same adds as the host twin; BITS CHANGE against the
+#: one-chain row (fold order), on every column together.
+#: blocks of LN_RW_LANES words a lane loads ahead of its chain (loads only:
+#: the chain's order is unchanged)
+comptime LN_RW_R = 8
+
+
+@always_inline
+def coop_rw_total(v: Float32) -> Float32:
+    """`tree32` (sequence/fold32.mojo) on the cell: level h (16, 8, 4, 2, 1) gives lane j the sum
+    add(p[j], p[j ^ h]); for j < h that is the tree's add(p[j], p[j + h]), and
+    for j >= h the same two operands (an IEEE add is commutative, so the
+    lane's word is bit-identical to its partner's). After five levels every
+    lane holds p[0], the row total. `shuffle_xor` with a stride below 32
+    never leaves a 32-lane half, so a 64-wide CDNA wavefront's two cells
+    fold apart; no mask arithmetic is needed."""
+    var t = v
+    comptime for lv in range(5):
+        comptime h = LN_RW_LANES >> (lv + 1)
+        t = add(t, shuffle_xor(t, UInt32(h)))
+    return t
+
+
+@always_inline
+def coop_rw_sum(p: FP, base: Int, D: Int, lane: Int) -> Float32:
+    """Lane `lane`'s partial of sum p[base + c] (c = lane, lane + 32, ...,
+    ascending from +0.0), then the cell total."""
+    var acc = Float32(0.0)
+    var k = 0
+    while k + LN_RW_LANES * LN_RW_R <= D:
+        var v = SIMD[DType.float32, LN_RW_R]()
+        comptime for r in range(LN_RW_R):
+            v[r] = ld(p, base + k + r * LN_RW_LANES + lane)
+        comptime for r in range(LN_RW_R):
+            acc = add(acc, v[r])
+        k += LN_RW_LANES * LN_RW_R
+    var c = k + lane
+    while c < D:
+        acc = add(acc, ld(p, base + c))
+        c += LN_RW_LANES
+    return coop_rw_total(acc)
+
+
+@always_inline
+def coop_rw_sq(p: FP, base: Int, D: Int, mean: Float32, lane: Int) -> Float32:
+    """Lane `lane`'s partial of sum (p[base + c] - mean)^2 (fma3 chain, the
+    host twin's `_rw_fold_sq`), then the cell total."""
+    var acc = Float32(0.0)
+    var k = 0
+    while k + LN_RW_LANES * LN_RW_R <= D:
+        var v = SIMD[DType.float32, LN_RW_R]()
+        comptime for r in range(LN_RW_R):
+            v[r] = sub(ld(p, base + k + r * LN_RW_LANES + lane), mean)
+        comptime for r in range(LN_RW_R):
+            acc = fma3(v[r], v[r], acc)
+        k += LN_RW_LANES * LN_RW_R
+    var c = k + lane
+    while c < D:
+        var d = sub(ld(p, base + c), mean)
+        acc = fma3(d, d, acc)
+        c += LN_RW_LANES
+    return coop_rw_total(acc)
+
+
+@always_inline
+def coop_ln_fwd_rw(row: Int, lane: Int, a: Args):
+    """`op_ln_fwd`'s row under LN_ROW_WARP: the host twin's `_stats` fold on
+    the cell (`_rw_fold_sum`, `_rw_fold_sq`, `tree32`); elementwise outputs
+    as `coop_ln_fwd`."""
+    var D = a.i0
+    var base = row * D
+    var mean = ln_div(coop_rw_sum(a.p0, base, D, lane), Float32(D))
+    var q = coop_rw_sq(a.p0, base, D, mean, lane)
+    var rstd = ftz(identical_rsqrt(add(ln_div(q, Float32(D)), a.f0)))
+    if lane == 0:
+        st(a.p4, row, mean)
+        st(a.p5, row, rstd)
+    var c = lane
+    while c < D:
+        var y = mul(sub(ld(a.p0, base + c), mean), rstd)
+        if a.i1 != 0:
+            y = mul(y, ld(a.p1, c))
+        if a.i2 != 0:
+            y = add(y, ld(a.p2, c))
+        st(a.p3, base + c, y)
+        c += LN_RW_LANES
+
+
+@always_inline
+def coop_ln_bwd_x_rw(row: Int, lane: Int, a: Args):
+    """`op_ln_bwd_x`'s row under LN_ROW_WARP: lane j's add(sg, g) and
+    fma3(g, xh, sgx) chains over c = j, j + 32, ... (the host twin's
+    `_rw_fold_bwd`), one tree per sum; elementwise outputs as
+    `coop_ln_bwd_x`."""
+    var D = a.i0
+    var base = row * D
+    var mean = ld(a.p4, row)
+    var rstd = ld(a.p5, row)
+    var sg = Float32(0.0)
+    var sgx = Float32(0.0)
+    var c = lane
+    while c < D:
+        var gx = ln_bwd_g(a, base, c, mean, rstd)
+        sg = add(sg, gx[0])
+        sgx = fma3(gx[0], gx[1], sgx)
+        c += LN_RW_LANES
+    sg = coop_rw_total(sg)
+    sgx = coop_rw_total(sgx)
+    var mg = ln_div(sg, Float32(D))
+    var mgx = ln_div(sgx, Float32(D))
+    c = lane
+    while c < D:
+        var gx = ln_bwd_g(a, base, c, mean, rstd)
+        st(a.p3, base + c, mul(rstd, sub(sub(gx[0], mg), mul(gx[1], mgx))))
+        c += LN_RW_LANES
+
+
+#: lane ag-pass6-rows (pass-6 idea C), ANONLIB_IDN_ROW_COOP (IDENTICAL
+#: default; autograd/row_ops.mojo has the define, the evidence and the
+#: host twins). A softmax-family row on the cell's 32 lanes: lane j owns
+#: slot j of the fold32 order (columns j, j + 32, ... ascending from +0.0)
+#: and `coop_rw_total` is `tree32`, so every sum is the host twin's adds
+#: (row_ops row_expsum32, row_softmax_fwd, row_softmax_vjp). Elementwise
+#: outputs: lane c writes columns c, c + 32, ... with the serial row's
+#: expressions. The max is the serial first-max scan, reproduced exactly by
+#: (value, column) partials combined in a butterfly (row_best_takes: a total
+#: order, so every lane ends with the same column). Every lane of a cell
+#: reads the same code and takes the same branches, so the shuffles are
+#: uniform; `shuffle_xor` with a stride below 32 stays inside a 64-wide CDNA
+#: wavefront's half.
+
+
+@always_inline
+def coop_row_best(p: FP, base: Int, cols: Int, lane: Int) -> Int:
+    """Column of the row's first maximum (row_ops row_first_max's), on every
+    lane of the cell."""
+    comptime assert COOP_W == ROW_L, "a row cell is the fold32 slots"
+    var m = Float32(0.0)
+    var i = Int32(-1)
+    var c = lane
+    while c < cols:
+        var v = ld(p, base + c)
+        if row_lane_takes(m, Int(i), v, c):
+            m = v
+            i = Int32(c)
+        c += COOP_W
+    comptime for lv in range(5):
+        comptime h = ROW_L >> (lv + 1)
+        var om = shuffle_xor(m, UInt32(h))
+        var oi = shuffle_xor(i, UInt32(h))
+        if row_best_takes(m, i, om, oi):
+            m = om
+            i = oi
+    return Int(i)
+
+
+@always_inline
+def coop_row_expsum(p: FP, base: Int, cols: Int, m: Float32, lane: Int) -> Float32:
+    """row_expsum32 on the cell: lane j's slot, then the tree."""
+    var acc = Float32(0.0)
+    var c = lane
+    while c < cols:
+        acc = add(acc, row_exp(ld(p, base + c), m))
+        c += COOP_W
+    return coop_rw_total(acc)
+
+
+@always_inline
+def coop_row_softmax_fwd(row: Int, lane: Int, a: Args):
+    """row_softmax_fwd's row on the cell: p0 x, p1 y, i0 = 1 log-softmax,
+    i1 cols. Each lane parks its own columns' exponentials in p1 and reads
+    back only those."""
+    var cols = a.i1
+    var base = row * cols
+    var m = ld(a.p0, base + coop_row_best(a.p0, base, cols, lane))
+    if a.i0 == 0:
+        var acc = Float32(0.0)
+        var c = lane
+        while c < cols:
+            var e = row_exp(ld(a.p0, base + c), m)
+            acc = add(acc, e)
+            st(a.p1, base + c, e)
+            c += COOP_W
+        var total = coop_rw_total(acc)
+        c = lane
+        while c < cols:
+            st(a.p1, base + c, row_div(ld(a.p1, base + c), total))
+            c += COOP_W
+    else:
+        var log_total = ftz(identical_log(coop_row_expsum(a.p0, base, cols, m, lane)))
+        var c = lane
+        while c < cols:
+            st(a.p1, base + c, sub(sub(ld(a.p0, base + c), m), log_total))
+            c += COOP_W
+
+
+@always_inline
+def coop_row_softmax_vjp(row: Int, lane: Int, a: Args):
+    """row_softmax_vjp's row on the cell: p0 y, p1 upstream, p2 destination,
+    i0 = 1 log-softmax, i1 cols."""
+    var cols = a.i1
+    var base = row * cols
+    var acc = Float32(0.0)
+    var c = lane
+    while c < cols:
+        acc = add(acc, row_softmax_vjp_term(a, base + c))
+        c += COOP_W
+    var total = coop_rw_total(acc)
+    c = lane
+    while c < cols:
+        row_softmax_vjp_out(a, base + c, total)
+        c += COOP_W
+
+
+@always_inline
+def coop_row_ce_fwd(row: Int, lane: Int, a: Args):
+    """row_ce_fwd's row on the cell: p0 logits, p1 codes, p2 row loss; lane 0
+    stores. A code outside [0, i1) gives NaN (every lane reads the code)."""
+    var cols = a.i1
+    var base = row * cols
+    var y = Int(ld(a.p1, row))
+    if y < 0 or y >= cols:
+        if lane == 0:
+            a.p2.unsafe_store(row, nan[DType.float32]())
+        return
+    var m = ld(a.p0, base + coop_row_best(a.p0, base, cols, lane))
+    var ls = ftz(identical_log(coop_row_expsum(a.p0, base, cols, m, lane)))
+    if lane == 0:
+        st(a.p2, row, sub(ls, sub(ld(a.p0, base + y), m)))
+
+
+@always_inline
+def coop_row_ce_grad(row: Int, lane: Int, a: Args, g: Float32):
+    """row_ce_grad's row on the cell: (softmax - onehot) * g into p3."""
+    var cols = a.i1
+    var base = row * cols
+    var y = Int(ld(a.p1, row))
+    var m = ld(a.p0, base + coop_row_best(a.p0, base, cols, lane))
+    var s = coop_row_expsum(a.p0, base, cols, m, lane)
+    var c = lane
+    while c < cols:
+        var p = row_div(row_exp(ld(a.p0, base + c), m), s)
+        if c == y:
+            p = sub(p, Float32(1))
+        st(a.p3, base + c, mul(p, g))
+        c += COOP_W
+
+
+@always_inline
+def coop_row_argmax_equal(row: Int, lane: Int, a: Args):
+    """MT_ARGMAX_EQUAL's row on the cell (identical: the serial scan's first
+    maximum): p0 codes, p1 scores (rows x i1), p2 terms; lane 0 stores."""
+    var cols = a.i1
+    var best = coop_row_best(a.p1, row * cols, cols, lane)
+    if lane == 0:
+        st(a.p2, row, Float32(1) if best == Int(ld(a.p0, row)) else Float32(0))
+
+
+@always_inline
+def apply_coop[OP: Int](cell: Int, lane: Int, a: Args):
+    """Cell `cell` of OP on one simdgroup. A FAST launch that carries
+    partials (i2 / i0 / i1 set) runs the one-thread op on lane 0."""
+    comptime if OP == OP_AF_ALPHA:
+        if a.i2 > 0:
+            if lane == 0:
+                op_af_alpha(cell, a)
+            return
+        var ss = coop_sumsq(a.p0, 0, a.i0, lane)
+        if lane == 0:
+            af_alpha_tail(a, ss)
+    elif OP == OP_AF_DENOM:
+        if a.i2 > 0:
+            if lane == 0:
+                op_af_denom(cell, a)
+            return
+        var ss = coop_sumsq(a.p0, 0, a.i0, lane)
+        if lane == 0:
+            af_denom_tail(a, ss)
+    elif OP == OP_AF_BLK_SUMSQ:
+        # op_af_blk_sumsq's block chain on the simdgroup
+        var lo = cell * a.i1
+        var ss = coop_sumsq(a.p0, lo, min(a.i1, a.i0 - lo), lane)
+        if lane == 0:
+            st(a.p1, cell, ss)
+    elif OP == OP_SEG_SUMSQ:
+        if a.i0 != 0:
+            if lane == 0:
+                op_seg_sumsq(cell, a)
+            return
+        var s = Int(a.p1.unsafe_load(cell))
+        var e = Int(a.p1.unsafe_load(cell + 1))
+        var ss = coop_sumsq(a.p0, s, e - s, lane)
+        if lane == 0:
+            st(a.p2, cell, ss)
+    elif OP == OP_LAMB_RATIO:
+        if a.i1 != 0:
+            if lane == 0:
+                op_lamb_ratio(cell, a)
+            return
+        var s = Int(a.p2.unsafe_load(cell))
+        var e = Int(a.p2.unsafe_load(cell + 1))
+        var pss = coop_sumsq(a.p0, s, e - s, lane)
+        var uss = coop_sumsq(a.p1, s, e - s, lane)
+        if lane == 0:
+            lamb_ratio_tail(a, cell, pss, uss)
+    elif THETA_SPEC and OP == OP_THETA:
+        # lane/apple-fast-gap-tsa: theta with the Nelder-Mead candidates on
+        # the simdgroup's lanes (sequence/theta_spec.mojo)
+        op_theta_spec(cell, lane, a)
+    elif OP == OP_COLSCALE:
+        # ANONLIB_SEQ_FAST_VAR_COOP: op_colscale's column on the simdgroup.
+        # Each lane takes the largest |v| over its strided rows with the
+        # one-thread op's `v > mx` test, the 32 partial maxima are combined by
+        # the same test (a maximum: the order cannot change it), then the
+        # lanes scale their strided rows: the same words as op_colscale.
+        var R = a.i0
+        var m = a.i1
+        var mx = Float32(0.0)
+        var r = lane
+        while r < R:
+            var v = abs(ld(a.p0, r * m + cell))
+            if v > mx:
+                mx = v
+            r += COOP_W
+        comptime for sh in range(5):
+            var o = shuffle_idx(mx, UInt32(lane ^ (1 << sh)))
+            if o > mx:
+                mx = o
+        var sc = pow2_scale(mx)
+        r = lane
+        while r < R:
+            st(a.p0, r * m + cell, mul(ld(a.p0, r * m + cell), sc))
+            r += COOP_W
+        if lane == 0:
+            st(a.p1, cell, sc)
+    elif OP == OP_VAR_SIGMA:
+        # ANONLIB_SEQ_FAST_VAR_COOP: op_var_sigma's cell, its R-long
+        # gemm_dot chain on the simdgroup (coop_dot: the same chain)
+        var K = a.i0
+        var R = a.i1
+        var i = cell // K
+        var j = cell - i * K
+        var s = coop_dot(a.p0, i, K, a.p0, j, K, R, Float32(0.0), lane)
+        if lane == 0:
+            st(a.p1, cell, mul(ftz(s), a.f0))
+    elif OP == OP_AF_ROW:
+        # nr-small D11: op_af_row's row chain on the simdgroup
+        var ss = coop_sumsq(a.p0, cell * a.i0, a.i0, lane)
+        if lane == 0:
+            af_row_tail(a, cell, ss)
+    elif OP == OP_AF_RMEAN:
+        var s = coop_sum(a.p0, 0, a.i0, lane)
+        if lane == 0:
+            af_rmean_tail(a, s)
+    elif OP == OP_LN_FWD:
+        comptime if LN_ROW_WARP:
+            # lane ag-pass6-host idea L: the row in registers (same bits)
+            if ln_one_pass_on(a.i0):
+                ln_fwd_rw_one_pass(cell, lane, a)
+            else:
+                coop_ln_fwd_rw(cell, lane, a)
+        else:
+            coop_ln_fwd(cell, lane, a)
+    elif OP == OP_LN_BWD_X:
+        comptime if LN_ROW_WARP:
+            if ln_one_pass_on(a.i0):
+                ln_bwd_x_rw_one_pass(cell, lane, a)
+            else:
+                coop_ln_bwd_x_rw(cell, lane, a)
+        else:
+            coop_ln_bwd_x(cell, lane, a)
+    elif ROW_COOP and OP == OP_AG_SOFTMAX_FWD:
+        coop_row_softmax_fwd(cell, lane, a)
+    elif ROW_COOP and OP == OP_AG_SOFTMAX_VJP:
+        coop_row_softmax_vjp(cell, lane, a)
+    elif ROW_COOP and OP == OP_LS_CE_FWD:
+        coop_row_ce_fwd(cell, lane, a)
+    elif ROW_COOP and OP == OP_LS_CE_VJP:
+        coop_row_ce_grad(cell, lane, a, ld(a.p2, cell))
+    elif ROW_COOP and OP == OP_P1_SCE_VJP:
+        coop_row_ce_grad(cell, lane, a, mul(ld(a.p2, 0), a.f0))
+    elif ROW_COOP and OP == OP_LS_METRIC_TERM:
+        # routed only for MT_ARGMAX_EQUAL (sequence/exec_device.mojo)
+        coop_row_argmax_equal(cell, lane, a)
+    elif OP == OP_GEMM:
+        # op_gemm's cell, the fold on the simdgroup
+        var n_cols = a.i1
+        var m = cell // n_cols
+        var n = cell - m * n_cols
+        var ci = m * a.i8 + n
+        var acc = Float32(0.0)
+        if a.i7 != 0:
+            acc = ld(a.p2, ci)
+        acc = coop_dot(a.p0, m * a.i3, a.i4, a.p1, n * a.i6, a.i5, a.i2, acc, lane)
+        if lane == 0:
+            st(a.p2, ci, acc)

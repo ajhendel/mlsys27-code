@@ -1,0 +1,758 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 the authors. Part of anonlib, DOI-WITHHELD
+"""CPython boundary for the C-SVC, epsilon-SVR and Isolation Forest lanes.
+
+A THIRD extension module, and a separate one on purpose. The header of
+`bindings/_anonlib_estimators.mojo` states the reason and it is the same
+reason here: an independently changing binding must not become a merge
+point. Two lanes share this module because they landed in one slot, not
+because they share code -- `svm/` is cuML's SMO solver and cuVS's kernel
+matrices, `isolation_forest/` is cuML's Isolation Forest and cuRAND's
+XORWOW, and nothing crosses between them.
+
+THE SVR PAIR RIDES THIS SAME MODULE AND NEEDED NO NEW EXTENSION (added
+2026-09-01). `svr_fit` and `svr_predict` call the same `SmoSolver` the
+classifier does, differing in the gradient initialization, the domain size
+and how the coefficients are combined, so `_backend.py`'s `_MODULES`,
+`pyproject.toml` and `build_release_wheel.sh`'s `EXT_NAMES` are unchanged.
+The whole cost of the regression surface is the two functions below.
+
+Arrays cross as borrowed NumPy addresses; all device buffers and contexts
+live for one call and no pointer is retained. The Python wrapper owns the
+arrays and keeps them alive for the duration of the call
+(`python/anonlib/_arrays.py` is where that contract is written down).
+
+SCALARS ARRIVE AS ONE LIST, NOT AS SEPARATE ARGUMENTS.
+`PythonModuleBuilder.def_function` infers its signature from arity and
+stops working above roughly nine arguments, so buffer addresses go
+positionally and every scalar goes in one `params` list. THE ORDER OF THAT
+LIST IS WRITTEN OUT IN A COMMENT ON BOTH SIDES IN THE SAME WORDS. A silent
+reordering is a wrong answer, not a failure, and the length check below is
+the only thing standing between a swapped pair and a plausible number.
+
+DEVIATIONS 870-879 are this surface's. 870-875 are used and each is named
+where it bites; 876-879 are unassigned.
+
+`SVC`, `SVR` and `IsolationForest` ARE wired into
+`python/anonlib/__init__.py`; this header said "NOT WIRED" for a week
+after they were. `_anonlib_svm` is also registered in
+`python/anonlib/_backend.py`'s `_MODULES` (added with DEVIATION 869, when
+five bindings were found missing from that tuple and were therefore
+resolving to the FAST binary under the identical label). `_svm_impl.py`
+still loads this module itself, mode-aware, and cross-checks
+`svm_numeric_mode()` against the mode the package asked for; see the comment
+there.
+"""
+
+# DEVIATION 2486: shared byte-preserving host copies.
+from bindings.hostptr import f32_ptr, f64_ptr, i32_ptr, read_f32, copy_f32, list_f32
+from std.os import abort
+from std.python import Python, PythonObject
+from std.python._cpython import GILReleased
+from std.python.bindings import PythonModuleBuilder
+
+from checks.vendor import COMPILED_VENDOR
+from isolation_forest.impl.isolation_forest import (
+    IF_DEVICE_TRANSPOSE,
+    IDN_IF_QUERY_DEVICE,
+    IDN_IF_RESIDENT,
+)
+
+from isolation_forest.impl.isolation_tree_builder import IF_FAST_ROWMAJOR
+from isolation_forest.estimator import (
+    IF_WANT_PREDICT,
+    IFResidentKey,
+    IFRunOutputs,
+    if_resident_new_token,
+    if_resident_put,
+    if_resident_release,
+    if_resident_take,
+    iforest_run_host,
+    iforest_run_resident,
+)
+from checks.numerics import GLOBAL_NUMERIC_MODE, NUMERIC_IDENTICAL
+# cgfin-c-svm: the epilogues, Platt, the shuffle and the row glue run on
+# the device (the CPU binding runs svm/host/svc_proba.mojo's host twin)
+from svm.impl.svc_epilogue import (
+    svc_pair_epilogue_device_binding,
+    svc_platt_train_device_binding,
+    svc_portable_math_device_binding,
+    svc_splitmix_perm_device_binding,
+)
+from svm.estimator import (
+    SvcFitOutputs,
+    SvrFitOutputs,
+    svc_fit_host,
+    svc_fit_host_borrowed,
+    svc_predict_host,
+    svr_fit_host,
+    svr_predict_host,
+)
+
+
+from svm.impl.scale_gamma_device import scale_gamma_limbs_device_binding, py2mojo_linear_flags_binding
+from svm.estimator import _family_ctx as _sg_family_ctx
+from svm.impl.svc_ovo_layout import svc_ovo_layout_device_binding, svc_dual_gemv_device_binding
+
+def _f32_ptr(addr: Int) raises -> MutPointer[Float32, MutUntrackedOrigin]:
+    return f32_ptr(addr)
+
+
+def _i32_ptr(addr: Int) raises -> MutPointer[Int32, MutUntrackedOrigin]:
+    return i32_ptr(addr)
+
+
+def _f64_ptr(addr: Int) raises -> MutPointer[Float64, MutUntrackedOrigin]:
+    return f64_ptr(addr)
+
+
+def svm_numeric_mode_binding() raises -> PythonObject:
+    """THE BUILD'S TIER, as the `NUMERIC_*` code itself: 0 FAST, 1
+    IDENTICAL. The same shape as `gbdt_numeric_mode`, and
+    for the same reason: the wrapper reads it once and refuses to run if the
+    binary it loaded disagrees with the mode the package asked for. A
+    wrong-arm measurement that is correctly labelled by accident is the
+    failure this prevents."""
+    return PythonObject(GLOBAL_NUMERIC_MODE)
+
+
+
+def _c_rows(params: PythonObject, slot: Int, n_rows: Int, who: String) raises -> List[Float32]:
+    """The OPTIONAL per-row bounds `C * sample_weight` (float32, formed and
+    rounded once by the caller; `InitPenalty`'s weighted arm) at the address
+    in `params[slot]`; absent or 0 is the unweighted arm. The solver checks
+    them (`check_c_rows`)."""
+    var out = List[Float32]()
+    if len(params) <= slot:
+        return out^
+    var a = Int(py=params[slot])
+    if a == 0:
+        return out^
+    out = read_f32(a, n_rows)
+    return out^
+
+def svc_fit_binding(
+    x_addr: PythonObject,
+    y_addr: PythonObject,
+    dual_addr: PythonObject,
+    support_idx_addr: PythonObject,
+    support_matrix_addr: PythonObject,
+    info_addr: PythonObject,
+    params: PythonObject,
+) raises -> PythonObject:
+    """`SVC.fit` (svm/, DEVIATIONS 630-637): binary C-SVC, dense FP32,
+    LINEAR or RBF. Returns `n_support`.
+
+    `params` is, in this exact order (mirrored in
+    `python/anonlib/_svm_impl.py`):
+
+        0  n_rows
+        1  n_features
+        2  kernel          (0 = LINEAR, 2 = RBF; cuML's KernelType values)
+        3  gamma           (float; read only by RBF)
+        4  C               (float)
+        5  tol             (float)
+        6  max_iter        (-1 = no limit, cuML's default)
+        7  nochange_steps
+        8  degree          (POLYNOMIAL only; 3 otherwise)
+        9  coef0           (float; POLYNOMIAL only; 0 otherwise)
+
+    The OUTPUT buffers are worst-case sized by the caller, because
+    `n_support` is not known until the solve finishes (DEVIATION 873):
+    `dual_addr` and `support_idx_addr` hold `n_rows` entries,
+    `support_matrix_addr` holds `n_rows * n_features` float32. Only the
+    first `n_support` (and `n_support * n_features`) are written.
+
+    `info_addr` is FIVE float64, written in this order:
+
+        0  b            (the intercept; a float32 value widened exactly)
+        1  n_support
+        2  n_iter
+        3  classes[0]   (the SMALLER of the two sorted distinct labels)
+        4  classes[1]   (the LARGER; the one mapped to +1, so it fixes the
+                         sign of the decision function)
+
+    `cache_size`, `epsilon`, `svmType`, `sample_weight`, POLYNOMIAL, TANH
+    and PRECOMPUTED are not on this surface at all: `svm/estimator.mojo`
+    pins the first three at the only values rung 1 accepts and refuses the
+    rest by name. `max_outer_iter` is pinned at -1, which is what cuML's
+    own Python layer does (`svm_base.pyx:371`).
+    """
+    if len(params) != 10 and len(params) != 11:
+        raise Error(
+            "svc_fit: params must contain 10 values (11 with the per-row bounds), got " + String(len(params))
+        )
+    var xp = _f32_ptr(Int(py=x_addr))
+    var yp = _f32_ptr(Int(py=y_addr))
+    var dp = _f32_ptr(Int(py=dual_addr))
+    var sip = _i32_ptr(Int(py=support_idx_addr))
+    var smp = _f32_ptr(Int(py=support_matrix_addr))
+    var ip = _f64_ptr(Int(py=info_addr))
+    var n_rows = Int(py=params[0])
+    var n_cols = Int(py=params[1])
+    var kernel = Int(py=params[2])
+    var gamma = Float64(py=params[3])
+    var c = Float64(py=params[4])
+    var tol = Float64(py=params[5])
+    var max_iter = Int(py=params[6])
+    var nochange_steps = Int(py=params[7])
+    var degree = Int(py=params[8])
+    var coef0 = Float64(py=params[9])
+    if n_rows <= 0 or n_cols <= 0:
+        raise Error("svc_fit: n_rows and n_features must both be positive")
+    var y = List[Float32]()
+    y = read_f32(Int(yp), max(0, n_rows))
+    var c_rows = _c_rows(params, 10, n_rows, "svc_fit")
+    var res = SvcFitOutputs()
+    with GILReleased(Python()):
+        # DEVIATION 2665: X is not copied into a host List; the fit checks
+        # and stages the caller's buffer, which `_svm_impl.py` holds alive.
+        res = svc_fit_host_borrowed(
+            xp, y, n_rows, n_cols, kernel, gamma, c, tol, max_iter,
+            nochange_steps, degree, coef0, c_rows,
+        )
+    copy_f32(res.dual_coefs.unsafe_ptr(), dp, res.n_support)
+    for i in range(res.n_support):
+        sip.unsafe_store(i, res.support_idx[i])
+    copy_f32(res.support_matrix.unsafe_ptr(), smp, res.n_support * n_cols)
+    ip.unsafe_store(0, Float64(res.b))
+    ip.unsafe_store(1, Float64(res.n_support))
+    ip.unsafe_store(2, Float64(res.n_iter))
+    ip.unsafe_store(3, Float64(res.label0))
+    ip.unsafe_store(4, Float64(res.label1))
+    return PythonObject(res.n_support)
+
+
+def svc_predict_binding(
+    x_addr: PythonObject,
+    dual_addr: PythonObject,
+    support_matrix_addr: PythonObject,
+    out_addr: PythonObject,
+    params: PythonObject,
+) raises -> PythonObject:
+    """`SVC.decision_function` / `SVC.predict` on a model handed back in.
+    Writes `n_rows` float32 to `out_addr` and returns `n_rows`.
+
+    `params` is, in this exact order (mirrored in
+    `python/anonlib/_svm_impl.py`):
+
+        0  n_rows
+        1  n_features
+        2  n_support
+        3  b               (float; the intercept from fit's info[0])
+        4  classes[0]      (float)
+        5  classes[1]      (float)
+        6  kernel          (0 = LINEAR, 2 = RBF)
+        7  gamma           (float; MUST be the gamma the fit resolved)
+        8  predict_class   (0 = the raw decision value, 1 = the class label)
+        9  cache_size_mib  (float; their `param.cache_size` at the
+                            `SVC::predict` call site -- the prediction
+                            BATCH knob, launch-invariant by gate)
+        10 degree          (POLYNOMIAL only; 3 otherwise)
+        11 coef0           (float; POLYNOMIAL only; 0 otherwise)
+
+    Slot 7 is the trap in this list. `gamma` here must be the value the
+    FIT resolved, not the constructor's, or the kernel matrix at predict
+    is not the one the dual coefficients were solved against and the
+    answer is quietly wrong. `_svm_impl.py` stores it as `_gamma` at fit
+    and passes that, which is what cuML does (`svm_base.pyx:464, 532`).
+    """
+    if len(params) != 12:
+        raise Error(
+            "svc_predict: params must contain 12 values, got " + String(len(params))
+        )
+    var xp = _f32_ptr(Int(py=x_addr))
+    var op = _f32_ptr(Int(py=out_addr))
+    var n_rows = Int(py=params[0])
+    var n_cols = Int(py=params[1])
+    var n_support = Int(py=params[2])
+    var b = Float32(Float64(py=params[3]))
+    var label0 = Float32(Float64(py=params[4]))
+    var label1 = Float32(Float64(py=params[5]))
+    var kernel = Int(py=params[6])
+    var gamma = Float64(py=params[7])
+    var predict_class = Int(py=params[8]) != 0
+    var buffer_mib = Float64(py=params[9])
+    var degree = Int(py=params[10])
+    var coef0 = Float64(py=params[11])
+    if n_rows <= 0 or n_cols <= 0:
+        raise Error("svc_predict: n_rows and n_features must both be positive")
+    if n_support < 0:
+        raise Error("svc_predict: n_support cannot be negative")
+    var x = List[Float32]()
+    x = read_f32(Int(xp), max(0, n_rows * n_cols))
+    var dual = List[Float32]()
+    var support = List[Float32]()
+    if n_support > 0:
+        var dp = _f32_ptr(Int(py=dual_addr))
+        var smp = _f32_ptr(Int(py=support_matrix_addr))
+        dual = read_f32(Int(dp), max(0, n_support))
+        if kernel != 4:
+            # kernel='precomputed' (4) reads no support rows: X is the
+            # cross-kernel and the caller passes no support matrix.
+            support = read_f32(Int(smp), max(0, n_support * n_cols))
+    var out = List[Float32]()
+    with GILReleased(Python()):
+        out = svc_predict_host(
+            x, n_rows, n_cols, support, dual, n_support, b, label0, label1,
+            kernel, gamma, predict_class, buffer_mib, degree, coef0,
+        )
+    copy_f32(out.unsafe_ptr(), op, n_rows)
+    return PythonObject(n_rows)
+
+
+def svr_fit_binding(
+    x_addr: PythonObject,
+    y_addr: PythonObject,
+    dual_addr: PythonObject,
+    support_idx_addr: PythonObject,
+    support_matrix_addr: PythonObject,
+    info_addr: PythonObject,
+    params: PythonObject,
+) raises -> PythonObject:
+    """`SVR.fit` (svm/, DEVIATIONS 630-637 plus the SVR pieces gated at
+    `fea6becc`): epsilon-SVR, dense FP32, LINEAR or RBF. Returns
+    `n_support`.
+
+    `params` is, in this exact order (mirrored in
+    `python/anonlib/_svm_impl.py`):
+
+        0  n_rows
+        1  n_features
+        2  kernel          (0 = LINEAR, 2 = RBF; cuML's KernelType values)
+        3  gamma           (float; read only by RBF)
+        4  C               (float)
+        5  epsilon         (float; the width of the insensitive tube)
+        6  tol             (float)
+        7  max_iter        (-1 = no limit, cuML's default)
+        8  nochange_steps
+
+    SLOT 5 IS THE ONE THIS LIST HAS THAT `svc_fit`'s DOES NOT, and it sits
+    between `C` and `tol` rather than at the end, so a reader comparing the
+    two lists sees one insertion instead of a reordering. `epsilon` crosses
+    UNCLAMPED: `check_rung1_scope` refuses a non-finite or negative value by
+    name and that refusal has to stay reachable from Python.
+
+    The OUTPUT buffers are worst-case sized by the caller, because
+    `n_support` is not known until the solve finishes (DEVIATION 873), and
+    they are the SAME SIZES the classifier uses: `dual_addr` and
+    `support_idx_addr` hold `n_rows` entries, `support_matrix_addr` holds
+    `n_rows * n_features` float32. NOT `2 * n_rows`. The solver's domain is
+    doubled but `Results` folds the two alpha halves before it selects, so
+    at most `n_rows` coefficients can ever be written
+    (`svm/estimator.mojo::svr_fit_host` spells the argument out).
+
+    `info_addr` is THREE float64, written in this order:
+
+        0  b            (the intercept; a float32 value widened exactly)
+        1  n_support
+        2  n_iter
+
+    THREE, NOT FIVE. `svc_fit`'s slots 3 and 4 are the class labels and a
+    regressor has none.
+
+    `cache_size`, `svmType`, `sample_weight`, POLYNOMIAL, TANH and
+    PRECOMPUTED are not on this surface at all: `svm/estimator.mojo` pins
+    the first two at the only values this rung accepts and refuses the rest
+    by name. `max_outer_iter` is pinned at -1, which is what cuML's own
+    Python layer does (`svm_base.pyx:371`), and -1 resolves over the DOUBLED
+    `n_train`.
+    """
+    if len(params) != 9 and len(params) != 10 and len(params) != 12:
+        raise Error(
+            "svr_fit: params must contain 9 values (10 with the per-row bounds, 12 with"
+            " degree and coef0), got " + String(len(params))
+        )
+    var xp = _f32_ptr(Int(py=x_addr))
+    var yp = _f32_ptr(Int(py=y_addr))
+    var dp = _f32_ptr(Int(py=dual_addr))
+    var sip = _i32_ptr(Int(py=support_idx_addr))
+    var smp = _f32_ptr(Int(py=support_matrix_addr))
+    var ip = _f64_ptr(Int(py=info_addr))
+    var n_rows = Int(py=params[0])
+    var n_cols = Int(py=params[1])
+    var kernel = Int(py=params[2])
+    var gamma = Float64(py=params[3])
+    var c = Float64(py=params[4])
+    var epsilon = Float64(py=params[5])
+    var tol = Float64(py=params[6])
+    var max_iter = Int(py=params[7])
+    var nochange_steps = Int(py=params[8])
+    if n_rows <= 0 or n_cols <= 0:
+        raise Error("svr_fit: n_rows and n_features must both be positive")
+    var x = List[Float32]()
+    var y = List[Float32]()
+    x = read_f32(Int(xp), max(0, n_rows * n_cols))
+    y = read_f32(Int(yp), max(0, n_rows))
+    var c_rows = _c_rows(params, 9, n_rows, "svr_fit")
+    var degree = 3
+    var coef0 = 0.0
+    if len(params) == 12:
+        degree = Int(py=params[10])
+        coef0 = Float64(py=params[11])
+    var res = SvrFitOutputs()
+    with GILReleased(Python()):
+        res = svr_fit_host(
+            x, y, n_rows, n_cols, kernel, gamma, c, epsilon, tol, max_iter,
+            nochange_steps, c_rows, degree, coef0,
+        )
+    copy_f32(res.dual_coefs.unsafe_ptr(), dp, res.n_support)
+    for i in range(res.n_support):
+        sip.unsafe_store(i, res.support_idx[i])
+    copy_f32(res.support_matrix.unsafe_ptr(), smp, res.n_support * n_cols)
+    ip.unsafe_store(0, Float64(res.b))
+    ip.unsafe_store(1, Float64(res.n_support))
+    ip.unsafe_store(2, Float64(res.n_iter))
+    return PythonObject(res.n_support)
+
+
+def svr_predict_binding(
+    x_addr: PythonObject,
+    dual_addr: PythonObject,
+    support_matrix_addr: PythonObject,
+    out_addr: PythonObject,
+    params: PythonObject,
+) raises -> PythonObject:
+    """`SVR.predict` on a model handed back in. Writes `n_rows` float32 to
+    `out_addr` and returns `n_rows`.
+
+    `params` is, in this exact order (mirrored in
+    `python/anonlib/_svm_impl.py`):
+
+        0  n_rows
+        1  n_features
+        2  n_support
+        3  b               (float; the intercept from fit's info[0])
+        4  kernel          (0 = LINEAR, 2 = RBF)
+        5  gamma           (float; MUST be the gamma the fit resolved)
+        6  cache_size_mib  (float; their `param.cache_size` at the
+                            `SVM::predict` call site -- the prediction
+                            BATCH knob, launch-invariant by gate)
+
+    SEVEN SLOTS, NOT TEN. `svc_predict`'s `classes[0]`, `classes[1]` and
+    `predict_class` are all absent: there are no classes and there is no
+    epilogue to select, so the regression estimate is the only thing this
+    call can return.
+
+    Slot 5 is the trap in this list, exactly as slot 7 is in `svc_predict`'s.
+    `gamma` here must be the value the FIT resolved, not the constructor's,
+    or the kernel matrix at predict is not the one the dual coefficients
+    were solved against and the answer is quietly wrong. `_svm_impl.py`
+    stores it as `_gamma` at fit and passes that, which is what cuML does
+    (`svm_base.pyx:464, 532`).
+    """
+    if len(params) != 7 and len(params) != 9:
+        raise Error(
+            "svr_predict: params must contain 7 values (9 with degree and coef0), got "
+            + String(len(params))
+        )
+    var xp = _f32_ptr(Int(py=x_addr))
+    var op = _f32_ptr(Int(py=out_addr))
+    var n_rows = Int(py=params[0])
+    var n_cols = Int(py=params[1])
+    var n_support = Int(py=params[2])
+    var b = Float32(Float64(py=params[3]))
+    var kernel = Int(py=params[4])
+    var gamma = Float64(py=params[5])
+    var buffer_mib = Float64(py=params[6])
+    var degree = 3
+    var coef0 = 0.0
+    if len(params) == 9:
+        degree = Int(py=params[7])
+        coef0 = Float64(py=params[8])
+    if n_rows <= 0 or n_cols <= 0:
+        raise Error("svr_predict: n_rows and n_features must both be positive")
+    if n_support < 0:
+        raise Error("svr_predict: n_support cannot be negative")
+    var x = List[Float32]()
+    x = read_f32(Int(xp), max(0, n_rows * n_cols))
+    var dual = List[Float32]()
+    var support = List[Float32]()
+    if n_support > 0:
+        var dp = _f32_ptr(Int(py=dual_addr))
+        var smp = _f32_ptr(Int(py=support_matrix_addr))
+        dual = read_f32(Int(dp), max(0, n_support))
+        if kernel != 4:
+            # kernel='precomputed' (4) reads no support rows: X is the
+            # cross-kernel and the caller passes no support matrix.
+            support = read_f32(Int(smp), max(0, n_support * n_cols))
+    var out = List[Float32]()
+    with GILReleased(Python()):
+        out = svr_predict_host(
+            x, n_rows, n_cols, support, dual, n_support, b, kernel, gamma,
+            buffer_mib, degree, coef0,
+        )
+    copy_f32(out.unsafe_ptr(), op, n_rows)
+    return PythonObject(n_rows)
+
+
+def iforest_run_binding(
+    train_addr: PythonObject,
+    query_addr: PythonObject,
+    out_f32_addr: PythonObject,
+    out_i32_addr: PythonObject,
+    info_addr: PythonObject,
+    params: PythonObject,
+) raises -> PythonObject:
+    """`IsolationForest.fit` plus ONE of `score_samples`,
+    `decision_function` or `predict`, in one call (isolation_forest/,
+    DEVIATIONS 680-686 and 750-751). Returns `n_query`.
+
+    DEVIATION 874: the fit happens on EVERY call, because the forest is
+    eight device buffers and this boundary retains no device pointer. See
+    the block comment at `isolation_forest/estimator.mojo::
+    iforest_run_host`.
+
+    `params` is, in this exact order (mirrored in
+    `python/anonlib/_iforest_impl.py`):
+
+         0  n_train
+         1  n_features
+         2  n_query
+         3  n_estimators
+         4  max_samples_mode     (0 = 'auto', 1 = int, 2 = float fraction)
+         5  max_samples_int
+         6  max_samples_frac     (float)
+         7  max_depth            (-1 = None, their auto)
+         8  max_features_mode    (0 = float fraction, 1 = int)
+         9  max_features_int
+        10  max_features_frac    (float)
+        11  bootstrap            (0/1)
+        12  random_state         (an int in [0, 2^32-1]; None is 0 here)
+        13  contamination_auto   (0/1)
+        14  contamination        (float; read only when slot 13 is 0)
+        15  want                 (0 = score_samples, 1 = decision_function,
+                                  2 = predict)
+
+    Slot 15 picks which output buffer is written. `want` 0 and 1 write
+    `n_query` float32 to `out_f32_addr` and touch `out_i32_addr` not at
+    all; `want` 2 writes `n_query` int32 to `out_i32_addr` and touches
+    `out_f32_addr` not at all. The unused address may be 0.
+
+    `info_addr` is THREE float64, written on every call:
+
+        0  offset_          (the contamination quantile, or -0.5)
+        1  max_samples_     (the resolved subsample size)
+        2  n_features_in_
+
+    Lane fam2-forests (`IDN_IF_RESIDENT`, isolation_forest/estimator.mojo
+    "THE RESIDENT ENTRY"): a binary whose `iforest_resident()` is 1 also
+    takes SEVENTEEN params and FOUR info slots:
+
+        params 16  token    (0 = fit a fresh forest and keep it; else the
+                             token an earlier call returned: that resident
+                             forest scores the query with NO fit; a token
+                             that is gone or whose key differs refits as
+                             DEVIATION 874 does and keeps the new forest)
+        info    3  token    (the resident forest's token after this call)
+
+    Sixteen params is the DEVIATION 874 form, unchanged.
+    """
+    var resident = False
+    comptime if IDN_IF_RESIDENT:
+        resident = len(params) == 17
+    if len(params) != 16 and not resident:
+        raise Error(
+            "iforest_run: params must contain 16 values, got " + String(len(params))
+        )
+    var tp = _f32_ptr(Int(py=train_addr))
+    var qp = _f32_ptr(Int(py=query_addr))
+    var ip = _f64_ptr(Int(py=info_addr))
+    var n_train = Int(py=params[0])
+    var n_features = Int(py=params[1])
+    var n_query = Int(py=params[2])
+    var n_estimators = Int(py=params[3])
+    var max_samples_mode = Int(py=params[4])
+    var max_samples_int = Int(py=params[5])
+    var max_samples_frac = Float64(py=params[6])
+    var max_depth = Int(py=params[7])
+    var max_features_mode = Int(py=params[8])
+    var max_features_int = Int(py=params[9])
+    var max_features_frac = Float64(py=params[10])
+    var bootstrap = Int(py=params[11]) != 0
+    var random_state = Int(py=params[12])
+    var contamination_auto = Int(py=params[13]) != 0
+    var contamination = Float64(py=params[14])
+    var want = Int(py=params[15])
+    if n_train <= 0 or n_features <= 0 or n_query <= 0:
+        raise Error("iforest_run: n_train, n_features and n_query must all be positive")
+    # DEVIATION 2638: the training matrix is LENT by address (the Python
+    # caller keeps it alive through this synchronous call) and transposed
+    # into the pinned upload stage across the host pool; it is no longer
+    # appended cell by cell into a List and transposed again cell by cell.
+    var train = List[Float32]()
+    var query = List[Float32]()
+    # Lane fam-forests (`IDN_IF_QUERY_DEVICE`, isolation_forest/impl/
+    # isolation_forest.mojo): the query matrix is LENT by address too and
+    # flushed and scanned on the device; otherwise the List copy as before.
+    var q_addr = 0
+    comptime if IDN_IF_QUERY_DEVICE:
+        q_addr = Int(qp)
+    else:
+        # the define's off arm: one memcpy (no per-cell host loop)
+        query = list_f32(qp, n_query * n_features)
+    var res = IFRunOutputs()
+    comptime if IDN_IF_RESIDENT:
+        if resident:
+            # The take and the put run under the GIL; the fit (on a miss) and
+            # the scoring run with it released, on an entry no other thread
+            # can reach while it is out of the store.
+            var token = Int(py=params[16])
+            var out_f32 = Int(py=out_f32_addr)
+            var out_i32 = Int(py=out_i32_addr)
+            var key = IFResidentKey(
+                Int(tp), n_train, n_features, n_estimators, max_samples_mode,
+                max_samples_int, max_samples_frac, max_depth, max_features_mode,
+                max_features_int, max_features_frac, bootstrap, random_state,
+                contamination_auto, contamination,
+            )
+            var held = if_resident_take(token, key)
+            var new_token = 0
+            if len(held) == 0:
+                new_token = if_resident_new_token()
+            try:
+                with GILReleased(Python()):
+                    res = iforest_run_resident(
+                        held, key, new_token, query, q_addr, n_query, want, out_f32, out_i32,
+                    )
+            except e:
+                # Preserve an existing caller-owned forest after a refused
+                # query. A new token has not reached Python yet: caching it
+                # here would orphan its buffers until native-global teardown.
+                if new_token == 0:
+                    if_resident_put(held)
+                raise e
+            if_resident_put(held)
+            ip.unsafe_store(0, res.offset_)
+            ip.unsafe_store(1, Float64(res.max_samples_))
+            ip.unsafe_store(2, Float64(res.n_features_in_))
+            ip.unsafe_store(3, Float64(res.token))
+            return PythonObject(n_query)
+    with GILReleased(Python()):
+        res = iforest_run_host(
+            train, n_train, n_features, query, n_query, n_estimators,
+            max_samples_mode, max_samples_int, max_samples_frac, max_depth,
+            max_features_mode, max_features_int, max_features_frac,
+            bootstrap, random_state, contamination_auto, contamination,
+            want, train_addr=Int(tp), query_addr=q_addr,
+        )
+    if want == IF_WANT_PREDICT:
+        var oi = _i32_ptr(Int(py=out_i32_addr))
+        for i in range(n_query):
+            oi.unsafe_store(i, res.labels[i])
+    else:
+        var of = _f32_ptr(Int(py=out_f32_addr))
+        for i in range(n_query):
+            of.unsafe_store(i, res.values[i])
+    ip.unsafe_store(0, res.offset_)
+    ip.unsafe_store(1, Float64(res.max_samples_))
+    ip.unsafe_store(2, Float64(res.n_features_in_))
+    return PythonObject(n_query)
+
+
+def svm_vendor_binding() raises -> PythonObject:
+    """THE ACCELERATOR API THIS BINARY WAS COMPILED FOR: 'metal', 'cuda',
+    'hip' or 'none'. A compile-time constant folded in from
+    `checks/vendor.mojo`, the same shape as the tier read-back
+    (`gbdt_numeric_mode`): the answer comes from the binary that actually
+    loaded, never from the directory it sat in or from the environment.
+    `python/anonlib/_backend.py` refuses at import when this disagrees
+    with the vendor directory the set was loaded from."""
+    return PythonObject(String(COMPILED_VENDOR))
+
+
+def svm_parallel_available() raises -> PythonObject:
+    return PythonObject(1)
+
+
+def iforest_device_finite_scan_binding() raises -> PythonObject:
+    """1 when this build's IsolationForest fit refuses a non-finite training
+    cell through a device scan (IF_FAST_ROWMAJOR, FAST on Apple), so the
+    Python layer skips its host scan of the same cells; 0 otherwise."""
+    return PythonObject(1 if IF_FAST_ROWMAJOR else 0)
+
+
+def iforest_parallel_available() raises -> PythonObject:
+    return PythonObject(1)
+
+
+def iforest_resident_binding() raises -> PythonObject:
+    """1 when this binary keeps the fitted forest resident between calls
+    (`IDN_IF_RESIDENT`, lane fam2-forests) and `iforest_run` takes the
+    17-value params with a token; 0 otherwise (DEVIATION 874's refit per
+    call)."""
+    comptime if IDN_IF_RESIDENT:
+        return PythonObject(1)
+    return PythonObject(0)
+
+
+def iforest_resident_release_binding(token: PythonObject) raises -> PythonObject:
+    """Drop the resident forest `token` names (the Python estimator was
+    refitted or collected). A token nobody holds is a no-op. Returns 0."""
+    comptime if IDN_IF_RESIDENT:
+        if_resident_release(Int(py=token))
+    return PythonObject(0)
+
+
+def iforest_device_scan_binding() raises -> PythonObject:
+    """1 when this binary's fit uploads the training matrix as raw row-major
+    bytes and scans it for non-finite cells on the device
+    (`IF_DEVICE_TRANSPOSE`, lane gap-trees-nv), so the Python layer's host
+    scan before the fit is the same refusal twice; 0 otherwise."""
+    comptime if IF_DEVICE_TRANSPOSE:
+        return PythonObject(1)
+    return PythonObject(0)
+
+
+
+def svm_scale_gamma_limbs_binding(
+    x_addr: PythonObject, count: PythonObject, out_addr: PythonObject
+) raises -> PythonObject:
+    """lane/apple-fast-py2mojo-linear: gamma='scale' exact sums on the device
+    (`svm/impl/scale_gamma_device.mojo`)."""
+    return scale_gamma_limbs_device_binding(_sg_family_ctx(), x_addr, count, out_addr)
+
+
+def svc_ovo_layout_binding(
+    sup_addrs: PythonObject, dual_addrs: PythonObject, meta: PythonObject, out_addrs: PythonObject
+) raises -> PythonObject:
+    """lane/apple-fast-py2mojo-linear: SVC's one-vs-one attribute layout on
+    the device (`svm/impl/svc_ovo_layout.mojo`)."""
+    return svc_ovo_layout_device_binding(_sg_family_ctx(), sup_addrs, dual_addrs, meta, out_addrs)
+
+
+def svc_dual_gemv_binding(
+    dual_addr: PythonObject, sv_addr: PythonObject, dims: PythonObject, out_addr: PythonObject
+) raises -> PythonObject:
+    """lane/apple-fast-py2mojo-linear: SVC coef_ (dual @ sv) on the device."""
+    return svc_dual_gemv_device_binding(_sg_family_ctx(), dual_addr, sv_addr, dims, out_addr)
+
+
+@export
+def PyInit__anonlib_svm() abi("C") -> PythonObject:
+    try:
+        var m = PythonModuleBuilder("_anonlib_svm")
+        m.def_function[svm_parallel_available]("svm_parallel_available")
+        m.def_function[iforest_parallel_available]("iforest_parallel_available")
+        m.def_function[svm_vendor_binding]("svm_vendor")
+        m.def_function[svm_numeric_mode_binding]("svm_numeric_mode")
+        m.def_function[svc_fit_binding]("svc_fit")
+        m.def_function[svc_predict_binding]("svc_predict")
+        m.def_function[svc_pair_epilogue_device_binding]("svc_pair_epilogue")
+        m.def_function[svc_platt_train_device_binding]("svc_platt_train")
+        m.def_function[svc_splitmix_perm_device_binding]("svc_splitmix_perm")
+        m.def_function[svc_portable_math_device_binding]("svc_portable_math")
+        m.def_function[svr_fit_binding]("svr_fit")
+        m.def_function[svr_predict_binding]("svr_predict")
+        m.def_function[iforest_run_binding]("iforest_run")
+        m.def_function[iforest_resident_binding]("iforest_resident")
+        m.def_function[iforest_resident_release_binding]("iforest_resident_release")
+        m.def_function[iforest_device_scan_binding]("iforest_device_scan")
+        m.def_function[iforest_device_finite_scan_binding]("iforest_device_finite_scan")
+        m.def_function[svm_scale_gamma_limbs_binding]("scale_gamma_limbs")
+        m.def_function[py2mojo_linear_flags_binding]("py2mojo_linear_flags")
+        m.def_function[svc_ovo_layout_binding]("svc_ovo_layout")
+        m.def_function[svc_dual_gemv_binding]("svc_dual_gemv")
+        return m.finalize()
+    except e:
+        abort(String("failed to create _anonlib_svm: ", e))

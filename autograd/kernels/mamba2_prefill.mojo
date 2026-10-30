@@ -1,0 +1,38 @@
+# SPDX-License-Identifier: Apache-2.0
+"""The Mamba-2 zero-state prefill VJP's result type. The device VJP is
+assembled on the tape (autograd/rules_mamba.mojo::mamba2_tape_backward); the
+CPU column's hand walk is mamba/host/mamba2_prefill_chain.mojo.
+"""
+# the weights these gradients mirror, field for field (also the host
+# generator's first top-level import, which it needs to place its own)
+from mamba.checks.mamba2_fixture import Mamba2Weights
+
+
+struct Mamba2PrefillGradients(Movable):
+    var x: List[Float32]
+    var block_norm_weight: List[Float32]
+    var in_proj_weight: List[Float32]
+    var conv1d_weight: List[Float32]
+    var conv1d_bias: List[Float32]
+    var dt_bias: List[Float32]
+    var A_log: List[Float32]
+    var D: List[Float32]
+    var norm_weight: List[Float32]
+    var out_proj_weight: List[Float32]
+
+    def __init__(out self):
+        self.x = List[Float32]()
+        self.block_norm_weight = List[Float32]()
+        self.in_proj_weight = List[Float32]()
+        self.conv1d_weight = List[Float32]()
+        self.conv1d_bias = List[Float32]()
+        self.dt_bias = List[Float32]()
+        self.A_log = List[Float32]()
+        self.D = List[Float32]()
+        self.norm_weight = List[Float32]()
+        self.out_proj_weight = List[Float32]()
+
+
+# TOMBSTONE: ANONLIB_AUTOGRAD_MAMBA_OFF (hand Mamba-2 prefill backward glue, superseded by the tape) deleted 2026-10-19 by e378999c7; code recoverable at e378999c7^.
+# Restore: git apply experiments/removed/ANONLIB_AUTOGRAD_MAMBA_OFF.patch
+# (the CPU column keeps the same walk as generator input: mamba/host/mamba2_prefill_chain.mojo)

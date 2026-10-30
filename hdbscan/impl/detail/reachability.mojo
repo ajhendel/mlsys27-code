@@ -1,0 +1,335 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 the authors. Part of anonlib, DOI-WITHHELD
+"""Core distances from the k-NN graph, and the mutual reachability space.
+
+Reference: `cuml-v26.08.00/cpp/src/hdbscan/detail/reachability.cuh`
+(cuML `265b9da`) and, for the parts cuML 26.08 has already delegated to
+cuVS, `cuvs/cpp/src/neighbors/detail/reachability.cuh` (cuVS `94c2819`).
+Both files carry the SAME `core_distances` and `compute_knn`, which is
+why one Mojo file stands for both. Steps run in the reference order.
+
+WHAT IS HERE
+  `core_distances`      `reachability.cuh:49-63` (cuVS) / `:42-56` (cuML)
+  `compute_knn`         `:80-94` (cuVS) / `:73-117` (cuML)
+  `_compute_core_dists` `:100-122` (cuVS) / `:123-145` (cuML)
+
+WHAT IS REFUSED BY NAME
+  `mutual_reachability_knn_l2`  `:151-188`
+  `mutual_reachability_graph`   `:190-256`
+both for DEVIATION 1600's two reasons, which are written out in full in
+`hdbscan/checks/mutual_reachability_dense.mojo`'s block: the sparse
+graph's MST is a forest and the fix-up (`connect_knn_graph`,
+`cross_component_nn`, `merge_msts`) is NOT IMPLEMENTED in `hierarchy/`; and the
+`DistanceEpilogue` template `mutual_reachability_knn_l2` needs does not
+exist on `neighbors/impl/detail/knn_brute_force.mojo`.
+
+WHICH k-NN, AND WHY IT MATTERS MORE HERE THAN ANYWHERE ELSE
+------------------------------------------------------------
+Theirs calls `tiled_brute_force_knn(..., dists, inds, metric)` whose
+`cuvs::selection::select_k(..., select_min, true)` -- the trailing `true`
+is `sorted` (`knn_brute_force.cuh:265-276` and `:307-318`) -- so the k
+neighbours arrive ASCENDING BY DISTANCE and `core_distances` reads the
+last column of a sorted row.
+
+Ours calls `neighbors/estimator.mojo::knn_search_traced`, this tree's
+k-NN entry, which under IDENTICAL runs the TILED arm (DEVIATION 509),
+takes its distances from `neighbors/checks/pinned_distance_tile.mojo`
+(DEVIATION 505), ranks on the composite `(distance, index)` radix key
+(DEVIATION 500) and then host-sorts the k slots on `(distance, index)`.
+That is theirs plus an index tie-break, and the tie-break is DEVIATION
+1602 below.
+
+WHERE IT RUNS. Theirs takes device pointers, and so does ours:
+`compute_knn` calls `knn_self_search_resident`, the same statements as
+`knn_search_traced` with the data and the result left on the device
+(lane cgr3-hdbscan-mst, 2026-10-03; before, X and the result went
+through host buffers).
+
+======================================================================
+DEVIATION BLOCK -- DEVIATION 1602. THE CORE DISTANCE IS A k-TH ORDER
+STATISTIC, AND THE NEIGHBOUR IT COMES FROM IS NAMED.
+======================================================================
+
+WHAT THE HAZARD IS. `core_distances` returns
+`knn_dists[row * n_neighbors + (min_samples - 1)]`: the k-th smallest
+distance from row `row`. When two neighbours of `row` are EQUIDISTANT at
+the k-th position -- which is not a corner case in a clustering library,
+it is duplicate points and grid data -- the VALUE of that k-th distance
+is well defined but WHICH NEIGHBOUR SUPPLIED IT is not. Upstream's answer
+comes from `select_k`'s comparator, which compares the distance only
+(IDENTITY_PATHS row 11), so the INDEX is arrival order.
+
+WHAT THAT DOES AND DOES NOT COST, PRECISELY, BECAUSE THE TWO ARE
+DIFFERENT QUESTIONS.
+
+  (a) THE VALUE. `core_dists[row]` is the k-th smallest element of a
+      multiset of `m` distances. A multiset's k-th smallest is a pure
+      function of the multiset, so it does not depend on which of several
+      equal elements was selected, on the order they were visited, or on
+      the selector. **Under IDENTICAL the core distance VALUE is
+      bit-identical whenever the distance MATRIX is**, and the distance
+      matrix is pinned by DEVIATION 505 and gated in `neighbors/`. That
+      is the claim `check_core_distances_vs_oracle` asserts, per cell,
+      bit for bit, against a host oracle that computes the same k-th
+      order statistic by a DIFFERENT route (a full serial sort of the
+      row, not a top-k).
+  (b) THE INDEX. `core_distances` does not read the index and this lane
+      never does either, so the tie has no path to an output through this
+      function. It is recorded as a stage (`knn.sorted_idx`, written by
+      `knn_search_traced` itself) so that a card diff can SEE a tie
+      resolving differently and dismiss it, rather than mistaking it for
+      a numeric divergence.
+  (c) WHAT MAKES (a) TRUE AND NOT MERELY PLAUSIBLE. It needs the selector
+      to return the k SMALLEST as a SET, which is what a top-k is, and
+      the k-th slot to be the k-th smallest, which needs the row SORTED.
+      `knn_search_traced` sorts on `(distance, index)`, a total order, so
+      slot `k-1` holds the k-th smallest distance on every vendor.
+      Without that sort the last SLOT would be an arbitrary member of the
+      set and (a) would be false. `neighbors/`'s own measurement is the
+      warning: the tiled arm returns the right k neighbours in an
+      UNSPECIFIED order (157 of 320 slots "wrong" ordered, 0 wrong as a
+      set), and `knn_search`'s host sort is what repairs it.
+
+WHERE THE GUARANTEE STOPS, and this lane may not assume it away.
+`archive/research/UNSUPERVISED_IDENTITY.md` records that under **FAST** three consecutive
+runs of one binary on one device returned three different sorted INDEX
+sets, and that two COLUMNS diverge at `knn.out_dist` with every sorted
+distance equal. So under FAST (b) is not reproducible run to run, and (a)
+is only as reproducible as the vendor matmul underneath it. Every
+distance-derived gate in this lane is therefore an ASSERTION under
+IDENTICAL and a REPORT under FAST, exactly as `hierarchy`'s are.
+======================================================================
+"""
+
+from std.gpu import block_dim, block_idx, thread_idx
+from max.gpu.host import DeviceBuffer, DeviceContext
+
+from core.identity_trace import IdentityTrace
+from hdbscan.checks.hdbscan_sabotage import (
+    HDB_SAB_CORE_KTH_PLUS_ONE,
+    HDB_SAB_NONE,
+)
+from hdbscan.checks.mutual_reachability_dense import refuse_nonfinite_device
+from hierarchy.impl.cluster.detail.connectivities import (
+    DISTANCE_L2_SQRT_EXPANDED,
+)
+from neighbors.estimator import knn_self_search_resident
+# TOMBSTONE: ANONLIB_HDB_CORE_TILE (DROP) deleted 2026-10-09 by lane/owed-deletions-D3; code recoverable at b639a2bd2.
+# Tried: core distances from one tiled kernel with a register top-k (core_tile.mojo, with its AFCL_G04 tile knob); hdbscan istella 44,717 -> 45,590 ms (+2%), taxi +0.8%, clusters identical; F15 mixed (B/A 0.95..1.04).
+# Restore: git apply experiments/removed/ANONLIB_HDB_CORE_TILE.patch; record in docs/TOMBSTONES.md.
+
+
+comptime CORE_TPB = 256
+"""Their `int tpb = 256` template default (`reachability.cuh:49`).
+SCHEDULING: one thread per row, one load, one store."""
+
+
+def core_distances_kernel(
+    out_core: MutPointer[Float32, MutAnyOrigin],
+    knn_dists: MutPointer[Float32, MutAnyOrigin],
+    min_samples_in: Int32,
+    n_neighbors_in: Int32,
+    n_in: Int32,
+    sabotage: Int32,
+):
+    """`reachability.cuh:60-62`, the `thrust::transform` body:
+
+        return knn_dists[row * n_neighbors + (min_samples - 1)];
+
+    One thread per row, one load, one store. No fold, no atomic, no lane
+    primitive, so the answer cannot see the launch shape.
+    """
+    var row = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if row >= Int(n_in):
+        return
+    var n_neighbors = Int(n_neighbors_in)
+    var slot = Int(min_samples_in) - 1
+    if sabotage == HDB_SAB_CORE_KTH_PLUS_ONE:
+        slot = Int(min_samples_in)
+    out_core.unsafe_store(row, knn_dists.unsafe_load(row * n_neighbors + slot))
+
+
+def core_distances(
+    ctx: DeviceContext,
+    mut knn_dists: DeviceBuffer[DType.float32],
+    min_samples: Int,
+    n_neighbors: Int,
+    n: Int,
+    mut out: DeviceBuffer[DType.float32],
+    core_tpb: Int = CORE_TPB,
+    sabotage: Int32 = HDB_SAB_NONE,
+) raises:
+    """`reachability.cuh:49-63`. `knn_dists` is `n x n_neighbors`, SORTED
+    ascending by `(distance, index)`; `out` is `n`."""
+    # `:53-54` ASSERT(n_neighbors >= min_samples, ...), their wording.
+    if n_neighbors < min_samples:
+        raise Error(
+            "hdbscan.core_distances: the size of the neighborhood should be"
+            " greater than or equal to min_samples (n_neighbors="
+            + String(n_neighbors) + ", min_samples=" + String(min_samples) + ")"
+        )
+    if min_samples < 1:
+        raise Error(
+            "hdbscan.core_distances: min_samples=" + String(min_samples)
+            + " < 1 refused by name; the k-th order statistic is undefined"
+            " below k = 1 and their slice would index at -1"
+        )
+    var blocks = (n + core_tpb - 1) // core_tpb if n > 0 else 1
+    ctx.enqueue_function[core_distances_kernel](
+        out.unsafe_ptr(),
+        knn_dists.unsafe_ptr(),
+        Int32(min_samples),
+        Int32(n_neighbors),
+        Int32(n),
+        sabotage,
+        grid_dim=(blocks, 1, 1),
+        block_dim=(core_tpb, 1, 1),
+    )
+    ctx.synchronize()
+
+
+def knn_inds_to_i32_kernel(
+    dst: MutPointer[Int32, MutAnyOrigin],
+    src: MutPointer[UInt32, MutAnyOrigin],
+    n_in: Int32,
+):
+    """`knn_search`'s `UInt32` indices narrowed to `Int32` (their
+    `thrust::transform`, `cuml .../reachability.cuh:111-116`)."""
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if i < Int(n_in):
+        dst[i] = Int32(Int(src[i]))
+
+
+def compute_knn(
+    ctx: DeviceContext,
+    mut trace: IdentityTrace,
+    mut x: DeviceBuffer[DType.float32],
+    m: Int,
+    n: Int,
+    k: Int,
+    mut out_dists: DeviceBuffer[DType.float32],
+    mut out_inds: DeviceBuffer[DType.int32],
+) raises:
+    """`reachability.cuh:80-94`: "perform knn", index and queries both X.
+
+    Device in, device out (lane cgr3-hdbscan-mst, 2026-10-03):
+    `knn_self_search_resident` runs `knn_search_traced`'s statements on the
+    device copy of X and leaves the rows, ascending by (distance, index), on
+    the device; the `UInt32` to `Int32` narrowing is a kernel. Before, X
+    went through host buffers into the host-pointer entry and the result
+    came back through the host.
+
+    `trace` is threaded in rather than constructed here so the k-NN's own
+    `knn.*` stages land in the SAME card as this lane's, with one
+    increasing `seq` (`core/identity_trace.mojo`'s uniqueness invariant;
+    the DEVIATION 518 lesson, restated at `neighbors/estimator.mojo:190`).
+    """
+    var idx_u32 = ctx.enqueue_create_buffer[DType.uint32](m * k)
+    _ = knn_self_search_resident(
+        ctx, trace, x, m, n, k, out_dists, idx_u32, True,
+    )
+    var blocks = (m * k + CORE_TPB - 1) // CORE_TPB if m * k > 0 else 1
+    ctx.enqueue_function[knn_inds_to_i32_kernel](
+        out_inds.unsafe_ptr(), idx_u32.unsafe_ptr(), Int32(m * k),
+        grid_dim=(blocks, 1, 1), block_dim=(CORE_TPB, 1, 1),
+    )
+    ctx.synchronize()
+    _ = idx_u32^
+
+
+def compute_core_dists(
+    ctx: DeviceContext,
+    mut trace: IdentityTrace,
+    mut x: DeviceBuffer[DType.float32],
+    mut core_dists: DeviceBuffer[DType.float32],
+    m: Int,
+    n: Int,
+    metric: Int,
+    min_samples: Int,
+    mut knn_dists: DeviceBuffer[DType.float32],
+    mut knn_inds: DeviceBuffer[DType.int32],
+    core_tpb: Int = CORE_TPB,
+    sabotage: Int32 = HDB_SAB_NONE,
+    n_neighbors: Int = 0,
+) raises:
+    """`n_neighbors` (fg-tsne-dbscan H2): the k-NN's width when it is wider
+    than `min_samples` (0 = `min_samples`); the core distance is still slot
+    `min_samples - 1` of each sorted row (DEVIATION 1602), the same value.
+
+    `_compute_core_dists`, `reachability.cuh:100-122`. Their name has a
+    leading underscore because it is their CPU/GPU interop entry; the
+    underscore is dropped here because Mojo has no such convention and
+
+
+    `knn_dists` (`m x min_samples`) and `knn_inds` are the caller's, so
+    the driver can record them as stages; theirs are function-local
+    `rmm::device_uvector`s (`:114-115`).
+    """
+    # `:109-110` RAFT_EXPECTS(metric == L2SqrtExpanded, "Currently only L2
+    # expanded distance is supported"), their wording and their only
+    # accepted metric.
+    if metric != DISTANCE_L2_SQRT_EXPANDED:
+        raise Error(
+            "hdbscan.compute_core_dists: metric=" + String(metric)
+            + " refused by name; Currently only L2 expanded distance is"
+            " supported (their RAFT_EXPECTS at reachability.cuh:109). To"
+            " close this refusal, implementation the metric into"
+            " hierarchy/impl/cluster/detail/connectivities.mojo's"
+            " distance step first, because the dense mutual reachability"
+            " graph reads that matrix"
+        )
+    # TOMBSTONE: ANONLIB_HDB_CORE_TILE (DROP) deleted 2026-10-09 by lane/owed-deletions-D3; code recoverable at b639a2bd2.
+    # Tried: compute_core_dists_tile here instead of the k-NN route.
+    # Restore: git apply experiments/removed/ANONLIB_HDB_CORE_TILE.patch; record in docs/TOMBSTONES.md.
+    var nn_w = n_neighbors if n_neighbors > min_samples else min_samples
+    compute_knn(ctx, trace, x, m, n, nn_w, knn_dists, knn_inds)
+    # `:121` Slice core distances (distances to kth nearest neighbor)
+    core_distances(
+        ctx, knn_dists, min_samples, nn_w, m, core_dists,
+        core_tpb, sabotage,
+    )
+    # NOT THEIRS. DEVIATION 1607: the core distances come off a different
+    # code path (`neighbors/`) from the dense matrix, so `hierarchy`'s
+    # DEVIATION 623 guard does not cover them.
+    refuse_nonfinite_device(
+        ctx, core_dists, m, "hdbscan.compute_core_dists", "core distances",
+        sabotage,
+    )
+
+
+def mutual_reachability_knn_l2() raises:
+    """`reachability.cuh:151-188`. NOT IMPLEMENTED; raises by name."""
+    raise Error(
+        "hdbscan.mutual_reachability_knn_l2: NOT IMPLEMENTED (DEVIATION 1600)."
+        " It runs cuvs::neighbors::detail::tiled_brute_force_knn with the"
+        " ReachabilityPostProcess epilogue so the k-selection happens IN"
+        " mutual reachability space, and"
+        " neighbors/impl/detail/knn_brute_force.mojo carries no"
+        " DistanceEpilogue template parameter. The epilogue is not"
+        " optional: max(core[col], max(core[row], alpha*d)) is not monotone"
+        " in d alone, so the mutual-reachability neighbours are not the"
+        " plain neighbours reordered. To close this refusal, the neighbors"
+        " lane threads an epilogue through the tiled arm; until then the"
+        " dense arm (DEVIATION 1600) is the graph"
+    )
+
+
+def mutual_reachability_graph(n_components_hint: Int) raises:
+    """`reachability.cuh:190-256`. NOT IMPLEMENTED; raises by name."""
+    raise Error(
+        "hdbscan.mutual_reachability_graph: NOT IMPLEMENTED (DEVIATION 1600)."
+        " Their sparse graph is a symmetrized min_samples-nearest-neighbour"
+        " COO, which is DISCONNECTED whenever the data has more than one"
+        " well-separated cluster -- the case HDBSCAN exists for -- so"
+        " build_sorted_mst returns a forest and enters its fix-up loop."
+        " That loop needs connect_knn_graph / cross_component_nn /"
+        " merge_msts, which is NOT IMPLEMENTED"
+        " and hierarchy/impl/cluster/detail/mst.mojo raises by name. It"
+        " also needs mutual_reachability_knn_l2, refused above. To close"
+        " this refusal, implementation the cross-component fix-up in the hierarchy"
+        " lane (pinning the host overload's std::mt19937 random vertex"
+        " choice, mst.cuh:167-190) and the k-NN epilogue in the neighbors"
+        " lane; until then use the dense arm, which is the complete graph"
+        " and cannot be disconnected (hint: "
+        + String(n_components_hint) + " components)"
+    )

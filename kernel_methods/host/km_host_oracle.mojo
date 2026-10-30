@@ -1,0 +1,825 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 the authors. Part of anonlib, DOI-WITHHELD
+# SHIPS: compiled into a CPU host binding (python/anonlib/host_surface.py names which); product, not only a check.
+"""KernelRidge, Nystroem and RBFSampler on the HOST: the one-shot entries of
+`kernel_methods/estimator.mojo` restated without a device (CPU training for
+the workstream D estimators, 2026-09-15).
+
+WHAT THIS IS. `kernel_ridge_fit_host`, `nystroem_fit_host`,
+`rbf_sampler_fit_host` and their predict and transform run their arithmetic
+in device kernels. This file is a SECOND spelling of the driver, in the
+driver's order, with no `DeviceContext`, no trace and no launch geometry, so
+the kernel_methods CPU host binding serves the three estimators on a
+CPU-only install. Every stage names the device line it mirrors:
+
+    the kernel matrix       kernel_methods/checks/kernel_matrix.mojo::
+                            km_kernel_matrix at LINEAR and RBF (plus polynomial,
+                            sigmoid and ascending L1 Laplacian epilogues): the squared row
+                            norms (svm row_norm_l2sq_kernel, an ascending
+                            ftz(identical_mul_add(v, v, acc)) chain), the
+                            product at OP_NT through the gemm profile's
+                            normative answer, then svm
+                            rbf_kernel_expanded_kernel's epilogue in its
+                            association
+    the ridge               kernel_ridge.mojo::add_ridge_diag_kernel,
+                            ftz(ftz(K_ii) + alpha)
+    potrf and potrs         cholesky/host/chol_oracle.mojo::
+                            chol_host_factor_lower and chol_host_solve (the
+                            gp host binding's factorization, without the
+                            door's validation), at jitter +0.0, which
+                            is DEVIATION 1660's state: the ridge is already in
+                            the matrix
+    the KRR prediction      identical_gemm_into at OP_NN, `K(X, X_fit) . dual`
+    the basis rows          random_features.mojo::km_basis_indices, CALLED
+                            (a host pass on the device path too)
+    the Jacobi              decomposition/host/pca_oracle.mojo::
+                            host_jacobi_eigh at JACOBI_SWEEPS and JACOBI_TOL,
+                            the PCA host lane's replay of jacobi_eigh_kernel
+    the sign flip           pca_oracle.mojo::host_sign_flip (sign_flip_kernel)
+    the order and the clip  estimator.mojo::_eigen_order_f32,
+                            _singular_value_f32 and _eigen_clip_f32, restated
+    U / sqrt(S)             estimator.mojo::scale_columns_kernel,
+                            identical_div per cell
+    the normalization       identical_gemm_into at OP_NT with the column
+                            signed Q when an eigenvalue is negative
+    the Nystroem embedding  the cross kernel, then OP_NT against the
+                            normalization (DEVIATION 1674's transpose)
+    the random features     random_features.mojo::km_random_weights_host and
+                            km_random_offsets_host: the SAME scalar functions
+                            random_weights_kernel and random_offsets_kernel
+                            call per cell, so the draws are integer arithmetic
+                            into one pinned transform on both sides
+    the RBF feature map     identical_gemm_into at OP_NN, then
+                            feature_map_epilogue_kernel's add, cos, multiply
+
+WHAT IS REFUSED, BY NAME, AS ON THE DEVICE: non-finite or mis-shaped inputs,
+a non-positive gamma where the kernel reads one, a NaN or negative alpha, a
+ridged kernel matrix that does not factor (DEVIATION 1662), an unconverged
+Jacobi, n_components above n_samples or above KM_MAX_BASIS_POOL rows, and a
+non-positive gamma or n_components for the sampler. Precomputed kernels remain refused, matching the device surface. Polynomial
+degree is passed through and bounded to the same 0..32 interval as the device.
+
+THE SABOTAGE. Laplacian reverses its L1 feature chain. Under
+`-D ANONLIB_HOST_SABOTAGE=1` every GEMM leaf walks descending
+(`gemm/host/gemm_oracle.mojo::GEMM_ORACLE_HOST_SABOTAGE`), which moves every
+kernel matrix, the Cholesky trailing update, the normalization, the
+embedding and the random feature map.
+"""
+
+from std.memory import bitcast
+from std.math import abs
+from std.sys.compile import is_defined
+
+from core.host_parallel import host_parallelize
+
+from checks.numerics import GLOBAL_NUMERIC_MODE, NUMERIC_IDENTICAL
+from checks.numerics import (
+    ftz,
+    identical_cos,
+    identical_div,
+    identical_exp,
+    identical_mul,
+    identical_mul_add,
+    identical_sqrt,
+    identical_tanh,
+)
+from core.host_predict_threads import (
+    host_list_ptr,
+    host_predict_chunk,
+    host_predict_task_count,
+)
+from cholesky.host.chol_oracle import chol_host_factor_lower, chol_host_solve
+from decomposition.host.pca_oracle import (
+    JACOBI_SWEEPS,
+    JACOBI_TOL,
+    host_jacobi_eigh,
+    host_sign_flip,
+)
+from gemm.host.identical_gemm import OP_NN, OP_NT, gemm_oracle
+from x_decomp.rr import RR_EIGH_SWEEPS, host_eigh_rr
+from x_decomp.eigh_scale import host_es_scale, host_es_unscale_diag
+from core.host_gemm_simd import host_gemm_identical
+from kernel_methods.checks.random_features import (
+    km_basis_indices,
+    km_feature_scale,
+    km_random_offsets_host,
+    km_random_weights_host,
+    km_weight_sigma,
+)
+
+#: `KM_KERNEL_*` (`kernel_methods/checks/kernel_matrix.mojo`), which are
+#: svm's `KERNEL_*` codes plus the lane's laplacian at 5.
+comptime KMH_KERNEL_LINEAR = 0
+comptime KMH_KERNEL_POLYNOMIAL = 1
+comptime KMH_KERNEL_RBF = 2
+comptime KMH_KERNEL_SIGMOID = 3
+comptime KMH_KERNEL_PRECOMPUTED = 4
+comptime KMH_KERNEL_LAPLACIAN = 5
+comptime KMH_KERNEL_COSINE = 6
+comptime KMH_KERNEL_CHI2 = 7
+comptime KMH_KERNEL_ADDITIVE_CHI2 = 8
+# Same bound as impl/distance/kernel_matrices.mojo, without importing GPU code.
+comptime KMH_MAX_DEGREE = 32
+
+
+def kmh_kernel_name(kernel: Int) -> String:
+    """`km_kernel_name`."""
+    if kernel == KMH_KERNEL_LINEAR:
+        return String("linear")
+    if kernel == KMH_KERNEL_POLYNOMIAL:
+        return String("polynomial")
+    if kernel == KMH_KERNEL_RBF:
+        return String("rbf")
+    if kernel == KMH_KERNEL_SIGMOID:
+        return String("sigmoid")
+    if kernel == KMH_KERNEL_PRECOMPUTED:
+        return String("precomputed")
+    if kernel == KMH_KERNEL_LAPLACIAN:
+        return String("laplacian")
+    if kernel == KMH_KERNEL_COSINE:
+        return String("cosine")
+    if kernel == KMH_KERNEL_CHI2:
+        return String("chi2")
+    if kernel == KMH_KERNEL_ADDITIVE_CHI2:
+        return String("additive_chi2")
+    return String("unknown")
+
+
+def kmh_validate_matrix(
+    values: List[Float32], n_rows: Int, n_cols: Int, what: String
+) raises:
+    """`km_validate_matrix`: shape and finiteness, by name, with the
+    offending flat index (DEVIATION 1686)."""
+    if n_rows <= 0 or n_cols <= 0:
+        raise Error(
+            what
+            + ": need positive dimensions, got "
+            + String(n_rows)
+            + " x "
+            + String(n_cols)
+        )
+    if len(values) != n_rows * n_cols:
+        raise Error(
+            what
+            + " holds "
+            + String(len(values))
+            + " floats, "
+            + String(n_rows)
+            + " x "
+            + String(n_cols)
+            + " needs "
+            + String(n_rows * n_cols)
+        )
+    for i in range(len(values)):
+        var v = values[i]
+        if v != v:
+            raise Error(
+                what + ": NaN at flat index " + String(i)
+                + "; refused by name (DEVIATION 1686)"
+            )
+        if v > Float32(3.4028234663852886e38) or v < Float32(
+            -3.4028234663852886e38
+        ):
+            raise Error(
+                what + ": infinity at flat index " + String(i)
+                + "; refused by name (DEVIATION 1686)"
+            )
+
+
+def kmh_validate_kernel(
+    kernel: Int, degree: Int, gamma: Float64, coef0: Float64, what: String
+) raises:
+    """The device's five kernel kinds and polynomial degree contract."""
+    if kernel == KMH_KERNEL_PRECOMPUTED:
+        raise Error(what + ": kernel='precomputed' is refused by name (DEVIATION 1683)")
+    if kernel < 0 or kernel > KMH_KERNEL_ADDITIVE_CHI2:
+        raise Error(what + ": unknown kernel value " + String(kernel))
+    if kernel == KMH_KERNEL_POLYNOMIAL:
+        if degree < 0 or degree > KMH_MAX_DEGREE:
+            raise Error(what + ": polynomial degree must be between 0 and " + String(KMH_MAX_DEGREE))
+    if gamma != gamma:
+        raise Error(what + ": gamma is NaN")
+    if coef0 != coef0:
+        raise Error(what + ": coef0 is NaN")
+    if kernel != KMH_KERNEL_LINEAR and kernel != KMH_KERNEL_COSINE and kernel != KMH_KERNEL_ADDITIVE_CHI2 and not (gamma > 0.0):
+        raise Error(
+            what
+            + ": the " + kmh_kernel_name(kernel) + " kernel needs a POSITIVE gamma; got a value that is"
+            " not greater than zero"
+        )
+
+
+#: fam2-kernel-gp (2026-10-04): the host column of
+#: `kernel_methods/checks/kernel_matrix.mojo::KM_IDN_RBF_CELL` (a candidate
+#: arm, OFF by default), the same defines and the same feature bound.
+comptime KMH_RBF_CELL = (
+    GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL
+    and is_defined["ANONLIB_IDN_KM_RBF_CELL"]()
+    and not is_defined["ANONLIB_IDN_ALL_OFF"]()
+)
+comptime KMH_RBF_CELL_MAX_D = 16 if is_defined["ANONLIB_IDN_KM_RBF_CELL_D16"]() else 64
+
+#: fix-kg1-kernel (audit B11): the host column of
+#: `kernel_methods/checks/kernel_matrix.mojo::KM_IDN_DOT_CELL` (ON by
+#: default), the same defines and the same feature bound.
+comptime KMH_DOT_CELL = GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL and not (
+    is_defined["ANONLIB_IDN_KM_DOT_CELL_OFF"]() or is_defined["ANONLIB_IDN_ALL_OFF"]()
+)
+comptime KMH_DOT_CELL_MAX_D = 16 if is_defined["ANONLIB_IDN_KM_DOT_CELL_D16"]() else 64
+
+
+def kmh_row_norms(x: List[Float32], n_rows: Int, k: Int) -> List[Float32]:
+    """`svm row_norm_l2sq_kernel`: one ascending chain per row."""
+    var out = List[Float32]()
+    for i in range(n_rows):
+        var acc = Float32(0.0)
+        for c in range(k):
+            var v = ftz(x[i * k + c])
+            acc = ftz(identical_mul_add(v, v, acc))
+        out.append(ftz(acc))
+    return out^
+
+
+def _kmh_cosine_rows(x: List[Float32], rows: Int, k: Int) -> List[Float32]:
+    """`cosine_rows_kernel`: each row over its l2 norm, a zero row as is."""
+    var norms = kmh_row_norms(x, rows, k)
+    var out = List[Float32](capacity=rows * k)
+    for r in range(rows):
+        var q = ftz(norms[r])
+        for c in range(k):
+            var v = ftz(x[r * k + c])
+            if q == Float32(0.0):
+                out.append(v)
+            else:
+                out.append(ftz(identical_div(v, ftz(identical_sqrt(q)))))
+    return out^
+
+
+def kmh_kernel_matrix(
+    kernel: Int,
+    degree: Int,
+    gamma: Float64,
+    coef0: Float64,
+    a: List[Float32],
+    b: List[Float32],
+    m: Int,
+    n: Int,
+    k: Int,
+) raises -> List[Float32]:
+    """Replay the five device kernels, preserving each cell's operation order.
+
+    Polynomial/tanh mirror impl/distance/kernel_matrices.mojo; Laplacian
+    mirrors the ascending L1 chain and checks/kernel_matrix.mojo epilogue.
+    """
+    kmh_validate_kernel(kernel, degree, gamma, coef0, "kernel matrix")
+    if kernel == KMH_KERNEL_LAPLACIAN:
+        var out = List[Float32](length=m * n, fill=Float32(0.0))
+        var op = host_list_ptr(out)
+        var gain = Float32(-gamma)
+        var tasks = host_predict_task_count(m)
+        if m * n * k < 32768:
+            tasks = 1
+        var chunk = host_predict_chunk(m, tasks)
+
+        def _rows(task: Int) {imm a, imm b, imm m, imm n, imm k, imm gain, imm chunk, imm op}:
+            var lo = task * chunk
+            var hi = min(lo + chunk, m)
+            for i in range(lo, hi):
+                for j in range(n):
+                    var acc = Float32(0.0)
+                    for pos in range(k):
+                        var c = pos
+                        comptime if is_defined["ANONLIB_HOST_SABOTAGE"]():
+                            c = k - 1 - pos
+                        acc = ftz(acc + abs(ftz(ftz(a[i * k + c]) - ftz(b[j * k + c]))))
+                    op.unsafe_store(
+                        i * n + j,
+                        ftz(identical_exp(ftz(identical_mul(gain, acc)))),
+                    )
+
+        if tasks == 1:
+            _rows(0)
+        else:
+            host_parallelize(_rows, tasks)
+        return out^
+    if kernel == KMH_KERNEL_CHI2 or kernel == KMH_KERNEL_ADDITIVE_CHI2:
+        # chi2_cell_kernel, cell by cell, the same line
+        var out = List[Float32](length=m * n, fill=Float32(0.0))
+        var gain = Float32(-gamma)
+        for i in range(m):
+            for j in range(n):
+                var acc = Float32(0.0)
+                for c in range(k):
+                    var x = ftz(a[i * k + c])
+                    var y = ftz(b[j * k + c])
+                    var s = ftz(x + y)
+                    if s != Float32(0.0):
+                        var d = ftz(x - y)
+                        acc = ftz(acc + ftz(identical_div(ftz(identical_mul(d, d)), s)))
+                if kernel == KMH_KERNEL_CHI2:
+                    out[i * n + j] = ftz(identical_exp(ftz(identical_mul(gain, acc))))
+                else:
+                    out[i * n + j] = -acc
+        return out^
+    if kernel == KMH_KERNEL_COSINE:
+        # cosine_rows_kernel on both operands, then the pinned GEMM
+        return gemm_oracle(_kmh_cosine_rows(a, m, k), _kmh_cosine_rows(b, n, k), OP_NT, m, n, k)
+    comptime if KMH_RBF_CELL:
+        if kernel == KMH_KERNEL_RBF and k <= KMH_RBF_CELL_MAX_D:
+            # `km_rbf_cell_kernel`, cell by cell, the same lines
+            var outc = List[Float32](length=m * n, fill=Float32(0.0))
+            var opc = host_list_ptr(outc)
+            var neg_gamma = -Float32(gamma)
+            var tasks_c = host_predict_task_count(m)
+            if m * n * k < 32768:
+                tasks_c = 1
+            var chunk_c = host_predict_chunk(m, tasks_c)
+
+            def _cell_rows(task: Int) {imm a, imm b, imm m, imm n, imm k, imm neg_gamma, imm chunk_c, imm opc}:
+                var lo = task * chunk_c
+                var hi = min(lo + chunk_c, m)
+                for i in range(lo, hi):
+                    for j in range(n):
+                        var acc = Float32(0.0)
+                        for c in range(k):
+                            var d = ftz(ftz(a[i * k + c]) - ftz(b[j * k + c]))
+                            acc = ftz(identical_mul_add(d, d, acc))
+                        opc.unsafe_store(
+                            i * n + j,
+                            ftz(identical_exp(ftz(identical_mul(neg_gamma, acc)))),
+                        )
+
+            if tasks_c == 1:
+                _cell_rows(0)
+            else:
+                host_parallelize(_cell_rows, tasks_c)
+            return outc^
+    comptime if KMH_DOT_CELL:
+        if (
+            kernel == KMH_KERNEL_POLYNOMIAL or kernel == KMH_KERNEL_SIGMOID
+        ) and k <= KMH_DOT_CELL_MAX_D:
+            # `km_dot_cell_kernel`, cell by cell, the same lines
+            var outd = List[Float32](length=m * n, fill=Float32(0.0))
+            var opd = host_list_ptr(outd)
+            var gain_d = Float32(gamma)
+            var offset_d = Float32(coef0)
+            var poly_d = kernel == KMH_KERNEL_POLYNOMIAL
+            var tasks_d = host_predict_task_count(m)
+            if m * n * k < 32768:
+                tasks_d = 1
+            var chunk_d = host_predict_chunk(m, tasks_d)
+
+            def _dot_rows(task: Int) {imm a, imm b, imm m, imm n, imm k, imm gain_d, imm offset_d, imm degree, imm poly_d, imm chunk_d, imm opd}:
+                var lo = task * chunk_d
+                var hi = min(lo + chunk_d, m)
+                for i in range(lo, hi):
+                    for j in range(n):
+                        var dd = Float32(0.0)
+                        for c in range(k):
+                            dd = ftz(identical_mul_add(ftz(a[i * k + c]), ftz(b[j * k + c]), dd))
+                        var base_d = ftz(identical_mul_add(gain_d, dd, offset_d))
+                        var v: Float32
+                        if poly_d:
+                            var acc_d = Float32(1.0)
+                            for _ in range(degree):
+                                acc_d = ftz(identical_mul(acc_d, base_d))
+                            v = acc_d
+                        else:
+                            v = ftz(identical_tanh(base_d))
+                        opd.unsafe_store(i * n + j, v)
+
+            if tasks_d == 1:
+                _dot_rows(0)
+            else:
+                host_parallelize(_dot_rows, tasks_d)
+            return outd^
+    var dot = host_gemm_identical(a, b, OP_NT, m, n, k)
+    if kernel == KMH_KERNEL_LINEAR:
+        return dot^
+    if kernel == KMH_KERNEL_RBF:
+        var na = kmh_row_norms(a, m, k)
+        var nb = kmh_row_norms(b, n, k)
+        var gain = Float32(gamma)
+        for i in range(m):
+            for j in range(n):
+                var t = i * n + j
+                var s = ftz(
+                    ftz(ftz(na[i]) + ftz(nb[j])) - ftz(Float32(2.0) * ftz(dot[t]))
+                )
+                var e = ftz((-gain) * s)
+                dot[t] = ftz(identical_exp(e))
+        return dot^
+    var gain = Float32(gamma)
+    var offset = Float32(coef0)
+    for t in range(m * n):
+        var base = ftz(identical_mul_add(gain, ftz(dot[t]), offset))
+        if kernel == KMH_KERNEL_SIGMOID:
+            dot[t] = ftz(identical_tanh(base))
+        else:
+            var acc = Float32(1.0)
+            for _ in range(degree):
+                acc = ftz(identical_mul(acc, base))
+            dot[t] = acc
+    return dot^
+
+
+# ===========================================================================
+# KernelRidge
+# ===========================================================================
+
+
+def kmh_kernel_ridge_fit(
+    x: List[Float32],
+    y: List[Float32],
+    n: Int,
+    d: Int,
+    t: Int,
+    kernel: Int,
+    degree: Int,
+    gamma: Float64,
+    coef0: Float64,
+    alpha: Float32,
+    sw: List[Float32] = List[Float32](),
+) raises -> List[Float32]:
+    """`kernel_ridge_fit_host`: form `K` (or take it, kernel='precomputed'),
+    weight it (`sw`, the per-row sqrt(sample_weight) factors, empty when
+    unweighted), ridge it, factor it, solve it. Returns `dual_coef_`,
+    `n x t` row-major; the fit refuses a non-zero `info` by name
+    (DEVIATION 1662)."""
+    kmh_validate_matrix(x, n, d, "kernel_ridge X")
+    kmh_validate_matrix(y, n, t, "kernel_ridge y")
+    var precomputed = kernel == KMH_KERNEL_PRECOMPUTED
+    if precomputed:
+        if d != n:
+            raise Error(
+                "kernel_ridge_fit_host: kernel='precomputed' needs a square"
+                " kernel matrix, got " + String(n) + " x " + String(d)
+            )
+    else:
+        kmh_validate_kernel(kernel, degree, gamma, coef0, "kernel_ridge")
+    var weighted = len(sw) > 0
+    if weighted:
+        if len(sw) != n:
+            raise Error(
+                "kernel_ridge_fit_host: sample weight factors hold "
+                + String(len(sw)) + " values, X has " + String(n) + " rows"
+            )
+        for i in range(n):
+            if not (sw[i] >= Float32(0.0)) or sw[i] > Float32(3.4028234663852886e38):
+                raise Error(
+                    "kernel_ridge_fit_host: sample weight factor " + String(i)
+                    + " is negative or not finite; refused by name"
+                )
+    if alpha != alpha:
+        raise Error("kernel_ridge_fit_host: alpha is NaN; refused by name")
+    if alpha < Float32(0.0):
+        raise Error(
+            "kernel_ridge_fit_host: alpha must be non-negative, got a"
+            " negative value. scikit-learn's own parameter constraint is"
+            " Interval(Real, 0, None, closed='left'). DEVIATION 1686"
+        )
+    var k = x.copy() if precomputed else kmh_kernel_matrix(kernel, degree, gamma, coef0, x, x, n, n, d)
+    if weighted:
+        # krr_weight_kernel: ftz(ftz(K_ij) * ftz(ftz(s_i) * ftz(s_j)))
+        for i in range(n):
+            var si = ftz(sw[i])
+            for j in range(n):
+                var w = ftz(si * ftz(sw[j]))
+                k[i * n + j] = ftz(ftz(k[i * n + j]) * w)
+    # add_ridge_diag_kernel
+    for i in range(n):
+        var dv = ftz(k[i * n + i])
+        k[i * n + i] = ftz(dv + alpha)
+    # potrf_lower at the pinned width with no jitter of its own
+    # (kernel_ridge_alpha_is_the_ridge) and no validation, as the device
+    # solve calls it; the host factorization's ridge step at +0.0 leaves
+    # every positive diagonal entry's bits as they are.
+    var f = chol_host_factor_lower(k, n, Float32(0.0))
+    if f.info != 0:
+        raise Error(
+            "kernel_ridge_fit_host: the ridged kernel matrix K + alpha I is"
+            " NOT positive definite (info="
+            + String(f.info)
+            + ", the leading minor of order "
+            + String(f.info)
+            + " failed). kernel="
+            + kmh_kernel_name(kernel)
+            + ", n_samples="
+            + String(n)
+            + ". THE CLOSURE IS alpha: raise it (DEVIATION 1662)"
+        )
+    var dual = chol_host_solve(f, kmh_scale_rows(y, sw, n, t) if weighted else y.copy(), t)
+    _ = f^
+    if weighted:
+        return kmh_scale_rows(dual, sw, n, t)
+    return dual^
+
+
+def kmh_scale_rows(v: List[Float32], sw: List[Float32], n: Int, t: Int) -> List[Float32]:
+    """`krr_scale_rows`: `ftz(ftz(v) * ftz(s_i))`, one rounding per cell."""
+    var out = List[Float32](capacity=n * t)
+    for i in range(n):
+        var si = ftz(sw[i])
+        for c in range(t):
+            out.append(ftz(ftz(v[i * t + c]) * si))
+    return out^
+
+
+def kmh_kernel_ridge_predict(
+    x_fit: List[Float32],
+    dual: List[Float32],
+    n: Int,
+    d: Int,
+    t: Int,
+    kernel: Int,
+    degree: Int,
+    gamma: Float64,
+    coef0: Float64,
+    x_new: List[Float32],
+    q: Int,
+) raises -> List[Float32]:
+    """`kernel_ridge_predict_host`: `K(X, X_fit) . dual` at OP_NN
+    (DEVIATION 1680). `q x t` row-major."""
+    kmh_validate_matrix(x_new, q, d, "predict X")
+    if kernel == KMH_KERNEL_PRECOMPUTED:
+        # X IS the q x n cross-kernel matrix.
+        if d != n:
+            raise Error("kernel_ridge predict: kernel='precomputed' needs X with n_samples columns")
+        return gemm_oracle(x_new, dual, OP_NN, q, t, n)
+    kmh_validate_kernel(kernel, degree, gamma, coef0, "kernel_ridge")
+    var k = kmh_kernel_matrix(kernel, degree, gamma, coef0, x_new, x_fit, q, n, d)
+    return host_gemm_identical(k, dual, OP_NN, q, t, n)
+
+
+# ===========================================================================
+# Nystroem
+# ===========================================================================
+
+
+@fieldwise_init
+struct KmhNystroem(Movable):
+    """`NystroemModel`'s arrays and sweep count."""
+
+    var components: List[Float32]
+    var indices: List[Int32]
+    var normalization: List[Float32]
+    var eigenvalues: List[Float32]
+    var eigenvectors: List[Float32]
+    var sweeps: Int
+
+
+#: fam-kernel-gp (2026-10-04): the host column of
+#: `kernel_methods/estimator.mojo::NYS_IDN_RR_EIGH`, the same two defines.
+comptime KMH_NYS_RR = GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL and not (
+    is_defined["ANONLIB_IDN_NYS_RR_EIGH_OFF"]() or is_defined["ANONLIB_IDN_ALL_OFF"]()
+)
+
+#: fam-kernel-gp (2026-10-04): the host column of
+#: `kernel_methods/estimator.mojo::RBF_IDN_FUSED`, the same two defines and
+#: the same feature bound (`kernel_methods/rbf_fused.mojo::RBF_FUSED_MAX_D`).
+comptime KMH_RBF_FUSED = GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL and not (
+    is_defined["ANONLIB_IDN_RBF_FUSED_OFF"]() or is_defined["ANONLIB_IDN_ALL_OFF"]()
+)
+comptime KMH_RBF_FUSED_MAX_D = 64
+
+
+def _kmh_singular_value(lam: Float32) -> Float32:
+    """`estimator.mojo::_singular_value_f32`: `|lambda|` by bits."""
+    return bitcast[DType.float32](
+        bitcast[DType.uint32](lam) & UInt32(0x7FFFFFFF)
+    )
+
+
+def _kmh_eigen_order(values: List[Float32], q: Int) -> List[Int]:
+    """`estimator.mojo::_eigen_order_f32` at KMSAB_NONE: a selection sort,
+    value descending, the lower index kept on a tie."""
+    var used = List[Bool]()
+    for _ in range(q):
+        used.append(False)
+    var order = List[Int]()
+    for _ in range(q):
+        var best = -1
+        for c in range(q):
+            if used[c]:
+                continue
+            if best < 0:
+                best = c
+                continue
+            if values[c] > values[best]:
+                best = c
+        used[best] = True
+        order.append(best)
+    return order^
+
+
+def kmh_nystroem_fit(
+    x: List[Float32],
+    n: Int,
+    d: Int,
+    kernel: Int,
+    degree: Int,
+    gamma: Float64,
+    coef0: Float64,
+    q: Int,
+    seed: UInt64,
+) raises -> KmhNystroem:
+    """`nystroem_fit_host`, step for step."""
+    kmh_validate_matrix(x, n, d, "nystroem X")
+    kmh_validate_kernel(kernel, degree, gamma, coef0, "nystroem")
+
+    var basis = km_basis_indices(seed, n, q)
+    var comp = List[Float32]()
+    for c in range(q):
+        var srow = Int(basis[c])
+        for f in range(d):
+            comp.append(x[srow * d + f])
+
+    var raw = kmh_kernel_matrix(kernel, degree, gamma, coef0, comp, comp, q, q, d)
+    # the device's power-of-two range scale (x_decomp/eigh_scale.mojo),
+    # the diagonal unscaled after the solve
+    var fac = host_es_scale(raw, q)
+    var vecs = List[Float32]()
+    var sweeps = 0
+    comptime if KMH_NYS_RR:
+        # `_nystroem_rr_eigh_idn`: the round-robin rounds, test and budget
+        vecs = List[Float32](length=q * q, fill=Float32(0.0))
+        var rr = host_eigh_rr(raw, vecs, q, RR_EIGH_SWEEPS, Float32(JACOBI_TOL))
+        if not rr[0]:
+            raise Error(
+                "nystroem_fit_host: the device Jacobi did not converge in "
+                + String(RR_EIGH_SWEEPS)
+                + " sweeps at n_components = "
+                + String(q)
+            )
+        host_sign_flip(vecs, q)
+        sweeps = rr[1]
+    else:
+        var jac = host_jacobi_eigh(raw, q, JACOBI_SWEEPS, Float32(JACOBI_TOL))
+        vecs = jac.vectors.copy()
+        host_sign_flip(vecs, q)
+        if not jac.converged:
+            raise Error(
+                "nystroem_fit_host: the device Jacobi did not converge in "
+                + String(JACOBI_SWEEPS)
+                + " sweeps at n_components = "
+                + String(q)
+                + "; ||offdiag(A)||_F / ||A||_F is still "
+                + String(jac.rel)
+                + " against a tolerance of "
+                + String(JACOBI_TOL)
+            )
+        sweeps = jac.executed
+    host_es_unscale_diag(raw, q, fac)
+
+    var values_raw = List[Float32]()
+    var mags = List[Float32]()
+    for c in range(q):
+        values_raw.append(raw[c * q + c])
+        mags.append(_kmh_singular_value(raw[c * q + c]))
+    var order = _kmh_eigen_order(mags, q)
+
+    var clip = Float32(1e-12)
+    var values = List[Float32]()
+    var sqrt_s = List[Float32]()
+    var any_negative = False
+    var vecs_ord = List[Float32](length=q * q, fill=Float32(0.0))
+    var vt_ord = List[Float32](length=q * q, fill=Float32(0.0))
+    for c in range(q):
+        var src = order[c]
+        var s = mags[src]
+        if s < clip:
+            s = clip
+        values.append(s)
+        sqrt_s.append(ftz(identical_sqrt(s)))
+        var negative = values_raw[src] < Float32(0.0)
+        if negative:
+            any_negative = True
+        for f in range(q):
+            var e = vecs[f * q + src]
+            vecs_ord[f * q + c] = e
+            vt_ord[f * q + c] = -e if negative else e
+
+    # scale_columns_kernel: a divide per cell, never a reciprocal.
+    var z = List[Float32](length=q * q, fill=Float32(0.0))
+    for tcell in range(q * q):
+        var kcol = tcell % q
+        z[tcell] = ftz(identical_div(ftz(vecs_ord[tcell]), ftz(sqrt_s[kcol])))
+
+    var norm: List[Float32]
+    if any_negative:
+        norm = host_gemm_identical(z, vt_ord, OP_NT, q, q, q)
+    else:
+        norm = host_gemm_identical(z, vecs_ord, OP_NT, q, q, q)
+
+    _ = raw^
+    return KmhNystroem(comp^, basis^, norm^, values^, vecs_ord^, sweeps)
+
+
+def kmh_nystroem_transform(
+    components: List[Float32],
+    normalization: List[Float32],
+    q: Int,
+    d: Int,
+    kernel: Int,
+    degree: Int,
+    gamma: Float64,
+    coef0: Float64,
+    x: List[Float32],
+    m: Int,
+) raises -> List[Float32]:
+    """`nystroem_transform_host`: `K(X, components) @ normalization.T`
+    (DEVIATION 1674). `m x q` row-major."""
+    kmh_validate_matrix(x, m, d, "nystroem transform X")
+    kmh_validate_kernel(kernel, degree, gamma, coef0, "nystroem")
+    var k = kmh_kernel_matrix(kernel, degree, gamma, coef0, x, components, m, q, d)
+    return host_gemm_identical(k, normalization, OP_NT, m, q, q)
+
+
+# ===========================================================================
+# RBFSampler
+# ===========================================================================
+
+
+@fieldwise_init
+struct KmhRBFSampler(Movable):
+    var weights: List[Float32]
+    var offset: List[Float32]
+    var sigma: Float32
+    var scale: Float32
+
+
+def kmh_rbf_sampler_fit(
+    d: Int, q: Int, gamma: Float32, seed: UInt64
+) raises -> KmhRBFSampler:
+    """`rbf_sampler_fit_host`: the draws depend on `n_features`,
+    `n_components` and the seed alone."""
+    if d <= 0:
+        raise Error(
+            "rbf_sampler_fit_host: n_features must be positive, got "
+            + String(d)
+        )
+    if q <= 0:
+        raise Error(
+            "rbf_sampler_fit_host: n_components must be positive, got "
+            + String(q)
+            + ". scikit-learn's constraint is Interval(Integral, 1, None,"
+            " closed='left'). DEVIATION 1686"
+        )
+    if gamma != gamma or not (gamma > Float32(0.0)):
+        raise Error(
+            "rbf_sampler_fit_host: gamma must be POSITIVE; got a value that"
+            " is not greater than zero. DEVIATION 1686"
+        )
+    var sigma = km_weight_sigma(gamma)
+    var scale = km_feature_scale(q)
+    var w = km_random_weights_host(seed, d, q, sigma)
+    var b = km_random_offsets_host(seed, q)
+    return KmhRBFSampler(w^, b^, sigma, scale)
+
+
+def kmh_rbf_sampler_transform(
+    weights: List[Float32],
+    offset: List[Float32],
+    d: Int,
+    q: Int,
+    scale: Float32,
+    x: List[Float32],
+    m: Int,
+) raises -> List[Float32]:
+    """`rbf_sampler_transform_host`: the dot at OP_NN, then
+    `feature_map_epilogue_kernel`'s add, cos and multiply in their order."""
+    kmh_validate_matrix(x, m, d, "rbf_sampler transform X")
+    var p = List[Float32]()
+    var chain = False
+    comptime if KMH_RBF_FUSED:
+        chain = d <= KMH_RBF_FUSED_MAX_D
+    if chain:
+        # rbf_fused_transform_kernel / rbf_fused_project_kernel: one chain
+        # per cell over the features ascending
+        p = List[Float32](length=m * q, fill=Float32(0.0))
+        var pp = host_list_ptr(p)
+        var tasks = host_predict_task_count(m)
+        var chunk = host_predict_chunk(m, tasks)
+
+        def _proj_rows(task: Int) {imm x, imm weights, imm m, imm q, imm d, imm chunk, imm pp}:
+            var lo = task * chunk
+            var hi = min(lo + chunk, m)
+            for i in range(lo, hi):
+                for jc in range(q):
+                    var acc = Float32(0.0)
+                    for f in range(d):
+                        acc = ftz(identical_mul_add(ftz(x[i * d + f]), ftz(weights[f * q + jc]), acc))
+                    pp.unsafe_store(i * q + jc, acc)
+
+        if tasks == 1:
+            _proj_rows(0)
+        else:
+            host_parallelize(_proj_rows, tasks)
+    else:
+        p = host_gemm_identical(x, weights, OP_NN, m, q, d)
+    for t in range(m * q):
+        var j = t % q
+        var pv = ftz(p[t])
+        var shifted = ftz(pv + ftz(offset[j]))
+        p[t] = ftz(identical_mul(identical_cos(shifted), scale))
+    return p^

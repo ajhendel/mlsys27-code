@@ -1,0 +1,4824 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 the authors. Part of anonlib, DOI-WITHHELD
+"""The NVIDIA-native opponents for the gradient-boosting and forest slice,
+plus the dataset loading, the hyper-parameter tables and the output contract
+that `bench/speed/forest_speed_arm.py` shares with them.
+
+    pixi run -e gbmbench python tools/speed_gbdt_arm.py --lane rf
+    pixi run -e gbmbench python tools/speed_gbdt_arm.py --download year
+
+WHY THIS FILE IS THE BASE MODULE AND NOT THE LEAF
+-------------------------------------------------
+`bench/speed/forest_speed_arm.py` imports this one, and not the other way
+round, for one reason: NOTHING HERE IMPORTS `anonlib`. On a rented box
+whose first-ever CUDA build of `ensemble/` has just failed, the opponents
+still run and still print a table, and the run is not wasted. Put the shared
+spec in the file that has our dependency and a broken build takes the
+opponents down with it.
+
+It also means the hyper-parameters live in ONE place (`lane_config`) that
+both sides read. Two files that each spell out "learning_rate 0.1" is exactly how
+a benchmark drifts into comparing two different problems while both sides
+still print numbers.
+
+WHAT CHANGES ON NVIDIA, AND IT IS THE WHOLE FRAMING
+---------------------------------------------------
+On Apple, CatBoost's `task_type="GPU"` raises and LightGBM ships no GPU
+learner, so the M4 tables in this repository compare our GPU against their
+CPU because that is their strongest LEGAL arm there. On NVIDIA that is
+false. CatBoost ships a CUDA learner, XGBoost ships `device="cuda"`, cuML
+is NVIDIA's own forest library, and LightGBM can be built with
+`USE_CUDA=ON`. Those are what an NVIDIA user would actually run, so those
+are the opponents. Every lane therefore times BOTH arms of each opponent:
+the CPU arm for continuity with the Apple tables, and the GPU arm because
+it is the honest one.
+
+**We expect to lose the GPU columns, possibly by a lot. Recording how much
+is the entire point.** No arm is dropped for winning and no dataset is
+chosen for flattering us.
+
+WHICH OPPONENT GOES IN WHICH LANE, AND THE STANDING ORDER BEHIND IT
+--------------------------------------------------------------------
+Standing rule since 2026-08-22: **the symmetric-tree comparison is
+CatBoost ONLY.** LightGBM has no symmetric mode -- leaf-wise is its only
+growth algorithm -- so a LightGBM arm beside the symmetric learner compares
+two different algorithms and is excluded from it.
+
+DEVIATION 1831 extends that order to XGBoost by the same argument, because
+the argument is about the algorithm and not about the vendor: XGBoost's
+`grow_policy` is `depthwise` or `lossguide` and it has no symmetric mode
+either. So:
+
+    lane gbdt-symmetric   ours grow_policy='SymmetricTree'
+                          opponents: catboost-cpu, catboost-gpu ONLY
+    lane gbdt-depthwise   ours grow_policy='Depthwise' (the level-wise
+                          binary tree)
+                          opponents: xgboost-cpu, xgboost-gpu
+                          (grow_policy='depthwise'), catboost-cpu/gpu
+                          under the SAME policy
+    lane gbdt-lossguide   ours grow_policy='Lossguide' (leaf-wise, one leaf
+                          per step)
+                          opponents: lightgbm-cpu, lightgbm-cuda -- this IS
+                          LightGBM's own algorithm, which is why LightGBM
+                          belongs here and not beside the symmetric lane --
+                          plus xgboost-*/catboost-* under lossguide
+    lane rf               opponents: cuml-rf-gpu, sklearn-rf-cpu,
+                          lightgbm-cpu/cuda in boosting_type='rf'
+    lane et               opponents: sklearn-et-cpu, lightgbm-cpu/cuda in
+                          rf + extra_trees; cuML has no ExtraTrees and
+                          REFUSES by name
+    lane iforest          opponents: sklearn-iforest-cpu, and cuml-iforest-gpu
+                          IF cuML ships one (DEVIATION 1837)
+
+THE TIMED REGION (DEVIATION 1830)
+----------------------------------
+What is timed is `fit(X, y)` on raw host numpy, on every arm, and nothing
+else. Loading, splitting, dtype conversion and the train/test split all
+happen before the timer starts. Prediction and scoring happen after it
+stops.
+
+This DIFFERS from `bench/interleaved/`, which hands CatBoost a pre-quantized
+`Pool` because the Mojo side there consumes a prebuilt compressed index.
+Here every arm quantizes inside its own `fit` -- ours computes borders in
+`fit`, CatBoost bins in `fit`, XGBoost builds its `QuantileDMatrix` in
+`fit`, LightGBM builds its `Dataset` in `fit`, cuML bins in `fit`. Timing
+`fit` therefore includes the same phase of work on every arm, which is the
+property that makes the ratio mean something. It is NOT the same number as
+the interleaved harness's and must never be quoted beside one.
+
+A GPU fit is only finished when the device says so. Every arm carries a
+`sync` that runs INSIDE the timer; for the libraries whose `fit` blocks it
+is a no-op and says so, and for cuML it is a device synchronize.
+
+THE OUTPUT CONTRACT
+--------------------
+Header, once per process:
+
+    FSPEED-HEADER family=forest lane=<lane> arm=<arm> mode=<FAST|IDENTICAL> \
+        device=<string> rounds=<n> size=<shipped|smoke>
+
+One line per timed round, one warm-up line per arm never in the table, one
+accuracy line per arm and metric, and a refusal wherever an opponent could
+not be installed or could not run:
+
+    FSPEED lane=<l> arm=<a> shape=<tag> round=<i> ms=<float> hash=<16 hex|->
+    FSPEED-WARMUP lane=<l> arm=<a> shape=<tag> ms=<float>
+    FSPEED-ACC lane=<l> arm=<a> metric=<rmse|logloss|accuracy|auc> value=<f>
+    FSPEED-REFUSED lane=<l> arm=<a> reason=<one line>
+
+One line type is NOT in the contract the maintainer handed down, and it is
+additive rather than a change to the four above (DEVIATION 1839):
+
+    FSPEED-NOTE lane=<l> arms=<a,b> metric=<m> delta=<f> reason=<one line>
+
+It fires when two arms OF THE SAME LIBRARY differ in accuracy by more than
+`_ACC_TOL`. Two arms of one library that disagree about the answer were not
+given identical configurations, whatever the config dict says, and a timing
+table that does not say so is reporting the speed of two different problems.
+A parser keyed on the four contract prefixes ignores it.
+
+Three more records are additive in the same way (2026-09-12, lane
+harness-honesty), and they answer the question nothing above them asked --
+what did each arm actually BUILD?
+
+    FSPEED-FIT lane=<l> arm=<a> library=<lib> trees=<n|-> nodes=<n|-> \
+        leaves=<n|-> depth_max=<n|-> source=<api>
+    FSPEED-FIT-NOTE lane=<l> arm=<a> <field>=<one line>
+    FSPEED-FIT-VERDICT lane=<l> arms=<a,b> leaves=<a:n,b:n> spread=<f> \
+        verdict=<COMPARABLE|NOT-COMPARABLE|UNKNOWN>
+
+Holding the config equal is not the same as fitting comparable models, and
+until these existed nothing in this file read a fitted ensemble at all. See
+FIT EQUIVALENCE below for what each field is read from and why UNAVAILABLE is
+reported by name instead of being left blank.
+
+BUDGET, BECAUSE THE BOX IS RENTED AND THE HOUR IS SHORT
+--------------------------------------------------------
+`ANONLIB_SPEED_BUDGET_S` (default 300) is a per-arm wall budget and
+`ANONLIB_SPEED_DEADLINE_S` (default 2400) is a whole-process one. An arm
+that runs past its budget is dropped from the rotation with a REFUSED line
+carrying the reason, so a slow CPU arm cannot eat the lease that the GPU
+arms are the point of. Nothing here waits unbounded on anything.
+"""
+
+import argparse
+import contextlib
+import hashlib
+import os
+import platform
+import subprocess
+import shutil
+import sys
+import time
+
+import numpy as np
+
+import board_pairing                  # noqa: E402  (tools/; the own-arm pairing table, no numpy)
+
+FAMILY = "forest"
+
+#: Accuracy tolerance between two arms of the SAME library, as a relative
+#: difference. Wider than float noise and much narrower than a config
+#: mistake; a CPU and a CUDA learner of one library legitimately differ in
+#: the last few digits because they sum in different orders.
+_ACC_TOL = 0.02
+
+#: The lanes this file knows. `training/` is deliberately absent: it is the
+#: neural-network training-step lane (`archive/plans/training/TRAINING_LOOP_PLAN.md`) and it
+#: has no gradient-boosting or forest surface, so there is no entry point to
+#: time.
+#:
+#: CORRECTED 2026-08-31. This comment used to add "and as of 2026-08-25
+#: nothing in it has ever been compiled". Commit `5ce6eb17` falsified that;
+#: the lane compiles and its step gate ran green on one device. The absence
+#: from this tuple was never for that reason.
+LANE_NAMES = (
+    "gbdt-symmetric",
+    # gbdt-symmetric at 1000 trees (2026-09-29): oblivious trees are weaker
+    # per tree, and 1000 is CatBoost's own default iteration count
+    # (tools/bench_board_harness.py CATBOOST_DEFAULTS)
+    "gbdt-symmetric-1000",
+    "gbdt-depthwise",
+    "gbdt-lossguide",
+    "rf",
+    "et",
+    "iforest",
+    # THE GBDT TASK LANES (lane bench-board-gbdt-tasks, 2026-09-26). Each is a
+    # TASK the public GradientBoosting surface fits beyond binary and
+    # regression, raced against each library's closest objective; every
+    # mismatch is in `TASK_LANES[lane]["mismatches"]`, one line each.
+    "gbdt-rank-yetirank",
+    "gbdt-rank-pairlogit",
+    "gbdt-multiclass",
+    "gbdt-categorical",
+    # Ordered boosting (2026-09-29): GradientBoosting boosting_type='Ordered'
+    # against CatBoost boosting_type='Ordered', gbm-bench's values otherwise
+    "gbdt-ordered",
+)
+
+
+# --------------------------------------------------------------------------
+# The output contract.
+# --------------------------------------------------------------------------
+
+def size_tag():
+    """`shipped` (the default, the real dataset) or `smoke` (a plumbing
+    check). Every emitted line carries it so the two can never be confused
+    in a results file."""
+    tag = os.environ.get("ANONLIB_SPEED_SIZE", "shipped").strip().lower()
+    if tag not in ("shipped", "smoke"):
+        raise SystemExit(
+            "ANONLIB_SPEED_SIZE must be 'shipped' or 'smoke', got "
+            + repr(tag)
+        )
+    return tag
+
+
+def rounds():
+    """Timed rounds after the one untimed warm-up (ANONLIB_SPEED_ROUNDS overrides)."""
+    # One seed, one scored run per arm by default (the author 2026-10-14): alpha, no noise fighting; just get measurements.
+    return max(1, int(os.environ.get("ANONLIB_SPEED_ROUNDS", "1")))
+
+
+def per_arm_budget_s():
+    return float(os.environ.get("ANONLIB_SPEED_BUDGET_S", "300"))
+
+
+def process_deadline_s():
+    return float(os.environ.get("ANONLIB_SPEED_DEADLINE_S", "2400"))
+
+
+def numeric_mode_label():
+    """Requested anonlib tier, not a claim about competitor arithmetic.
+
+    The anonlib runner separately verifies the actual binding before timing.
+    Opponent-only runs retain this label solely as experiment context.
+    """
+    mode = os.environ.get("ANONLIB_NUMERIC_MODE", "fast").strip().lower()
+    if mode not in ("fast", "identical"):
+        raise ValueError("invalid ANONLIB_NUMERIC_MODE: " + repr(mode))
+    return mode.upper()
+
+
+def device_string():
+    """What this box is, in one token-safe string. `nvidia-smi` first,
+    because on the box this file exists for the GPU is the answer; the host
+    platform is the fallback so a line is never emitted without a device."""
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=20, check=False,
+        )
+        name = out.stdout.strip().splitlines()
+        if out.returncode == 0 and name:
+            return name[0].strip().replace(" ", "_")
+    except (OSError, subprocess.SubprocessError):
+        pass
+    # An AMD box has no nvidia-smi; `rocm-smi --showproductname` names the
+    # card ("Card Series: AMD Instinct MI325X").
+    try:
+        out = subprocess.run(
+            ["rocm-smi", "--showproductname"],
+            capture_output=True, text=True, timeout=20, check=False,
+        )
+        for line in out.stdout.splitlines():
+            if "Card Series" in line and ":" in line:
+                return line.rsplit(":", 1)[1].strip().replace(" ", "_")
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return (platform.system() + "_" + platform.machine()).replace(" ", "_")
+
+
+def emit_header(lane, arm, dev, n_rounds, size):
+    print(
+        "FSPEED-HEADER family=%s lane=%s arm=%s mode=%s device=%s "
+        "rounds=%d size=%s"
+        % (FAMILY, lane, arm, numeric_mode_label(), dev, n_rounds, size)
+    )
+    sys.stdout.flush()
+
+
+def emit_warmup(lane, arm, shape, ms):
+    print("FSPEED-WARMUP lane=%s arm=%s shape=%s ms=%.3f"
+          % (lane, arm, shape, ms))
+    sys.stdout.flush()
+
+
+def emit_round(lane, arm, shape, index, ms, digest):
+    print("FSPEED lane=%s arm=%s shape=%s round=%d ms=%.3f hash=%s"
+          % (lane, arm, shape, index, ms, digest or "-"))
+    sys.stdout.flush()
+
+
+def emit_acc(lane, arm, metric, value):
+    print("FSPEED-ACC lane=%s arm=%s metric=%s value=%.6f"
+          % (lane, arm, metric, value))
+    sys.stdout.flush()
+
+
+def emit_refused(lane, arm, reason):
+    one_line = " ".join(str(reason).split())[:240]
+    print("FSPEED-REFUSED lane=%s arm=%s reason=%s" % (lane, arm, one_line))
+    sys.stdout.flush()
+
+
+def emit_note(lane, arms, metric, delta, reason):
+    one_line = " ".join(str(reason).split())[:240]
+    print("FSPEED-NOTE lane=%s arms=%s metric=%s delta=%.6f reason=%s"
+          % (lane, ",".join(arms), metric, delta, one_line))
+    sys.stdout.flush()
+
+
+def hash_predictions(vec):
+    """sha256 over dtype + shape + the exact bytes, truncated to 16 hex
+    digits, the same recipe `bench/external/patch_gbm_bench.py` puts in the
+    gbm-bench results.
+
+    Equal repeated hashes are a same-device witness, not cross-device
+    qualification. Competitor GPU fits may vary. An IDENTICAL anonlib arm
+    must retain its own exact predictions; different libraries need not match.
+    """
+    if vec is None:
+        return None
+    arr = np.ascontiguousarray(vec)
+    h = hashlib.sha256()
+    h.update(str(arr.dtype).encode())
+    h.update(str(arr.shape).encode())
+    h.update(arr.tobytes())
+    return h.hexdigest()[:16]
+
+
+# --------------------------------------------------------------------------
+# Metrics. Computed OUTSIDE every timer, on a held-out split.
+# --------------------------------------------------------------------------
+
+def rmse(y, p):
+    d = np.asarray(y, dtype=np.float64) - np.asarray(p, dtype=np.float64)
+    return float(np.sqrt(np.mean(d * d)))
+
+
+def logloss(y, p1):
+    """Binary log loss with the same clip sklearn uses since it dropped its
+    `eps` argument in 1.5 (the sharp edge `patch_gbm_bench.py` already had to
+    work around upstream)."""
+    y = np.asarray(y, dtype=np.float64)
+    p = np.clip(np.asarray(p1, dtype=np.float64), 1e-15, 1.0 - 1e-15)
+    return float(-np.mean(y * np.log(p) + (1.0 - y) * np.log(1.0 - p)))
+
+
+def accuracy(y, labels):
+    return float(np.mean(np.asarray(y).ravel() == np.asarray(labels).ravel()))
+
+
+def auc(y, score):
+    """Rank-based AUC in numpy, with ties averaged. Written out rather than
+    imported so the metric does not become a reason the run needs sklearn on
+    a box where only the CUDA libraries installed."""
+    y = np.asarray(y, dtype=np.float64).ravel()
+    s = np.asarray(score, dtype=np.float64).ravel()
+    pos = float(np.sum(y > 0.5))
+    neg = float(y.size) - pos
+    if pos == 0.0 or neg == 0.0:
+        return float("nan")
+    order = np.argsort(s, kind="mergesort")
+    ranks = np.empty(s.size, dtype=np.float64)
+    ranks[order] = np.arange(1, s.size + 1, dtype=np.float64)
+    # Average the ranks inside each tie group, which is what makes this
+    # agree with sklearn's roc_auc_score rather than merely resemble it.
+    sorted_s = s[order]
+    i = 0
+    while i < sorted_s.size:
+        j = i
+        while j + 1 < sorted_s.size and sorted_s[j + 1] == sorted_s[i]:
+            j += 1
+        if j > i:
+            ranks[order[i:j + 1]] = np.mean(ranks[order[i:j + 1]])
+        i = j + 1
+    return float((np.sum(ranks[y > 0.5]) - pos * (pos + 1.0) / 2.0)
+                 / (pos * neg))
+
+
+def mlogloss(y, proba):
+    """Multiclass log loss: the mean negative log of the probability each
+    row's TRUE class received, clipped as `logloss` clips. `proba` is
+    (rows, n_classes) with column j the probability of class j."""
+    y = np.asarray(y).astype(np.int64).ravel()
+    p = np.asarray(proba, dtype=np.float64)
+    picked = np.clip(p[np.arange(y.size), y], 1e-15, 1.0)
+    return float(-np.mean(np.log(picked)))
+
+
+def query_bounds(qid):
+    """Row offsets of each query's run, [0, ..., rows]. Queries are the runs
+    of equal consecutive ids, which is what every ranking arm here groups by."""
+    qid = np.asarray(qid).ravel()
+    change = np.flatnonzero(np.diff(qid) != 0) + 1
+    return np.concatenate([[0], change, [qid.size]]).astype(np.int64)
+
+
+def _pessimistic_order(grades, scores):
+    """Score descending, ties broken by grade ASCENDING, so no arm is
+    credited for the file order of tied documents
+    (tools/speed_gbdt_rank.py's convention)."""
+    return np.lexsort((grades, -scores))
+
+
+def ndcg_at(k, bounds, grades, scores):
+    """Mean NDCG@k over queries: gain 2^grade - 1, discount 1/log2(rank + 1),
+    ties pessimistic, a query with no relevant document scores 1.0
+    (LightGBM's and CatBoost's convention). The same definition as
+    tools/speed_gbdt_rank.py's `ndcg_at` (its default, pessimistic ties);
+    test_speed_gbdt_tasks.py holds the two equal."""
+    g_all = np.power(2.0, np.asarray(grades, dtype=np.float64)) - 1.0
+    s_all = np.asarray(scores, dtype=np.float64).ravel()
+    disc = 1.0 / np.log2(np.arange(2, k + 2, dtype=np.float64))
+    total, n_q = 0.0, bounds.size - 1
+    for i in range(n_q):
+        a, b = int(bounds[i]), int(bounds[i + 1])
+        g = g_all[a:b]
+        order = _pessimistic_order(g, s_all[a:b])
+        kk = min(k, b - a)
+        idcg = float(np.dot(np.sort(g)[::-1][:kk], disc[:kk]))
+        total += 1.0 if idcg == 0.0 else float(np.dot(g[order[:kk]], disc[:kk])) / idcg
+    return total / max(n_q, 1)
+
+
+def mean_average_precision(bounds, grades, scores):
+    """MAP over queries on BINARY relevance (grade > 0), the whole ranked
+    list (no cutoff), ties pessimistic; a query with no relevant document
+    scores 1.0, as NDCG does here."""
+    rel_all = (np.asarray(grades, dtype=np.float64) > 0).astype(np.float64)
+    s_all = np.asarray(scores, dtype=np.float64).ravel()
+    total, n_q = 0.0, bounds.size - 1
+    for i in range(n_q):
+        a, b = int(bounds[i]), int(bounds[i + 1])
+        r = rel_all[a:b]
+        n_rel = float(r.sum())
+        if n_rel == 0.0:
+            total += 1.0
+            continue
+        hit = r[_pessimistic_order(r, s_all[a:b])]
+        prec = np.cumsum(hit) / np.arange(1, hit.size + 1, dtype=np.float64)
+        total += float(np.sum(prec * hit)) / n_rel
+    return total / max(n_q, 1)
+
+
+def ranking_metrics(bounds, grades, scores):
+    """(metric, value) pairs a ranking lane reports: NDCG@10 first (the
+    headline), then NDCG@5 and MAP."""
+    return [("ndcg10", ndcg_at(10, bounds, grades, scores)),
+            ("ndcg5", ndcg_at(5, bounds, grades, scores)),
+            ("map", mean_average_precision(bounds, grades, scores))]
+
+
+# --------------------------------------------------------------------------
+# Datasets.
+# --------------------------------------------------------------------------
+
+def _smoke_staging():
+    """tools/smoke_inproc.py when this process is the campaign smoke's worker (it serves the --params-only
+    parameter probe only), else None: a timed run returns None here without importing anything, so it loads
+    its dataset exactly as before."""
+    if os.environ.get("ANONLIB_SMOKE_IN_PROCESS") != str(os.getpid()):
+        return None
+    here = os.path.dirname(os.path.abspath(__file__))
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    import smoke_inproc
+    return smoke_inproc if smoke_inproc.in_process() else None
+
+
+def _open_npz(path):
+    """np.load(path), as every loader here reads its decoded cache. Inside the smoke worker (smoke-fixes r14,
+    2026-10-14; the trees recipes on istella/taxi STARTED at 5 s in zipfile crc32 / read_array inside these
+    loaders) every array of the file is read once per process and pinned for the whole smoke
+    (smoke_inproc.staged_npz, keyed by the file's path, size and mtime; the arrays `z[k]` gives), shared by
+    every dataset form built from it (istella, istellareg, istellamc, istellarank; taxi, taxireg, taximc,
+    taxicat)."""
+    SI = _smoke_staging()
+    if SI is None:
+        return np.load(path)
+    return SI.staged_npz(path, contiguous=False)
+
+
+class Data(object):
+    """Train/test split, already in host memory, already the right dtype.
+
+    `task` is 'regression', 'binary', 'multiclass' or 'anomaly'. `tag` is
+    what every emitted line carries as `shape=`, and it names the dataset AND
+    the training shape so a smoke line can never be mistaken for a shipped
+    one even if somebody loses the header."""
+
+    def __init__(self, name, x_train, x_test, y_train, y_test, task,
+                 n_classes=0, y_anom=None, cat_idx=None):
+        self.name = name
+        self.X_train = x_train
+        self.X_test = x_test
+        self.y_train = y_train
+        self.y_test = y_test
+        self.task = task
+        self.n_classes = n_classes
+        # Only for the anomaly lane: the planted anomaly labels of X_test.
+        self.y_anom = y_anom
+        # Column indices holding DENSE CATEGORY CODES 0..k-1, or () when every
+        # column is numeric. Until criteo landed (2026-09-12) this was always
+        # empty, which is why no benchmark had ever exercised the categorical
+        # path: DEVIATION 2634 skips the CTR target prep when no column is
+        # categorical, so its measured 0.9603 came entirely from the SKIP side.
+        # An arm that can use categoricals reads this; one that cannot ignores
+        # it and is then timed on a different problem, so a lane that passes
+        # cat_idx to one arm must pass it to all of them.
+        self.cat_idx = tuple(cat_idx or ())
+        self.tag = "%s-%dx%d" % (name, x_train.shape[0], x_train.shape[1])
+
+
+def data_root():
+    """Where the multi-gigabyte downloads live. Same environment variable
+    `bench/external/run_gbm_bench.sh` uses, so a box that already has the
+    gbm-bench store does not fetch anything twice."""
+    return os.environ.get(
+        "GBM_BENCH_DATA", os.path.join(os.path.expanduser("~"),
+                                       "datasets", "gbm-bench"))
+
+
+def _smoke_rows(x, y, limit):
+    if limit is None or x.shape[0] <= limit:
+        return x, y
+    return x[:limit], y[:limit]
+
+
+def _synth_regression(rows, feats, seed=7):
+    """The same generator `tools/interleaved_prep.py` uses, at the same
+    default shape, so a synthetic fallback number here sits beside the
+    interleaved harness's synthetic numbers rather than beside nothing."""
+    rng = np.random.default_rng(seed)
+    x = rng.normal(size=(rows, feats)).astype(np.float32)
+    y = (3.0 * x[:, 0] - 2.0 * x[:, 3] + 1.5 * x[:, 7] * x[:, 0]
+         + 0.1 * rng.normal(size=rows)).astype(np.float32)
+    return x, y
+
+
+def _synth_binary(rows, feats, seed=7):
+    x, raw = _synth_regression(rows, feats, seed)
+    y = (raw > np.median(raw)).astype(np.float32)
+    return x, y
+
+
+def _split_tail(x, y, task, name, n_classes=0, frac=0.1):
+    """A deterministic TAIL split, no shuffle, no sklearn. The test rows are
+    only ever used for the accuracy column, so what matters is that every arm
+    of every lane scores the same rows -- not that the split is clever."""
+    n_test = max(1, int(x.shape[0] * frac))
+    n_train = x.shape[0] - n_test
+    return Data(name, x[:n_train], x[n_train:], y[:n_train], y[n_train:],
+                task, n_classes)
+
+
+def load_year(size, rows_cap=None):
+    """YearPredictionMSD, the regression dataset gbm-bench uses and the one
+    the M4 GBDT tables were taken on.
+
+    THE DOWNLOAD IS 211 MB and it is a SEPARATE, EXPLICITLY NAMED STEP
+    (`--download year`), never something a timed run does on its own, because
+    the maintainer has to budget a one-hour GPU lease around it. The
+    train/test split is gbm-bench's own: the first 463,715 rows train, the
+    remaining 51,630 test, no shuffle, which that dataset's own
+    documentation requires (an artist's tracks must not straddle the split).
+
+    Read straight from the zip with pandas rather than through gbm-bench's
+    `year.pkl`. Their pickle carries their `Data` and `LearningTask` classes,
+    so unpickling it would make this file depend on their checkout being
+    importable, which on a fresh pod it is not."""
+
+    folder = os.path.join(data_root(), "year")
+    zip_path = os.path.join(folder, "YearPredictionMSD.txt.zip")
+    npz_path = os.path.join(folder, "year_speed.npz")
+    # A CACHE ENTRY THAT EXISTS IS NOT A CACHE ENTRY THAT LOADS.
+    #
+    # `os.path.exists` stood here and it sent a ZERO-BYTE stub down the
+    # cached branch: on 2026-09-03 a rented box was destroyed while the
+    # decode's writes were still in page cache, and the volume came back
+    # holding a complete 2,816,407,858-byte HIGGS.csv.gz beside an
+    # `higgs_speed.npz` of 0 bytes. numpy raises "No data left in file" on
+    # that, which reads like a truncated DOWNLOAD and is not one -- the
+    # download was perfect and the decode was the casualty.
+    #
+    # A half-written cache must be treated as an absent one, because the
+    # ingredient it is derived from is still sitting right next to it. The
+    # decode is a couple of minutes; failing the whole leg to avoid it is
+    # the wrong trade, and reporting it as a missing download sends the
+    # next person to re-fetch 2.6 GB they already have.
+    cached = None
+    if os.path.exists(npz_path) and os.path.getsize(npz_path) > 0:
+        try:
+            cached = np.load(npz_path)
+        except Exception as exc:                   # noqa: BLE001
+            sys.stderr.write(
+                "speed_gbdt_arm: %s is unreadable (%s); re-decoding from "
+                "the gzip beside it\n" % (npz_path, exc))
+            cached = None
+    if cached is not None:
+        z = cached
+        x, y = z["x"], z["y"]
+    else:
+        if not os.path.isfile(zip_path):
+            raise RuntimeError(
+                "year is not downloaded: %s is missing. Run "
+                "`python tools/speed_gbdt_arm.py --download year` first "
+                "(211 MB), OUTSIDE the timed run." % zip_path
+            )
+        import pandas as pd
+        frame = pd.read_csv(zip_path, header=None)
+        x = frame.iloc[:, 1:].to_numpy(dtype=np.float32)
+        y = frame.iloc[:, 0].to_numpy(dtype=np.float32)
+        np.savez(npz_path, x=x, y=y)
+    n_train = 463715
+    if size == "smoke" or rows_cap:
+        cap = rows_cap or 50000
+        x, y = _smoke_rows(x, y, cap + max(1, cap // 10))
+        return _split_tail(x, y, "regression", "year")
+    return Data("year", x[:n_train], x[n_train:], y[:n_train], y[n_train:],
+                "regression")
+
+
+def load_covtype(size, binary=False, rows_cap=None):
+    """Forest covertype, 581,012 x 54, downloaded by scikit-learn itself into
+    `~/scikit_learn_data` (about 11 MB compressed). The forest lanes' shipped
+    dataset.
+
+    `binary=True` is the `covtype2` task: y == 2 (Lodgepole Pine, the
+    majority class) against the rest. It exists because our `GradientBoosting`
+    Python surface has no `MultiClass` -- the Mojo layer implements it, the
+    wrapper is one-dimensional -- so the GBDT lanes cannot run the 7-class
+    problem at all (DEVIATION 1838). The derived task is applied IDENTICALLY
+    to every arm, it is named differently in the `shape=` tag so it can never
+    be read as the 7-class result, and it is not a dataset chosen for
+    flattering anyone: it is the only covtype an arm that refuses multiclass
+    can run.
+
+    THE DECODED CACHE IS `<GBM_BENCH_DATA>/covtype/covtype_speed.npz` (x as
+    float32, target as sklearn's raw int32 labels 1..7), the same shape of
+    cache `load_higgs` and `load_year` keep, so `tools/dataset_store.sh stage`
+    can put it on a box (`gbm-bench/covtype/covtype_speed.npz`) and no rented
+    pod asks figshare for the archive. Both tasks derive from the raw target
+    exactly as they did from `fetch_covtype().target`, bit for bit. Without
+    the cache, scikit-learn's own fetch is the fallback and the cache is
+    written beside it, once."""
+    folder = os.path.join(data_root(), "covtype")
+    npz_path = os.path.join(folder, "covtype_speed.npz")
+    cached = None
+    if os.path.exists(npz_path) and os.path.getsize(npz_path) > 0:
+        try:
+            cached = np.load(npz_path)
+        except Exception as exc:                   # noqa: BLE001
+            sys.stderr.write(
+                "speed_gbdt_arm: %s is unreadable (%s); re-fetching with "
+                "scikit-learn\n" % (npz_path, exc))
+            cached = None
+    if cached is not None:
+        x, target = cached["x"], cached["target"]
+    else:
+        from sklearn.datasets import fetch_covtype
+
+        ds = fetch_covtype()
+        x = np.ascontiguousarray(ds.data, dtype=np.float32)
+        target = np.ascontiguousarray(ds.target, dtype=np.int32)
+        os.makedirs(folder, exist_ok=True)
+        np.savez(npz_path, x=x, target=target)
+    if binary:
+        y = (target == 2).astype(np.float32)
+        name, task, n_classes = "covtype2", "binary", 2
+    else:
+        y = (target.astype(np.int64) - 1).astype(np.float32)
+        name, task, n_classes = "covtype", "multiclass", 7
+    if size == "smoke" or rows_cap:
+        x, y = _smoke_rows(x, y, rows_cap or 50000)
+    return _split_tail(x, y, task, name, n_classes)
+
+
+def load_synth(size, task, rows_cap=None):
+    rows = 800000 if size == "shipped" else 50000
+    feats = 100 if size == "shipped" else 32
+    if rows_cap:
+        rows = min(rows, rows_cap)
+    if task == "binary":
+        x, y = _synth_binary(rows, feats)
+        return _split_tail(x, y, "binary", "synthclf", 2)
+    x, y = _synth_regression(rows, feats)
+    return _split_tail(x, y, "regression", "synth")
+
+
+def load_anomaly(size, rows_cap=None):
+    """A planted-anomaly fixture for the isolation-forest lane.
+
+    covtype and year carry no anomaly labels, so an isolation forest scored
+    on them has no accuracy column at all, and this slice's whole premise is
+    that a timing without an accuracy column is meaningless. So the iforest
+    lane runs a synthetic fixture whose anomalies are known by construction:
+    a 99% inlier Gaussian blob and a 1% uniform outlier shell, AUC of the
+    anomaly score against the planted label. Stated here rather than buried,
+    because it is a weaker dataset than the other lanes get."""
+    rows = 500000 if size == "shipped" else 50000
+    feats = 32 if size == "shipped" else 16
+    if rows_cap:
+        rows = min(rows, rows_cap)
+    rng = np.random.default_rng(11)
+    n_out = max(1, rows // 100)
+    n_in = rows - n_out
+    inliers = rng.normal(size=(n_in, feats)).astype(np.float32)
+    outliers = rng.uniform(-8.0, 8.0, size=(n_out, feats)).astype(np.float32)
+    x = np.vstack((inliers, outliers))
+    lab = np.concatenate((np.zeros(n_in, np.float32),
+                          np.ones(n_out, np.float32)))
+    order = rng.permutation(rows)
+    x = np.ascontiguousarray(x[order])
+    lab = lab[order]
+    # The anomaly lane fits and scores the SAME rows, which is what
+    # `IsolationForest` is for; the test split is the scoring set.
+    d = Data("anomaly", x, x, lab, lab, "anomaly")
+    d.y_anom = lab
+    return d
+
+
+def load_higgs(size, rows_cap=None):
+    """HIGGS, 11,000,000 x 28, binary. THE LARGE-LOAD DATASET.
+
+    `year` and `covtype` both stop near half a million rows, and half a
+    million rows is not where a GPU tree learner is decided. Every ratio in
+    the first NVIDIA trees table was taken at that size, and the question
+    it cannot answer is the one that matters: our per-row work has measured
+    FASTER than CatBoost's while our fixed per-tree cost measured 5.7x
+    theirs, so the ratios should improve monotonically with rows and the
+    forest gap should close hardest. That is a prediction, and it is
+    untestable on a dataset that ends at 522,911 rows.
+
+    HIGGS is the dataset NVIDIA's own gbm-bench uses for exactly this, so
+    the ladder runs on data the vendors already benchmark themselves on
+    rather than on a synthetic fixture we chose. The split is gbm-bench's:
+    the LAST 500,000 rows are test, everything before them is train, no
+    shuffle.
+
+    `rows_cap` is the ladder. It caps the TRAINING rows only and takes them
+    from the FRONT, deterministically, so `--rows 1000000` and
+    `--rows 5000000` are nested prefixes of the same data and every arm at
+    every rung scores the SAME 500,000 test rows. A rung is therefore a
+    comparison of load, not of two different problems.
+
+    THE DOWNLOAD IS 2.6 GB and it is a SEPARATE, EXPLICITLY NAMED STEP
+    (`--download higgs`), never something a timed run does on its own, for
+    the reason `load_year` gives: the maintainer budgets a lease around
+    it. The decoded cache is another 1.3 GB of float32.
+    """
+    folder = os.path.join(data_root(), "higgs")
+    gz_path = os.path.join(folder, "HIGGS.csv.gz")
+    npz_path = os.path.join(folder, "higgs_speed.npz")
+    # A CACHE ENTRY THAT EXISTS IS NOT A CACHE ENTRY THAT LOADS.
+    #
+    # `os.path.exists` stood here and it sent a ZERO-BYTE stub down the
+    # cached branch: on 2026-09-03 a rented box was destroyed while the
+    # decode was still in page cache, and the volume came back holding a
+    # COMPLETE 2,816,407,858-byte HIGGS.csv.gz beside an higgs_speed.npz of
+    # 0 bytes. numpy raises "No data left in file" on that, which reads like
+    # a truncated DOWNLOAD and is not one -- the download was perfect and
+    # the decode was the casualty.
+    #
+    # A half-written cache is treated as an absent one, because the gzip it
+    # is derived from is sitting right beside it and the decode is a couple
+    # of minutes. Failing the leg to avoid that is the wrong trade, and
+    # reporting it as a missing download sends the next run to re-fetch
+    # 2.6 GB it already has.
+    cached = None
+    if os.path.exists(npz_path) and os.path.getsize(npz_path) > 0:
+        try:
+            cached = np.load(npz_path)
+        except Exception as exc:                   # noqa: BLE001
+            sys.stderr.write(
+                "speed_gbdt_arm: %s is unreadable (%s); re-decoding from "
+                "the gzip beside it\n" % (npz_path, exc))
+            cached = None
+    if cached is not None:
+        z = cached
+        x, y = z["x"], z["y"]
+    else:
+        if not os.path.isfile(gz_path):
+            raise RuntimeError(
+                "higgs is not downloaded: %s is missing. Run "
+                "`python tools/speed_gbdt_arm.py --download higgs` first "
+                "(2.6 GB), OUTSIDE the timed run." % gz_path
+            )
+        import pandas as pd
+        # Chunked, because the frame is 11M x 29 and reading it whole
+        # alongside the float32 copy peaks near 5 GB of host memory on a
+        # box whose whole job is the GPU.
+        xs, ys = [], []
+        for chunk in pd.read_csv(gz_path, header=None, dtype=np.float32,
+                                 chunksize=1_000_000):
+            arr = chunk.to_numpy(dtype=np.float32)
+            ys.append(arr[:, 0])
+            xs.append(arr[:, 1:])
+        x = np.ascontiguousarray(np.concatenate(xs))
+        y = np.ascontiguousarray(np.concatenate(ys))
+        del xs, ys
+        np.savez(npz_path, x=x, y=y)
+    n_test = 500000
+    n_train = x.shape[0] - n_test
+    if size == "smoke":
+        rows_cap = min(rows_cap or 50000, 50000)
+    if rows_cap:
+        n_train = min(n_train, rows_cap)
+    # THE TEST ROWS ARE THE FIXED TAIL AT EVERY RUNG. Slicing them off the
+    # end rather than off `n_train` is what makes two rungs comparable.
+    x_train = np.ascontiguousarray(x[:n_train])
+    y_train = np.ascontiguousarray(y[:n_train])
+    x_test = np.ascontiguousarray(x[-n_test:])
+    y_test = np.ascontiguousarray(y[-n_test:])
+    return Data("higgs", x_train, x_test, y_train, y_test, "binary", 2)
+
+
+ISTELLA_URL = "http://library.istella.it/dataset/istella-s-letor.tar.gz"
+ISTELLA_FEATURES = 220
+ISTELLA_N_TEST = 500000
+
+
+def _decode_letor(path, n_features):
+    """SVMlight/LETOR text ("rel qid:N 1:v ... F:v" per line, every feature
+    present and in order) to (x float32 [rows, F], y float32 [rows]). The
+    'k:' prefixes are stripped per 64 MB chunk with one regex and the rest
+    is one `np.fromstring`, which is what makes a 2M-line file a few
+    minutes instead of an hour. Istella marks a missing value with the
+    float64 maximum (1.797e308); that is above float32 and would become
+    inf, so anything at or above 1e300 is clamped to the float32 maximum:
+    still the largest value in its column, so every threshold rule sees
+    the same ordering, and finite for every library's binning."""
+    import re
+    strip = re.compile(rb" \d+:")
+    xs, ys = [], []
+    tail = b""
+    with open(path, "rb") as f:
+        while True:
+            block = f.read(64 << 20)
+            if not block:
+                break
+            block = tail + block
+            cut = block.rfind(b"\n")
+            if cut < 0:
+                tail = block
+                continue
+            chunk, tail = block[:cut + 1], block[cut + 1:]
+            chunk = strip.sub(b" ", chunk.replace(b" qid:", b" "))
+            arr = np.fromstring(chunk.decode("ascii"), sep=" ",
+                                dtype=np.float64)
+            arr = arr.reshape(-1, n_features + 2)
+            ys.append(arr[:, 0].astype(np.float32))
+            feats = arr[:, 2:]
+            big = feats >= 1e300
+            if big.any():
+                feats = feats.copy()
+                feats[big] = np.finfo(np.float32).max
+            xs.append(feats.astype(np.float32))
+    if tail.strip():
+        raise RuntimeError("%s: trailing partial line" % path)
+    return (np.ascontiguousarray(np.concatenate(xs)),
+            np.ascontiguousarray(np.concatenate(ys)))
+
+
+#: Istella-S grades are 0..4; the multiclass cell predicts the grade itself.
+ISTELLA_GRADES = 5
+
+
+def load_istella(size, rows_cap=None, regression=False, multiclass=False):
+    """Istella-S LETOR, 3,408,630 x 220, THE HIGH-FEATURE LARGE DATASET
+    (CONTRIBUTING.md (Performance claims), the second kind beside NYC taxi; HIGGS is retired).
+
+    Real web-search query/document feature vectors from the istella search
+    engine (Dato et al., ACM TOIS 2016), dense, 220 numeric features,
+    graded relevance 0..4. train.txt is 2,043,304 rows, test.txt 681,250.
+    Binary target: relevance > 0 (about 11% positive); `regression=True`
+    keeps the 0..4 grade as a float target (the RMSE cell); `multiclass=True`
+    is the `istellamc` task, the grade as one of five classes (lane
+    gbdt-multiclass). The test rows
+    are the first ISTELLA_N_TEST rows of test.txt at every rung, the train
+    rows the first `rows_cap` of train.txt, so rungs are comparable the way
+    HIGGS rungs are. Direct download, no credentials (Bosch needs Kaggle).
+
+    THE DOWNLOAD IS 472 MB and is a SEPARATE, EXPLICITLY NAMED STEP
+    (`--download istella`); the decode is minutes and is done there too."""
+    folder = os.path.join(data_root(), "istella")
+    npz_path = os.path.join(folder, "istella_speed.npz")
+    cached = None
+    if os.path.exists(npz_path) and os.path.getsize(npz_path) > 0:
+        try:
+            cached = _open_npz(npz_path)
+        except Exception as exc:                   # noqa: BLE001
+            sys.stderr.write(
+                "speed_gbdt_arm: %s is unreadable (%s); re-decoding from "
+                "the text files beside it\n" % (npz_path, exc))
+            cached = None
+    if cached is not None:
+        x_tr, r_tr = cached["x_train"], cached["r_train"]
+        x_te, r_te = cached["x_test"], cached["r_test"]
+    else:
+        train_txt = _find_file(folder, "train.txt")
+        test_txt = _find_file(folder, "test.txt")
+        if train_txt is None or test_txt is None:
+            raise RuntimeError(
+                "istella is not downloaded: train.txt/test.txt missing under "
+                "%s. Run `python tools/speed_gbdt_arm.py --download istella` "
+                "first (472 MB), OUTSIDE the timed run." % folder)
+        x_tr, r_tr = _decode_letor(train_txt, ISTELLA_FEATURES)
+        x_te, r_te = _decode_letor(test_txt, ISTELLA_FEATURES)
+        x_te = np.ascontiguousarray(x_te[:ISTELLA_N_TEST])
+        r_te = np.ascontiguousarray(r_te[:ISTELLA_N_TEST])
+        np.savez(npz_path, x_train=x_tr, r_train=r_tr, x_test=x_te,
+                 r_test=r_te)
+    n_train = x_tr.shape[0]
+    if size == "smoke":
+        rows_cap = min(rows_cap or 50000, 50000)
+    if rows_cap:
+        n_train = min(n_train, rows_cap)
+    x_train = np.ascontiguousarray(x_tr[:n_train])
+    r_train = np.ascontiguousarray(r_tr[:n_train])
+    if regression:
+        return Data("istellareg", x_train, x_te, r_train, r_te,
+                    "regression", 0)
+    if multiclass:
+        # lane gbdt-multiclass: the relevance grade 0..4 itself, five
+        # classes, the same rows as the binary cell (whose label is grade > 0)
+        return Data("istellamc", x_train, x_te, r_train, r_te,
+                    "multiclass", ISTELLA_GRADES)
+    y_train = (r_train > 0).astype(np.float32)
+    y_test = (r_te > 0).astype(np.float32)
+    return Data("istella", x_train, x_te, y_train, y_test, "binary", 2)
+
+
+class RankData(object):
+    """Istella-S as a ranking dataset: features, grades, query ids."""
+
+    def __init__(self, x_train, r_train, qid_train, x_test, r_test, qid_test):
+        self.name = "istellarank"
+        self.x_train, self.r_train, self.qid_train = x_train, r_train, qid_train
+        self.x_test, self.r_test, self.qid_test = x_test, r_test, qid_test
+
+
+def load_istella_rank(rows_cap=None):
+    """Istella-S LETOR as the RANKING dataset it is (lane istella-ranking-bench).
+
+    Train features and grades come from `istella_speed.npz`, the same bytes
+    every tree arm reads; the query ids and the WHOLE test split (681,250
+    rows, not the binary cell's first 500,000, which would cut a query in
+    half) come from the side file `istella_rank.npz` written by
+    `tools/istella_rank_prep.py`, which refuses to write unless its train
+    grades and first 500,000 test rows equal the speed npz bit for bit. Both
+    are staged from R2 (`gbm-bench/istella/istella_speed.npz`,
+    `gbm-bench/istella/istella_rank.npz`). `rows_cap` keeps whole queries: it
+    cuts at the last query boundary at or below the cap. Grades stay 0..4,
+    the target of every ranking loss here."""
+    folder = os.path.join(data_root(), "istella")
+    speed = _open_npz(os.path.join(folder, "istella_speed.npz"))
+    rank = _open_npz(os.path.join(folder, "istella_rank.npz"))
+    x_tr, r_tr = speed["x_train"], speed["r_train"]
+    qid_tr = rank["qid_train"]
+    if qid_tr.shape[0] != r_tr.shape[0]:
+        raise RuntimeError("istella_rank.npz has %d train qids for %d rows"
+                           % (qid_tr.shape[0], r_tr.shape[0]))
+    n = x_tr.shape[0]
+    if rows_cap and rows_cap < n:
+        starts = np.flatnonzero(np.diff(qid_tr) != 0) + 1
+        cut = starts[starts <= rows_cap]
+        n = int(cut[-1]) if cut.size else rows_cap
+    return RankData(np.ascontiguousarray(x_tr[:n]),
+                    np.ascontiguousarray(r_tr[:n]),
+                    np.ascontiguousarray(qid_tr[:n]),
+                    rank["x_test"], rank["r_test"], rank["qid_test"])
+
+
+def load_istella_rank_data(size, rows_cap=None):
+    """`load_istella_rank` as a `Data` (task 'ranking', dataset tag
+    `istellarank`) for the gbdt-rank-* lanes of the forest driver.
+
+    y is the grade 0..4 (the target of every ranking loss here). Beside it:
+    `qid_train`/`qid_test` (Istella-S's own query ids, consecutive per query),
+    `qid_train_seq` (each train query renumbered by its order of appearance,
+    uint32: XGBoost refuses a qid that is not sorted non-decreasing and
+    Istella-S numbers its queries in neither file in ascending order, so the
+    same partition of the same rows in the same order is handed to it under
+    names it accepts; tools/speed_gbdt_rank.py does the same), `group_sizes`
+    (LightGBM's `group`) and `bounds_test` (the scorer's query offsets). All
+    prepared here, outside every timer. The test split is the WHOLE 681,250
+    rows of test.txt (the binary cell's first 500,000 would cut a query in
+    half), and `rows_cap` cuts at a query boundary."""
+    if size == "smoke":
+        rows_cap = min(rows_cap or 50000, 50000)
+    r = load_istella_rank(rows_cap)
+    d = Data("istellarank", r.x_train, r.x_test, r.r_train, r.r_test,
+             "ranking", 0)
+    d.qid_train = np.ascontiguousarray(r.qid_train)
+    d.qid_test = np.ascontiguousarray(r.qid_test)
+    bounds = query_bounds(d.qid_train)
+    d.group_sizes = np.diff(bounds).astype(np.int64)
+    d.qid_train_seq = np.repeat(np.arange(d.group_sizes.size, dtype=np.uint32),
+                                d.group_sizes)
+    d.bounds_test = query_bounds(d.qid_test)
+    return d
+
+
+def _find_file(folder, name):
+    for root, _dirs, files in os.walk(folder):
+        if name in files:
+            return os.path.join(root, name)
+    return None
+
+
+TAXI_MONTHS = ("2024-01", "2024-02")
+TAXI_URL = "https://d37ci6vzurychx.cloudfront.net/trip-data/yellow_tripdata_%s.parquet"
+TAXI_N_TEST = 500000
+#: The 16 tree features, in column order. Categorical ids stay as their
+#: integer codes (the same code for every arm; CatBoost is NOT told they are
+#: categorical, per "same everything except GPU"). A missing value is -1.
+TAXI_FEATURES = ("vendor", "passengers", "distance_mi", "ratecode",
+                 "store_fwd", "pu_zone", "do_zone", "pickup_hour",
+                 "pickup_weekday", "pickup_day", "duration_min", "extra",
+                 "mta_tax", "tolls", "congestion", "airport_fee")
+#: The columns a classical (kNN, k-means, PCA, OLS) lane takes: the numeric
+#: ones, no ids.
+TAXI_NUMERIC = ("passengers", "distance_mi", "pickup_hour", "pickup_weekday",
+                "pickup_day", "duration_min", "extra", "mta_tax", "tolls",
+                "congestion", "airport_fee")
+
+
+def _decode_taxi_month(path):
+    """One TLC yellow-taxi parquet month to (features float32 [rows, 16],
+    fare float32, tip float32, card bool). Needs pyarrow; only the untimed
+    `--download taxi` step calls it."""
+    import pyarrow.parquet as pq
+    cols = ["VendorID", "tpep_pickup_datetime", "tpep_dropoff_datetime",
+            "passenger_count", "trip_distance", "RatecodeID",
+            "store_and_fwd_flag", "PULocationID", "DOLocationID",
+            "payment_type", "fare_amount", "extra", "mta_tax", "tip_amount",
+            "tolls_amount", "congestion_surcharge", "Airport_fee"]
+    t = pq.read_table(path, columns=cols)
+
+    def col(name, fill=-1.0):
+        a = t.column(name).to_numpy(zero_copy_only=False)
+        if a.dtype.kind in "OU":
+            return a
+        a = a.astype(np.float64)
+        a[~np.isfinite(a)] = fill
+        return a
+
+    pu = t.column("tpep_pickup_datetime").to_numpy(zero_copy_only=False)
+    do = t.column("tpep_dropoff_datetime").to_numpy(zero_copy_only=False)
+    pu_us = pu.astype("datetime64[us]").astype(np.int64)
+    do_us = do.astype("datetime64[us]").astype(np.int64)
+    duration_min = (do_us - pu_us) / 60e6
+    pu_min = pu_us // 60_000_000
+    pickup_hour = (pu_min // 60) % 24
+    pu_day = pu_min // (60 * 24)
+    pickup_weekday = (pu_day + 3) % 7          # 1970-01-01 was a Thursday
+    pickup_day = (pu.astype("datetime64[D]").astype(np.int64)
+                  - pu.astype("datetime64[M]").astype("datetime64[D]").astype(np.int64)) + 1
+    flag = t.column("store_and_fwd_flag").to_numpy(zero_copy_only=False)
+    store_fwd = np.full(len(flag), -1.0)
+    store_fwd[flag == "N"] = 0.0
+    store_fwd[flag == "Y"] = 1.0
+    fare = col("fare_amount")
+    tip = col("tip_amount")
+    distance = col("trip_distance")
+    payment = col("payment_type")
+    feats = np.stack([
+        col("VendorID"), col("passenger_count"), distance, col("RatecodeID"),
+        store_fwd, col("PULocationID"), col("DOLocationID"),
+        pickup_hour.astype(np.float64), pickup_weekday.astype(np.float64),
+        pickup_day.astype(np.float64), duration_min, col("extra"),
+        col("mta_tax"), col("tolls_amount"), col("congestion_surcharge"),
+        col("Airport_fee")], axis=1)
+    # Plausible trips only: a positive fare under $500, a positive distance
+    # under 100 miles, one minute to three hours. Same filter for every arm.
+    keep = ((fare > 0) & (fare <= 500) & (distance > 0) & (distance <= 100)
+            & (duration_min >= 1) & (duration_min <= 180))
+    return (feats[keep].astype(np.float32), fare[keep].astype(np.float32),
+            tip[keep].astype(np.float32), payment[keep] == 1)
+
+
+#: lane gbdt-multiclass on taxi: the tip share of the fare on card-paid
+#: trips, cut at 20%, 25% and 30% (four classes: under 20%, 20-25%, 25-30%,
+#: 30% or more). Class >= 1 is exactly the binary cell's label (tip >= 20%).
+#: Measured on the staged cache: 23.7%, 18.4%, 28.0% and 29.9% of card trips.
+TAXI_TIP_CUTS = (0.2, 0.25, 0.3)
+
+#: lane gbdt-categorical on taxi: the id columns declared categorical on
+#: EVERY arm (vendor, rate code, store-and-forward flag, pickup zone, dropoff
+#: zone). The zones carry about 260 categories each, above every library's
+#: one-hot threshold, so they reach the target-statistics (CTR) and
+#: partition-search paths; the small ones take one-hot.
+TAXI_CAT_COLUMNS = (0, 3, 4, 5, 6)
+
+
+def load_taxi(size, rows_cap=None, regression=False, multiclass=False,
+              categorical=False):
+    """NYC TLC yellow taxi trips, January and February 2024, THE MIXED-TYPE
+    LARGE DATASET (CONTRIBUTING.md (Performance claims), the second kind beside
+    Istella-S).
+
+    About 5.8M plausible trips after the filter in `_decode_taxi_month`,
+    16 features of the kind a business table has: categorical ids (vendor,
+    rate code, pickup and dropoff zone), small integers (passengers, hour,
+    weekday, day), skewed positives (distance, duration, tolls), columns
+    that are mostly missing (congestion surcharge, airport fee; -1 marks a
+    missing value for every arm). `taxi` is the classification task: on
+    card-paid trips (cash tips are not recorded), did the rider tip 20% of
+    the fare or more. `taxireg` is fare_amount on every trip. The test rows
+    are the LAST TAXI_N_TEST rows (late February) at every rung, the train
+    rows the first `rows_cap`, so rungs are comparable and the split is
+    the temporal one a real deployment has.
+
+    THE DOWNLOAD IS ABOUT 100 MB of parquet and is a SEPARATE, EXPLICITLY
+    NAMED STEP (`--download taxi`, needs pyarrow); timed runs load the
+    NumPy cache only."""
+    folder = os.path.join(data_root(), "taxi")
+    npz_path = os.path.join(folder, "taxi_speed.npz")
+    cached = None
+    if os.path.exists(npz_path) and os.path.getsize(npz_path) > 0:
+        try:
+            cached = _open_npz(npz_path)
+        except Exception as exc:                   # noqa: BLE001
+            sys.stderr.write(
+                "speed_gbdt_arm: %s is unreadable (%s); re-decoding from "
+                "the parquet files beside it\n" % (npz_path, exc))
+            cached = None
+    if cached is not None:
+        x, fare, tip, card = (cached["x"], cached["fare"], cached["tip"],
+                              cached["card"])
+    else:
+        paths = [os.path.join(folder, "yellow_tripdata_%s.parquet" % m)
+                 for m in TAXI_MONTHS]
+        if not all(os.path.isfile(q) for q in paths):
+            raise RuntimeError(
+                "taxi is not downloaded: %s missing. Run `python "
+                "tools/speed_gbdt_arm.py --download taxi` first (about "
+                "100 MB, needs pyarrow), OUTSIDE the timed run." % folder)
+        parts = [_decode_taxi_month(q) for q in paths]
+        x = np.ascontiguousarray(np.concatenate([p[0] for p in parts]))
+        fare = np.concatenate([p[1] for p in parts])
+        tip = np.concatenate([p[2] for p in parts])
+        card = np.concatenate([p[3] for p in parts])
+        np.savez(npz_path, x=x, fare=fare, tip=tip, card=card)
+    if regression:
+        y = fare
+        name = "taxireg"
+    elif multiclass:
+        x, fare, tip = x[card], fare[card], tip[card]
+        y = np.zeros(tip.shape[0], dtype=np.float32)
+        for cut in TAXI_TIP_CUTS:
+            y += (tip >= cut * fare).astype(np.float32)
+        name = "taximc"
+    else:
+        x, fare, tip = x[card], fare[card], tip[card]
+        y = (tip >= 0.2 * fare).astype(np.float32)
+        name = "taxicat" if categorical else "taxi"
+    n_test = TAXI_N_TEST
+    n_train = x.shape[0] - n_test
+    if size == "smoke":
+        rows_cap = min(rows_cap or 50000, 50000)
+    if rows_cap:
+        n_train = min(n_train, rows_cap)
+    x_train = np.ascontiguousarray(x[:n_train])
+    y_train = np.ascontiguousarray(y[:n_train])
+    x_test = np.ascontiguousarray(x[-n_test:])
+    y_test = np.ascontiguousarray(y[-n_test:])
+    if regression:
+        return Data(name, x_train, x_test, y_train, y_test, "regression", 0)
+    if multiclass:
+        return Data(name, x_train, x_test, y_train, y_test, "multiclass",
+                    len(TAXI_TIP_CUTS) + 1)
+    if categorical:
+        # Dense codes 0..k-1 within the train slice, an unseen test value on
+        # the one unknown bucket k: the criteo rule, for the same reason
+        # (our fit refuses a non-dense categorical column by name).
+        x_train, x_test = _criteo_densify_slice(x_train, x_test,
+                                                TAXI_CAT_COLUMNS)
+        return Data(name, x_train, x_test, y_train, y_test, "binary", 2,
+                    cat_idx=TAXI_CAT_COLUMNS)
+    return Data(name, x_train, x_test, y_train, y_test, "binary", 2)
+
+
+#: Which dataset each lane runs by default. Since 2026-09-11 every tree
+#: lane defaults to `taxi` (CONTRIBUTING.md (Performance claims)); a leg runs
+#: `taxi` and `istella` both, and HIGGS is retired (its loader stays so old
+#: evidence can be re-read). `year` and `covtype` remain as small fixtures.
+LANE_DEFAULT_DATASET = {
+    "gbdt-symmetric": "taxi",
+    "gbdt-symmetric-1000": "taxi",
+    "gbdt-depthwise": "taxi",
+    "gbdt-lossguide": "taxi",
+    "rf": "taxi",
+    "et": "taxi",
+    "iforest": "anomaly",
+    "gbdt-rank-yetirank": "istellarank",
+    "gbdt-rank-pairlogit": "istellarank",
+    "gbdt-multiclass": "taximc",
+    "gbdt-categorical": "taxicat",
+    "gbdt-ordered": "taxi",
+}
+
+
+#: Criteo display-advertising click logs, the CATEGORICAL dataset. Public on
+#: HuggingFace, ungated (the API reports gated:false and an unauthenticated
+#: range request returns 206), so it needs no credentials -- which is why it is
+#: usable where Bosch was not. One `part-*` file is about 97 MB and 1,529,035
+#: rows; three reach ~4.6M, past the section 9 million-row floor.
+CRITEO_BASE = ("https://huggingface.co/datasets/criteo/CriteoClickLogs/"
+               "resolve/main/data/day=2015-02-15/")
+CRITEO_PARTS = (
+    "part-00015-99c339d5-fbac-4110-9dcf-75453a61a5c1.c000.snappy.parquet",
+    "part-00079-99c339d5-fbac-4110-9dcf-75453a61a5c1.c000.snappy.parquet",
+    "part-00104-99c339d5-fbac-4110-9dcf-75453a61a5c1.c000.snappy.parquet",
+)
+CRITEO_N_INT = 13
+CRITEO_N_CAT = 26
+CRITEO_N_TEST = 500000
+
+
+def _decode_criteo(paths):
+    """Criteo parquet -> (X float32, y float32, cat_idx).
+
+    Layout is `label`, `integer_feature_1..13`, `categorical_feature_1..26`
+    (40 columns, verified against the file). The integers keep -1 for missing,
+    the same convention `_decode_taxi_month` uses, so one arm cannot read a
+    missing value as a real one while another refuses it.
+
+    THE CATEGORY CODES ARE DETERMINISTIC BY CONSTRUCTION, and that is
+    load-bearing rather than tidiness. Our surface wants DENSE CODES 0..k-1
+    (`ensemble.py`: CatBoost's own dispatch then picks one-hot for a small
+    cardinality and target statistics for a large one). Criteo ships 32-bit
+    HASHED STRINGS instead, so the codes have to be assigned here -- and if
+    they came from dict or hash iteration order, two decodes of the same rows
+    would produce different codes, hence different borders, different splits
+    and a different model hash. The identity property would break on the one
+    dataset whose reason for existing is to exercise the categorical path.
+    So: codes are the rank of the string in SORTED UNIQUE order per column,
+    computed once over the decoded rows and frozen in the npz beside the
+    matrix. NULL is a category of its own (`cat_14`, `cat_16`, `cat_17` and
+    `cat_23` are 34.3% null and `cat_1` 3.9%: the missingness clusters, so
+    folding it into an arbitrary code would destroy signal).
+
+    Measured on `part-00015` (1,529,035 rows, 3.21% positive): cardinality
+    runs from 3 (`cat_6`, `cat_17`) to 371,237 (`cat_20`), 1,697,108 distinct
+    over the 26 columns. That spread is the point -- the small columns take
+    CatBoost's one-hot branch and the large ones force the CTR branch, so one
+    dataset covers both sides of the dispatch."""
+    try:
+        import pyarrow.parquet as pq
+    except ImportError:
+        raise RuntimeError(
+            "criteo needs pyarrow to decode parquet; it is a download-step "
+            "dependency only, never imported inside a timed run")
+    tables = [pq.read_table(p) for p in paths]
+    int_cols = ["integer_feature_%d" % i for i in range(1, CRITEO_N_INT + 1)]
+    cat_cols = ["categorical_feature_%d" % i for i in range(1, CRITEO_N_CAT + 1)]
+    y = np.concatenate([
+        np.asarray(t.column("label").to_numpy(zero_copy_only=False),
+                   dtype=np.float32) for t in tables])
+    n = y.shape[0]
+    x = np.empty((n, CRITEO_N_INT + CRITEO_N_CAT), dtype=np.float32)
+    for j, name in enumerate(int_cols):
+        col = np.concatenate([
+            np.asarray(t.column(name).to_numpy(zero_copy_only=False),
+                       dtype=np.float64) for t in tables])
+        # -1 marks missing for every arm, as in taxi
+        col = np.where(np.isnan(col), -1.0, col)
+        x[:, j] = col.astype(np.float32)
+    tables_cat = {}
+    for j, name in enumerate(cat_cols):
+        parts = []
+        for t in tables:
+            parts.append(np.asarray(t.column(name).to_pylist(), dtype=object))
+        col = np.concatenate(parts)
+        col = np.where(col == None, "\x00NULL", col)        # noqa: E711
+        col = col.astype(str)
+        # sorted unique -> rank. np.unique sorts, so the mapping is a pure
+        # function of the value set and never of iteration order.
+        uniq, codes = np.unique(col, return_inverse=True)
+        x[:, CRITEO_N_INT + j] = codes.astype(np.float32)
+        tables_cat[name] = uniq
+    # NOTE: these codes are dense over THE DECODED MATRIX and over no slice of
+    # it. `load_criteo` re-densifies within the train slice; see the comment
+    # there and the audit numbers it cites.
+    cat_idx = tuple(range(CRITEO_N_INT, CRITEO_N_INT + CRITEO_N_CAT))
+    return x, y, cat_idx, tables_cat
+
+
+def load_criteo(size, rows_cap=None):
+    """Criteo click logs, 13 integer + 26 categorical, THE CATEGORICAL SET.
+
+    NOT a section 9 gating dataset. taxi and Istella-S remain the two kinds
+    every flip verdict is computed over; criteo exists to tune and check the
+    categorical and CTR paths, which taxi's low-cardinality ids and
+    Istella-S's 220 dense numerics never reach. A win measured here alone is
+    a one-kind win and stays opt-in, exactly as the rules say.
+
+    Binary target `label` (about 3.2% positive, so far more skewed than
+    taxi's 76% or Istella-S's 11%). The test rows are the LAST
+    CRITEO_N_TEST rows at every rung and the train rows the first
+    `rows_cap`, so rungs are comparable.
+
+    THE DOWNLOAD IS ABOUT 291 MB of parquet over three parts and is a
+    SEPARATE, EXPLICITLY NAMED STEP (`--download criteo`, needs pyarrow);
+    timed runs load the NumPy cache only."""
+    folder = os.path.join(data_root(), "criteo")
+    npz_path = os.path.join(folder, "criteo_speed.npz")
+    cached = None
+    if os.path.exists(npz_path) and os.path.getsize(npz_path) > 0:
+        try:
+            cached = np.load(npz_path, allow_pickle=False)
+        except Exception as exc:                   # noqa: BLE001
+            sys.stderr.write(
+                "speed_gbdt_arm: %s is unreadable (%s); re-decoding from the "
+                "parquet parts beside it\n" % (npz_path, exc))
+            cached = None
+    if cached is not None:
+        x_all, y_all = cached["x_all"], cached["y_all"]
+        cat_idx = tuple(int(v) for v in cached["cat_idx"])
+    else:
+        paths = [os.path.join(folder, p) for p in CRITEO_PARTS]
+        missing = [p for p in paths if not os.path.isfile(p)]
+        if missing:
+            raise RuntimeError(
+                "criteo is not downloaded: %d of %d parquet parts missing "
+                "under %s. Run `python tools/speed_gbdt_arm.py --download "
+                "criteo` first (about 291 MB), OUTSIDE the timed run."
+                % (len(missing), len(paths), folder))
+        x_all, y_all, cat_idx, _codes = _decode_criteo(paths)
+        os.makedirs(folder, exist_ok=True)
+        np.savez(npz_path, x_all=x_all, y_all=y_all,
+                 cat_idx=np.asarray(cat_idx, dtype=np.int32))
+    n_all = x_all.shape[0]
+    n_test = min(CRITEO_N_TEST, max(1, n_all // 5))
+    x_te = np.ascontiguousarray(x_all[n_all - n_test:])
+    y_te = np.ascontiguousarray(y_all[n_all - n_test:])
+    n_train = n_all - n_test
+    if size == "smoke":
+        rows_cap = min(rows_cap or 50000, 50000)
+    if rows_cap:
+        n_train = min(n_train, rows_cap)
+    x_train = np.ascontiguousarray(x_all[:n_train])
+    y_train = np.ascontiguousarray(y_all[:n_train])
+    x_train, x_te = _criteo_densify_slice(x_train, x_te, cat_idx)
+    return Data("criteo", x_train, x_te, y_train, y_te, "binary", 2,
+                cat_idx=cat_idx)
+
+
+def _criteo_densify_slice(x_train, x_test, cat_idx):
+    """Re-rank each categorical column WITHIN the train slice, 0..k-1.
+
+    WHY THIS EXISTS, and why the obvious alternative is wrong.
+    `_decode_criteo` ranks each category over every decoded row, which makes
+    the codes dense over the whole matrix and dense over NO SLICE of it. Our
+    surface requires dense 0..k-1 in the rows that reach `fit`, and
+    `gbdt/train.mojo` refuses otherwise, by name:
+
+        cat_features column 13 is not densely coded: category 1 is absent
+        from 0..621909
+
+    and the refusal is CORRECT. `tools/criteo_density_audit.py` measured it on
+    an H100 (2026-09-12) rather than arguing about it: of 26 declared columns,
+    0 are non-dense over all 3,061,005 decoded rows, but 19 are non-dense over
+    the UNCAPPED train split (386,091 missing codes), 21 at 1,000,000 rows
+    (1,702,570 missing) and 22 at 200,000 (2,592,446 missing). So this is a
+    property of the global ranking, not an artefact of `--rows`: no train/test
+    split of criteo as decoded is densely coded.
+
+    The global ranking was chosen so codes reproduce between runs. It does
+    that, and it is still the wrong basis, because reproducibility of a code
+    that `fit` refuses to accept is worth nothing. Re-ranking per slice keeps
+    what matters -- the mapping is a pure function of the slice's value set
+    via `np.unique`'s sorted order, so the same rung decodes to the same codes
+    every time -- and gives up only cross-RUNG comparability of raw code
+    values, which nothing reads.
+
+    TEST ROWS. A category the train slice never saw has no code. It is mapped
+    to k (one past the train maximum), a single explicit unknown bucket per
+    column, rather than to an arbitrary in-range code that would silently
+    claim to be a category the model had learned. This is a REAL COST and it
+    is large: at 1M train rows the audit's shape put 493,612 of 500,000 test
+    rows carrying at least one unknown category. Quality figures on criteo
+    therefore describe a harder problem than a global-ranking split would, and
+    that belongs beside any number quoted from this loader."""
+    if not cat_idx:
+        return x_train, x_test
+    xtr = np.ascontiguousarray(x_train)
+    xte = np.ascontiguousarray(x_test)
+    for j in cat_idx:
+        uniq, codes = np.unique(xtr[:, j], return_inverse=True)
+        xtr[:, j] = codes.astype(np.float32)
+        # searchsorted gives the train rank; anything not present lands on the
+        # single unknown bucket k. `uniq` is sorted, which is what makes the
+        # lookup well defined.
+        pos = np.searchsorted(uniq, xte[:, j])
+        pos = np.clip(pos, 0, len(uniq) - 1)
+        hit = uniq[pos] == xte[:, j]
+        xte[:, j] = np.where(hit, pos, len(uniq)).astype(np.float32)
+    return xtr, xte
+
+
+def load_dataset(name, size, rows_cap=None):
+    if name == "criteo":
+        return load_criteo(size, rows_cap)
+    if name == "higgs":
+        return load_higgs(size, rows_cap)
+    if name == "higgsreg":
+        # HIGGS with its 0/1 label as a float TARGET: the RMSE cell of the
+        # boosting lanes on the same bytes as the Logloss cell, so the two
+        # objectives (one with a Newton walker, one without) are timed on
+        # one fixture. RMSE on a 0/1 target is a legitimate regression
+        # (a Brier-style fit); it is not what CatBoost users run on HIGGS.
+        d = load_higgs(size, rows_cap)
+        return Data("higgsreg", d.X_train, d.X_test, d.y_train, d.y_test,
+                    "regression", 0)
+    if name == "istella":
+        return load_istella(size, rows_cap)
+    if name == "istellareg":
+        return load_istella(size, rows_cap, regression=True)
+    if name == "taxi":
+        return load_taxi(size, rows_cap)
+    if name == "taxireg":
+        return load_taxi(size, rows_cap, regression=True)
+    if name == "taximc":
+        return load_taxi(size, rows_cap, multiclass=True)
+    if name == "taxicat":
+        return load_taxi(size, rows_cap, categorical=True)
+    if name == "istellamc":
+        return load_istella(size, rows_cap, multiclass=True)
+    if name == "istellarank":
+        return load_istella_rank_data(size, rows_cap)
+    if name == "year":
+        return load_year(size, rows_cap)
+    if name == "covtype":
+        return load_covtype(size, False, rows_cap)
+    if name == "covtype2":
+        return load_covtype(size, True, rows_cap)
+    if name == "synth":
+        return load_synth(size, "regression", rows_cap)
+    if name == "synthclf":
+        return load_synth(size, "binary", rows_cap)
+    if name == "anomaly":
+        return load_anomaly(size, rows_cap)
+    raise SystemExit("unknown dataset " + repr(name))
+
+
+#: Where `tools/dataset_store.sh` pins every dataset it can stage onto a box:
+#: one row of key, byte size, sha256. The refusal below names it, so a missing
+#: dataset sends the reader to the one file that says what it should have been.
+DATASET_MANIFEST = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "bench", "results", "dataset_store", "manifest.tsv")
+
+#: The manifest key a dataset's decoded cache is staged under, for the ones
+#: the R2 store carries. A dataset absent from this table is not pinned and is
+#: fetched with `--download <name>`; the refusal says which case it is.
+DATASET_STORE_KEYS = {
+    "taxi": "gbm-bench/taxi/taxi_speed.npz",
+    "taxireg": "gbm-bench/taxi/taxi_speed.npz",
+    "istella": "gbm-bench/istella/istella_speed.npz",
+    "istellareg": "gbm-bench/istella/istella_speed.npz",
+    "higgs": "gbm-bench/higgs/higgs_speed.npz",
+    "higgsreg": "gbm-bench/higgs/higgs_speed.npz",
+    "year": "gbm-bench/year/year_speed.npz",
+    "covtype": "gbm-bench/covtype/covtype_speed.npz",
+    "covtype2": "gbm-bench/covtype/covtype_speed.npz",
+    "taximc": "gbm-bench/taxi/taxi_speed.npz",
+    "taxicat": "gbm-bench/taxi/taxi_speed.npz",
+    "istellamc": "gbm-bench/istella/istella_speed.npz",
+    # and gbm-bench/istella/istella_speed.npz beside it (the train features)
+    "istellarank": "gbm-bench/istella/istella_rank.npz",
+}
+
+#: Generated in process, so they cannot be missing and are never a substitute
+#: for anything. Asking for one BY NAME is legitimate; being handed one is not.
+GENERATED_DATASETS = ("synth", "synthclf", "anomaly")
+
+
+def _manifest_pin(key):
+    """`(size, sha256)` for `key` in the dataset-store manifest, or None."""
+    try:
+        with open(DATASET_MANIFEST, "r") as fh:
+            for line in fh:
+                fields = line.rstrip("\n").split("\t")
+                if len(fields) >= 3 and fields[0] == key:
+                    return fields[1], fields[2]
+    except OSError:
+        return None
+    return None
+
+
+def load_with_fallback(name, size, rows_cap=None):
+    """A MISSING DATASET IS A REFUSAL. THERE IS NO FALLBACK.
+
+    THIS FUNCTION USED TO SUBSTITUTE (removed 2026-09-12, lane
+    harness-honesty). When a download had failed it quietly loaded the
+    SYNTHETIC fixture of the same task, wrote one line to stderr, and let the
+    run continue. The reasoning was that a failed fetch must not cost the
+    lease. The effect was the worst failure mode a benchmark has: **the run
+    SUCCEEDED**. It printed a full table of plausible timings, an accuracy
+    column, model hashes and a flip verdict, all describing a different
+    dataset than the one every line above them named. stderr is not where a
+    results file is read, `shape=` was a tag nobody diffed, and a leg once
+    measured `synthclf` while believing it had Istella-S
+    (`tools/dataset_store.sh`'s own header records it, and
+    `tools/gbdt_accuracy_ab.sh` had to grow a shape-tag guard downstream to
+    catch it).
+
+    A benchmark suite that substitutes data on failure is a benchmark suite
+    that lies, and it lies in the direction nobody checks, because a run that
+    crashes gets investigated and a run that prints numbers does not.
+
+    So: the loader's own error is re-raised as a refusal that names the
+    dataset, the error, and the manifest the dataset is pinned in. The lease
+    is not the thing being protected here; the number is.
+
+    THE SYNTHETIC FIXTURES ARE STILL REACHABLE, BY NAME. `--dataset synthclf`,
+    `--dataset synth` and `--dataset anomaly` load exactly what they say and
+    tag every line with it. You may ASK for generated data. You may not be
+    GIVEN it."""
+    if name in GENERATED_DATASETS:
+        return load_dataset(name, size, rows_cap)
+    try:
+        return load_dataset(name, size, rows_cap)
+    except Exception as exc:                       # noqa: BLE001
+        key = DATASET_STORE_KEYS.get(name)
+        pin = _manifest_pin(key) if key else None
+        if pin is not None:
+            where = ("%s is pinned in %s at %s bytes, sha256 %s; stage it with "
+                     "`sh tools/dataset_store.sh stage \"<ssh flags+target>\" %s`"
+                     % (key, DATASET_MANIFEST, pin[0], pin[1], key))
+        elif key:
+            where = ("%s is NOT pinned in %s (the manifest has no row for it); "
+                     "fetch it with `python tools/speed_gbdt_arm.py --download "
+                     "%s`" % (key, DATASET_MANIFEST, name))
+        else:
+            where = ("%r has no key in the dataset store (%s pins taxi and "
+                     "Istella-S only); fetch it with `python "
+                     "tools/speed_gbdt_arm.py --download %s`"
+                     % (name, DATASET_MANIFEST, name))
+        raise SystemExit(
+            "speed_gbdt_arm: REFUSING to run. Dataset %r is unavailable on "
+            "this box: %s: %s. %s. There is no synthetic fallback: a run that "
+            "substitutes data succeeds while describing a different dataset "
+            "than every line it prints. To measure generated data, ask for it "
+            "by name with --dataset synthclf, --dataset synth or --dataset "
+            "anomaly."
+            % (name, exc.__class__.__name__, " ".join(str(exc).split()),
+               where))
+
+
+_load_with_fallback_uncached = load_with_fallback
+
+
+def _dataset_files(name):
+    """The decoded-cache files dataset `name` is built from (its dataset-store folder's .npz files), for the
+    smoke's staging key; () for a generated dataset."""
+    key = DATASET_STORE_KEYS.get(name)
+    if not key:
+        return ()
+    folder = os.path.join(data_root(), key.split("/")[1])
+    try:
+        return tuple(sorted(os.path.join(folder, f) for f in os.listdir(folder) if f.endswith(".npz")))
+    except OSError:
+        return ()
+
+
+def load_with_fallback(name, size, rows_cap=None):
+    """The dataset (see _load_with_fallback_uncached: a missing dataset is a refusal, never a substitute).
+
+    Inside the smoke worker (smoke-fixes r14, 2026-10-14; trees recipes on istella/taxi STARTED at 5 s inside
+    their loaders) the Data of (name, size, rows_cap) is built once per process by the same loader, from the
+    pinned decoded caches (_open_npz), and kept pinned for the whole smoke while it fits (keyed by the data root
+    and every decoded-cache file's path, size and mtime). Each caller gets its own Data object over the same
+    arrays (attributes a run sets on it stay that run's own); the arrays are only read downstream. A timed run
+    never reaches the cache."""
+    SI = _smoke_staging()
+    if SI is None:
+        return _load_with_fallback_uncached(name, size, rows_cap)
+    import copy
+    files = _dataset_files(name)
+    key = (("trees-data", name, size, rows_cap, os.path.abspath(data_root()))
+           + tuple(SI.file_stamp(f) for f in files))
+    data = SI.staged(key, lambda: _load_with_fallback_uncached(name, size, rows_cap), pin=bool(files))
+    return copy.copy(data)
+
+
+def catboost_cat_frame_once(x, cat_idx):
+    """catboost_cat_frame(x, cat_idx); inside the smoke worker (smoke-fixes r14, 2026-10-14;
+    trees/gbdt-categorical/taxi STARTED at 5 s building this frame) once per staged matrix (the Data arrays are
+    the pinned ones of load_with_fallback), the same frame for every recipe that reads it."""
+    SI = _smoke_staging()
+    if SI is None:
+        return catboost_cat_frame(x, cat_idx)
+    return SI.memo_on("catboost-cat-frame", (x,), lambda: catboost_cat_frame(x, cat_idx),
+                      extra=tuple(int(j) for j in cat_idx))
+
+
+def stage_inputs(lane, dataset, data):
+    """The smoke worker's stage-data step for one trees recipe (tools/smoke_worker.py; the forest driver's
+    stage_inputs), outside every recipe's timer: the dataset (load_with_fallback, pinned) and, when a CatBoost
+    arm races a categorical dataset, its frames. `data`: {"size", "rows", "arms"}. A no-op outside the smoke
+    worker."""
+    if _smoke_staging() is None:
+        return {"status": "not in the smoke worker"}
+    data = dict(data or {})
+    d = load_with_fallback(dataset, data.get("size") or "shipped", data.get("rows"))
+    staged = ["dataset %s" % d.name]
+    if getattr(d, "cat_idx", None) and any("catboost" in str(a) for a in data.get("arms") or ()):
+        catboost_cat_frame_once(d.X_train, d.cat_idx)
+        catboost_cat_frame_once(d.X_test, d.cat_idx)
+        staged.append("catboost frames")
+    arms = [str(a) for a in data.get("arms") or ()]
+    if any(board_pairing.prebinned_arm(lane, a) for a in arms) and not getattr(d, "cat_idx", None):
+        # smoke-fixes r17 (2026-10-14; trees/gbdt-depthwise/istella and gbdt-lossguide/istella STARTED at 5 s
+        # in the pre-binned XGBoost pairing's binning): the block both arms of the pairing read, built once
+        # here by the same function and cfg as the recipe's (prebinned_data), pinned for the whole smoke.
+        blk = _prebinned_block_once(d, lane_config(lane, data.get("size") or "shipped"))
+        staged.append("pre-binned block (bins sha256 %s)" % blk["sha256"])
+    return {"status": "ok", "staged": staged}
+
+
+#: The decoded cache each `--download <name>` exists to produce. When the R2
+#: store has already put this file on the box, there is nothing left to fetch
+#: and nothing left to decode.
+DOWNLOAD_PRODUCES = {
+    "higgs": ("higgs", "higgs_speed.npz"),
+    "taxi": ("taxi", "taxi_speed.npz"),
+    "istella": ("istella", "istella_speed.npz"),
+    "year": ("year", "year_speed.npz"),
+    "covtype": ("covtype", "covtype_speed.npz"),
+    "covtype2": ("covtype", "covtype_speed.npz"),
+}
+
+
+def staged_cache(name):
+    """The staged decoded npz for `name`, or None.
+
+    A file of zero or near-zero length is NOT a cache: `load_higgs` already
+    carries a scar about a 0-byte `higgs_speed.npz` left by a killed decode,
+    and accepting one here would turn a truncated file into "already staged"
+    and then into a refusal three steps later with the wrong cause attached.
+    """
+    ent = DOWNLOAD_PRODUCES.get(name)
+    if ent is None:
+        return None
+    path = os.path.join(data_root(), ent[0], ent[1])
+    try:
+        if os.path.isfile(path) and os.path.getsize(path) > (1 << 20):
+            return path
+    except OSError:
+        return None
+    return None
+
+
+def download(name):
+    """The explicitly named, untimed fetch step. Prints the size it pulled so
+    the maintainer can budget the lease around it.
+
+    THE STAGED CACHE SHORT-CIRCUITS EVERYTHING BELOW (DEVIATION 2704).
+    Every branch used to test for the RAW artifact -- `HIGGS.csv.gz`,
+    `yellow_tripdata_*.parquet`, `istella-s-letor.tar.gz`,
+    `YearPredictionMSD.txt.zip` -- so a box that already held the pinned,
+    sha256-verified `*_speed.npz` from R2 still pulled 2.6 GB from
+    archive.ics.uci.edu, or 472 MB from library.istella.it, and then decoded
+    it again. The npz IS what this function exists to produce; when it is
+    there, the fetch and the decode are both finished.
+
+    The taxi branch is the one this matters most for and the one that was
+    least visible: it never printed an `R2_STAGING_MISSED` line at all, so its
+    re-download left no trace in the leg's evidence.
+    """
+    staged = staged_cache(name)
+    if staged is not None:
+        print("%s: staged decoded cache already present, nothing to download: "
+              "%s (%.1f MB)" % (name, staged, os.path.getsize(staged) / 1e6))
+        return
+    if name == "higgs":
+        import urllib.request
+        folder = os.path.join(data_root(), "higgs")
+        os.makedirs(folder, exist_ok=True)
+        url = ("https://archive.ics.uci.edu/ml/machine-learning-databases/"
+               "00280/HIGGS.csv.gz")
+        dest = os.path.join(folder, "HIGGS.csv.gz")
+        if os.path.isfile(dest):
+            print("higgs already present: %s (%.1f MB)"
+                  % (dest, os.path.getsize(dest) / 1e6))
+        else:
+            print("downloading %s -> %s (about 2.6 GB)" % (url, dest))
+            print("R2_STAGING_MISSED: downloading from the origin on this box; the runner should have staged it (tools/stage_from_r2.sh: always use R2)")
+            urllib.request.urlretrieve(url, dest)
+            print("higgs: %.1f MB" % (os.path.getsize(dest) / 1e6))
+        # Decode once, here. The gzip csv parse is several MINUTES and it
+        # must not happen inside a timed run's setup on a leased box.
+        d = load_higgs("shipped")
+        print("higgs decoded to %s (train %d x %d, test %d)"
+              % (os.path.join(folder, "higgs_speed.npz"),
+                 d.X_train.shape[0], d.X_train.shape[1], d.X_test.shape[0]))
+        return
+    if name == "taxi":
+        import urllib.request
+        folder = os.path.join(data_root(), "taxi")
+        os.makedirs(folder, exist_ok=True)
+        for m in TAXI_MONTHS:
+            dest = os.path.join(folder, "yellow_tripdata_%s.parquet" % m)
+            if os.path.isfile(dest):
+                print("taxi %s already present (%.1f MB)"
+                      % (m, os.path.getsize(dest) / 1e6))
+                continue
+            print("downloading %s -> %s" % (TAXI_URL % m, dest))
+            # An explicit agent: the TLC CloudFront has refused Python-urllib's
+            # default one (MI325X trees leg, 2026-09-11). It also refuses
+            # DigitalOcean droplets BY ADDRESS whatever the agent (curl with a
+            # browser agent got 403 on droplet 599682588, 2026-09-11), so a
+            # DigitalOcean leg needs taxi from the anonlib-data-tor1 volume.
+            # Written to .part and renamed, so a failed fetch leaves no
+            # truncated file for the "already present" test to accept.
+            req = urllib.request.Request(
+                TAXI_URL % m,
+                headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) anonlib-bench"})
+            part = dest + ".part"
+            with urllib.request.urlopen(req) as resp, open(part, "wb") as fh:
+                while True:
+                    chunk = resp.read(1 << 20)
+                    if not chunk:
+                        break
+                    fh.write(chunk)
+            os.replace(part, dest)
+            print("taxi %s: %.1f MB" % (m, os.path.getsize(dest) / 1e6))
+        d = load_taxi("shipped")
+        print("taxi decoded to %s (train %d x %d, test %d, positives %.3f)"
+              % (os.path.join(folder, "taxi_speed.npz"), d.X_train.shape[0],
+                 d.X_train.shape[1], d.X_test.shape[0],
+                 float(d.y_train.mean())))
+        return
+    if name == "istella":
+        import tarfile
+        import urllib.request
+        folder = os.path.join(data_root(), "istella")
+        os.makedirs(folder, exist_ok=True)
+        dest = os.path.join(folder, "istella-s-letor.tar.gz")
+        if os.path.isfile(dest):
+            print("istella already present: %s (%.1f MB)"
+                  % (dest, os.path.getsize(dest) / 1e6))
+        else:
+            print("downloading %s -> %s (about 472 MB)" % (ISTELLA_URL, dest))
+            print("R2_STAGING_MISSED: downloading from the origin on this box; the runner should have staged it (tools/stage_from_r2.sh: always use R2)")
+            urllib.request.urlretrieve(ISTELLA_URL, dest)
+            print("istella: %.1f MB" % (os.path.getsize(dest) / 1e6))
+        if _find_file(folder, "train.txt") is None:
+            with tarfile.open(dest) as tar:
+                tar.extractall(folder)
+        d = load_istella("shipped")
+        print("istella decoded to %s (train %d x %d, test %d)"
+              % (os.path.join(folder, "istella_speed.npz"),
+                 d.X_train.shape[0], d.X_train.shape[1], d.X_test.shape[0]))
+        return
+    if name == "criteo":
+        import urllib.request
+        folder = os.path.join(data_root(), "criteo")
+        os.makedirs(folder, exist_ok=True)
+        for part in CRITEO_PARTS:
+            dest = os.path.join(folder, part)
+            if os.path.isfile(dest) and os.path.getsize(dest) > 0:
+                print("criteo part already present: %s (%.1f MB)"
+                      % (part, os.path.getsize(dest) / 1e6))
+                continue
+            url = CRITEO_BASE + part
+            print("downloading %s -> %s (about 97 MB)" % (url, dest))
+            # .part then rename, so an interrupted fetch cannot leave a
+            # truncated file that the size>0 check above would accept as
+            # complete. urlretrieve cannot resume, and a half file that
+            # counts as present is how a leg once measured synthetic data
+            # while believing it had Istella-S.
+            tmp = dest + ".part"
+            print("R2_STAGING_MISSED: downloading from the origin on this box; the runner should have staged it (tools/stage_from_r2.sh: always use R2)")
+            urllib.request.urlretrieve(url, tmp)
+            os.replace(tmp, dest)
+            print("criteo part: %.1f MB" % (os.path.getsize(dest) / 1e6))
+        d = load_criteo("shipped")
+        print("criteo decoded to %s (train %d x %d, test %d, %d categorical "
+              "columns at %s)"
+              % (os.path.join(folder, "criteo_speed.npz"),
+                 d.X_train.shape[0], d.X_train.shape[1], d.X_test.shape[0],
+                 len(d.cat_idx), ",".join(str(i) for i in d.cat_idx[:4]) + ",..."))
+        return
+    if name == "year":
+        import urllib.request
+        folder = os.path.join(data_root(), "year")
+        os.makedirs(folder, exist_ok=True)
+        url = ("https://archive.ics.uci.edu/ml/machine-learning-databases/"
+               "00203/YearPredictionMSD.txt.zip")
+        dest = os.path.join(folder, "YearPredictionMSD.txt.zip")
+        if os.path.isfile(dest):
+            print("year already present: %s (%.1f MB)"
+                  % (dest, os.path.getsize(dest) / 1e6))
+        else:
+            print("downloading %s -> %s (about 211 MB)" % (url, dest))
+            print("R2_STAGING_MISSED: downloading from the origin on this box; the runner should have staged it (tools/stage_from_r2.sh: always use R2)")
+            urllib.request.urlretrieve(url, dest)
+            print("year: %.1f MB" % (os.path.getsize(dest) / 1e6))
+        # Decode once, here, so the first timed run does not pay a
+        # two-minute csv parse inside its setup.
+        load_year("shipped")
+        print("year decoded to %s" % os.path.join(folder, "year_speed.npz"))
+        return
+    if name in ("covtype", "covtype2"):
+        d = load_covtype("shipped")
+        print("covtype decoded to %s (%d x %d + %d test rows)"
+              % (os.path.join(data_root(), "covtype", "covtype_speed.npz"),
+                 d.X_train.shape[0], d.X_train.shape[1], d.X_test.shape[0]))
+        return
+    if name in ("synth", "synthclf", "anomaly"):
+        print("%s is generated in-process; nothing to download" % name)
+        return
+    raise SystemExit("nothing known to download for " + repr(name))
+
+
+# --------------------------------------------------------------------------
+# The hyper-parameters, in ONE place, held equal across every arm of a lane.
+# --------------------------------------------------------------------------
+
+#: THE GBDT TASK LANES: what each one fits, each library's objective, the
+#: datasets it runs, and every mismatch that could not be removed, one line
+#: each with its reason. The shared knobs are the gbdt lanes' own
+#: (`lane_config`): gbm-bench's 500 trees, depth 8, 256 leaves, rate 0.1, L2 1
+#: for gbdt-multiclass and gbdt-categorical; 100 trees, depth 6, 64 leaves for
+#: the ranking lanes, which gbm-bench does not have; 254 borders, no bagging,
+#: seed 7, Plain boosting on all. Only the task, the objective and the grower
+#: differ.
+#:
+#: WHY THE GROWER DIFFERS. The public GradientBoosting fits the ranking and
+#: multiclass losses on SymmetricTree only (Depthwise and Lossguide refuse by
+#: name, as CatBoost's GPU learner does: it registers a non-symmetric trainer
+#: for eleven pointwise losses; probed on 0.8.22, identical and fast). So
+#: those lanes race CatBoost on the same oblivious grower, and XGBoost and
+#: LightGBM, which have none, on their own growers at the same depth, labeled.
+#: The categorical lane has no such limit and runs Lossguide, the one policy
+#: all four libraries grow.
+TASK_LANES = {
+    "gbdt-rank-yetirank": dict(
+        task="ranking", loss="YetiRank", grow_policy="SymmetricTree",
+        datasets=("istellarank",),
+        objectives={"anonlib": "YetiRank", "catboost": "YetiRank",
+                    "xgboost": "rank:ndcg", "lightgbm": "lambdarank"},
+        mismatches=(
+            # FAIRNESS FIX (2026-10-13 audit): the arms named below are refused by name in
+            # their builders. Results raced before this change were wrong for this lane;
+            # apply extra scrutiny.
+            "XGBoost and LightGBM are refused (2026-10-13 audit): depthwise or leaf-wise trees "
+            "with LambdaMART objectives are a different algorithm from YetiRank on oblivious "
+            "trees; CatBoost races",
+            "grower: ours and CatBoost fit YetiRank on symmetric trees (ours has no other "
+            "policy for a ranking loss); XGBoost depthwise at depth 6, LightGBM leaf-wise "
+            "capped at depth 6 and 64 leaves, because neither has an oblivious grower",
+            "objective: XGBoost rank:ndcg and LightGBM lambdarank are LambdaMART "
+            "(NDCG-weighted pairwise gradients), a different loss from YetiRank's sampled "
+            "permutations; each is that library's closest listwise objective, labeled",
+            "l2 1.0 is pinned on every arm; the YetiRank default in CatBoost (and ours) is 0",
+            "YetiRank draws its permutations from each library's own seeded generator "
+            "(seed 7); the streams are not shared, so the fits differ by construction",
+            "XGBoost pair construction (lambdarank_pair_method, lambdarank_num_pair_per_sample) "
+            "and LightGBM's lambdarank_truncation_level (30) and label_gain (2^g - 1) are left "
+            "at their defaults; no library exposes the others' pair sampling",
+            "XGBoost is handed each query renumbered by order of appearance (it refuses "
+            "unsorted qids); the same partition of the same rows in the same order",
+            "LightGBM min_child_samples 20 and min_child_weight 1e-3 stay at its defaults: "
+            "at 0 (the gbdt lanes' value) LightGBM 4.7.0 aborts the first lambdarank tree",
+        )),
+    "gbdt-rank-pairlogit": dict(
+        task="ranking", loss="PairLogit", grow_policy="SymmetricTree",
+        datasets=("istellarank",),
+        objectives={"anonlib": "PairLogit", "catboost": "PairLogit",
+                    "xgboost": "rank:pairwise"},
+        mismatches=(
+            # FAIRNESS FIX (2026-10-13 audit): the arms named below are refused by name in
+            # their builders. Results raced before this change were wrong for this lane;
+            # apply extra scrutiny.
+            "XGBoost is refused (2026-10-13 audit): depthwise trees with sampled pairs are a "
+            "different algorithm from PairLogit over every pair on oblivious trees; CatBoost races",
+            "grower: ours and CatBoost fit PairLogit on symmetric trees (ours has no other "
+            "policy for a ranking loss); XGBoost depthwise at depth 6",
+            "objective: XGBoost rank:pairwise is the same pairwise logistic loss, but it "
+            "samples its pairs (lambdarank_pair_method and lambdarank_num_pair_per_sample at "
+            "their defaults) where CatBoost and ours generate them from the grades",
+            "LightGBM is not raced here: it has no pairwise logistic objective without NDCG "
+            "weighting (its lambdarank races in gbdt-rank-yetirank)",
+            "XGBoost is handed each query renumbered by order of appearance (it refuses "
+            "unsorted qids); the same partition of the same rows in the same order",
+        )),
+    "gbdt-multiclass": dict(
+        task="multiclass", loss="MultiClass", grow_policy="SymmetricTree",
+        datasets=("taximc", "istellamc", "covtype"),
+        objectives={"anonlib": "MultiClass", "catboost": "MultiClass",
+                    "xgboost": "multi:softprob", "lightgbm": "multiclass"},
+        mismatches=(
+            # FAIRNESS FIX (2026-10-13 audit): the arms named below are refused by name in
+            # their builders. Results raced before this change were wrong for this lane;
+            # apply extra scrutiny.
+            "XGBoost and LightGBM are refused (2026-10-13 audit): one depthwise or leaf-wise tree "
+            "per class per round is a different model from one oblivious vector-leaf tree; "
+            "CatBoost races",
+            "grower: ours and CatBoost fit MultiClass on symmetric trees (ours has no other "
+            "policy for a multiclass loss); XGBoost depthwise at depth 8, LightGBM leaf-wise "
+            "capped at depth 8 and 256 leaves, because neither has an oblivious grower",
+            "model shape: ours and CatBoost grow ONE tree per round with a vector of class "
+            "values in each leaf; XGBoost and LightGBM grow one tree PER CLASS per round, so "
+            "the fit verdict divides their tree and leaf counts by n_classes",
+            "the loss is the same softmax cross-entropy on every arm; gbm-bench itself "
+            "gives CatBoost MultiClassOneVsAll beside XGBoost multi:softmax, two different "
+            "losses, so the board keeps one loss on every arm",
+            "LightGBM min_child_samples 20 and min_child_weight 1e-3 stay at its defaults: "
+            "at 0 (the gbdt lanes' value) LightGBM 4.7.0 aborts the first multiclass tree",
+        )),
+    # FAIRNESS FIX (2026-10-13 audit): this lane raced ours' one-hot/CTR categorical
+    # algorithm against XGBoost's partition search (max_cat_to_onehot 1) and LightGBM's own
+    # categorical split, two different algorithms, and converted the input of XGBoost (a
+    # pandas CategoricalDtype frame) and CatBoost (x.astype(object)) INSIDE their fit clocks
+    # while ours got float32 codes prepared outside. Now: XGBoost and LightGBM are REFUSED by
+    # name on any dataset with declared categorical columns (xgboost_arms, lightgbm_arms);
+    # CatBoost, the one library running the same algorithm, gets its frame built ONCE outside
+    # the clock (catboost_arms) and has_time=True, so it computes its CTRs over the rows in the
+    # order given, as ours does (it shuffled them first); and with CatBoost the only opponent
+    # the lane scores splits with L2, which ours, CatBoost GPU and CatBoost CPU all implement
+    # (it was NewtonL2, chosen for XGBoost and LightGBM, which CatBoost's CPU learner lacks and
+    # silently replaced with Cosine). Results raced before this change were wrong for this
+    # lane; apply extra scrutiny.
+    "gbdt-categorical": dict(
+        task="binary", loss="Logloss", grow_policy="Lossguide", score_function="L2",
+        datasets=("taxicat", "criteo"),
+        objectives={"anonlib": "Logloss", "catboost": "Logloss",
+                    "xgboost": "binary:logistic", "lightgbm": "binary"},
+        mismatches=(
+            "categorical method: ours follows CatBoost's dispatch (one-hot at or below "
+            "one_hot_max_size, CTR target statistics above), CatBoost runs its own at its "
+            "defaults: two libraries, one algorithm, on the same declared columns",
+            "XGBoost and LightGBM are refused: their categorical splits (XGBoost partition "
+            "search, LightGBM's gradient-sorted categorical split) are different algorithms "
+            "from CTR target statistics",
+            "inputs prepared once outside every clock: ours the float32 codes, CatBoost a "
+            "pandas frame with the declared columns int64 (it refuses float categorical "
+            "columns) and the others float32; each library builds its own pool inside its "
+            "fit clock",
+            "CTR row order: one permutation, the rows in the order given, on both arms: "
+            "CatBoost has_time True (no shuffle, one identity permutation), ours one "
+            "permutation with the identity as its CTR estimation order, set explicitly",
+            "codes are dense 0..k-1 within the train slice (our fit refuses a non-dense "
+            "categorical column); a test value unseen in training shares one unknown bucket "
+            "k per column",
+        ),
+        # smoke-fixes (2026-10-14; gbdt-categorical/taxi: "ctr_estimation_permutation_id missing
+        # from catboost-gpu read-back", "has_time missing from ours read-back"): the CTR
+        # permutations, pinned on ours to the ones CatBoost's has_time=True runs. CatBoost 1.2.10:
+        # has_time sets PermutationCount = 1 (catboost_options.cpp:1042-1044, an assignment), the
+        # estimation permutation is PermutationsCount() - 1 = 0 (doc_parallel_boosting.h:101-103),
+        # and permutation 0 is the identity order (permutation.cpp:14-17, permutation.h
+        # IdentityPermutationId 0); has_time also skips the load-time pool shuffle
+        # (private/libs/algo/preprocess.cpp:161-199). Ours unset ran CatBoost's has_time=False
+        # GPU default instead: 4 permutations (gbdt/train.mojo perm_count) with the CTRs of the
+        # exported model estimated on permutation 3, a keyed shuffle of the rows
+        # (gbdt/ctrs/ctr_order.mojo), so the lane note "ours computes them over the rows in the
+        # order given" was not what ours ran. Ours now runs one permutation, the identity
+        # (train.mojo est_perm; doc_parallel_boosting.mojo learn_perm_count fallback 1, as theirs
+        # :317). Ours' bits on this lane change. Results raced before this change were wrong for
+        # this lane; apply extra scrutiny.
+        ctr_permutations=dict(permutation_count=1, ctr_estimation_permutation_id=0)),
+}
+
+
+TASK_LANES["gbdt-ordered"] = dict(
+    task=("binary", "regression"), loss=None, grow_policy="SymmetricTree",
+    boosting_type="Ordered", datasets=("taxi", "istella"),
+    # CatBoost's Ordered knobs, set EXPLICITLY on both arms (lane/ordered-speed,
+    # 2026-09-29): their defaults are device dependent -- fold_permutation_block
+    # is 64 on their GPU from 50,000 rows and 1 on their CPU -- and an unset
+    # value on the CatBoost arm is not a matched value. 64 is their GPU's (the
+    # algorithm ours restates, dynamic_boosting.h:115-128); 4 permutations and
+    # a fold growth of 2 are both devices' defaults (boosting_options.cpp:11-14).
+    ordered=dict(permutation_count=4, fold_len_multiplier=2.0,
+                 fold_permutation_block=64),
+    objectives={"anonlib": "Logloss (taxi) / RMSE (Istella-S)",
+                "catboost": "Logloss (taxi) / RMSE (Istella-S)"},
+    mismatches=(
+        "Ordered boosting on ours and CatBoost only: XGBoost and LightGBM have no ordered "
+        "(permutation) boosting, so the lane races CatBoost alone, on the symmetric grower "
+        "Ordered requires (catboost_options.cpp:757-759)",
+        "each library draws its fold permutations from its own generator seeded 7; the "
+        "streams are not shared, so the fits differ by construction",
+        "approx_on_full_history: CatBoost CPU only (default False, refused on their GPU); "
+        "ours restates their GPU Ordered boosting, which has no full-history arm, so both "
+        "arms run the False behaviour",
+    ))
+
+
+#: smoke-fixes (2026-10-14; gbdt-symmetric/-1000, gbdt-multiclass, gbdt-ordered:
+#: "use_pointwise_searcher missing from catboost-gpu read-back"): the oblivious-tree SEARCHER
+#: each lane races, pinned on both arms. CatBoost 1.2.10's GPU picks it from the loss and the
+#: boosting type, and ours has both of its searchers (ensemble.py use_pointwise_searcher):
+#:   - single-target Plain SymmetricTree (Logloss, RMSE; no CTRs): pointwise.cpp registers
+#:     train_template_pointwise.h's trainer, a Plain fit without CTRs gets data_partition
+#:     DocParallel (train.cpp:73-83), and DocParallel trains TDocParallelObliviousTree
+#:     (train_template_pointwise.h:49-50), whose searcher is TDocParallelObliviousTreeSearcher
+#:     (doc_parallel_pointwise_oblivious_tree.h:45) -- ours use_pointwise_searcher=True. Ours'
+#:     default greedy subsets searcher is ANOTHER algorithm: on it random_strength cancels in the
+#:     gain (gbdt/train.mojo random_strength note), while on the doc-parallel searcher the lane's
+#:     random_strength 1.0 is real split-score noise. Before this pin ours raced the greedy
+#:     searcher against CatBoost's doc-parallel one. Results raced before this change were wrong
+#:     for these lanes; apply extra scrutiny.
+#:   - MultiClass: multiclass.cpp:1 builds its trainer from
+#:     train_template_pointwise_greedy_subsets_searcher.h (TGreedySubsetsSearcher, line 35), and
+#:     the GPU forces DocParallel for it (catboost_options.cpp:951-971) -- ours' greedy subsets
+#:     searcher, use_pointwise_searcher=False.
+#:   - Ordered: DocParallel refuses Ordered (boosting_options.cpp:70-72), so it trains
+#:     FeatureParallel, TDynamicBoosting with TFeatureParallelPointwiseObliviousTree
+#:     (train_template_pointwise.h:27-29) -- ours' Ordered fold searcher, which refuses
+#:     use_pointwise_searcher=True (ensemble.py _check_ordered_options).
+#: CatBoost's data_partition is GPU-only and passed on its GPU arm only (catboost_tree_params).
+R7_SEARCHER_LANES = {
+    "gbdt-symmetric": dict(use_pointwise_searcher=True, data_partition="DocParallel"),
+    "gbdt-symmetric-1000": dict(use_pointwise_searcher=True, data_partition="DocParallel"),
+    "gbdt-multiclass": dict(use_pointwise_searcher=False, data_partition="DocParallel"),
+    "gbdt-ordered": dict(use_pointwise_searcher=False, data_partition="FeatureParallel"),
+}
+
+
+#: FAIRNESS FIX (2026-10-13 audit): the depth bound of every Lossguide lane, on every arm.
+#: At max_depth 8 with max_leaves 256 (= 2 ** 8) a Lossguide tree that fills its budget is the
+#: depthwise tree, so the lane timed XGBoost's lossguide grower building its depthwise model.
+#: 16 is CatBoost's GPU depth cap for these losses and far above log2(256), so the leaf budget
+#: stops the tree. Results raced before this change were wrong for this lane; apply extra
+#: scrutiny.
+LOSSGUIDE_MAX_DEPTH = 16
+
+
+def task_names(task):
+    """A task lane's task, or tuple of tasks, as a tuple."""
+    t = task["task"]
+    return t if isinstance(t, tuple) else (t,)
+
+
+def task_of(lane):
+    """The TASK_LANES record of a task lane, or None for the original lanes."""
+    return TASK_LANES.get(lane)
+
+
+def lane_config(lane, size):
+    """The knobs every arm of `lane` is given, spelled once.
+
+    NVIDIA'S VALUES (2026-09-29: their tuning parameters for our arm and the
+    opponent). Every lane NVIDIA gbm-bench covers takes each parameter
+    gbm-bench sets explicitly, on our arm and every opponent arm
+    (tools/bench_board_harness.py GBM, source URL and commit there and in
+    `cfg["harness"]`): 500 trees (runme.py -ntrees), max_depth 8,
+    learning_rate 0.1, reg_lambda 1 (shared_params), 256 leaves (LightGBM's
+    max_leaves, 2 ** 8 on every arm), and on a binary task scale_pos_weight =
+    len(y_train) / count_nonzero(y_train) on XGBoost, LightGBM and CatBoost
+    (ours class_weights [1, that]). The rf lane takes gbm-bench's forest
+    values: max_depth 8, 500 trees. What gbm-bench leaves at each library's
+    default stays pinned below, one value on every arm. gbdt-symmetric-1000
+    is gbdt-symmetric at 1000 trees, CatBoost's own default. The ranking
+    lanes, et and iforest have no gbm-bench entry and keep the values below
+    (100 trees, depth 6, 64 leaves; depth 16 forests).
+
+    IDENTICAL CONFIG ON EVERY ARM; THE DEVICE IS THE ONLY VARIABLE. Where a
+    default differs between libraries it is set EXPLICITLY on all of them and
+    the difference is named in a comment, because an unset default is how two
+    arms end up solving two problems.
+
+    The GBDT knobs:
+
+      n_estimators 100   Matches `tools/nvidia_forest_bench.sh`'s default so
+                         this run and that one are the same size of job.
+                         CatBoost's own default is 1000 and sklearn's is 100.
+      max_depth 6        CatBoost's default. XGBoost's is 6 too; LightGBM has
+                         no depth limit by default (-1) and is pinned here.
+      learning_rate 0.1  Set explicitly on every arm. CatBoost's constructor
+                         value is 0.03 but a CatBoost user with the rate
+                         unset gets a value FITTED from the pool
+                         (`options_helper.cpp:252-288`, about 0.097 at 800k
+                         rows), which is not implemented. Pinning it removes the
+                         whole question.
+      l2 1.0             CatBoost `l2_leaf_reg`, XGBoost `reg_lambda`,
+                         LightGBM `lambda_l2`. Same quantity, three
+                         spellings. CatBoost's default is 3.0, XGBoost's 1.0,
+                         LightGBM's 0.0.
+      borders 254        DEVIATION 1832, AND IT IS AN OFF-BY-ONE. CatBoost's
+                         `border_count` counts BORDERS; XGBoost's `max_bin`
+                         and LightGBM's `max_bin` count BINS. 254 borders is
+                         255 bins, so the XGBoost and LightGBM arms get
+                         max_bin=255 to quantize the same way. Our
+                         `border_count` is CatBoost's, so it takes 254.
+                         (Defaults would have been 128 ours, 254 CatBoost
+                         CPU, 128 CatBoost GPU, 256 XGBoost, 255 LightGBM --
+                         five different grids.)
+      no bagging         DEVIATION 1833. `bootstrap_type='No'` on CatBoost
+                         and ours, `subsample=1.0`/`colsample_bytree=1.0` on
+                         XGBoost, `bagging_fraction=1.0`/
+                         `feature_fraction=1.0` on LightGBM. Row and column
+                         sampling are the largest RNG term in a boosting fit
+                         and the arms cannot share a generator, so they are
+                         switched off rather than matched. It makes the fits
+                         SLOWER on every arm equally.
+      boosting Plain     DEVIATION 1841, AND THIS ONE IS A TRAP. CatBoost's
+                         `boosting_type` default is data-dependent: `Ordered`
+                         on small pools and `Plain` on large ones, and
+                         `Ordered` is a DIFFERENT ALGORITHM that trains
+                         several permutations. A smoke-size run would have
+                         silently timed Ordered against everyone else's
+                         Plain. Both CatBoost arms are pinned to `Plain`.
+      seed 7             Every arm.
+
+    SAME SEED, SAME TUNING PARAMETERS (2026-09-29: races must be comparable). The M3 Ultra board read
+    NOT-COMPARABLE on the taxi depthwise/lossguide races and the LightGBM
+    forests; the knobs below were left to library defaults that differ in
+    meaning, and are now pinned on every arm that has them:
+
+      max_leaves 64      2 ** depth on every lane and arm (ours and CatBoost
+                         accept exactly that value off Lossguide; XGBoost
+                         max_leaves, LightGBM num_leaves).
+                         FAIRNESS FIX (2026-10-13 audit): at max_leaves =
+                         2 ** depth a Lossguide tree that fills its budget IS
+                         the depthwise tree, so the lossguide lane never
+                         tested leaf-wise growth (XGBoost built its depthwise
+                         model, more slowly). Lossguide lanes now keep the
+                         leaf budget and lift max_depth to
+                         LOSSGUIDE_MAX_DEPTH (16) on every arm, so the budget,
+                         not the depth, stops each tree; lane_config refuses a
+                         Lossguide lane whose max_leaves >= 2 ** max_depth.
+                         Results raced before this change were wrong for this
+                         lane; apply extra scrutiny.
+      min_child_weight 0 XGBoost's default 1.0 is a hessian floor ours and
+                         CatBoost do not have; on taxi's Logloss (hessian
+                         about 0.18 per row) it stopped XGBoost at 3911
+                         leaves against ours 5903. Ours carries it as
+                         min_child_hessian (0.0) where it exists (Depthwise
+                         and Lossguide with NewtonL2; FAIRNESS FIX 2026-10-13:
+                         Depthwise too, now that it scores NewtonL2). LightGBM
+                         keeps 1e-3 (it aborts at 0).
+      min_split_gain 0   XGBoost gamma 0.0 and LightGBM 0.0 require a
+                         positive gain, and so does CatBoost CPU (gain >=
+                         1e-9, greedy_tensor_search.cpp); ours off
+                         SymmetricTree could split at zero gain (min_split_gain
+                         None), which grew ours past CatBoost on taxi
+                         Lossguide (6239 against 5743). Ours now takes 0.0 on
+                         Depthwise and Lossguide.
+                         smoke-fixes r13 (the author 2026-10-14): CatBoost GPU
+                         Lossguide has no gain check at all, so gbdt-lossguide
+                         races two own arms (tools/board_pairing.py): `ours`
+                         at None against catboost-gpu, `ours-gain0` at 0.0
+                         against xgboost-*.
+      leaf estimation    Newton, ONE iteration on ours and CatBoost: the one
+                         Newton step XGBoost and LightGBM take. CatBoost's
+                         Logloss default is 10, cut to 1 on taxi by
+                         UpdateLeavesEstimationIterations (under 200 trees and
+                         20 features, every policy) while ours applies that
+                         cut under SymmetricTree only, so ours ran 10 against
+                         CatBoost's 1 on taxi Depthwise and Lossguide.
+      random_strength    1.0 on the symmetric grower (both libraries'
+                         default), 0.0 on Depthwise and Lossguide, where
+                         CatBoost CPU's default 1.0 met ours 0.0.
+      score_function     Cosine on SymmetricTree; NewtonL2 on Depthwise and
+                         Lossguide (ours and CatBoost GPU), the one Newton L2
+                         gain XGBoost and LightGBM have (they have no such
+                         knob); L2 on gbdt-categorical (TASK_LANES), whose
+                         only opponent is CatBoost.
+                         FAIRNESS FIX (2026-10-13 audit): Depthwise ran Cosine
+                         on ours against XGBoost's Newton L2 gain, two split
+                         scores (taxi: ours 106,182 leaves, XGBoost 91,234,
+                         NOT-COMPARABLE), and CatBoost CPU silently ran Cosine
+                         against ours' NewtonL2 on Lossguide. Depthwise now
+                         scores NewtonL2 on every arm, and a CatBoost CPU arm
+                         is REFUSED by name where the lane's score function is
+                         one its CPU learner lacks (it has Cosine and L2
+                         only), never swapped. Results raced before this
+                         change were wrong for this lane; apply extra
+                         scrutiny.
+      boost_from_average False for Logloss on ours and CatBoost (their
+                         default), XGBoost base_score 0.5 (margin 0) and
+                         LightGBM boost_from_average False, which both
+                         default to the class prior; True for RMSE on every
+                         arm.
+      borders            GreedyLogSum and nan_mode Min on ours and CatBoost.
+
+    The forest knobs:
+
+      n_estimators 100   cuML's, sklearn's and ours.
+      max_depth 16       Set explicitly on every arm, and as of 2026-09-01
+                         it is NOBODY's default. It was cuML's until
+                         v26.08.00 -- this repo's pin -- changed it to None
+                         (randomforestclassifier.py:68-74). sklearn's is
+                         also None. Both mean grow until pure, a different
+                         and much more expensive tree, so every arm is
+                         pinned to 16 rather than left to a library.
+      max_features       'sqrt' for classification, 1.0 for regression -- the
+                         RF definition and every library's own default for
+                         that task. Set explicitly on all.
+      n_bins 128         cuML's and ours. DEVIATION 1834 AND IT IS NOT
+                         REMOVABLE: sklearn searches EXACT thresholds and has
+                         no bin count. That is an ALGORITHM difference in
+                         sklearn's favour on accuracy and against it on
+                         speed, it is what `PARITY_NOTES['rf-quantile-splits']`
+                         already records for the gbm-bench arms, and it is
+                         recorded rather than corrected because correcting it
+                         would mean not running cuML's algorithm.
+      bootstrap          True for rf, False for et. LightGBM's `rf` boosting
+                         REFUSES `bagging_fraction=1.0`, so its forest arms
+                         run 0.632/freq=1 -- DEVIATION 1835, forced by
+                         LightGBM, already recorded as
+                         `PARITY_NOTES['lgbm-rf-bagging']`.
+      LightGBM forests   (2026-09-29) max_features is sampled PER NODE
+                         (feature_fraction_bynode, the RF definition), not per
+                         tree: feature_fraction 0.25 per tree left each taxi
+                         tree 4 of 16 columns and LightGBM grew 3538 ET leaves
+                         against ours 881399. max_bin is the rf lane's n_bins
+                         (128), min_data_in_bin 1, num_leaves 2 ** max_depth
+                         (65536, never binding at depth 16).
+      max_samples        1.0 on ours and sklearn in rf (each draws n rows with
+                         replacement); et does not bootstrap.
+    """
+    smoke = size == "smoke"
+    common = dict(
+        seed=7,
+        n_estimators=10 if smoke else 100,
+    )
+    harness = _harness_source(lane)
+    if lane.startswith("gbdt-"):
+        cfg = dict(common)
+        task = task_of(lane)
+        cfg.update(
+            max_depth=6,
+            learning_rate=0.1,
+            l2=1.0,
+            borders=254,       # CatBoost border count; max_bin = borders + 1
+            max_leaves=64,     # 2 ** 6, so the lossguide lane matches depth 6
+            grow_policy=task["grow_policy"] if task else {
+                "gbdt-symmetric": "SymmetricTree",
+                "gbdt-symmetric-1000": "SymmetricTree",
+                "gbdt-depthwise": "Depthwise",
+                "gbdt-lossguide": "Lossguide",
+            }[lane],
+        )
+        if harness:
+            # gbm-bench: shared_params, runme.py -ntrees 500, LightGBM
+            # max_leaves 256 (2 ** 8, every arm), the binary scale_pos_weight
+            cfg.update(
+                n_estimators=10 if smoke else (1000 if lane == "gbdt-symmetric-1000" else 500),
+                max_depth=8,
+                learning_rate=0.1,
+                l2=1.0,
+                max_leaves=256,
+                scale_pos_weight="gbm-bench",
+                harness=harness,
+            )
+        policy = cfg["grow_policy"]
+        symmetric = policy == "SymmetricTree"
+        loss = task["loss"] if task else None
+        if policy == "Lossguide":
+            # FAIRNESS FIX (2026-10-13 audit): max_leaves was 2 ** max_depth (256 at depth 8,
+            # 64 at depth 6), so a Lossguide tree that filled its leaf budget was exactly the
+            # depthwise tree and the lane never exercised leaf-wise growth (XGBoost's lossguide
+            # built its depthwise model, more slowly). The leaf budget is kept and max_depth is
+            # lifted to LOSSGUIDE_MAX_DEPTH on every arm (ours, CatBoost, XGBoost, LightGBM read
+            # the same cfg), so the budget, not the depth, stops each tree; a Lossguide lane
+            # whose budget could still fill a full tree is refused. Results raced before this
+            # change were wrong for this lane; apply extra scrutiny.
+            cfg["max_depth"] = LOSSGUIDE_MAX_DEPTH
+            if cfg["max_leaves"] >= 2 ** cfg["max_depth"]:
+                raise SystemExit(
+                    "lane %s: Lossguide with max_leaves %d >= 2 ** max_depth (%d) grows the "
+                    "depthwise tree; it does not test leaf-wise growth"
+                    % (lane, cfg["max_leaves"], 2 ** cfg["max_depth"]))
+        # FAIRNESS FIX (2026-10-13 audit): Depthwise scored splits with Cosine on ours (and
+        # CatBoost) while XGBoost, its other opponent, has only the Newton L2 gain, so the
+        # arms grew different trees (taxi: ours 106,182 leaves, XGBoost 91,234). Depthwise
+        # now scores NewtonL2 on every arm, as Lossguide does, and takes the same 0.0 hessian
+        # floor XGBoost's min_child_weight 0 is; a task lane may name its own score function
+        # (gbdt-categorical: L2, see TASK_LANES). Results raced before this change were wrong
+        # for this lane; apply extra scrutiny.
+        score = (task or {}).get("score_function") or ("Cosine" if symmetric else "NewtonL2")
+        newton = score in ("NewtonL2", "NewtonCosine")
+        cfg.update(
+            # the SAME SEED, SAME TUNING PARAMETERS block of the docstring
+            min_child_weight=0.0,          # XGBoost; ours min_child_hessian below
+            min_split_gain=None if symmetric else 0.0,
+            min_child_hessian=(0.0 if not symmetric and newton
+                               and loss in (None, "Logloss", "RMSE") else None),
+            min_data_in_leaf=1,
+            random_strength=1.0 if symmetric else 0.0,
+            score_function=score,
+            leaf_estimation_method="Newton",
+            leaf_estimation_iterations=1,
+            feature_border_type="GreedyLogSum",
+            nan_mode="Min",
+            boosting_type="Plain",
+        )
+        if task:
+            cfg.update(task=task["task"], loss=task["loss"],
+                       objectives=dict(task["objectives"]),
+                       mismatches=list(task["mismatches"]))
+            if task.get("boosting_type"):
+                cfg["boosting_type"] = task["boosting_type"]
+            if task.get("ordered"):
+                cfg.update(task["ordered"])
+            if task.get("ctr_permutations"):
+                cfg.update(task["ctr_permutations"])    # ours only (catboost_tree_params skips them)
+            if task["grow_policy"] == "SymmetricTree" and lane != "gbdt-ordered":
+                # the opponents without an oblivious grower race their own
+                # at the same depth (TASK_LANES, "grower")
+                cfg["xgboost_grow_policy"] = "depthwise"
+                cfg["lightgbm_leafwise"] = True
+                cfg["mismatches"] += [
+                    "random_strength 1.0 on ours and CatBoost (the symmetric-grower default "
+                    "on both, each from its own seeded generator); XGBoost and LightGBM have "
+                    "no split-score noise",
+                    "split floors: ours takes min_split_gain and min_child_hessian off the "
+                    "symmetric grower only, so here ours and CatBoost have no hessian floor or "
+                    "gain threshold; XGBoost min_child_weight 0, gamma 0, LightGBM "
+                    "min_split_gain 0",
+                ]
+        # FAIRNESS FIX (2026-10-13 audit, completed 2026-10-15): CatBoost GPU
+        # querywise.cpp registers PairLogit/YetiRank through train_template_pointwise.h.
+        # Plain DocParallel uses TDocParallelObliviousTreeSearcher, including its
+        # split-score noise. Previously these two lanes used our different greedy
+        # subsets searcher and correctly refused. Native freeze f63ef223 adds the
+        # grouped target statistics to the actual pointwise searcher (24 numerical
+        # cases / 207 output+model members identical on Apple, NVIDIA and AMD).
+        # Pin only the algorithm choices here; library defaults and all other
+        # recipe settings stay unchanged. Released 0.8.45 cannot execute this route.
+        if lane in ("gbdt-rank-pairlogit", "gbdt-rank-yetirank"):
+            cfg.update(use_pointwise_searcher=True, data_partition="DocParallel")
+        if lane in R7_SEARCHER_LANES:
+            cfg.update(R7_SEARCHER_LANES[lane])
+            # smoke-fixes (2026-10-14; gbdt-symmetric/-1000, gbdt-multiclass, gbdt-ordered:
+            # "border_build_max_samples, feature_fraction missing from catboost-gpu read-back"):
+            # both are ACTIVE settings, so both arms are given them explicitly and read them back.
+            # The border search subsamples 200,000 rows on both (ours border_build_max_samples;
+            # CatBoost dev_max_subset_size_for_build_borders, binarization_options.h:19, set by
+            # set_params in catboost_arms because the CatBoostClassifier constructor does not take
+            # it; plain_options_helper.cpp:459 parses it). Every feature is a split candidate in
+            # every tree on both (ours feature_fraction 1.0; CatBoost rsm 1.0, the only value its
+            # GPU learner accepts for a non-pairwise loss, catboost_options.cpp:638, a check of
+            # the VALUE against the default, option.h:68).
+            cfg.update(border_build_max_samples=200000, feature_fraction=1.0)
+        if lane in board_pairing.OUR_PAIRINGS:
+            # smoke-fixes r13 (the author 2026-10-14, DECISIONS.md decisions 1 and 2): this lane races
+            # more than one explicit own configuration, each paired with the one opponent library it matches
+            # (tools/board_pairing.py OUR_PAIRINGS). Each arm's settings override the lane values
+            # above on that arm only, are passed explicitly and read back; the parameter check, the
+            # ratios and the fairness rows compare each own arm with its own opponents only.
+            cfg["our_pairings"] = {
+                arm: dict(opponents=list(p["opponents"]), settings=dict(p["settings"]), why=p["why"],
+                          input_binning=(PREBIN_RECORD % cfg["borders"]) if p.get("prebinned")
+                          else "raw input (each arm bins it with its own border rule)")
+                for arm, p in board_pairing.OUR_PAIRINGS[lane].items()}
+        return cfg
+    if lane in ("rf", "et"):
+        cfg = dict(common)
+        cfg.update(
+            max_depth=16,
+            n_bins=128,
+            min_samples_leaf=1,
+            min_samples_split=2,
+            min_impurity_decrease=0.0,
+            bootstrap=(lane == "rf"),
+            # n draws with replacement per tree on ours and sklearn; sklearn
+            # refuses max_samples without bootstrap, so et leaves it unset
+            max_samples=1.0 if lane == "rf" else None,
+        )
+        if lane == "rf":
+            # smoke-fixes (2026-10-14; rf: "conflicting aliases for max_leaves" / "no parameter
+            # records"): no leaf cap, cuML's sentinel -1, given explicitly to ours and cuML
+            # (cuML 26.08 ensemble/randomforest_common.pyx __init__ max_leaves=-1; ours
+            # randomforest.py max_leaves=-1), with max_samples beside it on both
+            cfg["max_leaves"] = -1
+        if harness:
+            # gbm-bench skrf / cumlrf: shared_params minus reg_lambda and
+            # learning_rate (max_depth 8), n_estimators = runme.py -ntrees 500
+            cfg.update(max_depth=8, n_estimators=10 if smoke else 500, harness=harness)
+        return cfg
+    if lane == "iforest":
+        cfg = dict(common)
+        cfg.update(
+            max_samples=256,
+            max_features=1.0,
+            bootstrap=False,
+        )
+        return cfg
+    raise SystemExit("unknown lane " + repr(lane))
+
+
+def _harness_source(lane):
+    """tools/bench_board_harness.harness_source(lane): the NVIDIA harness a
+    lane's values come from (URL, commit), or None for a lane it lacks."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    import bench_board_harness
+    return bench_board_harness.harness_source(lane)
+
+
+def scale_pos_weight_for(cfg, data):
+    """gbm-bench's binary classification weight on the positive class,
+    len(y_train) / count_nonzero(y_train) (algorithms.py, XgbAlgorithm,
+    LgbmAlgorithm and CatAlgorithm configure), for a lane that takes
+    gbm-bench's values; None otherwise (no weight passed)."""
+    if cfg.get("scale_pos_weight") != "gbm-bench" or data.task != "binary":
+        return None
+    y = np.asarray(data.y_train)
+    return float(len(y)) / float(np.count_nonzero(y))
+
+
+def max_features_for(data):
+    """'sqrt' for a classification forest, 1.0 for a regression forest. The
+    RF definition, and each library's own default for the task."""
+    return "sqrt" if data.task in ("binary", "multiclass") else 1.0
+
+
+def boost_from_average_for(data):
+    """The starting margin every boosted arm is given, explicitly: the mean
+    for RMSE (ours and CatBoost's default, LightGBM's, XGBoost's fitted
+    intercept), margin 0 for Logloss (ours and CatBoost's default; XGBoost
+    and LightGBM default to the class prior and are pinned to 0). None for
+    multiclass, whose loss no arm starts from an average.
+
+    smoke-fixes (2026-10-14; gbdt-rank-pairlogit/-yetirank: "boost_from_average missing from
+    catboost-gpu read-back"): False for ranking, set explicitly on ours and CatBoost's ranker
+    (catboost_rank_arms) and read back on both. It is the value both resolve unset: CatBoost's
+    default false (boosting_options.cpp:17), True refused for PairLogit and YetiRank
+    (catboost_options.cpp:703-709); ours' unset is True only for RMSE, MAE, Quantile and MAPE
+    (gbdt/train.mojo boost_from_average -1), True refused for the ranking losses (:2805-2822).
+    No bit change. XGBoost's and LightGBM's ranking arms are refused by name on these lanes
+    and do not call this."""
+    if data.task == "regression":
+        return True
+    if data.task in ("binary", "ranking"):
+        return False
+    return None
+
+
+def forest_feature_fraction(data):
+    """max_features as the fraction LightGBM samples PER NODE: floor(sqrt(n))
+    features of n for 'sqrt', the count sklearn (int(sqrt(n))) and ours (the
+    fraction truncated) take; LightGBM rounds n * fraction, so the fraction
+    is the exact count over n."""
+    n_feat = data.X_train.shape[1]
+    if max_features_for(data) == "sqrt":
+        return max(1, int(np.sqrt(n_feat))) / float(n_feat)
+    return 1.0
+
+
+def enforce_board_params(lane, arms, skip=()):
+    """THE BOARD'S PARAMETER CHECK (tools/bench_board_params.py): same seed,
+    same tuning parameters, read back from a constructed estimator of every
+    arm (one `make()` each, no fit) before the first warm-up. Prints the
+    BOARD-PARAMS line; on a mismatch prints BOARD-PARAMS-REFUSED and one
+    FSPEED-REFUSED line per arm and returns False, so the race fails by name.
+    `skip`: arms whose `make()` is not an estimator (the CPU proxy)."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    import bench_board_params as BP
+    objs = {}
+    for arm in arms:
+        if arm.name in skip:
+            continue
+        try:
+            objs[arm.name] = arm.make()
+        except Exception as exc:                   # noqa: BLE001
+            emit_refused(lane, arm.name, "BOARD-PARAMS: constructing the arm for the "
+                         "parameter check raised %s: %s" % (exc.__class__.__name__, exc))
+            return False
+    try:
+        BP.enforce(lane, objs, family="trees")
+    except BP.ParamsRefused as exc:
+        for name in objs:
+            emit_refused(lane, name, "BOARD-PARAMS-REFUSED: %s" % exc)
+        return False
+    return True
+
+
+def emit_seed_note(lane, arms, sampled):
+    """Rule 1 of the bench board: every arm gets seed 7 through its own seed
+    argument. Say by name where a seed reaches an arm and changes nothing."""
+    if sampled:
+        emit_note(lane, arms, "mismatch", 0.0,
+                  "seed 7 on every arm through its own argument (random_state, random_seed, "
+                  "seed); each library draws from its own generator, so the streams are not "
+                  "shared: %s" % sampled)
+    else:
+        emit_note(lane, arms, "mismatch", 0.0,
+                  "seed 7 on every arm through its own argument; with no row or column "
+                  "sampling and random_strength 0 no arm draws a random number in this fit, "
+                  "so the seed is passed and ignored by every library alike")
+
+
+# --------------------------------------------------------------------------
+# An arm: build a model, fit it inside the timer, score it outside.
+# --------------------------------------------------------------------------
+
+class Arm(object):
+    """One timed competitor.
+
+    `make()` returns a fresh unfitted estimator. The shared runner times
+    construction, `fit(model, data)` and `sync()` together: constructor work
+    and input conversion in fit are included. Synchronization is included
+    because a fit is not finished until the device says so, and
+    for the libraries whose `fit` already blocks it is a documented no-op.
+    `score(model, data)` runs outside and returns `(metric_name, value,
+    prediction_vector)`."""
+
+    def __init__(self, name, make, fit, score, sync=None, library=None):
+        self.name = name
+        self.make = make
+        self.fit = fit
+        self.score = score
+        self.sync = sync or (lambda: None)
+        #: Arms sharing a library are cross-checked for accuracy agreement.
+        self.library = library or name.split("-")[0]
+        #: The agreement check's group (default: the library). An own arm of a paired lane
+        #: (tools/board_pairing.py) runs another configuration on purpose and is its own group.
+        self.agreement_group = None
+        #: The block this arm fits and is scored on, when it is not the race's (attach_input:
+        #: the pre-binned input of an XGBoost pairing). None: the race's data.
+        self.data = None
+        #: Set by `run` after the last round: what this arm's FITTED MODEL
+        #: turned out to be (trees, nodes, leaves, depth), read back through
+        #: the library's own API. See FIT EQUIVALENCE below.
+        self.fit_shape = None
+
+
+def _cuda_sync():
+    """Device synchronize for the arms whose `fit` returns before the device
+    is done. cupy ships with every RAPIDS install; if it is absent the sync
+    is a no-op and the arm's number is then a LOWER BOUND rather than a
+    measurement, which is why the absence is printed rather than swallowed."""
+    try:
+        import cupy
+    except ImportError:
+        return
+    cupy.cuda.runtime.deviceSynchronize()
+
+
+def _blocking(name):
+    """A named no-op for a library whose `fit` is synchronous on the host.
+    Spelled out rather than passed as `None` so that reading the arm table
+    tells you which arms were checked and which were assumed."""
+    del name
+    return None
+
+
+# ---- Pre-binned input (smoke-fixes r13) --------------------------------------
+
+#: ours' border-search sample, its GradientBoosting default (python/anonlib/ensemble.py:1180,
+#: CatBoost's MaxSubsetSizeForBuildBorders, data_processing_options.cpp:37)
+BORDER_SAMPLE_ROWS = 200000
+#: the input_binning record both arms of an XGBoost pairing read back (tools/board_pairing.py)
+PREBIN_RECORD = "pre-binned input on both arms (GreedyLogSum, %d borders)"
+
+
+def prebinned_data(lane, data, cfg):
+    """`data` with every feature value replaced by its GreedyLogSum bin id (train AND test rows),
+    computed once per dataset and process (the author 2026-10-14, DECISIONS.md decision 1), outside
+    every clock. Both arms of the XGBoost pairing on gbdt-depthwise / gbdt-lossguide
+    (tools/board_pairing.py `prebinned`) fit and are scored on it; the CatBoost pairings keep the
+    raw rows.
+
+    The borders are ours' rule, CatBoost's GreedyLogSum (ours matches CatBoost 1.2.10's borders bit
+    for bit, checks/border_types_check.mojo), built by CatBoost's own Pool.quantize as the harness's
+    border oracles do (tools/greedylogsum_oracle.py, tools/border_types_oracle.py): this file
+    imports nothing from anonlib, so the opponent-only process computes the same matrix. Same
+    settings as ours' fit: cfg's border count (254) and border type, nan_mode, a 200,000-row
+    border sample drawn with the lane's seed. A value's bin id is the number of borders below it
+    (ours' and CatBoost's `value > border` rule). Every feature then holds at most 255 distinct
+    values, each its own bin on both arms: ours at 254 borders over every row
+    (border_build_max_samples 0), XGBoost at max_bin 255 (>= the distinct values, checked here).
+
+    Returns a shallow copy of `data` carrying `input_binning` (the read-back record, with the
+    sha256 of the borders and both binned blocks) and `bins_sha256`. Raises by name on
+    categorical columns or NaN (neither arm's binning of them is the other's).
+
+    smoke-fixes r17 (2026-10-14; trees/gbdt-depthwise/istella and trees/gbdt-lossguide/istella STARTED at
+    5 s, "parameter probe started; no board line", on NVIDIA and AMD): the binning (Pool.quantize over the
+    full training set, the bin ids of every train and test value, the NaN scan and the sha256) is
+    _prebinned_block, which inside the smoke worker runs once per staged matrix pair and cfg and stays
+    pinned (stage_inputs builds it before the recipe's timer); each caller still gets its own copy of its
+    own `data` carrying the same arrays and record. A timed run never reaches the cache."""
+    cached = getattr(data, "_prebinned", None)
+    if cached is not None:
+        return cached
+    import copy
+    if data.cat_idx:
+        raise RuntimeError("PREBIN: declared categorical columns are not pre-binned")
+    blk = _prebinned_block_once(data, cfg)
+    n_borders = blk["n_borders"]
+    pb = copy.copy(data)
+    for k in ("_ours_X", "_ours_Xtest", "_ours_y", "_prebinned"):
+        pb.__dict__.pop(k, None)
+    pb.X_train, pb.X_test = blk["x_train"], blk["x_test"]
+    pb.bins_sha256 = blk["sha256"]
+    pb.input_binning = "%s; bins sha256 %s" % (PREBIN_RECORD % n_borders, blk["sha256"])
+    data._prebinned = pb
+    emit_note(lane, ["*"], "input_binning", float(blk["widest"]),
+              "%s for the XGBoost pairing (CatBoost %s Pool.quantize, %d-row border sample, seed %d; "
+              "at most %d bins per feature; the CatBoost pairings take the raw rows)"
+              % (pb.input_binning, blk["catboost_version"], BORDER_SAMPLE_ROWS, int(cfg["seed"]), blk["widest"]))
+    return pb
+
+
+def _prebin_settings(cfg):
+    """Everything of cfg the binning reads (the memo key's extra part)."""
+    return (int(cfg["borders"]), str(cfg["feature_border_type"]), str(cfg["nan_mode"]), int(cfg["seed"]),
+            BORDER_SAMPLE_ROWS)
+
+
+def greedylogsum_borders(x_train, cfg):
+    """(per-feature sorted unique float32 borders, catboost version): CatBoost's own Pool.quantize over
+    `x_train` with cfg's border count and type, nan_mode, seed and the 200,000-row border sample."""
+    import tempfile
+    import catboost
+    n_borders = int(cfg["borders"])
+    pool = catboost.Pool(np.ascontiguousarray(x_train, dtype=np.float32))
+    pool.quantize(border_count=n_borders, feature_border_type=cfg["feature_border_type"],
+                  nan_mode=cfg["nan_mode"], random_seed=int(cfg["seed"]),
+                  dev_max_subset_size_for_build_borders=BORDER_SAMPLE_ROWS)
+    n_feat = x_train.shape[1]
+    borders = [[] for _ in range(n_feat)]
+    with tempfile.TemporaryDirectory() as td:
+        path = os.path.join(td, "borders.tsv")
+        pool.save_quantization_borders(path)
+        with open(path) as fh:
+            for line in fh:
+                fields = line.split("\t")
+                if len(fields) >= 2 and fields[0].strip():
+                    borders[int(fields[0])].append(float(fields[1]))
+    del pool
+    return [np.unique(np.asarray(b, dtype=np.float32)) for b in borders], catboost.__version__
+
+
+def _prebinned_block(x_train_raw, x_test_raw, cfg):
+    """The pre-binned arrays of prebinned_data: {"x_train", "x_test", "sha256", "widest", "n_borders",
+    "catboost_version"}. Raises by name on NaN or more bins than XGBoost's max_bin."""
+    if np.isnan(x_train_raw).any() or np.isnan(x_test_raw).any():
+        raise RuntimeError("PREBIN NAN-INPUT: the data holds NaN; a missing value has no bin id "
+                           "both arms read the same way")
+    n_borders = int(cfg["borders"])
+    n_feat = x_train_raw.shape[1]
+    borders, version = greedylogsum_borders(x_train_raw, cfg)
+
+    def binned(x):
+        out = np.empty(x.shape, dtype=np.float32)
+        for f in range(n_feat):
+            out[:, f] = np.searchsorted(borders[f], np.asarray(x[:, f], dtype=np.float32), side="left")
+        return out
+
+    x_train, x_test = binned(x_train_raw), binned(x_test_raw)
+    widest = max((len(b) + 1 for b in borders), default=1)
+    if widest > n_borders + 1:
+        raise RuntimeError("PREBIN: %d bins on one feature, more than XGBoost's max_bin %d"
+                           % (widest, n_borders + 1))
+    h = hashlib.sha256()
+    for b in borders:
+        h.update(np.int64(len(b)).tobytes())
+        h.update(b.tobytes())
+    h.update(np.ascontiguousarray(x_train).tobytes())
+    h.update(np.ascontiguousarray(x_test).tobytes())
+    return dict(x_train=x_train, x_test=x_test, sha256=h.hexdigest(), widest=int(widest), n_borders=n_borders,
+                catboost_version=str(version))
+
+
+def _prebinned_block_once(data, cfg):
+    """_prebinned_block of data's train and test matrices; inside the smoke worker (smoke-fixes r17) once per
+    staged matrix pair and cfg (smoke_inproc.memo_on, pinned: the staged Data copies of load_with_fallback
+    share the matrices), the same arrays and sha256 for every recipe that reads them."""
+    build = lambda: _prebinned_block(data.X_train, data.X_test, cfg)       # noqa: E731
+    SI = _smoke_staging()
+    if SI is None:
+        return build()
+    return SI.memo_on("trees-prebinned", (data.X_train, data.X_test), build, extra=_prebin_settings(cfg),
+                      pin=True)
+
+
+def attach_input(arm, pb):
+    """Give `arm` the pre-binned block `pb`: the runner fits and scores it on `arm.data`, and every
+    constructed estimator carries the read-back field `input_binning` (tools/bench_board_params.py
+    read_params) so the parameter check compares the two arms' records."""
+    arm.data = pb
+    make = arm.make
+
+    def tagged():
+        model = make()
+        model._board_input_binning = pb.input_binning
+        return model
+    arm.make = tagged
+    return arm
+
+
+# ---- CatBoost -------------------------------------------------------------
+
+def catboost_tree_params(cfg, task_type):
+    """Every tree knob a CatBoost arm is given, one dict for the gbdt and the
+    ranking builders, each set explicitly (lane_config's SAME SEED, SAME
+    TUNING PARAMETERS). CatBoost CPU scores splits with Cosine or L2 only
+    (leafwise_scoring.cpp), so a lane with another score function has no
+    CatBoost CPU arm (catboost_arms refuses it by name)."""
+    score = cfg["score_function"]
+    if task_type == "CPU" and score not in CATBOOST_CPU_SCORES:
+        # FAIRNESS FIX (2026-10-13 audit): this silently swapped a NewtonL2 lane to Cosine on
+        # CatBoost's CPU learner, so that arm raced a different split score than ours. A CPU
+        # arm is now refused by name upstream (catboost_arms); reaching here is a harness
+        # bug. Results raced before this change were wrong for this lane; apply extra
+        # scrutiny.
+        raise RuntimeError(
+            "CatBoost's CPU learner has no score_function %r (Cosine or L2 only); the arm "
+            "must be refused, not given another score" % score)
+    p = dict(
+        iterations=cfg["n_estimators"],
+        depth=cfg["max_depth"],
+        learning_rate=cfg["learning_rate"],
+        l2_leaf_reg=cfg["l2"],
+        border_count=cfg["borders"],
+        random_seed=cfg["seed"],
+        bootstrap_type="No",       # DEVIATION 1833
+        boosting_type=cfg["boosting_type"],   # Plain (DEVIATION 1841) or the Ordered lane's
+        grow_policy=cfg["grow_policy"],
+        max_leaves=cfg["max_leaves"],   # 2 ** depth; CatBoost accepts exactly that off Lossguide
+        min_data_in_leaf=cfg["min_data_in_leaf"],
+        random_strength=cfg["random_strength"],
+        score_function=score,
+        leaf_estimation_method=cfg["leaf_estimation_method"],
+        leaf_estimation_iterations=cfg["leaf_estimation_iterations"],
+        feature_border_type=cfg["feature_border_type"],
+        nan_mode=cfg["nan_mode"],
+        task_type=task_type,
+        verbose=False,
+        allow_writing_files=False,
+    )
+    # the Ordered lane's knobs (TASK_LANES "ordered"). NOT permutation_count:
+    # CatBoostClassifier(permutation_count=...) raises TypeError (1.2.10, the
+    # constructor does not take it), so their arm runs its default 4
+    # (boosting_options.cpp:14), the value ours is given (bench_board_params
+    # EXCEPTIONS)
+    for k in ("fold_len_multiplier", "fold_permutation_block"):
+        if cfg.get(k) is not None:
+            p[k] = cfg[k]
+    # smoke-fixes (2026-10-14; gbdt-symmetric/-1000, gbdt-multiclass, gbdt-ordered:
+    # "feature_fraction, use_pointwise_searcher missing from catboost-gpu read-back"): the
+    # searcher (R7_SEARCHER_LANES) and the feature fraction, where the lane pins them
+    if cfg.get("feature_fraction") is not None:
+        p["rsm"] = cfg["feature_fraction"]
+    if task_type == "GPU" and cfg.get("data_partition") is not None:
+        p["data_partition"] = cfg["data_partition"]     # a GPU-only option
+    if task_type == "GPU":
+        p["devices"] = "0"
+    return p
+
+
+#: The split scores CatBoost's CPU learner implements (leafwise_scoring.cpp).
+CATBOOST_CPU_SCORES = ("Cosine", "L2")
+
+
+def catboost_cat_frame(x, cat_idx):
+    """float32 matrix -> pandas DataFrame: the declared categorical columns int64, the
+    others float32, columns labelled 0..d-1 so `cat_features` indices name them.
+
+    CatBoost refuses float columns named in `cat_features` ("Invalid type for
+    cat_feature"), so those columns go in as integers. The codes are already dense
+    0..k-1 integers held exactly in float32 (the largest is 371,237, well inside
+    float32's 24-bit exact-integer range), so the cast moves no value.
+
+    FAIRNESS FIX (2026-10-13 audit): this was `x.astype(object)` built inside CatBoost's
+    fit and predict clocks; the callers now build it once, outside every clock. Results
+    raced before this change were wrong for this lane; apply extra scrutiny."""
+    import pandas as pd
+    cat = set(int(j) for j in cat_idx)
+    cols = {}
+    for j in range(x.shape[1]):
+        col = x[:, j]
+        cols[j] = (col.astype(np.int64) if j in cat
+                   else np.ascontiguousarray(col, dtype=np.float32))
+    return pd.DataFrame(cols)
+
+
+def _catboost_cpu_refusal(cfg):
+    """Why CatBoost's CPU arm cannot race this lane, or None.
+
+    FAIRNESS FIX (2026-10-13 audit): this was a mismatch NOTE while the arm ran Cosine against
+    ours' NewtonL2 (gbdt-lossguide, gbdt-categorical): a settings difference on one arm. The
+    arm is now refused by name instead. Results raced before this change were wrong for this
+    lane; apply extra scrutiny."""
+    if cfg["score_function"] not in CATBOOST_CPU_SCORES:
+        return ("SCORE-FUNCTION: the lane scores splits with %s on every arm and CatBoost's CPU "
+                "learner has Cosine and L2 only (leafwise_scoring.cpp); another score would be "
+                "another tree, so the CPU arm does not race this lane" % cfg["score_function"])
+    return None
+
+
+def catboost_arms(lane, cfg, data, devices):
+    """CatBoost CPU and CatBoost's CUDA learner. The symmetric-tree opponent,
+    and by standing rule the ONLY opponent in `gbdt-symmetric`."""
+    import catboost
+
+    def _params(task_type):
+        p = catboost_tree_params(cfg, task_type)
+        bfa = boost_from_average_for(data)
+        if bfa is not None:
+            p["boost_from_average"] = bfa
+        spw = scale_pos_weight_for(cfg, data)
+        if spw is not None:
+            p["scale_pos_weight"] = spw
+        return p
+
+    def make(task_type):
+        p = _params(task_type)
+        # DEVIATION 2634's other side. `cat_features` is what makes CatBoost
+        # run the CTR machinery at all: its own dispatch
+        # (binarizations_manager.cpp:106-115) takes one-hot below a
+        # cardinality threshold and target statistics above it. criteo spans
+        # 3 to 371,237 distinct per column, so one dataset exercises both
+        # branches. Passing the indices is also what makes the comparison
+        # honest: without them CatBoost would treat 26 hashed-id columns as
+        # ORDERED NUMBERS and be timed on a different, easier problem than
+        # ours.
+        if data.cat_idx:
+            p["cat_features"] = list(data.cat_idx)
+            # FAIRNESS FIX (2026-10-13 audit): make the automatic one-hot
+            # threshold explicit. Ours' native TCatFeatureParams.default()
+            # fixes it at 2 (gbdt/options/catboost_options.mojo); a manual
+            # one_hot_features override is not the same categorical policy.
+            if task_type == "GPU":
+                p["one_hot_max_size"] = 2
+            # FAIRNESS FIX (2026-10-13 audit): CatBoost shuffled the learn rows before
+            # computing its CTR target statistics (preprocess.cpp:161-199) while ours computes
+            # them over the rows in the order given (ensemble.py cat_features), extra work and
+            # different statistics on one arm. has_time=True makes CatBoost use the given order,
+            # the CTR computation ours runs. Results raced before this change were wrong for this
+            # lane; apply extra scrutiny.
+            p["has_time"] = True
+        if data.task == "regression":
+            m = catboost.CatBoostRegressor(loss_function="RMSE", **p)
+        elif data.task == "binary":
+            m = catboost.CatBoostClassifier(loss_function="Logloss", **p)
+        else:
+            m = catboost.CatBoostClassifier(loss_function="MultiClass", **p)
+        if cfg.get("border_build_max_samples") is not None:
+            # smoke-fixes (2026-10-14; gbdt-symmetric/-1000, gbdt-multiclass, gbdt-ordered:
+            # "border_build_max_samples missing from catboost-gpu read-back"): the constructors
+            # do not take dev_max_subset_size_for_build_borders (catboost 1.2.10 core.py
+            # CatBoostClassifier.__init__); set_params stores it in the params fit sends
+            # (core.py:3829-3841) and get_params reads it back
+            m.set_params(dev_max_subset_size_for_build_borders=cfg["border_build_max_samples"])
+        return m
+
+    # FAIRNESS FIX (2026-10-13 audit): the categorical input was converted with
+    # x.astype(object) INSIDE CatBoost's fit clock, while ours got its float32 codes prepared
+    # outside every clock (forest_speed_arm.prepare_our_inputs). The frame is now built ONCE
+    # here, before any clock, as a pandas DataFrame (the input CatBoost documents for mixed
+    # columns; an object matrix is its slow per-element path), and fit and the scorer reuse
+    # it; CatBoost still builds its own Pool inside fit, as every other arm builds its own
+    # dataset inside its fit. Results raced before this change were wrong for this lane;
+    # apply extra scrutiny.
+    if data.cat_idx:
+        data._catboost_X_train = catboost_cat_frame_once(data.X_train, data.cat_idx)
+        data._catboost_X_test = catboost_cat_frame_once(data.X_test, data.cat_idx)
+
+    def _fit(m, d):
+        if not d.cat_idx:
+            return m.fit(d.X_train, d.y_train)
+        return m.fit(d._catboost_X_train, d.y_train)
+
+    def _score(m, d):
+        if not d.cat_idx:
+            return _score_sklearn_like(m, d)
+        # predict MUST see the same column types the fit saw. Without this the
+        # scorer would hand raw float32 test rows to a model fitted with
+        # cat_features and CatBoost would raise -- a failure that would have
+        # looked like "criteo is broken" rather than "the scorer was not
+        # wired". Reuse the shared scorer so the metric stays defined once.
+        shim = Data(d.name, d.X_train, d._catboost_X_test,
+                    d.y_train, d.y_test, d.task, d.n_classes,
+                    y_anom=d.y_anom, cat_idx=d.cat_idx)
+        return _score_sklearn_like(m, shim)
+
+    out = []
+    for dev in devices:
+        if dev == "opencl":
+            continue                   # LightGBM's device name only
+        if dev == "cpu":
+            # FAIRNESS FIX (2026-10-13 audit): refused by name where the lane's score
+            # function is one CatBoost's CPU learner lacks (it ran Cosine there before).
+            # Results raced before this change were wrong for this lane; apply extra scrutiny.
+            why = _catboost_cpu_refusal(cfg)
+            if why:
+                emit_refused(lane, "catboost-cpu", why)
+                continue
+        task_type = "CPU" if dev == "cpu" else "GPU"
+        out.append(Arm(
+            "catboost-" + dev,
+            (lambda tt: (lambda: make(tt)))(task_type),
+            _fit,
+            _score,
+            sync=lambda: _blocking("catboost"),
+            library="catboost",
+        ))
+    return out
+
+
+# ---- XGBoost --------------------------------------------------------------
+
+def _xgb_gpu_refusal(xgb):
+    """Why XGBoost's GPU arm cannot run on this box's GPU, or None.
+
+    `device='cuda'` on a build without this vendor's GPU backend does NOT
+    raise: XGBoost warns and trains on the CPU. On do-amd (MI325X, 2026-09-29)
+    the pinned PyPI wheel (a CUDA build) timed `xgboost-gpu` on the host CPU,
+    the same as `xgboost-cpu`, under the GPU arm's name. A ROCm build (AMD's
+    amd_xgboost) reports USE_HIP; a CUDA build reports USE_CUDA."""
+    vendor = accel_vendor()
+    try:
+        info = xgb.build_info()
+    except Exception as exc:                       # noqa: BLE001
+        return "xgboost.build_info() raised %s: %s" % (exc.__class__.__name__, exc)
+    if vendor == "amd" and not (info.get("USE_HIP") or info.get("USE_ROCM")):
+        return ("NO ROCm BUILD: xgboost %s is built for CUDA (USE_CUDA=%s, USE_HIP=%s); on an AMD "
+                "GPU device='cuda' falls back to the CPU, so the GPU arm would time the CPU"
+                % (xgb.__version__, info.get("USE_CUDA"), info.get("USE_HIP")))
+    if vendor == "nvidia" and not info.get("USE_CUDA"):
+        return ("NO CUDA BUILD: xgboost %s has USE_CUDA=%s; device='cuda' would fall back to the CPU"
+                % (xgb.__version__, info.get("USE_CUDA")))
+    if vendor is None:
+        return "no GPU on this box: device='cuda' would fall back to the CPU"
+    return None
+
+
+def xgboost_arms(lane, cfg, data, devices):
+    """XGBoost `tree_method='hist'` on CPU and on CUDA.
+
+    DEVIATION 1831: XGBoost never appears in `gbdt-symmetric`. Its
+    `grow_policy` is depthwise or lossguide and it has no symmetric mode, so
+    the same argument that keeps LightGBM out of the symmetric pair keeps
+    XGBoost out of it."""
+    # FAIRNESS FIX (2026-10-13 audit): on declared categorical columns XGBoost ran its
+    # partition search (max_cat_to_onehot 1) against ours' one-hot/CTR target statistics, a
+    # different algorithm, and its pandas CategoricalDtype frame was built inside its fit
+    # clock. No XGBoost setting runs CTR target statistics, so the arm is refused by name.
+    # (Its frame code below is kept for the record; if this refusal is ever lifted for a
+    # same-algorithm configuration, build the frames once outside the clock, as catboost_arms
+    # does.) Results raced before this change were wrong for this lane; apply extra scrutiny.
+    if data.cat_idx:
+        raise RuntimeError(
+            "CATEGORICAL-ALGORITHM: XGBoost's categorical split (partition search, or one-hot "
+            "up to max_cat_to_onehot) is not the one-hot/CTR target statistics ours and CatBoost "
+            "run on the declared columns; a different algorithm is not raced")
+    if cfg.get("grow_policy") == "SymmetricTree" and cfg.get("xgboost_grow_policy"):
+        # FAIRNESS FIX (2026-10-13 audit): on the symmetric task lanes (gbdt-multiclass) XGBoost
+        # raced its own depthwise grower, one tree PER CLASS per round, against ours' and
+        # CatBoost's one oblivious tree with a vector of class values per leaf: a different
+        # algorithm and a different model (taxi: 99,745 leaves against 128,000). XGBoost has no
+        # oblivious grower, so the arm is refused by name; CatBoost is the lane's opponent.
+        # Results raced before this change were wrong for this lane; apply extra scrutiny.
+        raise RuntimeError(
+            "DIFFERENT-GROWER: ours and CatBoost fit this loss on oblivious (symmetric) trees; "
+            "XGBoost has no symmetric grower and would race depthwise trees, one per class, "
+            "a different algorithm")
+    # smoke-fixes (2026-10-14; gbdt-depthwise/lossguide: "nan_mode missing from xgboost-gpu
+    # read-back", "missing missing from ours read-back"): tools/bench_board_params.py _semantic_r6
+    # maps ours' nan_mode 'Min' and XGBoost's missing=NaN as unread only because the data holds no
+    # NaN. With a NaN the two rules differ (XGBoost learns a default direction per split,
+    # src/tree/gpu_hist/evaluate_splits.cu:18-33; ours and CatBoost sort a NaN below every border),
+    # so the arm is refused by name where that premise fails. Checked once, before any clock.
+    if np.isnan(data.X_train).any() or np.isnan(data.X_test).any():
+        raise RuntimeError(
+            "NAN-INPUT: the data holds NaN; XGBoost learns a default direction for missing values "
+            "per split where ours and CatBoost sort NaN below every border (nan_mode 'Min'), "
+            "a different split rule")
+    import xgboost as xgb
+
+    policy = cfg.get("xgboost_grow_policy") or {
+        "Depthwise": "depthwise", "Lossguide": "lossguide"}.get(cfg["grow_policy"])
+    if policy is None:
+        raise RuntimeError(
+            "xgboost has no symmetric growth policy; the symmetric-tree "
+            "comparison is CatBoost ONLY (standing order 2026-08-22, "
+            "DEVIATION 1831)"
+        )
+
+    def _params(device):
+        p = dict(
+            n_estimators=cfg["n_estimators"],
+            max_depth=cfg["max_depth"],
+            learning_rate=cfg["learning_rate"],
+            reg_lambda=cfg["l2"],
+            reg_alpha=0.0,
+            # DEVIATION 1832: their max_bin counts BINS, CatBoost's
+            # border_count counts BORDERS.
+            max_bin=cfg["borders"] + 1,
+            subsample=1.0,             # DEVIATION 1833
+            colsample_bytree=1.0,
+            colsample_bylevel=1.0,
+            colsample_bynode=1.0,
+            # no hessian floor and a strictly positive gain, as ours and
+            # CatBoost (lane_config); XGBoost's default 1.0 was a floor no
+            # other arm had
+            min_child_weight=cfg["min_child_weight"],
+            gamma=0.0,
+            max_delta_step=0.0,
+            max_leaves=cfg["max_leaves"],
+            booster="gbtree",
+            tree_method="hist",
+            grow_policy=policy,
+            random_state=cfg["seed"],
+            device=device,
+            verbosity=0,
+        )
+        if boost_from_average_for(data) is False:
+            p["base_score"] = 0.5      # margin 0, ours and CatBoost's Logloss start
+        spw = scale_pos_weight_for(cfg, data)
+        if spw is not None:
+            p["scale_pos_weight"] = spw
+        return p
+
+    def make(device):
+        p = _params(device)
+        # XGBoost's categorical support is opt-in and needs the columns to
+        # arrive as pandas `category` dtype; raw integer codes would be split
+        # as ORDERED NUMBERS, which is a different (easier) problem than the
+        # partition search CatBoost and ours do. Declaring it is what keeps
+        # the three arms on the same problem.
+        if data.cat_idx:
+            p["enable_categorical"] = True
+            p["max_cat_to_onehot"] = 1      # force partition search, not one-hot
+        if data.task == "regression":
+            return xgb.XGBRegressor(objective="reg:squarederror", **p)
+        if data.task == "binary":
+            return xgb.XGBClassifier(objective="binary:logistic", **p)
+        return xgb.XGBClassifier(objective="multi:softprob",
+                                 num_class=data.n_classes, **p)
+
+    def _frame(x, cat_idx):
+        """float32 matrix -> DataFrame with the declared columns as category.
+
+        Built once per fit and per predict, OUTSIDE the timed region's
+        intent... which is exactly why it is measured: the conversion is part
+        of what an XGBoost user pays to use categoricals, the same way our
+        staging cost is part of ours. It is not hidden from the clock for one
+        arm and charged to another.
+
+        ONE `CategoricalDtype` PER COLUMN, SHARED BY FIT AND PREDICT
+        (FIXED 2026-09-12, lane harness-honesty; found by lane criteo-smoke on
+        pod 0zl2hrxqq26b0t). This used to call plain `.astype("category")`,
+        which DERIVES the category set from the values in front of it -- so
+        the fit frame and the predict frame got two different sets and
+        XGBoost 3.2.0 raised while scoring:
+
+            Found a category not in the training set for the 32th (0-based)
+            column: 679286
+
+        The timings survived that and the QUALITY COLUMN DID NOT, which is the
+        shape of failure this lane exists for: the table still printed, one
+        column just quietly went missing. The category set is pinned to
+        `range(k)` over BOTH matrices, so fit and predict agree by
+        construction and a test-only code is a declared category the model
+        never split on rather than an error."""
+        import pandas as pd
+        from pandas.api.types import CategoricalDtype
+        df = pd.DataFrame(x)
+        for j in cat_idx:
+            k = _cat_levels[j]
+            df[j] = df[j].astype("int64").astype(
+                CategoricalDtype(categories=list(range(k))))
+        return df
+
+    # The category count per declared column, over the train AND test blocks,
+    # computed ONCE here so both frames are built from the same table. Our
+    # loader maps a test value unseen in train to code k (one past the train
+    # maximum), so the test block legitimately carries a code the train block
+    # does not and `range(k)` has to span both.
+    _cat_levels = {}
+    for _j in (data.cat_idx or ()):
+        _hi = max(float(np.max(data.X_train[:, _j])),
+                  float(np.max(data.X_test[:, _j])))
+        _cat_levels[_j] = int(_hi) + 1
+
+    def _fit(m, d):
+        if not d.cat_idx:
+            return m.fit(d.X_train, d.y_train)
+        return m.fit(_frame(d.X_train, d.cat_idx), d.y_train)
+
+    def _score(m, d):
+        if not d.cat_idx:
+            return _score_sklearn_like(m, d)
+        # predict must see the SAME dtypes the fit saw, or XGBoost raises on
+        # the category mismatch. Swap in a framed test matrix and reuse the
+        # shared scorer so the metric definition stays in one place.
+        shim = Data(d.name, d.X_train, _frame(d.X_test, d.cat_idx),
+                    d.y_train, d.y_test, d.task, d.n_classes,
+                    y_anom=d.y_anom, cat_idx=d.cat_idx)
+        return _score_sklearn_like(m, shim)
+
+    out = []
+    for dev in devices:
+        if dev == "opencl":
+            continue                   # LightGBM's device name only
+        # "cuda" is also the device string of AMD's ROCm build (amd_xgboost).
+        device = "cpu" if dev == "cpu" else "cuda"
+        why = None if dev == "cpu" else _xgb_gpu_refusal(xgb)
+        if why:
+            emit_refused(lane, "xgboost-" + dev, why)
+            continue
+        arm = Arm(
+            "xgboost-" + dev,
+            (lambda dv: (lambda: make(dv)))(device),
+            _fit,
+            _score,
+            sync=_cuda_sync,
+            library="xgboost",
+        )
+        if board_pairing.prebinned_arm(lane, arm.name):
+            # smoke-fixes r13 (the author 2026-10-14, DECISIONS.md decision 1): the XGBoost pairing of
+            # gbdt-depthwise / gbdt-lossguide fits and is scored on the same pre-binned block as its
+            # own arm (prebinned_data, once per dataset, before any clock); max_bin 255 >= the at
+            # most 255 bin ids per feature, so every bin id is its own bin.
+            attach_input(arm, prebinned_data(lane, data, cfg))
+        out.append(arm)
+    return out
+
+
+# ---- LightGBM -------------------------------------------------------------
+
+def lightgbm_arms(lane, cfg, data, devices):
+    """LightGBM CPU and LightGBM CUDA.
+
+    THE PIP AND CONDA WHEELS HAVE NO CUDA SUPPORT. `device_type='cuda'`
+    requires a source build with `USE_CUDA=ON`, so the cuda arm is expected
+    to REFUSE on a box where nobody built it, and its refusal must be visible
+    as a refusal rather than as a missing row.
+
+    LightGBM never appears in `gbdt-symmetric`: leaf-wise is its only growth
+    algorithm (standing rule since 2026-08-22). In the forest lanes it
+    runs `boosting_type='rf'`, which is what
+    `PARITY_NOTES['lgbm-rf-bagging']` and `tools/nvidia_forest_bench.sh`
+    already compare against."""
+    # FAIRNESS FIX (2026-10-13 audit): on declared categorical columns LightGBM ran its own
+    # categorical split (one-hot up to max_cat_to_onehot, else its gradient-sorted partition)
+    # against ours' one-hot/CTR target statistics, a different algorithm. It is refused by
+    # name. Results raced before this change were wrong for this lane; apply extra scrutiny.
+    if data.cat_idx:
+        raise RuntimeError(
+            "CATEGORICAL-ALGORITHM: LightGBM's categorical split (one-hot up to "
+            "max_cat_to_onehot, else its gradient-sorted partition) is not the one-hot/CTR "
+            "target statistics ours and CatBoost run on the declared columns; a different "
+            "algorithm is not raced")
+    # FAIRNESS FIX (2026-10-13 audit): the remaining LightGBM arms raced other settings than
+    # ours. Boosted lanes: LightGBM 4.7.0 aborts a tree at the lanes' min_child_samples 1 and
+    # min_child_weight 0 (best_split_info.left_count > 0), so it ran its defaults 20 and 1e-3,
+    # a different stopping rule from every other arm (and, on the symmetric task lanes, leaf-wise
+    # trees per class against ours' oblivious trees). Forest lanes: its rf boosting refuses
+    # bagging_fraction 1.0, so each tree sampled 63.2% of rows WITHOUT replacement against ours'
+    # n draws with replacement (rf) or every row (et), with its own bin finder and one random bin
+    # threshold for et (taxi et: 66,043 leaves against ours' 881,399). Both are refused by name.
+    # Results raced before this change were wrong for these lanes; apply extra scrutiny.
+    if lane in ("rf", "et"):
+        raise RuntimeError(
+            "ROW-SAMPLING: LightGBM's rf boosting refuses bagging_fraction 1.0, so each tree would "
+            "sample 63.2%% of rows without replacement where ours %s; another sample is another "
+            "forest" % ("draws n rows with replacement" if lane == "rf" else "uses every row"))
+    raise RuntimeError(
+        "MIN-CHILD: LightGBM 4.7.0 aborts at the lane's min_child_samples 1 and min_child_weight 0, "
+        "and its defaults 20 and 1e-3 are another stopping rule than every other arm's; %s"
+        % ("it also has no oblivious grower for this loss" if cfg.get("lightgbm_leafwise")
+           else "the arm is not raced with other settings"))
+    import lightgbm as lgb
+
+    forest = lane in ("rf", "et")
+    # LightGBM's scikit-learn names throughout (subsample, subsample_freq,
+    # colsample_bytree): a LightGBM alias beside its scikit-learn twin is two
+    # spellings of one knob in get_params, and the board's parameter check
+    # reads get_params.
+    p = dict(
+        n_estimators=cfg["n_estimators"],
+        random_state=cfg["seed"],
+        verbose=-1,
+        min_child_samples=1,
+        min_child_weight=0.0,
+        min_split_gain=0.0,
+        reg_alpha=0.0,
+    )
+    if forest:
+        # LightGBM REFUSES rf boosting with bagging_fraction=1.0
+        # (DEVIATION 1835): the asymmetry is forced by LightGBM, not chosen.
+        #
+        # max_features IS PER NODE (2026-09-29). This passed feature_fraction,
+        # which LightGBM samples ONCE PER TREE: on taxi each tree saw 4 of 16
+        # columns for every split, and the M3 Ultra board read 463191 rf
+        # leaves and 3538 et leaves against ours 1718168 and 881399.
+        # feature_fraction_bynode is the per-node draw ours, sklearn and cuML
+        # make, with the same count (forest_feature_fraction).
+        p.update(
+            boosting_type="rf",
+            subsample=0.632,
+            subsample_freq=1,
+            colsample_bytree=1.0,
+            feature_fraction_bynode=forest_feature_fraction(data),
+            max_depth=cfg["max_depth"],
+            # 2 ** max_depth: a depth-16 tree never reaches it, as ours and
+            # sklearn have no leaf cap (was 2 ** 15, a cap below theirs)
+            num_leaves=2 ** cfg["max_depth"],
+            # rf: the lane's n_bins (ours and cuML 128 quantile bins); et has
+            # no bin count on ours or sklearn and keeps LightGBM's 255
+            max_bin=cfg["n_bins"] if lane == "rf" else 255,
+            min_data_in_bin=1,
+            reg_lambda=0.0,
+            learning_rate=1.0,   # ignored by rf boosting; pinned, not left
+        )
+        if lane == "et":
+            p["extra_trees"] = True
+        for i, why in enumerate((
+                "rows: LightGBM rf boosting refuses bagging_fraction 1.0, so each tree "
+                "samples 63.2%% of rows WITHOUT replacement (subsample 0.632, freq 1); ours "
+                "and sklearn %s" % ("draw n rows WITH replacement (bootstrap True)"
+                                    if lane == "rf" else "use every row (bootstrap False)"),
+                "split criterion: LightGBM has none to set; its gain on binary logloss at "
+                "the constant starting score is the variance of the label, the Gini "
+                "decrease up to scale (ours and sklearn criterion gini)",
+                "binning: LightGBM max_bin %d from its own bin finder on a 200,000-row "
+                "sample, min_data_in_bin 1; %s" % (
+                    p["max_bin"], "ours 128 quantile bins (n_bins), sklearn exact thresholds"
+                    if lane == "rf" else "ours and sklearn ExtraTrees draw a uniform threshold "
+                    "in the node's range, LightGBM extra_trees one random bin threshold"),
+                "max_features per node: LightGBM feature_fraction_bynode %.6f of the "
+                "features it keeps after binning (it drops constant columns), ours and "
+                "sklearn %s of every column; sklearn keeps drawing past that count while "
+                "the drawn columns are constant in the node, ours and LightGBM do not"
+                % (p["feature_fraction_bynode"], max_features_for(data)),
+                "leaf cap: LightGBM num_leaves %d (2 ** max_depth, never binding at "
+                "depth %d); ours max_leaves -1 and sklearn max_leaf_nodes None have no cap"
+                % (p["num_leaves"], cfg["max_depth"]),
+        )):
+            emit_note(lane, ["lightgbm-*"], "mismatch", float(i + 1), why)
+    else:
+        if cfg["grow_policy"] == "SymmetricTree" and not cfg.get("lightgbm_leafwise"):
+            raise RuntimeError(
+                "the symmetric-tree comparison is CatBoost ONLY (standing "
+                "order 2026-08-22); LightGBM has no symmetric mode"
+            )
+        p.update(
+            boosting_type="gbdt",
+            max_depth=cfg["max_depth"],
+            num_leaves=cfg["max_leaves"],
+            learning_rate=cfg["learning_rate"],
+            reg_lambda=cfg["l2"],
+            max_bin=cfg["borders"] + 1,      # DEVIATION 1832
+            subsample=1.0,                   # DEVIATION 1833
+            subsample_freq=0,
+            colsample_bytree=1.0,
+        )
+        bfa = boost_from_average_for(data)
+        if bfa is not None:
+            p["boost_from_average"] = bfa
+        spw = scale_pos_weight_for(cfg, data)
+        if spw is not None:
+            # read back by the parameter check as every other arm's value; the fit
+            # passes it as per-row weights instead (_lgb_fit, below)
+            p["scale_pos_weight"] = spw
+        # At min_child_weight 0 LightGBM 4.7.0 aborts a boosted tree ("Check
+        # failed: (best_split_info.left_count) > (0)"): the first multiclass
+        # and categorical tree (Apple board smoke 2026-09-26) and, at full
+        # size, the binary gbdt-lossguide warm-up on taxi AND Istella-S (M3
+        # Ultra board 2026-09-29, both cells REFUSED). So every boosted
+        # LightGBM arm keeps LightGBM's defaults, and a non-task lane says so
+        # in a mismatch line (the task lanes carry it in TASK_LANES).
+        p.update(min_child_samples=20, min_child_weight=1e-3)
+        if not cfg.get("task"):
+            emit_note(lane, ["lightgbm-*"], "mismatch", 1.0,
+                      "LightGBM min_child_samples 20 and min_child_weight 1e-3 stay at its "
+                      "defaults: at 0 (the other arms' value) LightGBM 4.7.0 aborts the "
+                      "first tree (Check failed: best_split_info.left_count > 0)")
+        emit_note(lane, ["lightgbm-*"], "mismatch", 2.0,
+                  "LightGBM min_data_in_bin 3 (its default; ours, CatBoost and XGBoost have "
+                  "no minimum bin count) and a 200,000-row bin sample (ours "
+                  "border_build_max_samples 200000, CatBoost's 200000, XGBoost sketches every row)")
+    # ANONLIB_SPEED_LGBM_PARAMS=name=value,... (lane trees-hotaisle,
+    # 2026-09-11): LightGBM 4.7.0 refused every AMD cell with "Check failed:
+    # (best_split_info.left_count) > (0)" under min_child_weight=0.0, so ONE
+    # retry runs with other params. Unset means the params above, unchanged;
+    # set means every LightGBM arm in the process takes them, and the log says so.
+    raw = os.environ.get("ANONLIB_SPEED_LGBM_PARAMS", "").strip()
+    if raw:
+        import ast
+        over = {}
+        for item in raw.split(","):
+            key, _, val = item.partition("=")
+            over[key.strip()] = ast.literal_eval(val.strip())
+        p.update(over)
+        emit_note(lane, ["lightgbm-*"], "params", float(len(over)),
+                  "ANONLIB_SPEED_LGBM_PARAMS overrides the harness LightGBM "
+                  "params: %s" % ", ".join("%s=%r" % kv for kv in sorted(over.items())))
+
+    # FAIRNESS FIX (opponent-quality lane, 2026-10-14): every binary lightgbm-cuda cell on the
+    # NVIDIA board (gbdt-lossguide istella and taxi, gbdt-categorical taxi; opponents-default-
+    # 20261006) fitted ONE tree with ONE leaf (fit "trees=1 leaves=1 depth=0", AUC 0.500): its
+    # first tree found no split, so LightGBM stopped and predicted the prior. The multiclass and
+    # ranking lightgbm-cuda cells on the same data, device and build trained (istella multiclass
+    # 640,000 leaves, rank 6,400). The binary arms alone carry scale_pos_weight (gbm-bench's
+    # positive-class weight), which LightGBM's CUDA binary objective applies through its own
+    # device label-weight table (CUDABinaryLogloss), a path no other cell uses. The weight now
+    # reaches LightGBM as per-row sample weights (spw on the positive rows, 1 elsewhere), built
+    # once outside the clock: the same gradient and hessian on every row (LightGBM multiplies
+    # both by the label weight and by the sample weight alike), and BoostFromScore, the one other
+    # reader of sample weights, is off on Logloss (boost_from_average False). CPU and CUDA run
+    # this one data path. A fit that still ends with a single leaf is refused by name, so a model
+    # that learned nothing is never scored as a quality cell.
+    pos_weights = None
+    if p.get("scale_pos_weight") is not None and data.task == "binary":
+        y_bin = np.asarray(data.y_train)
+        pos_weights = np.where(y_bin != 0, float(p["scale_pos_weight"]), 1.0).astype(np.float64)
+
+    def _lgb_fit(m, d):
+        kw = {}
+        if pos_weights is not None and d.y_train is data.y_train:
+            m.set_params(scale_pos_weight=1.0)
+            kw["sample_weight"] = pos_weights
+        # lane gbdt-categorical (and criteo): the declared columns go to
+        # LightGBM's own categorical split, as every other arm's do
+        if d.cat_idx:
+            kw["categorical_feature"] = list(d.cat_idx)
+        try:
+            m.fit(d.X_train, d.y_train, **kw)
+        finally:
+            if "sample_weight" in kw:
+                m.set_params(scale_pos_weight=p["scale_pos_weight"])   # the read-back value
+        bst = m.booster_
+        if p["n_estimators"] > 1 and bst.current_iteration() <= 1:
+            first = bst.dump_model(num_iteration=1).get("tree_info") or []
+            if all(int(t.get("num_leaves", 0)) <= 1 for t in first):
+                raise RuntimeError(
+                    "DEGENERATE-FIT: LightGBM stopped after its first iteration with a single "
+                    "leaf (no split met its split requirements), a model of the prior; it is "
+                    "not scored as a quality cell")
+        return m
+
+    def make(device_type):
+        q = dict(p)
+        q["device_type"] = device_type
+        if data.task == "regression":
+            return lgb.LGBMRegressor(objective="regression", **q)
+        if data.task == "binary":
+            return lgb.LGBMClassifier(objective="binary", **q)
+        return lgb.LGBMClassifier(objective="multiclass",
+                                  num_class=data.n_classes, **q)
+
+    out = []
+    for dev in devices:
+        # `opencl` is LightGBM's OpenCL learner (device_type 'gpu', a
+        # USE_GPU=ON build), the GPU build that can run on an AMD box.
+        device_type = {"cpu": "cpu", "opencl": "gpu"}.get(dev, "cuda")
+        out.append(Arm(
+            "lightgbm-" + {"cpu": "cpu", "opencl": "opencl"}.get(dev, "cuda"),
+            (lambda dt: (lambda: make(dt)))(device_type),
+            _lgb_fit,
+            _score_sklearn_like,
+            sync=_cuda_sync,
+            library="lightgbm",
+        ))
+    return out
+
+
+# ---- Ranking (lanes gbdt-rank-yetirank, gbdt-rank-pairlogit) -------------
+
+def _rank_common(cfg):
+    return dict(max_depth=cfg["max_depth"], learning_rate=cfg["learning_rate"],
+                random_state=cfg["seed"])
+
+
+def catboost_rank_arms(lane, cfg, data, devices):
+    """CatBoost's ranker with the lane's loss (YetiRank or PairLogit), on
+    the symmetric grower ours uses, every shared knob as the gbdt lanes pin
+    it. The Pool with `group_id` is built inside `fit`, inside the clock, as
+    our run lengths are."""
+    import catboost
+
+    def make(task_type):
+        p = catboost_tree_params(cfg, task_type)
+        p["loss_function"] = cfg["objectives"]["catboost"]
+        bfa = boost_from_average_for(data)
+        if bfa is not None:
+            p["boost_from_average"] = bfa       # False, as ours (boost_from_average_for)
+        return catboost.CatBoostRanker(**p)
+
+    def fit(m, d):
+        return m.fit(d.X_train, d.y_train, group_id=d.qid_train)
+
+    def score(m, d):
+        return score_ranking(m.predict(d.X_test), d)
+
+    out = []
+    for dev in devices:
+        if dev == "opencl":
+            continue
+        tt = "CPU" if dev == "cpu" else "GPU"
+        out.append(Arm("catboost-" + dev, (lambda t: (lambda: make(t)))(tt), fit, score,
+                       sync=lambda: _blocking("catboost"), library="catboost"))
+    return out
+
+
+def xgboost_rank_arms(lane, cfg, data, devices):
+    """XGBRanker, the lane's closest objective (rank:ndcg beside YetiRank,
+    rank:pairwise beside PairLogit), depthwise at the lane's depth
+    (TASK_LANES mismatches)."""
+    # FAIRNESS FIX (2026-10-13 audit): XGBRanker raced depthwise trees with LambdaMART
+    # (rank:ndcg) or sampled pairs (rank:pairwise, lambdarank_pair_method at its default) against
+    # ours' and CatBoost's oblivious trees with YetiRank or PairLogit over every pair of a query:
+    # a different grower and a different objective. Refused by name; CatBoost is the lane's
+    # opponent. Results raced before this change were wrong for these lanes; apply extra scrutiny.
+    raise RuntimeError(
+        "DIFFERENT-ALGORITHM: ours and CatBoost fit %s on oblivious trees; XGBoost would race "
+        "depthwise trees with %s, a different grower and objective"
+        % (cfg.get("loss"), (cfg.get("objectives") or {}).get("xgboost")))
+    import xgboost as xgb
+
+    def make(device):
+        return xgb.XGBRanker(
+            objective=cfg["objectives"]["xgboost"], n_estimators=cfg["n_estimators"],
+            reg_lambda=cfg["l2"], reg_alpha=0.0, max_bin=cfg["borders"] + 1,
+            subsample=1.0, colsample_bytree=1.0, colsample_bylevel=1.0,
+            colsample_bynode=1.0, min_child_weight=cfg["min_child_weight"], gamma=0.0,
+            max_delta_step=0.0, max_leaves=cfg["max_leaves"], booster="gbtree",
+            tree_method="hist",
+            grow_policy=cfg.get("xgboost_grow_policy", "depthwise"), device=device,
+            verbosity=0, **_rank_common(cfg))
+
+    def fit(m, d):
+        return m.fit(d.X_train, d.y_train, qid=d.qid_train_seq)
+
+    def score(m, d):
+        return score_ranking(m.predict(d.X_test), d)
+
+    out = []
+    for dev in devices:
+        if dev == "opencl":
+            continue
+        device = "cpu" if dev == "cpu" else "cuda"
+        why = None if dev == "cpu" else _xgb_gpu_refusal(xgb)
+        if why:
+            emit_refused(lane, "xgboost-" + dev, why)
+            continue
+        out.append(Arm("xgboost-" + dev, (lambda dv: (lambda: make(dv)))(device), fit, score,
+                       sync=_cuda_sync, library="xgboost"))
+    return out
+
+
+def lightgbm_rank_arms(lane, cfg, data, devices):
+    """LGBMRanker with lambdarank, leaf-wise capped at the lane's depth and
+    2**depth leaves, the gbdt lanes' LightGBM knobs otherwise, except
+    min_child_samples and min_child_weight, which stay at LightGBM's defaults
+    (20 and 1e-3, as tools/speed_gbdt_rank.py leaves them): at 0 LightGBM
+    4.7.0 aborts the first lambdarank tree ("Check failed:
+    (best_split_info.left_count) > (0)", the Apple board smoke, 2026-09-26)."""
+    # FAIRNESS FIX (2026-10-13 audit): LGBMRanker raced lambdarank (NDCG-weighted LambdaMART) on
+    # leaf-wise trees at LightGBM's own min_child_samples 20 and min_child_weight 1e-3 against
+    # ours' and CatBoost's YetiRank on oblivious trees: a different objective, grower and stopping
+    # rule. Refused by name. Results raced before this change were wrong for this lane; apply
+    # extra scrutiny.
+    raise RuntimeError(
+        "DIFFERENT-ALGORITHM: ours and CatBoost fit YetiRank on oblivious trees; LightGBM would "
+        "race lambdarank on leaf-wise trees at min_child_samples 20, a different objective and grower")
+    import lightgbm as lgb
+
+    def make(device_type):
+        return lgb.LGBMRanker(
+            objective=cfg["objectives"]["lightgbm"], n_estimators=cfg["n_estimators"],
+            num_leaves=cfg["max_leaves"], reg_lambda=cfg["l2"], reg_alpha=0.0,
+            max_bin=cfg["borders"] + 1, boosting_type="gbdt",
+            subsample=1.0, subsample_freq=0, colsample_bytree=1.0, min_child_samples=20,
+            min_child_weight=1e-3, min_split_gain=0.0, verbose=-1,
+            device_type=device_type, **_rank_common(cfg))
+
+    def fit(m, d):
+        return m.fit(d.X_train, d.y_train, group=d.group_sizes)
+
+    def score(m, d):
+        return score_ranking(m.predict(d.X_test), d)
+
+    out = []
+    for dev in devices:
+        device_type = {"cpu": "cpu", "opencl": "gpu"}.get(dev, "cuda")
+        out.append(Arm("lightgbm-" + {"cpu": "cpu", "opencl": "opencl"}.get(dev, "cuda"),
+                       (lambda dt: (lambda: make(dt)))(device_type), fit, score,
+                       sync=_cuda_sync, library="lightgbm"))
+    return out
+
+
+# ---- cuML and scikit-learn forests ---------------------------------------
+
+def cuml_rf_arm(lane, cfg, data):
+    """cuML's RandomForest on the GPU: NVIDIA's own forest, and the library
+    `ensemble/` is an implementation of. The honest opponent for the `rf` lane.
+
+    `n_streams` is left at cuML's default for the primary competitor baseline.
+    A separately labeled one-stream arm can diagnose scheduling effects.
+    Neither requires cuML to implement anonlib's IDENTICAL contract.
+    """
+    from cuml.ensemble import RandomForestClassifier, RandomForestRegressor
+
+    if lane != "rf":
+        raise RuntimeError(
+            "cuML has no ExtraTrees estimator: its RandomForest searches "
+            "quantile splits, not the uniform-random thresholds that define "
+            "ExtraTrees. The like-for-like comparator for `et` is sklearn."
+        )
+    mf = max_features_for(data)
+    common = dict(
+        n_estimators=cfg["n_estimators"],
+        max_depth=cfg["max_depth"],
+        max_features=mf,
+        n_bins=cfg["n_bins"],
+        min_samples_leaf=cfg["min_samples_leaf"],
+        min_samples_split=cfg["min_samples_split"],
+        min_impurity_decrease=cfg["min_impurity_decrease"],
+        bootstrap=cfg["bootstrap"],
+        # smoke-fixes (2026-10-14; rf): explicit, as on ours (cuML's defaults are the same 1.0
+        # and -1, randomforest_common.pyx __init__, but a default is not a matched value)
+        max_samples=cfg["max_samples"],
+        max_leaves=cfg["max_leaves"],
+        random_state=cfg["seed"],
+    )
+
+    def make():
+        if data.task == "regression":
+            return RandomForestRegressor(split_criterion=2, **common)
+        # 0 = GINI, cuML's default and ours.
+        return RandomForestClassifier(split_criterion=0, **common)
+
+    def fit(model, d):
+        # cuML's classifier wants int32 labels. The cast is a HOST cast on an
+        # already-loaded array; it is prepared once in `_cuml_labels` outside
+        # the timer and only indexed here.
+        return model.fit(d.X_train, d._cuml_y)
+
+    return Arm("cuml-rf-gpu", make, fit, _score_sklearn_like,
+               sync=_cuda_sync, library="cuml")
+
+
+def sklearn_forest_arm(lane, cfg, data):
+    """scikit-learn's RandomForest / ExtraTrees on every core.
+
+    `n_jobs=-1` deliberately, reusing `PARITY_NOTES['skl-threads']`'s reason:
+    gbm-bench's own sklearn arms pass no `n_jobs` and therefore run on ONE
+    core, and beating a single-core sklearn is not a result.
+
+    `max_depth` is pinned to 16 rather than left at sklearn's `None`. Their
+    default grows every tree until its leaves are pure, which is a different
+    and far more expensive tree than cuML's depth-16 default, and comparing
+    them would be comparing tree sizes."""
+    if lane == "rf":
+        # FAIRNESS FIX (2026-10-13 audit): DEVIATION 1834 said it outright: scikit-learn's
+        # RandomForest searches EXACT thresholds (it has no bin count) where ours and cuML split
+        # on 128 quantile bins, an algorithm difference (sorting every node's values against a
+        # histogram pass) recorded instead of corrected. A different algorithm is not raced:
+        # the arm is refused by name; ExtraTrees (et), where both draw a uniform random threshold,
+        # still races scikit-learn. Results raced before this change were wrong for this lane;
+        # apply extra scrutiny.
+        raise RuntimeError(
+            "DIFFERENT-ALGORITHM: scikit-learn's RandomForest searches exact thresholds; ours "
+            "splits on %d quantile bins per feature (cuML's algorithm)" % cfg["n_bins"])
+    import sklearn.ensemble as sken
+
+    common = dict(
+        n_estimators=cfg["n_estimators"],
+        max_depth=cfg["max_depth"],
+        max_features=max_features_for(data),
+        min_samples_leaf=cfg["min_samples_leaf"],
+        min_samples_split=cfg["min_samples_split"],
+        min_impurity_decrease=cfg["min_impurity_decrease"],
+        bootstrap=cfg["bootstrap"],
+        random_state=cfg["seed"],
+        min_weight_fraction_leaf=0.0,
+        max_leaf_nodes=None,       # sklearn's best-first budget; None = depth-first, no cap
+        ccp_alpha=0.0,
+        criterion="squared_error" if data.task == "regression" else "gini",
+        n_jobs=-1,
+    )
+    if cfg.get("max_samples") is not None:
+        common["max_samples"] = cfg["max_samples"]
+    emit_note(lane, [("sklearn-et-cpu" if lane == "et" else "sklearn-rf-cpu"), "ours"],
+              "mismatch", 1.0,
+              "%s. sklearn keeps drawing features past max_features while the drawn ones "
+              "are constant in the node; ours stops at max_features"
+              % ("thresholds: ours and sklearn both draw one uniform threshold per candidate "
+                 "feature in the node's range, each from its own seeded generator"
+                 if lane == "et" else
+                 "thresholds: sklearn searches exact thresholds (no bin count), ours 128 "
+                 "quantile bins (n_bins, cuML's algorithm; DEVIATION 1834)"))
+
+    def make():
+        if lane == "et":
+            if data.task == "regression":
+                return sken.ExtraTreesRegressor(**common)
+            return sken.ExtraTreesClassifier(**common)
+        if data.task == "regression":
+            return sken.RandomForestRegressor(**common)
+        return sken.RandomForestClassifier(**common)
+
+    name = "sklearn-et-cpu" if lane == "et" else "sklearn-rf-cpu"
+    return Arm(name, make,
+               lambda m, d: m.fit(d.X_train, d.y_train),
+               _score_sklearn_like,
+               sync=lambda: _blocking("sklearn"),
+               library="sklearn")
+
+
+# ---- isolation forests ----------------------------------------------------
+
+def sklearn_iforest_arm(cfg, data):
+    """scikit-learn's IsolationForest, on every core.
+
+    LABEL IT HONESTLY: this is a CPU opponent, and unless the cuML arm below
+    runs it is the ONLY opponent this lane has. A GPU-versus-CPU ratio in
+    this lane is not the same claim as a GPU-versus-GPU ratio in the others,
+    and the benchmark output must say so in the lane's own row."""
+    from sklearn.ensemble import IsolationForest
+
+    emit_note("iforest", ["sklearn-iforest-cpu", "ours"], "mismatch", 1.0,
+              "max_depth: sklearn has no parameter and fixes ceil(log2(max_samples)) = 8; "
+              "ours max_depth None resolves to the same integer ceil(log2(max_samples)). "
+              "Ours keeps no forest after fit (DEVIATION 1836), so its leaf count cannot be "
+              "read and the fit verdict is UNKNOWN by construction")
+
+    def make():
+        return IsolationForest(
+            n_estimators=cfg["n_estimators"],
+            max_samples=cfg["max_samples"],
+            max_features=cfg["max_features"],
+            bootstrap=cfg["bootstrap"],
+            contamination="auto",
+            random_state=cfg["seed"],
+            warm_start=False,
+            n_jobs=-1,
+        )
+
+    def score(model, d):
+        s = -np.asarray(model.score_samples(d.X_test), dtype=np.float64)
+        return [("auc", auc(d.y_anom, s), s)]
+
+    return Arm("sklearn-iforest-cpu", make,
+               lambda m, d: m.fit(d.X_train),
+               score, sync=lambda: _blocking("sklearn"), library="sklearn")
+
+
+def cuml_iforest_arm(cfg, data):
+    """cuML's IsolationForest, IF this cuML has one.
+
+    DEVIATION 1837, AND IT IS A DISAGREEMENT WITH THE BRIEF. The brief for
+    this file states that cuML has no IsolationForest. Our own implementation says
+    otherwise: `python/anonlib/_iforest_impl.py` cites
+    `isolation_forest.pyx:663-702` for cuML's `max_samples` resolution, and
+    `isolation_forest/` is described throughout as an implementation of cuML's. Both
+    cannot be right, and the cheap way to settle it is to try the import on
+    the box and print what happens. If it is absent the arm REFUSES by name
+    and the lane falls back to sklearn alone; if it is present the lane gets
+    the GPU-versus-GPU column every other lane has.
+
+    Settling it also closes a real open question the implementation carries: DEVIATION
+    750, cuML's `curand_u64` word order, has never been checked against a
+    cuML binary because there has never been one on the same machine."""
+    try:
+        from cuml.ensemble import IsolationForest
+    except ImportError:
+        from cuml import IsolationForest    # older layouts
+
+    def make():
+        return IsolationForest(
+            n_estimators=cfg["n_estimators"],
+            max_samples=cfg["max_samples"],
+            max_features=cfg["max_features"],
+            bootstrap=cfg["bootstrap"],
+            contamination="auto",
+            random_state=cfg["seed"],
+        )
+
+    def score(model, d):
+        s = -np.asarray(model.score_samples(d.X_test), dtype=np.float64)
+        return [("auc", auc(d.y_anom, s), s)]
+
+    return Arm("cuml-iforest-gpu", make,
+               lambda m, d: m.fit(d.X_train),
+               score, sync=_cuda_sync, library="cuml")
+
+
+# ---- scoring, shared by every sklearn-shaped arm --------------------------
+
+def _score_sklearn_like(model, d):
+    """`(metric, value, prediction_vector)` triples for an estimator with the
+    scikit-learn surface -- which is all of them, ours included.
+
+    Regression gets RMSE. Binary gets BOTH logloss and AUC, because the two
+    answer different questions and a boosting table with only one of them
+    invites the reader to pick. Multiclass gets accuracy.
+
+    A note about log loss that this repository has already been bitten by:
+    gbm-bench's own Log_Loss column is ASYMMETRIC for CatBoost because it
+    scores their RAW MARGINS (bench/external/README.md). Nothing here has
+    that bug -- every arm is scored through `predict_proba`, which every one
+    of these libraries defines as the probability after the link -- but the
+    resemblance is close enough to be worth naming."""
+    out = []
+    if d.task == "regression":
+        p = np.asarray(model.predict(d.X_test)).ravel()
+        out.append(("rmse", rmse(d.y_test, p), p))
+        return out
+    proba = np.asarray(model.predict_proba(d.X_test), dtype=np.float64)
+    if proba.ndim == 1:
+        proba = np.column_stack((1.0 - proba, proba))
+    if d.task == "binary":
+        p1 = proba[:, 1]
+        out.append(("logloss", logloss(d.y_test, p1), p1))
+        out.append(("auc", auc(d.y_test, p1), None))
+        return out
+    # Multiclass: the multi-logloss first, so the round hash covers the whole
+    # probability matrix (lane gbdt-multiclass), then accuracy.
+    if proba.shape[1] == d.n_classes:
+        out.append(("mlogloss", mlogloss(d.y_test, proba), proba))
+    labels = np.argmax(proba, axis=1)
+    out.append(("accuracy", accuracy(d.y_test, labels), labels))
+    return out
+
+
+def score_ranking(scores, d):
+    """The ranking lanes' quality, from raw scores on the whole Istella-S
+    test split: NDCG@10, NDCG@5 and MAP (`ranking_metrics`), the scores as the
+    hashed vector."""
+    s = np.ascontiguousarray(np.asarray(scores, dtype=np.float64).reshape(-1))
+    m = ranking_metrics(d.bounds_test, d.y_test, s)
+    return [(m[0][0], m[0][1], s)] + [(k, v, None) for k, v in m[1:]]
+
+
+#: Public alias. `bench/speed/forest_speed_arm.py` scores our arm through the
+#: SAME helper every opponent uses, on the same held-out rows; reaching for a
+#: private name to do that would invite somebody to write a second scorer,
+#: and two scorers is how an accuracy column stops being comparable.
+score_sklearn_like = _score_sklearn_like
+
+
+# --------------------------------------------------------------------------
+# FIT EQUIVALENCE: compare the MODELS, not only the configs.
+# --------------------------------------------------------------------------
+#
+# THE HOLE THIS CLOSES (2026-09-12, lane harness-honesty). Every cell above
+# holds the hyper-parameters equal, spells them in ONE place (`lane_config`)
+# and prints them. Until today that was the entire fairness argument: two arms
+# were "the same problem" because one dict said so. NOTHING READ THE MODELS
+# THAT CAME OUT. An arm that silently built fewer trees, shallower trees or
+# fewer leaves -- because a library clamped a knob, because a default did not
+# mean what the table assumed, because a grow policy ran out of gain and
+# stopped early -- would simply look FASTER, and no line of the output would
+# say so. `_check_same_library_agreement` (DEVIATION 1839) catches only the
+# case where two arms OF ONE LIBRARY disagree on ACCURACY; it is blind to a
+# cross-library size difference, and blind to any difference that does not
+# move a metric.
+#
+# IT IS NOT HYPOTHETICAL. A hand-written check in
+# `tools/gbdt_fairness_probe.py` (lane gbdt-fairness, 2026-09-12) measured
+# CatBoost building about 120 FEWER LEAVES than ours on Istella-S under an
+# identical config. That one came out in OUR favour -- we were solving the
+# harder problem -- which is exactly why it had to be measured rather than
+# assumed: the same silence hides the reverse just as well, and the reverse is
+# a benchmark we would have published.
+#
+# WHAT THIS REPORTS, AND WHAT IT REFUSES TO GUESS. After the timed rounds and
+# outside every timer, each arm's LAST FITTED MODEL is read back through its
+# own library's API: tree count, node count, leaf count, maximum depth. Every
+# number carries the API that answered it, because `get_tree_leaf_counts` and
+# `get_leaf_values` are not the same measurement, and a reader comparing model
+# sizes is entitled to know which one this is. An arm whose library exposes
+# nothing says UNAVAILABLE BY NAME and the cell's verdict becomes UNKNOWN.
+#
+# **UNAVAILABLE IS NOT A PASS.** A cell where the shapes could not be read is
+# reported as UNKNOWN, never as comparable. The whole point is that an
+# unexamined comparison stops being quietly assumed to be fair.
+#
+# NOTHING HERE READS A CONFIG BACK AS EVIDENCE. `n_estimators` is what we
+# ASKED for; it is used only as the expectation a fitted tree count is checked
+# AGAINST, and it is never reported as if it were the tree count that came
+# out. An estimator that exposes only its constructor arguments exposes
+# nothing about its fit.
+
+#: Relative spread in total leaf count, across the arms of one cell, above
+#: which the arms are not solving comparable problems. Wide, deliberately: two
+#: libraries' growers legitimately differ (sklearn searches exact thresholds,
+#: cuML and ours bin; a lossguide budget lands differently), and this is a
+#: tripwire for a FACTOR, not a referee for a few percent.
+_FIT_LEAF_TOL = 0.10
+
+#: A depth walk is a host loop over every node of every tree. Above this many
+#: nodes the depth is reported as unknown rather than spending a minute of a
+#: rented box proving what the tree count and leaf count already said.
+_FIT_WALK_NODE_CAP = 20_000_000
+
+
+def _int_list(seq):
+    """A `anonlib.Array`, a numpy array or a plain sequence -> list of int."""
+    if seq is None:
+        return None
+    return [int(v) for v in np.asarray(seq).ravel().tolist()]
+
+
+def _exact_log2(n):
+    """`d` when `n == 2 ** d`, else None. No float log: `log2(2**53+...)`
+    rounding is exactly the sort of thing that would put a wrong depth in a
+    table (`[[mojo-log-breaks-ties]]` is the same lesson one language over)."""
+    if n is None or n < 1:
+        return None
+    d, v = 0, int(n)
+    while v > 1:
+        if v & 1:
+            return None
+        v >>= 1
+        d += 1
+    return d
+
+
+def _flat_forest_depths(offsets, left_child):
+    """Max depth per tree of a flat cuML-shaped forest, or None.
+
+    `ensemble/flatnode.mojo`: a node is a LEAF iff `left_child == -1`
+    (`flatnode.h:58`) and the right child is `left_child + 1`, the sibling
+    rule (`flatnode.h:45`). `offsets[t]..offsets[t+1]` is tree `t`'s node
+    block and child indices are read as TREE-LOCAL.
+
+    A child index that does not land inside its own tree's block, or a walk
+    that visits more nodes than the tree has, returns None for the WHOLE
+    forest. It does not quietly reinterpret the index as a global one and
+    carry on: a depth computed by a walk that does not match the model's
+    layout is a wrong number, and a wrong number here is worse than no number,
+    which is this entire file's argument applied to itself.
+
+    Level by level in numpy, so the cost is O(depth) array operations per tree
+    rather than O(nodes) Python iterations."""
+    left = np.asarray(left_child, dtype=np.int64).ravel()
+    offs = np.asarray(offsets, dtype=np.int64).ravel()
+    if offs.size < 2 or int(offs[-1]) != left.size:
+        return None
+    depths = []
+    for t in range(offs.size - 1):
+        start, end = int(offs[t]), int(offs[t + 1])
+        n = end - start
+        if n <= 0:
+            return None
+        block = left[start:end]
+        cur = np.zeros(1, dtype=np.int64)
+        depth, visited = 0, 0
+        while cur.size:
+            visited += int(cur.size)
+            if visited > n:
+                return None                 # a cycle: the walk is not the layout
+            lc = block[cur]
+            internal = lc >= 0
+            if not internal.any():
+                break
+            kids = lc[internal]
+            if int(kids.min()) < 0 or int(kids.max()) + 1 >= n:
+                return None                 # not tree-local after all
+            cur = np.concatenate((kids, kids + 1))
+            depth += 1
+        depths.append(depth)
+    return depths
+
+
+def _shape_anonlib(model):
+    """OUR arm. Two shapes live under one name and they are read differently.
+
+    GradientBoosting keeps its ensemble as MODEL TEXT (`model_`, the format in
+    `gbdt/models/model_text.mojo`), so the counts come from the public
+    accessor `get_tree_leaf_counts` -- CatBoost's own spelling, host-side,
+    launching no GPU work -- cross-checked against a parse of the text's own
+    `tree`/`ntree` records. The two disagreeing would itself be a defect, so
+    the disagreement is reported rather than resolved.
+
+    The forests (`RandomForest*`, `ExtraTrees*`) keep flat cuML-shaped arrays,
+    so the counts come from those directly."""
+    if hasattr(model, "get_tree_leaf_counts"):
+        counts = _int_list(model.get_tree_leaf_counts())
+        out = dict(library="anonlib", source="get_tree_leaf_counts",
+                   trees=len(counts), leaves=int(sum(counts)))
+        declared, depths, internal, text_leaves = None, [], 0, 0
+        for line in str(getattr(model, "model_", "") or "").splitlines():
+            f = line.split()
+            if not f:
+                continue
+            if f[0] == "trees":
+                declared = int(f[1])
+            elif f[0] == "tree":                 # oblivious: `tree t depth d`
+                d = int(f[3])
+                depths.append(d)
+                text_leaves += 1 << d
+                internal += (1 << d) - 1
+            elif f[0] == "ntree":                # non-symmetric: `ntree t nodes n`
+                n = int(f[3])
+                text_leaves += n + 1
+                internal += n
+        out["nodes"] = int(internal + out["leaves"])
+        if depths and len(depths) == out["trees"]:
+            out["depth_max"] = int(max(depths))
+        else:
+            # A Depthwise/Lossguide model text carries node counts, not depth;
+            # recovering it needs the pre-order subtree walk, which is not
+            # worth a second parser here. Say so instead of leaving it blank.
+            out["depth_max"] = None
+            out["depth_note"] = "non-symmetric model text carries nodes, not depth"
+        if declared is not None and declared != out["trees"]:
+            out["disagreement"] = ("model text declares %d trees, "
+                                   "get_tree_leaf_counts returned %d"
+                                   % (declared, out["trees"]))
+        if text_leaves and text_leaves != out["leaves"]:
+            out["disagreement"] = ("model text holds %d leaves, "
+                                   "get_tree_leaf_counts returned %d"
+                                   % (text_leaves, out["leaves"]))
+        if getattr(model, "stopped_early_", False):
+            out["early_stopped"] = True
+            out["best_iteration"] = int(getattr(model, "best_iteration_", -1))
+        return out
+    if hasattr(model, "_offsets"):
+        offsets = _int_list(model._offsets)
+        left = np.asarray(model._left_child, dtype=np.int64).ravel()
+        out = dict(library="anonlib", source="flat forest arrays",
+                   trees=len(offsets) - 1, nodes=int(left.size),
+                   leaves=int((left == -1).sum()))
+        if left.size <= _FIT_WALK_NODE_CAP:
+            depths = _flat_forest_depths(offsets, left)
+            out["depth_max"] = None if depths is None else int(max(depths))
+            if depths is None:
+                out["depth_note"] = "child indices do not match the flat layout"
+        else:
+            out["depth_max"] = None
+            out["depth_note"] = "%d nodes is above the walk cap" % left.size
+        return out
+    return dict(library="anonlib", source="none",
+                note="this estimator exposes no fitted ensemble; "
+                     "IsolationForest rebuilds its forest per call "
+                     "(DEVIATION 874/1836) and keeps nothing to read")
+
+
+def _shape_catboost(model):
+    """CatBoost. `tree_count_` is the fitted count; the leaves come from
+    `get_tree_leaf_counts` where the build has it and from the flat
+    `get_leaf_values` where it does not. The two are labeled separately and
+    never merged, because they are not the same measurement."""
+    out = dict(library="catboost")
+    try:
+        out["trees"] = int(model.tree_count_)
+    except Exception as exc:                       # noqa: BLE001
+        out["trees"] = None
+        out["note"] = "tree_count_ unavailable: %s" % exc
+    counts = None
+    for name in ("get_tree_leaf_counts", "_get_tree_leaf_counts"):
+        try:
+            counts = _int_list(getattr(model, name)())
+            if counts:
+                out["source"] = name
+                break
+        except Exception:                          # noqa: BLE001
+            counts = None
+    if counts:
+        out["leaves"] = int(sum(counts))
+        out["nodes"] = None                        # their surface exposes none
+        per = max(counts)
+        if min(counts) == per:
+            out["depth_max"] = _exact_log2(per)    # oblivious: 2**depth leaves
+    else:
+        try:
+            out["leaves"] = int(np.asarray(model.get_leaf_values()).size)
+            out["source"] = "get_leaf_values"
+            out["leaves_note"] = ("flat leaf values, one per leaf for a "
+                                  "single-dimension objective")
+        except Exception as exc:                   # noqa: BLE001
+            out["leaves"] = None
+            out["note"] = "no leaf accessor answered: %s" % exc
+    return out
+
+
+def _shape_xgboost(model):
+    """XGBoost, from the booster's own text dump: one line per node, a leaf
+    line carries `leaf=`, and the depth is the deepest indentation."""
+    booster = model.get_booster()
+    dump = booster.get_dump(with_stats=False)
+    leaves, nodes, depth = 0, 0, 0
+    for tree in dump:
+        for line in tree.splitlines():
+            stripped = line.lstrip("\t")
+            if not stripped:
+                continue
+            nodes += 1
+            if "leaf=" in stripped:
+                leaves += 1
+            depth = max(depth, len(line) - len(stripped))
+    return dict(library="xgboost", source="booster.get_dump", trees=len(dump),
+                nodes=nodes, leaves=leaves, depth_max=depth)
+
+
+def _shape_lightgbm(model):
+    """LightGBM, from `dump_model`'s `tree_info`. `num_leaves` is exact and
+    free; the depth walk is bounded by the same node cap as everything else."""
+    info = model.booster_.dump_model()["tree_info"]
+    leaves = int(sum(int(t.get("num_leaves", 0)) for t in info))
+    out = dict(library="lightgbm", source="booster_.dump_model", trees=len(info),
+               leaves=leaves, nodes=max(0, 2 * leaves - len(info)))
+    if leaves > _FIT_WALK_NODE_CAP:
+        out["depth_max"] = None
+        out["depth_note"] = "%d leaves is above the walk cap" % leaves
+        return out
+    depth = 0
+    for tree in info:
+        stack = [(tree.get("tree_structure", {}), 0)]
+        while stack:
+            node, d = stack.pop()
+            if not isinstance(node, dict) or "split_index" not in node:
+                depth = max(depth, d)
+                continue
+            for side in ("left_child", "right_child"):
+                if side in node:
+                    stack.append((node[side], d + 1))
+    out["depth_max"] = depth
+    return out
+
+
+def _shape_sklearn(model):
+    """scikit-learn, from the fitted `estimators_` themselves. `tree_` carries
+    the node count, the children arrays and the realized depth exactly, so
+    this is the one arm where nothing has to be inferred."""
+    trees = list(getattr(model, "estimators_", []) or [])
+    if not trees:
+        return dict(library="sklearn", source="none",
+                    note="the fitted estimator exposes no estimators_")
+    nodes = int(sum(int(e.tree_.node_count) for e in trees))
+    leaves = int(sum(int(np.sum(np.asarray(e.tree_.children_left) == -1))
+                     for e in trees))
+    return dict(library="sklearn", source="estimators_[i].tree_",
+                trees=len(trees), nodes=nodes, leaves=leaves,
+                depth_max=int(max(int(e.tree_.max_depth) for e in trees)))
+
+
+def _shape_cuml(model):
+    """cuML. Their Python forest exposes no node or leaf accessor; the JSON
+    dump is the only door, it is not on every build, and on a big forest it is
+    a large string. Tried, bounded, and reported UNAVAILABLE by name when it
+    does not answer -- never backfilled from `n_estimators`, which is the
+    config we asked for and says nothing about the fit."""
+    import json
+    dumper = None
+    for name in ("get_json", "dump_as_json"):
+        if callable(getattr(model, name, None)):
+            dumper = getattr(model, name)
+            break
+    if dumper is None:
+        return dict(library="cuml", source="none",
+                    note="this cuML build exposes neither get_json nor "
+                         "dump_as_json, so its fitted shape cannot be read")
+    try:
+        trees = json.loads(dumper())
+    except Exception as exc:                       # noqa: BLE001
+        return dict(library="cuml", source="get_json",
+                    note="the JSON dump did not parse: %s" % exc)
+    if not isinstance(trees, list):
+        trees = [trees]
+    nodes = leaves = 0
+    depth = 0
+    for tree in trees:
+        stack = [(tree, 0)]
+        while stack:
+            node, d = stack.pop()
+            if not isinstance(node, dict):
+                continue
+            nodes += 1
+            kids = node.get("children")
+            if not kids:
+                leaves += 1
+                depth = max(depth, d)
+                continue
+            for kid in kids:
+                stack.append((kid, d + 1))
+    # THE DANGEROUS CASE IS NOT ABSENCE, IT IS A SCHEMA THAT PARSES
+    # (2026-09-12, lane harness-honesty). A cuML build without the dump is
+    # handled above and is SAFE, because it is loud: the cell reads UNKNOWN
+    # and a reader knows nothing was compared. The case that would put a wrong
+    # number in a table is a dump that parses into a shape this walk does not
+    # understand -- a flat per-tree node list, or a different spelling of
+    # `children` -- because then every internal node looks childless, every
+    # node counts as a leaf, and a PLAUSIBLE WRONG leaf count flows into
+    # FSPEED-FIT-VERDICT dressed as a measurement.
+    #
+    # Any real ensemble satisfies nodes >= leaves >= trees >= 1: a tree has at
+    # least its root, and no node is counted twice. A parse that violates it
+    # has been misread, so it degrades to UNAVAILABLE. This cannot rescue a
+    # schema that is wrong but self-consistent; it catches the one failure
+    # mode observed to produce numbers instead of errors.
+    # `tools/cuml_forest_json_probe.py` settles the schema in a minute.
+    if not (nodes >= leaves >= len(trees) >= 1):
+        return dict(library="cuml", source="get_json",
+                    note="the JSON dump parsed but violates nodes >= leaves >= "
+                         "trees >= 1 (trees=%d nodes=%d leaves=%d), so this "
+                         "build's schema is not the one this reader walks; "
+                         "reporting UNAVAILABLE rather than a plausible wrong "
+                         "leaf count (tools/cuml_forest_json_probe.py settles "
+                         "the schema)" % (len(trees), nodes, leaves))
+    return dict(library="cuml", source="get_json", trees=len(trees),
+                nodes=nodes, leaves=leaves, depth_max=depth)
+
+
+#: Which reader answers for which library. Keyed on `Arm.library`, which every
+#: arm already sets, so a new opponent gets a reader or gets UNAVAILABLE --
+#: it cannot get a silent pass.
+MODEL_SHAPE_READERS = {
+    "anonlib": _shape_anonlib,
+    "catboost": _shape_catboost,
+    "xgboost": _shape_xgboost,
+    "lightgbm": _shape_lightgbm,
+    "sklearn": _shape_sklearn,
+    "cuml": _shape_cuml,
+}
+
+
+def model_shape(arm, model):
+    """`arm`'s fitted model as a shape dict. NEVER RAISES: a benchmark that
+    dies while inspecting a model it already timed has thrown away the
+    measurement it paid a rented box for."""
+    reader = MODEL_SHAPE_READERS.get(arm.library)
+    if reader is None:
+        return dict(library=arm.library, source="none",
+                    note="no fit-shape reader for this library")
+    try:
+        return reader(model)
+    except Exception as exc:                       # noqa: BLE001
+        return dict(library=arm.library, source="none",
+                    note="%s while reading the fitted model: %s"
+                         % (exc.__class__.__name__,
+                            " ".join(str(exc).split())[:160]))
+
+
+def _fit_field(shape, key):
+    v = shape.get(key)
+    return "-" if v is None else str(int(v))
+
+
+def emit_fit(lane, arm_name, shape):
+    print("FSPEED-FIT lane=%s arm=%s library=%s trees=%s nodes=%s leaves=%s "
+          "depth_max=%s source=%s"
+          % (lane, arm_name, shape.get("library", "-"),
+             _fit_field(shape, "trees"), _fit_field(shape, "nodes"),
+             _fit_field(shape, "leaves"), _fit_field(shape, "depth_max"),
+             shape.get("source", "-")))
+    for key in ("note", "leaves_note", "depth_note", "disagreement"):
+        if shape.get(key):
+            print("FSPEED-FIT-NOTE lane=%s arm=%s %s=%s"
+                  % (lane, arm_name, key, " ".join(str(shape[key]).split())))
+    sys.stdout.flush()
+
+
+def check_fit_equivalence(lane, arms, models, cfg=None):
+    """Read every arm's fitted model back, print it, and say whether the arms
+    of this cell were solving comparable problems.
+
+    Two separate questions, and they are answered separately on purpose:
+
+    1. **Did an arm build what it was asked to build?** A fitted tree count
+       below the lane's `n_estimators` is a REFUSAL by name, because that arm
+       did less work than the cell says it did and its time is not the time of
+       the job in the header. Early stopping is the one legitimate reason and
+       the arm has to SAY so (ours sets `stopped_early_`); an arm that just
+       came up short is refused.
+
+    2. **Were the arms solving comparable problems?** Compared across
+       libraries, on total leaves, with a wide tolerance. A difference here is
+       NOT automatically a defect -- two growers legitimately differ, and the
+       120-leaf CatBoost gap that motivated this check was real and in our
+       favour -- so it is a loud NOTE carrying both numbers, never a refusal.
+       What it is not is invisible.
+
+    The verdict line is COMPARABLE, NOT-COMPARABLE or UNKNOWN. UNKNOWN is
+    where the shapes could not be read, and it is not a pass."""
+    shapes = {}
+    for arm in arms:
+        model = models.get(arm.name)
+        if model is None:
+            continue
+        shape = model_shape(arm, model)
+        arm.fit_shape = shape
+        shapes[arm.name] = shape
+        emit_fit(lane, arm.name, shape)
+
+    # lane gbdt-multiclass: XGBoost and LightGBM grow one tree PER CLASS per
+    # round where ours and CatBoost grow one vector-leaf tree, so their counts
+    # are divided by n_classes before either check, and the line says so.
+    per_class = int((cfg or {}).get("n_classes") or 0)
+    if (cfg or {}).get("task") == "multiclass" and per_class > 1:
+        for name, shape in shapes.items():
+            if shape.get("library") in ("xgboost", "lightgbm"):
+                for key in ("trees", "leaves"):
+                    if shape.get(key) is not None:
+                        shape[key + "_raw"] = shape[key]
+                        shape[key] = int(round(shape[key] / float(per_class)))
+                print("FSPEED-FIT-NOTE lane=%s arm=%s per_class=trees and leaves divided by "
+                      "n_classes %d (one tree per class per round; raw trees %s leaves %s)"
+                      % (lane, name, per_class, shape.get("trees_raw", "-"),
+                         shape.get("leaves_raw", "-")))
+    expected = (cfg or {}).get("n_estimators")
+    for name, shape in sorted(shapes.items()):
+        trees = shape.get("trees")
+        if expected is None or trees is None:
+            continue
+        if trees < int(expected) and not shape.get("early_stopped"):
+            emit_refused(
+                lane, name,
+                "FIT-EQUIVALENCE: this arm FITTED %d trees where the lane's "
+                "config asked for %d, and it did not report early stopping. "
+                "Its timing is the time of a smaller job than the header "
+                "names and must not be put in a ratio against an arm that "
+                "built the full ensemble." % (trees, int(expected)))
+        elif trees != int(expected):
+            emit_note(lane, [name], "trees", float(trees - int(expected)),
+                      "FIT-EQUIVALENCE: fitted %d trees against a requested "
+                      "%d%s" % (trees, int(expected),
+                                "; the arm reports early stopping at "
+                                "iteration %d" % shape.get("best_iteration", -1)
+                                if shape.get("early_stopped") else ""))
+
+    known = {n: int(s["leaves"]) for n, s in shapes.items()
+             if s.get("leaves") is not None}
+    unknown = sorted(n for n in shapes if n not in known)
+    listing = ",".join("%s:%d" % kv for kv in sorted(known.items())) or "-"
+    if len(known) < 2:
+        print("FSPEED-FIT-VERDICT lane=%s arms=%s leaves=%s spread=- "
+              "verdict=UNKNOWN reason=fewer than two arms exposed a leaf "
+              "count; an unread comparison is not a fair one"
+              % (lane, ",".join(sorted(shapes)) or "-", listing))
+        sys.stdout.flush()
+        return shapes
+    lo, hi = min(known.values()), max(known.values())
+    spread = (hi - lo) / float(hi) if hi else 0.0
+    verdict = "NOT-COMPARABLE" if spread > _FIT_LEAF_TOL else "COMPARABLE"
+    if unknown:
+        verdict = "UNKNOWN"
+    print("FSPEED-FIT-VERDICT lane=%s arms=%s leaves=%s spread=%.4f "
+          "verdict=%s%s"
+          % (lane, ",".join(sorted(shapes)), listing, spread, verdict,
+             " unread=" + ",".join(unknown) if unknown else ""))
+    sys.stdout.flush()
+    if spread > _FIT_LEAF_TOL:
+        emit_note(
+            lane, sorted(known), "leaves", spread,
+            "FIT-EQUIVALENCE: the arms of this cell built ensembles differing "
+            "by %.1f%% in TOTAL LEAVES (%s), above the %.0f%% tripwire. The "
+            "configs were held equal, so the growers disagree about what that "
+            "config means: the arm with fewer leaves is solving a smaller "
+            "problem and the ratio prices two different jobs. This is not "
+            "automatically a defect -- it is a fact the table must carry."
+            % (100.0 * spread, listing, 100.0 * _FIT_LEAF_TOL))
+    return shapes
+
+
+# --------------------------------------------------------------------------
+# The opponent roster for a lane.
+# --------------------------------------------------------------------------
+
+def opponent_builders(lane, cfg, data, devices):
+    """`[(arm_name, thunk)]`. Each thunk returns a LIST of arms or raises;
+    the raise becomes an FSPEED-REFUSED line for every arm it would have
+    produced, which is why the names are known before the thunk runs. An
+    opponent that cannot be installed must be visible as a refusal, never as
+    an absent row."""
+    builders = []
+    task = task_of(lane)
+    if task and task["task"] == "ranking":
+        builders.append((["catboost-cpu", "catboost-gpu"],
+                         lambda: catboost_rank_arms(lane, cfg, data, devices)))
+        builders.append((["xgboost-cpu", "xgboost-gpu"],
+                         lambda: xgboost_rank_arms(lane, cfg, data, devices)))
+        if "lightgbm" in task["objectives"]:
+            builders.append((["lightgbm-cpu", "lightgbm-cuda", "lightgbm-opencl"],
+                             lambda: lightgbm_rank_arms(lane, cfg, data, devices)))
+    elif lane == "gbdt-ordered":
+        # Ordered boosting: CatBoost is the only other library that has it
+        builders.append((["catboost-cpu", "catboost-gpu"],
+                         lambda: catboost_arms(lane, cfg, data, devices)))
+    elif task:
+        # multiclass and categorical: the gbdt builders, which read the task
+        # from the data (MultiClass / multi:softprob / multiclass) and the
+        # declared categorical columns from data.cat_idx
+        builders.append((["catboost-cpu", "catboost-gpu"],
+                         lambda: catboost_arms(lane, cfg, data, devices)))
+        builders.append((["xgboost-cpu", "xgboost-gpu"],
+                         lambda: xgboost_arms(lane, cfg, data, devices)))
+        builders.append((["lightgbm-cpu", "lightgbm-cuda", "lightgbm-opencl"],
+                         lambda: lightgbm_arms(lane, cfg, data, devices)))
+    elif lane in ("gbdt-symmetric", "gbdt-symmetric-1000"):
+        # CatBoost ONLY. Standing order, 2026-08-22.
+        builders.append((["catboost-cpu", "catboost-gpu"],
+                         lambda: catboost_arms(lane, cfg, data, devices)))
+    elif lane in ("gbdt-depthwise", "gbdt-lossguide"):
+        builders.append((["catboost-cpu", "catboost-gpu"],
+                         lambda: catboost_arms(lane, cfg, data, devices)))
+        builders.append((["xgboost-cpu", "xgboost-gpu"],
+                         lambda: xgboost_arms(lane, cfg, data, devices)))
+        if lane == "gbdt-lossguide":
+            # Leaf-wise growth IS LightGBM's algorithm; this is the only
+            # boosting lane it belongs in.
+            builders.append((["lightgbm-cpu", "lightgbm-cuda", "lightgbm-opencl"],
+                             lambda: lightgbm_arms(lane, cfg, data, devices)))
+    elif lane == "rf":
+        builders.append((["cuml-rf-gpu"],
+                         lambda: [cuml_rf_arm(lane, cfg, data)]))
+        builders.append((["sklearn-rf-cpu"],
+                         lambda: [sklearn_forest_arm(lane, cfg, data)]))
+        builders.append((["lightgbm-cpu", "lightgbm-cuda", "lightgbm-opencl"],
+                         lambda: lightgbm_arms(lane, cfg, data, devices)))
+    elif lane == "et":
+        # Named `cuml-et-gpu` so the refusal reads as "cuML has no ExtraTrees"
+        # rather than as a missing RandomForest row.
+        builders.append((["cuml-et-gpu"],
+                         lambda: [cuml_rf_arm(lane, cfg, data)]))
+        builders.append((["sklearn-et-cpu"],
+                         lambda: [sklearn_forest_arm(lane, cfg, data)]))
+        builders.append((["lightgbm-cpu", "lightgbm-cuda", "lightgbm-opencl"],
+                         lambda: lightgbm_arms(lane, cfg, data, devices)))
+    elif lane == "iforest":
+        builders.append((["cuml-iforest-gpu"],
+                         lambda: [cuml_iforest_arm(cfg, data)]))
+        builders.append((["sklearn-iforest-cpu"],
+                         lambda: [sklearn_iforest_arm(cfg, data)]))
+    else:
+        raise SystemExit("unknown lane " + repr(lane))
+    return builders
+
+
+def accel_visible():
+    """Is this a GPU vendor's box?"""
+    # NOT on macOS: importing torch there loads torch's libomp before
+    # LightGBM's, and LightGBM's first train in the same process then
+    # segfaults (exit 139; lightgbm 4.7.0 + torch 2.13.0, M4, 2026-09-26: the
+    # bench board's rf race died in lightgbm-cpu's warm-up). torch.cuda is
+    # never available on a Mac, so the import could only ever answer False.
+    if sys.platform == "darwin":
+        return False
+    try:
+        import torch                                   # noqa: PLC0415
+        if torch.cuda.is_available():
+            return True
+    except Exception:                                  # noqa: BLE001
+        pass
+    for var in ("CUDA_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES"):
+        if os.environ.get(var, "").strip() not in ("", "-1"):
+            return True
+    return bool(shutil.which("nvidia-smi") or shutil.which("rocm-smi"))
+
+
+def accel_vendor():
+    """'nvidia', 'amd' or None: which GPU vendor's box this is. NVIDIA wins
+    when both tools are present (a CUDA image with rocm-smi installed is
+    still an NVIDIA box)."""
+    if shutil.which("nvidia-smi"):
+        return "nvidia"
+    if shutil.which("rocm-smi") or os.path.exists("/dev/kfd"):
+        return "amd"
+    return None
+
+
+def resolve_devices(requested, lane=None):
+    """Which device arms of each opponent may run here.
+
+    CORRECTED 2026-09-11 (CONTRIBUTING.md (Comparing against libraries without a GPU path)): on AMD a library
+    with no AMD GPU path runs on the box's CPU on all cores when `cpu` is
+    requested by name, and every arm name says -cpu or -gpu; the GPU-only
+    rule below now binds NVIDIA only.
+
+    THE RULE, AND IT IS NOT A PREFERENCE. On NVIDIA we compare
+    against the vendor's GPU path ONLY. Their CPU path is for the MacBook,
+    where it is the only path they have.
+
+    A GPU-versus-CPU ratio is not the claim this project makes. Beating
+    CatBoost's CPU learner by 1.70x on an H100 is not a result, it is a
+    category error, and printing it beside the GPU column invites the table
+    to be graded on the easy comparison. It also costs the lease:
+    `lightgbm-cpu` took 89 SECONDS on 522,911 rows in the rf lane, and at a
+    5,000,000-row rung it would spend most of a per-arm budget measuring
+    something nobody asked about.
+
+    `auto` -- the default -- is `gpu` wherever an accelerator is visible and
+    `cpu` on the MacBook. An explicit list still wins, because the Apple
+    runs need to ask for `cpu` by name, and because a deliberate override
+    should be possible; what is not possible is getting the CPU arms by
+    ACCIDENT on a box that is billing by the minute.
+
+    THE CONSEQUENCE IS STATED, NOT WORKED AROUND. cuML ships no ExtraTrees
+    and no IsolationForest, so on NVIDIA the `et` and `iforest` lanes have
+    NO legal opponent, and every arm they would have had is refused BY NAME.
+    That is a finding about the vendor's GPU coverage. It is not a licence
+    to run scikit-learn on the host CPU and call it an opponent.
+    CORRECTED 2026-09-11: `et` on NVIDIA with `cpu` requested by name runs
+    scikit-learn's ExtraTrees on the pod CPU, labeled CPU (lane trees-taxi-h100).
+    """
+    want = [d.strip().lower() for d in (requested or "").split(",")
+            if d.strip()]
+    if not want or want == ["auto"]:
+        want = ["gpu"] if accel_visible() else ["cpu"]
+        auto = True
+    else:
+        auto = False
+    if "cpu" in want and accel_visible() and accel_vendor() == "amd":
+        if lane is not None:
+            emit_note(
+                lane, want, "devices", float(len(want)),
+                "AMD box: CPU arms run for libraries with no AMD GPU path, "
+                "on all cores (CONTRIBUTING.md (Comparing against libraries without a GPU path)); every arm "
+                "name carries its device")
+    elif "cpu" in want and accel_visible() and lane == "et" and not auto:
+        # CORRECTED 2026-09-11 (lane trees-taxi-h100): NVIDIA has no GPU
+        # ExtraTrees, so an explicit `cpu` admits scikit-learn's
+        # ExtraTreesClassifier on the pod CPU for `et` only, labeled -cpu.
+        if lane is not None:
+            emit_note(
+                lane, want, "devices", float(len(want)),
+                "NVIDIA box, lane et: no GPU ExtraTrees exists, so the CPU "
+                "arm requested by name runs on all cores and is labeled CPU")
+    elif "cpu" in want and accel_visible():
+        dropped = [d for d in want if d == "cpu"]
+        want = [d for d in want if d != "cpu"]
+        if lane is not None and dropped:
+            emit_refused(
+                lane, "*-cpu",
+                "GPU-PATH-ONLY: an accelerator is visible on this box, so the "
+                "vendors' CPU arms do not run. On NVIDIA we compare against "
+                "the vendor's GPU arm only; the CPU arm is the MacBook's. An "
+                "explicit cpu is admitted on NVIDIA for lane et only.")
+    if not want:
+        want = ["gpu"]
+    return want, auto
+
+
+def build_opponents(lane, cfg, data, devices, wanted=None):
+    """Run every builder inside its own `try` and turn a failure into
+    refusals. Nothing here may take the process down: an opponent that will
+    not install on a rented box is the NORMAL case, not the exception.
+
+    `wanted` (the --arms list): a builder none of whose arms is wanted is not
+    run at all. Before 2026-09-29 every builder ran and --arms filtered
+    afterwards, so an unwanted builder's refusal (cuML on a Mac) still
+    printed FSPEED-REFUSED and the bench board recorded a REFUSED cell for an
+    arm it never planned."""
+    arms = []
+    allow_cpu = "cpu" in devices
+    for names, thunk in opponent_builders(lane, cfg, data, devices):
+        if wanted is not None and not set(names) & set(wanted):
+            continue
+        # THE CHOKEPOINT FOR THE GPU-PATH-ONLY RULE, and it is here rather
+        # than in each builder because two of the forest builders --
+        # `sklearn_forest_arm` and `sklearn_iforest_arm` -- never took
+        # `devices` at all. Gating at the call sites would have left those
+        # two running scikit-learn on an H100's host CPU while every other
+        # arm obeyed the rule, which is the worst of both: the table would
+        # look GPU-only and would not be.
+        blocked = [n for n in names if n.endswith("-cpu")] if not allow_cpu else []
+        for name in blocked:
+            emit_refused(lane, name,
+                         "GPU-PATH-ONLY: %s is a CPU arm and cpu was not "
+                         "requested on this accelerator box. On NVIDIA we "
+                         "compare against the vendor's GPU path only; on AMD "
+                         "request cpu by name (CONTRIBUTING.md section "
+                         "10)." % name)
+        if blocked and len(blocked) == len(names):
+            continue
+        try:
+            arms.extend(thunk())
+        except Exception as exc:                   # noqa: BLE001
+            reason = " ".join(str(exc).split()) or exc.__class__.__name__
+            for name in names:
+                emit_refused(lane, name, "%s: %s" % (exc.__class__.__name__,
+                                                     reason))
+    return arms
+
+
+def prepare_cuml_labels(data):
+    """cuML's classifier wants int32 labels; make the cast ONCE, outside
+    every timer, so no arm is charged for it."""
+    data._cuml_y = (
+        data.y_train
+        if data.task == "regression"
+        else np.ascontiguousarray(data.y_train, dtype=np.int32)
+    )
+
+
+# --------------------------------------------------------------------------
+# The runner. Arms ALTERNATE; they never run in blocks.
+# --------------------------------------------------------------------------
+
+def prepare_anomaly_labels(lane, data):
+    """The iforest lane on a labeled dataset (taxi, Istella-S; CONTRIBUTING.md (Performance claims), lane forest-speed 2026-09-11). Neither has planted anomalies, so
+    the AUC column is a PROXY: the anomaly score against the training set's
+    minority class on the test rows (taxi: no 20% tip, about 24%; Istella-S:
+    relevance above 0, about 11%). It checks that two forests rank the same
+    rows alike; it is not a detection-quality claim. The fixture lane keeps
+    its planted labels."""
+    if lane != "iforest" or getattr(data, "y_anom", None) is not None:
+        return
+    if data.task != "binary":
+        raise SystemExit("iforest on %r needs a binary dataset for the proxy "
+                         "AUC; use taxi, istella or anomaly" % data.name)
+    positive_share = float(np.mean(np.asarray(data.y_train) > 0.5))
+    minority = 1.0 if positive_share <= 0.5 else 0.0
+    data.y_anom = (np.asarray(data.y_test) > 0.5).astype(np.float32)
+    if minority == 0.0:
+        data.y_anom = (1.0 - data.y_anom).astype(np.float32)
+    emit_note(lane, ["*"], "auc", positive_share,
+              "proxy AUC: anomaly score against the minority class (label %d) "
+              "of %s, no planted anomalies" % (int(minority), data.name))
+
+
+def dataset_scale(data):
+    """Visible workload heuristic, not a performance acceptance criterion."""
+    rows, features = data.X_train.shape
+    input_bytes = data.X_train.nbytes
+    return dict(rows=int(rows), features=int(features), input_bytes=int(input_bytes),
+                large_candidate=bool(rows >= 1_000_000 or input_bytes >= 256 * 1024**2))
+
+
+def emit_scale_reminder(data, stage):
+    scale = dataset_scale(data)
+    print("FSPEED-SCALE stage=%s rows=%d features=%d input_mib=%.1f large_candidate=%s"
+          % (stage, scale['rows'], scale['features'], scale['input_bytes'] / 1024**2,
+             str(scale['large_candidate']).lower()))
+    print("FSPEED-REMINDER stage=%s %s"
+          % (stage, "Optimize for large datasets; confirm representative feature/class counts, "
+             "tree depth and memory pressure before making speed/default decisions."
+             if scale['large_candidate'] else
+             "SMALL WORKLOAD: useful for correctness/smoke diagnostics; do not use this "
+             "run alone for training-speed claims or optimization/default decisions. "
+             "Also test representative large datasets (taxi and istella at 1M rows or more)."))
+
+
+def run(lane, arms, data, n_rounds, size, dev=None, *, rotate_order=False,
+        fit_context=None, cfg=None, operation_prepare=None, operation_capture=False, skip_warmup=False):
+    """One untimed warm-up per arm, then `n_rounds` timed rounds in which
+    every surviving arm takes one turn before any arm takes its second.
+    Optional rotate_order advances the first arm each round to distribute
+    position effects; it does not remove noise or establish timing stability.
+    fit_context optionally returns a context manager for (arm_name, round),
+    with round 0 for warm-up. It surrounds constructor/fit/sync, excluding
+    scoring; entry/exit are outside the timer. Use for diagnostic traces only.
+
+    THE ALTERNATION IS THE POINT AND NOT A STYLE CHOICE. A rented box may
+    throttle mid-run. Blocks give you the first arm's cold clocks against the
+    last arm's hot ones and no way to tell; alternation spreads the drift
+    across every arm, and a ratio survives what an absolute number does not.
+
+    A per-arm wall budget and a whole-process deadline keep a slow CPU arm
+    from eating the lease that the GPU arms are the point of. An arm that
+    exceeds either is dropped from the rotation with a refusal carrying the
+    reason, so the table says what happened."""
+    emit_scale_reminder(data, "before")
+    dev = dev or device_string()
+    budget = per_arm_budget_s()
+    deadline = time.time() + process_deadline_s()
+    spent = {a.name: 0.0 for a in arms}
+    last_model = {}
+    operation_scores = {}
+
+    for arm in arms:
+        emit_header(lane, arm.name, dev, n_rounds, size)
+
+    # The AFT full queue supplies its excluded warmup as a separate capture.
+    # Historical callers retain the in-process warmup by default.
+    live = list(arms) if skip_warmup else []
+    for arm in (() if skip_warmup else arms):
+        if time.time() > deadline:
+            emit_refused(lane, arm.name, "process deadline reached before "
+                                         "warm-up")
+            continue
+        try:
+            with (fit_context(arm.name, 0) if fit_context is not None
+                  else contextlib.nullcontext()):
+                if operation_prepare is not None:
+                    operation_prepare(arm, data)
+                t0 = time.perf_counter()
+                model = arm.make()
+                arm.fit(model, arm.data or data)
+                arm.sync()
+                ms = (time.perf_counter() - t0) * 1000.0
+        except Exception as exc:                   # noqa: BLE001
+            emit_refused(lane, arm.name, "%s during warm-up: %s"
+                         % (exc.__class__.__name__,
+                            " ".join(str(exc).split())))
+            continue
+        emit_warmup(lane, arm.name, data.tag, ms)
+        spent[arm.name] += ms / 1000.0
+        last_model[arm.name] = model
+        live.append(arm)
+
+    for r in range(1, n_rounds + 1):
+        ordered = list(live)
+        if rotate_order and ordered:
+            offset = (r - 1) % len(ordered)
+            ordered = ordered[offset:] + ordered[:offset]
+        print("FSPEED-ORDER lane=%s round=%d arms=%s"
+              % (lane, r, ",".join(arm.name for arm in ordered)))
+        for arm in ordered:
+            if time.time() > deadline:
+                emit_refused(lane, arm.name,
+                             "process deadline reached at round %d" % r)
+                live.remove(arm)
+                continue
+            if spent[arm.name] > budget:
+                emit_refused(lane, arm.name,
+                             "per-arm budget %.0fs exceeded after %.1fs; "
+                             "remaining rounds skipped"
+                             % (budget, spent[arm.name]))
+                live.remove(arm)
+                continue
+            try:
+                with (fit_context(arm.name, r) if fit_context is not None
+                      else contextlib.nullcontext()):
+                    operation_start = time.perf_counter() if operation_capture else None
+                    if operation_prepare is not None:
+                        operation_prepare(arm, data)
+                    t0 = time.perf_counter()
+                    model = arm.make()
+                    arm.fit(model, arm.data or data)
+                    arm.sync()
+                    ms = (time.perf_counter() - t0) * 1000.0
+            except Exception as exc:               # noqa: BLE001
+                emit_refused(lane, arm.name, "%s at round %d: %s"
+                             % (exc.__class__.__name__, r,
+                                " ".join(str(exc).split())))
+                live.remove(arm)
+                continue
+            spent[arm.name] += ms / 1000.0
+            last_model[arm.name] = model
+            digest = None
+            try:
+                triples = arm.score(model, arm.data or data)
+                if operation_capture:
+                    # AFT source-only integration: consume every requested
+                    # scored output, while keeping the historical fit clock.
+                    # This is benchmark glue, never product runtime.
+                    hashes = [hash_predictions(vec) for _, _, vec in triples if vec is not None]
+                    operation_scores[arm.name] = triples
+                    operation_end = time.perf_counter()
+                    print("FSPEED-OPERATION " + json.dumps({
+                        "lane": lane, "arm": arm.name, "round": r, "status": "CAPTURED",
+                        "ms": (operation_end - operation_start) * 1000.0,
+                        "prepare_ms": (t0 - operation_start) * 1000.0,
+                        "fit_ms": ms, "consumed_output_hashes": hashes,
+                    }, sort_keys=True), flush=True)
+                for _, _, vec in triples:
+                    if vec is not None:
+                        digest = hash_predictions(vec)
+                        break
+            except Exception:                      # noqa: BLE001
+                digest = None
+            emit_round(lane, arm.name, data.tag, r, ms, digest)
+
+    # Accuracy, once per arm, from the last model each arm produced. Outside
+    # every timer, and after the whole table, so a scoring failure cannot
+    # perturb a timing.
+    scores = {}
+    for arm in arms:
+        model = last_model.get(arm.name)
+        if model is None:
+            continue
+        try:
+            final_triples = operation_scores[arm.name] if operation_capture and arm.name in operation_scores else arm.score(model, arm.data or data)
+            for metric, value, _ in final_triples:
+                emit_acc(lane, arm.name, metric, value)
+                scores.setdefault((arm.agreement_group or arm.library, metric), []).append(
+                    (arm.name, value))
+        except Exception as exc:                   # noqa: BLE001
+            emit_refused(lane, arm.name, "%s while scoring: %s"
+                         % (exc.__class__.__name__,
+                            " ".join(str(exc).split())))
+
+    _check_same_library_agreement(lane, scores)
+    # FIT EQUIVALENCE, after every timer and after the accuracy column: what
+    # did each arm actually BUILD? `cfg` is the lane's own config dict, so the
+    # tree-count expectation is the one the table already published; passing
+    # None keeps the shape report and skips that one check rather than
+    # inventing an expectation.
+    check_fit_equivalence(lane, arms, last_model, cfg)
+    emit_scale_reminder(data, "after")
+    return live
+
+
+def _check_same_library_agreement(lane, scores):
+    """DEVIATION 1839. Two arms of the SAME library that disagree about the
+    answer were not given identical configurations, whatever the config dict
+    says. This is the only automatic check that the fairness rule was
+    actually obeyed rather than merely intended, and it is worth more than
+    the config dict because it reads the RESULT."""
+    for (library, metric), entries in sorted(scores.items()):
+        if len(entries) < 2:
+            continue
+        vals = [v for _, v in entries if v == v]     # drop NaN
+        if len(vals) < 2:
+            continue
+        lo, hi = min(vals), max(vals)
+        scale = max(abs(lo), abs(hi), 1e-12)
+        delta = (hi - lo) / scale
+        if delta > _ACC_TOL:
+            emit_note(
+                lane, [n for n, _ in entries], metric, delta,
+                "two arms of %s differ by %.2f%% on %s (tolerance %.2f%%); "
+                "their configurations were NOT identical, so the timing "
+                "ratio compares two different problems"
+                % (library, 100.0 * delta, metric, 100.0 * _ACC_TOL),
+            )
+
+
+# --------------------------------------------------------------------------
+# CLI.
+# --------------------------------------------------------------------------
+
+def build_parser(prog=None):
+    p = argparse.ArgumentParser(
+        prog=prog,
+        description="the NVIDIA-native opponents for the forest slice",
+    )
+    p.add_argument("--lane", choices=LANE_NAMES,
+                   help="which lane to run; ONE lane per process, because a "
+                        "lane that segfaults must not take the others down")
+    p.add_argument("--dataset", default=None,
+                   help="taxi, taxireg, istella, istellareg, higgs (retired), year, covtype, covtype2, synth, synthclf, "
+                        "anomaly; the lane's own default if unset. `higgs` "
+                        "is the LARGE-LOAD dataset (11M x 28) and is what "
+                        "--rows climbs.")
+    p.add_argument("--devices", default="cpu,gpu",
+                   help="which device arms of each opponent to run; the "
+                        "default runs BOTH, which is the whole point on "
+                        "NVIDIA")
+    p.add_argument("--rows", type=int, default=None,
+                   help="cap the training rows. On `higgs` this IS the load "
+                        "ladder: rungs are nested prefixes of the same "
+                        "data scored against the same fixed 500,000-row "
+                        "tail, so 1000000 vs 5000000 is a comparison of "
+                        "LOAD and not of two problems. Every line carries "
+                        "the row count in shape=.")
+    p.add_argument("--download", default=None,
+                   help="fetch a dataset and exit; a SEPARATE step, outside "
+                        "any timed run")
+    p.add_argument("--list-arms", action="store_true",
+                   help="print the arm roster for the lane and exit")
+    p.add_argument("--arms", default=None,
+                   help="comma-separated arm names to run, a SUBSET of the "
+                        "lane's roster. This exists because the opponents do "
+                        "not all share an interpreter: cuml and cuvs are not "
+                        "on conda-forge and live on the pod's system python, "
+                        "while catboost, lightgbm and our own extension live "
+                        "in the pixi `gbmbench` environment (pixi.toml). One "
+                        "process cannot import both sets, so a vendor leg "
+                        "runs the lane TWICE with different --arms and the "
+                        "tables are merged. An arm named here that the "
+                        "roster does not have is a REFUSAL, not a silent "
+                        "empty run.")
+    return p
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    if args.download:
+        download(args.download)
+        return 0
+    if not args.lane:
+        build_parser().error("--lane is required (or --download)")
+
+    size = size_tag()
+    dataset = args.dataset or LANE_DEFAULT_DATASET[args.lane]
+    devices = [d.strip() for d in args.devices.split(",") if d.strip()]
+
+    if (args.lane.startswith("gbdt-") and dataset == "covtype"
+            and args.lane != "gbdt-multiclass"):
+        # DEVIATION 1838: our GBDT Python surface has no MultiClass, so the
+        # 7-class problem is not something every arm can run. Refuse by name
+        # rather than quietly swapping the task underneath the reader.
+        emit_refused(args.lane, "ours",
+                     "covtype is 7-class and anonlib.GradientBoosting has "
+                     "no MultiClass on the Python surface; use "
+                     "--dataset covtype2 (the derived binary task) or year")
+        dataset = "covtype2"
+
+    data = load_with_fallback(dataset, size, args.rows)
+    cfg = lane_config(args.lane, size)
+    if data.task == "multiclass":
+        cfg["n_classes"] = data.n_classes
+    prepare_cuml_labels(data)
+
+    if args.list_arms:
+        for names, _ in opponent_builders(args.lane, cfg, data, devices):
+            for name in names:
+                print(name)
+        return 0
+
+    arms = build_opponents(args.lane, cfg, data, devices)
+    if args.arms:
+        # A FILTER IS EXPLICIT INTENT AND AN ABSENT ROW IS NOT. `build_opponents`
+        # already turns an uninstallable opponent into a visible refusal rather
+        # than a missing line; selecting a subset must keep that property, so a
+        # name asked for and not found is refused BY NAME here.
+        wanted = [n for n in (x.strip() for x in args.arms.split(",")) if n]
+        have = {a.name for a in arms}
+        for name in wanted:
+            if name not in have:
+                emit_refused(args.lane, name,
+                             "not in this lane's roster on this interpreter; "
+                             "the roster here is: %s" % ",".join(sorted(have)))
+        arms = [a for a in arms if a.name in wanted]
+    if not arms:
+        emit_refused(args.lane, "all-opponents",
+                     "no opponent could be constructed on this box")
+        return 1
+    if not enforce_board_params(args.lane, arms):
+        return 2
+    run(args.lane, arms, data, rounds(), size, cfg=cfg)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

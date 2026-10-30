@@ -1,0 +1,409 @@
+# Byte LM CPU inference gate (DEVIATIONS 2610-2616, 2640) on GitHub's free standard
+# runners: ARM64 Linux (Azure Cobalt 100), x86-64 Linux and Apple M1 macOS.
+#
+# What it proves on each runner, and nothing more: the CPU binding built ON
+# THAT RUNNER reproduces the retained Metal/CUDA/HIP loss bytes for the byte LM
+# checkpoint states in bench/results/resume/2026-09-07-root-byte-lm-three-vendor
+# (tools/byte_lm_host_gate.py), and a build with the head fold reversed
+# (DEVIATION 2612) fails the same comparison. No GPU is used or wanted.
+#
+# A green job is evidence for docs/BYTE_LM_CPU_INFERENCE.md's certified table
+# only after its uploaded reports are read; the job summary is not the record.
+#
+# Hosted macOS has failed GPU binding builds with "Unknown GPU architecture
+# detected" (wheel-ci.yml). This binding compiles no kernel, but it imports
+# max.gpu.host through core/identity_trace.mojo, so that row is measured, not
+# assumed; fail-fast is off so one runner cannot hide another.
+
+name: Byte LM CPU gate
+
+on:
+  # LIGHT TOUCH: this workflow never starts by itself. Every job
+  # is skipped unless the dispatch input confirm is RUN-HEAVY, so a wrong trigger costs nothing.
+  # DEVIATION 2680. `train_steps` narrows the CPU training comparison without a
+  # commit; the default is ALL 128 steps.
+  #
+  # An earlier revision sampled `every:16` on the reasoning that a replay costs
+  # about ten seconds per step, so 128 would be twenty minutes on each of seven
+  # runners. That estimate was wrong by roughly twentyfold: it came from a
+  # 32-second window that actually contained a binding build. Measured, the full
+  # 128-step job takes 2m23s against the sample's 2m6s, so sampling bought
+  # seventeen seconds and cost 119 steps of coverage. Narrowing is now only for
+  # bisecting a failure to one step.
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: "Heavy run on paid or queued runners. Type RUN-HEAVY to really run it; anything else skips every job"
+        required: true
+        default: ""
+        type: string
+      train_steps:
+        description: "CPU training steps to compare: all, every:N, or a comma list"
+        required: false
+        default: "all"
+
+permissions: {}
+
+jobs:
+  gate:
+    if: inputs.confirm == 'RUN-HEAVY'
+    name: ${{ matrix.label }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # One environment per CPU OS/architecture; no repeated x86 draws.
+        include:
+          - runner: ubuntu-24.04-arm
+            slot: arm64
+            label: ARM64 Linux (Azure Cobalt 100)
+          - runner: macos-15
+            slot: macos15
+            label: Apple silicon macOS (hosted)
+          - runner: ubuntu-24.04
+            slot: x86-a
+            label: x86-64 Linux (24.04)
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      ANONLIB_GATE_COMMIT: ${{ github.sha }}
+      GATE_OUT: ${{ github.workspace }}/cpu-gate-out
+    defaults:
+      run:
+        shell: bash
+    steps:
+      # bench/results is 2.6 GB; only the one capture the gate reads comes down.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /*
+            !/bench/results/*
+            /bench/results/resume/
+            !/bench/results/resume/*
+            /bench/results/resume/2026-09-07-root-byte-lm-three-vendor/
+            /bench/results/resume/2026-09-12-root-byte-lm-b4l32-nvidia/
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+
+      - name: Runner facts
+        run: |
+          mkdir -p "$GATE_OUT"
+          {
+            uname -a
+            python3 --version
+            if [ "$(uname -s)" = Darwin ]; then
+              sysctl -n machdep.cpu.brand_string
+              sw_vers -productVersion
+            else
+              lscpu
+              grep -m1 -E '^(flags|Features)' /proc/cpuinfo
+            fi
+          } 2>&1 | tee "$GATE_OUT/runner.txt"
+          # The step shell is `bash -eo pipefail`, and ARM64 /proc/cpuinfo has no
+          # `model name`, so every lookup here must tolerate no match.
+          if [ "$(uname -s)" = Darwin ]; then
+            cpu="$(sysctl -n machdep.cpu.brand_string || true)"
+          else
+            cpu="$( (grep -m1 -E '^model name' /proc/cpuinfo || true) | cut -d: -f2- | sed 's/^ //')"
+            [ -n "$cpu" ] || cpu="$( (lscpu | grep -m1 'Model name' || true) | cut -d: -f2- | sed 's/^ *//')"
+          fi
+          echo "### ${{ matrix.slot }}: ${cpu:-unknown CPU} ($(uname -m))" >> "$GITHUB_STEP_SUMMARY"
+          test -f bench/results/resume/2026-09-07-root-byte-lm-three-vendor/comparison.json
+
+      - uses: prefix-dev/setup-pixi@v0.10.1
+        with:
+          run-install: true
+          cache: true
+
+      - name: Build the CPU binding (production)
+        run: |
+          set -o pipefail
+          pixi run mojo --version | tee "$GATE_OUT/mojo_version.txt"
+          sh bindings/build_byte_lm_host.sh 2>&1 | tee "$GATE_OUT/build_prod.log"
+
+      # DEVIATION 2680 PROBE, NOT A GATE, hence continue-on-error: it must
+      # never be able to fail this workflow. One question, measured instead of
+      # argued from a comment: transformer/checks/transformer_backward_oracle
+      # computes on the host but imports three names from gemm/checks/
+      # gemm_backward, which imports max.gpu.host, and one from
+      # core/identity_trace, which does too. _anonlib_byte_lm_host.mojo says
+      # HOST ONLY, nothing imported from the GPU side. If the toolchain
+      # enforces that, this compile fails here with no accelerator target and
+      # the error names what has to move; if it succeeds, the rule is policy
+      # the compiler does not enforce and the CPU trainer needs no refactor.
+      # Compiling the module is the test: an import forces its transitive
+      # imports to be analyzed. Delete the step and the probe once answered.
+      - name: Probe, does the host backward oracle compile with no GPU
+        if: always()
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          pixi run mojo build -j 1 -D ANONLIB_NUMERIC_IDENTICAL=1 -I . -I bindings \
+            training/checks/byte_lm_host_bwd_probe.mojo -o "$GATE_OUT/bwd_probe" 2>&1 \
+            | tee "$GATE_OUT/bwd_probe.log"
+          echo "probe exit ${PIPESTATUS[0]}" | tee -a "$GATE_OUT/bwd_probe.log"
+
+      - name: Gate, production build must reproduce every loss byte
+        run: |
+          set -o pipefail
+          cp python/anonlib/host/_anonlib_byte_lm_host.so "$GATE_OUT/_anonlib_byte_lm_host.prod.so"
+          python3 tools/byte_lm_host_gate.py --steps every:8 \
+            --report "$GATE_OUT/gate_prod.json" 2>&1 | tee "$GATE_OUT/gate_prod.log"
+
+      - name: Build the sabotage binding (DEVIATION 2612)
+        if: always()
+        env:
+          ANONLIB_BYTE_LM_HOST_OUTDIR: ${{ runner.temp }}/host-sab
+          ANONLIB_BUILD_EXTRA_DEFINES: "-D ANONLIB_BYTE_LM_HOST_SABOTAGE=1"
+        run: |
+          set -o pipefail
+          sh bindings/build_byte_lm_host.sh 2>&1 | tee "$GATE_OUT/build_sab.log"
+
+      - name: Gate, sabotage build must be caught
+        if: always()
+        env:
+          ANONLIB_BYTE_LM_HOST_ALLOW_SABOTAGE: "1"
+          ANONLIB_BYTE_LM_HOST_BINARY: ${{ runner.temp }}/host-sab/_anonlib_byte_lm_host.so
+        run: |
+          set -o pipefail
+          python3 tools/byte_lm_host_gate.py --steps every:8 --expect-mismatch \
+            --report "$GATE_OUT/gate_sab.json" 2>&1 | tee "$GATE_OUT/gate_sab.log"
+
+      # Fake-binding plumbing tests (python/anonlib/tests/test_byte_lm_host.py):
+      # refusals, the threaded flag, the helper fallback and the CPU-only
+      # selector. They prove wiring, never arithmetic, and need the production
+      # binding built above so `import anonlib` takes the CPU-only path.
+      - name: Host plumbing tests
+        if: always()
+        run: |
+          set -o pipefail
+          python3 -m pip install --quiet numpy pytest
+          cd python
+          python3 -m pytest -q anonlib/tests/test_byte_lm_host.py \
+            anonlib/tests/test_byte_lm_host_trainer.py 2>&1 | tee "$GATE_OUT/pytest_host.log"
+
+      # DEVIATION 2682. The shape helper replaced five sets of shape literals
+      # with one derivation, so the derivation is checked against the literals
+      # the certified b2-l32 run was produced and admitted with. If it ever
+      # drifts, this fails here rather than on a leased box.
+      # The witness tests are here for a specific reason: the capture harness
+      # runs only where a GPU is, so its checks are otherwise first executed on
+      # a rented box, and two leases were spent on failures that needed no GPU
+      # to find.
+      - name: Shape derivation and the capture witness, against the certified literals
+        if: always()
+        run: |
+          set -o pipefail
+          python3 -m pytest -q tools/test_byte_lm_shape.py \
+            tools/test_byte_lm_capture_witness.py \
+            tools/test_byte_lm_callsites.py \
+            tools/test_byte_lm_capture_endtoend.py 2>&1 \
+            | tee "$GATE_OUT/pytest_shape.log"
+
+      # DEVIATION 2640: the threaded path against the reference path byte for
+      # byte through the public surface, at every batch from 1 to 8 and every
+      # length from 1 to 32, next bytes and losses, three parameter states,
+      # thread counts 1, 2 and 3. Same seed everywhere, so the per-state
+      # reference logits SHA-256 in each report can be compared across CPUs.
+      - name: Path sweep, threaded against reference at every shape
+        if: always()
+        run: |
+          set -o pipefail
+          python3 tools/byte_lm_host_path_sweep.py --threads 1,2,3 --max-batch 8 \
+            --report "$GATE_OUT/path_sweep.json" 2>&1 | tee "$GATE_OUT/path_sweep.log"
+
+      # DEVIATION 2680, AND THIS ONE IS ALLOWED TO FAIL THE WORKFLOW, because a
+      # gate that cannot fail is worthless. The first comparison of a CPU
+      # TRAINING step against recorded GPU bytes: it replays a step of the
+      # retained capture from that step's own initial parameters, moments and
+      # token ids, runs forward, backward and AdamW on this runner's CPU, and
+      # requires the gradient, the loss, and the post-step parameters and both
+      # Adam moments to equal the Apple/Metal bytes exactly. Each step is
+      # judged in isolation, so a failure names the step and the tensor.
+      # All 128 steps by default. The shape is read from the capture rather
+      # than assumed (DEVIATION 2682), so this compares whatever shape the
+      # tree on this runner records, which today is the certified b2-l32.
+      - name: CPU training step against the recorded Metal bytes
+        if: always()
+        run: |
+          set -o pipefail
+          python3 tools/byte_lm_cpu_train_gate.py cpu \
+            --steps "${{ github.event.inputs.train_steps || 'all' }}" --verify-digests \
+            --vendor apple --report "$GATE_OUT/cpu_train.json" 2>&1 \
+            | tee "$GATE_OUT/cpu_train.log"
+
+      # THE TRAINING PATH'S OWN NEGATIVE CONTROL, and it was missing until now.
+      # DEVIATION 2612's arm reverses a fold inside byte_host_logits, which the
+      # training step never calls: it goes to gemm_oracle directly. So a 2612
+      # sabotage build computes a CORRECT training step, and the gate above had
+      # never been shown capable of failing. These two steps fix that with the
+      # GEMM lane's own arm, which drops the transpose bookkeeping in the
+      # backward routing the host step calls through, so the gradient it
+      # produces is wrong by construction.
+      - name: Build the backward-sabotage binding (SAB_BWD_UNTRANSPOSED)
+        if: always()
+        env:
+          ANONLIB_BYTE_LM_HOST_OUTDIR: ${{ runner.temp }}/host-bwd-sab
+          ANONLIB_BUILD_EXTRA_DEFINES: "-D ANONLIB_GEMM_SABOTAGE_BWD_UNTRANSPOSED=1"
+        run: |
+          set -o pipefail
+          sh bindings/build_byte_lm_host.sh 2>&1 | tee "$GATE_OUT/build_bwd_sab.log"
+
+      - name: CPU training gate must catch the wrong gradient
+        if: always()
+        env:
+          ANONLIB_BYTE_LM_HOST_ALLOW_SABOTAGE: "1"
+          ANONLIB_BYTE_LM_HOST_BINARY: ${{ runner.temp }}/host-bwd-sab/_anonlib_byte_lm_host.so
+        run: |
+          set -o pipefail
+          python3 tools/byte_lm_cpu_train_gate.py cpu --steps 1,64 --expect-mismatch \
+            --vendor apple --report "$GATE_OUT/cpu_train_sab.json" 2>&1 \
+            | tee "$GATE_OUT/cpu_train_sab.log"
+
+      # DEVIATION 2682, THE SECOND SHAPE, AND IT IS A SEPARATE CERTIFICATE.
+      # Nine weight gradients contract over the token count, so 128 tokens in a
+      # step is a different sum from 64 and not two of them accumulated. Passing
+      # at the two-row shape says nothing here and passing here says nothing
+      # there. The tree is one vendor, an L40S, so this is a CPU against CUDA
+      # comparison at this shape and not a cross-vendor claim.
+      - name: CPU training step against the recorded four-row CUDA bytes
+        if: always()
+        env:
+          ANONLIB_BYTE_LM_HOST_BINARY: ""
+        run: |
+          set -o pipefail
+          python3 tools/byte_lm_cpu_train_gate.py cpu --steps all --verify-digests \
+            --shape 4,32 --vendor cuda \
+            --tree cuda=bench/results/resume/2026-09-12-root-byte-lm-b4l32-nvidia/run1/remote/byte-lm-validation/full128-b4-l32 \
+            --report "$GATE_OUT/cpu_train_b4l32.json" 2>&1 \
+            | tee "$GATE_OUT/cpu_train_b4l32.log"
+
+      # The same control at the new shape, reusing the sabotage binding built
+      # above. A gate that cannot fail proves nothing, and that is as true of
+      # the second shape as it was of the first.
+      - name: Four-row training gate must catch the wrong gradient
+        if: always()
+        env:
+          ANONLIB_BYTE_LM_HOST_ALLOW_SABOTAGE: "1"
+          ANONLIB_BYTE_LM_HOST_BINARY: ${{ runner.temp }}/host-bwd-sab/_anonlib_byte_lm_host.so
+        run: |
+          set -o pipefail
+          python3 tools/byte_lm_cpu_train_gate.py cpu --steps 1,64 --expect-mismatch \
+            --shape 4,32 --vendor cuda \
+            --tree cuda=bench/results/resume/2026-09-12-root-byte-lm-b4l32-nvidia/run1/remote/byte-lm-validation/full128-b4-l32 \
+            --report "$GATE_OUT/cpu_train_b4l32_sab.json" 2>&1 \
+            | tee "$GATE_OUT/cpu_train_b4l32_sab.log"
+
+      # DEVIATION 2680: re-derive the three-vendor TRAINING agreement from the
+      # retained raw bytes, every one of the 128 steps, all 11 arrays per step
+      # including the gradient and both Adam moments, each checked against the
+      # SHA-256 its own capture.json records. The gate above reads parameters
+      # and loss only, and trusted comparison.json's identity_admitted flag
+      # for the rest; this reads the bytes. No GPU, no binding, about a second.
+      - name: Training capture, recorded digests and any vendors present
+        if: always()
+        run: |
+          set -o pipefail
+          # --require-vendors 1 is deliberate and the verdict line says which
+          # trees it had. The checkout above fetches only the three-vendor
+          # bundle, whose raw capture is Apple; the CUDA and HIP trees are
+          # separate result trees totalling about 308 MB and are not worth
+          # pulling onto seven runners per push. The cross-vendor comparison is
+          # run with --require-vendors 3 from a full checkout instead.
+          python3 tools/byte_lm_cpu_train_gate.py vendors --steps all --verify-digests \
+            --require-vendors 1 \
+            --report "$GATE_OUT/train_capture.json" 2>&1 | tee "$GATE_OUT/train_capture.log"
+
+      # THE INITIALIZATION IS A SEED, NOT A GIFT. Everything above starts from
+      # parameters read out of a capture, so the honest reading of it is "given
+      # these starting bytes". These steps show the starting bytes are a pinned
+      # deterministic function of an index -- fmix32((i+1) ^ 0x42595445) >> 24,
+      # centered at 128 over 2^-10, with the four RMS norm vectors set to
+      # exactly 1.0 -- which is what makes the chain end to end: a seed fixes
+      # the initialization, the initialization and the token stream fix the
+      # trained weights.
+      #
+      # It is bit-exact by construction rather than by a measurement that
+      # passed. An 8-bit integer over a power of two is exact in FP32, there is
+      # no accumulator so no fold order, and no transcendental, which is where
+      # cross-vendor agreement actually breaks. Element i depends on i alone.
+      - name: The seeded initializer, pinned without any capture
+        if: always()
+        run: |
+          set -o pipefail
+          # Needs no retained tree: it regenerates the vector and hashes it
+          # against the digest all three captures record. That is the claim in
+          # one line, and it runs on every runner.
+          python3 -m unittest -v tools.test_byte_lm_seeded_init 2>&1 \
+            | tee "$GATE_OUT/seeded_init_tests.log"
+
+      - name: The recorded initialization is reproduced from the seed
+        if: always()
+        run: |
+          set -o pipefail
+          # --require-vendors 1 for the same reason as the step above: this
+          # checkout holds the Apple tree only. The three-vendor form is run
+          # from a full checkout, where all three record one identifier and one
+          # initial digest.
+          python3 tools/byte_lm_seeded_init_gate.py --require-vendors 1 \
+            --verify-digests --report "$GATE_OUT/seeded_init.json" 2>&1 \
+            | tee "$GATE_OUT/seeded_init.log"
+
+      # The control, and it needs no sabotage BUILD because the seed is an
+      # input rather than compiled arithmetic: move the XOR constant by one and
+      # the digest must not survive. A generator that reproduced the recorded
+      # bytes under any constant would mean this gate reads something other
+      # than the draw.
+      - name: The seeded-init gate must refuse a wrong seed
+        if: always()
+        run: |
+          set -o pipefail
+          python3 tools/byte_lm_seeded_init_gate.py --require-vendors 1 \
+            --seed-xor 0x42595446 --expect-mismatch \
+            --report "$GATE_OUT/seeded_init_sab.json" 2>&1 \
+            | tee "$GATE_OUT/seeded_init_sab.log"
+
+      # DEVIATION 2640's two Mojo checks, built with the binding's CPU target so
+      # they test the codegen the gate ran: the host kernels against the
+      # oracles by bits on shapes and planted values the captures never reach,
+      # and the lane-wise exp and SiLU against the scalar seams on all 2^32
+      # Float32 bit patterns (3 threads).
+      - name: Kernel check, host kernels against the oracles by bits
+        if: always()
+        run: |
+          set -o pipefail
+          case "$(uname -s)-$(uname -m)" in
+            Linux-x86_64) cpu="--target-cpu x86-64-v3" ;;
+            Darwin-arm64) cpu="--target-cpu apple-m1" ;;
+            *) cpu="" ;;
+          esac
+          pixi run mojo build $cpu -D ANONLIB_NUMERIC_IDENTICAL=1 -I . \
+            training/checks/byte_lm_host_kernels_check.mojo -o "$RUNNER_TEMP/kernels_check" \
+            2>&1 | tee "$GATE_OUT/build_kernels_check.log"
+          "$RUNNER_TEMP/kernels_check" 2>&1 | tee "$GATE_OUT/kernels_check.log"
+
+      - name: Exhaustive check, lane-wise exp and SiLU on all 2^32 bit patterns
+        if: always()
+        run: |
+          set -o pipefail
+          case "$(uname -s)-$(uname -m)" in
+            Linux-x86_64) cpu="--target-cpu x86-64-v3" ;;
+            Darwin-arm64) cpu="--target-cpu apple-m1" ;;
+            *) cpu="" ;;
+          esac
+          pixi run mojo build $cpu -D ANONLIB_NUMERIC_IDENTICAL=1 -I . \
+            training/checks/byte_lm_host_exp_check.mojo -o "$RUNNER_TEMP/exp_check" \
+            2>&1 | tee "$GATE_OUT/build_exp_check.log"
+          "$RUNNER_TEMP/exp_check" 2>&1 | tee "$GATE_OUT/exp_check.log"
+
+      - name: Upload reports and logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: byte-lm-cpu-gate-${{ matrix.slot }}
+          path: cpu-gate-out/
+          if-no-files-found: warn

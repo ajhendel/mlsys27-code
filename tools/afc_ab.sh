@@ -1,0 +1,72 @@
+#!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 the authors. Part of anonlib, DOI-WITHHELD
+# afc_ab.sh <tag> <lane> <dataset> <reps> <rounds> <envA> [<envB>]
+#
+# Alternating A/B of the FAST tier on an Apple box, one build serving both
+# arms: arm A runs with the space-separated VAR=VALUE list envA, arm B with
+# envB ("-" = no extra env), alternated A, B, A, B ... reps times, each a
+# `bench_board_algos.py race --arms ours-fast` of <rounds> timed rounds at the
+# board shape (rows-full), or on a synthetic shape s-r<rows>-f<features>
+# (tools/afc_shape_data.py; families algos, classical2, classical). Prints one AFC-AB line per run and a summary of the
+# median of each arm's run medians, its digests and its quality.
+# AFC_ARM=ours races the IDENTICAL tier instead. With no envB, only arm A runs (a baseline). Output under ~/mq/out/race-<tag>/
+# so `lq log <box> <tag>` greps it. Run inside a built tree (FAST bindings).
+set -u
+TAG=$1 LANE=$2 DS=$3 REPS=$4 ROUNDS=$5 EA=$6 EB=${7:-}
+# One run per arm (the author, Oct 3): reps and rounds are 1 unless AB_MULTI_RUN=1.
+[ "${AB_MULTI_RUN:-0}" = 1 ] || { REPS=1; ROUNDS=1; }
+for b in board-0834 board-0833; do [ -d $HOME/$b/cache/algos-data/rows-full ] && { B=$HOME/$b; break; }; done
+VP=$B/cache/venv/bin/python
+# AFC_FAMILY: algos (default, tools/bench_board_algos.py), classical2
+# (tools/bench_board_more.py), classical (tools/classical_two_datasets.py) or
+# trees (tools/afc_trees_race.py: bench_board.py's own trees race for our one
+# arm, forest_speed_arm.py --ours-only at ANONLIB_SPEED_SIZE=shipped, one
+# untimed warm-up + <rounds> timed; data = GBM_BENCH_DATA, default
+# ~/datasets/gbm-bench, the Apple board's data_root)
+FAM=${AFC_FAMILY:-algos}
+case $FAM in
+  algos) DRV=tools/bench_board_algos.py; PFX=ALGOS; DATA=$B/cache/algos-data/rows-full; XARGS= ;;
+  classical2) DRV=tools/bench_board_more.py; PFX=MORE
+     DATA=$(find $B -maxdepth 4 -type d -name more-data 2>/dev/null | head -1)/rows-full; XARGS= ;;
+  classical) DRV=tools/classical_two_datasets.py; PFX=CTD
+     DATA=$(find $B -maxdepth 4 -type d -name ctd-data 2>/dev/null | head -1)/rows-full; XARGS="--root $PWD" ;;
+  trees) DRV=tools/afc_trees_race.py; PFX=TREES; DATA=${GBM_BENCH_DATA:-$HOME/datasets/gbm-bench}; XARGS= ;;
+esac
+OUT=$HOME/mq/out/race-$TAG; mkdir -p $OUT
+# A synthetic shape dataset s-r<rows>-f<features> (tools/afc_shape_data.py):
+# the lane's block is written once under AFC_SHAPE_DATA (default
+# ~/afc-shape-data) and the driver reads it from there; the AFC-AB lines carry
+# shape=<rows>x<features>. Board dataset names are unchanged.
+SHP=
+case $DS in s-*)
+  [ $FAM = trees ] && { echo "AFC-FAIL $TAG ds=$DS: AFC_FAMILY=trees has no synthetic shapes" | tee -a $OUT/race.log; exit 1; }
+  DATA=${AFC_SHAPE_DATA:-$HOME/afc-shape-data}
+  $VP tools/afc_shape_data.py ensure --family $FAM --lane $LANE --shape $DS --data $DATA 2>&1 | grep -E '^AFC-SHAPE|Error|REFUSED' | tail -n 3 | tee -a $OUT/race.log
+  [ ${PIPESTATUS[0]} = 0 ] || { echo "AFC-FAIL $TAG ds=$DS: no synthetic data"; exit 1; }
+  SHP=" shape=$(echo $DS | sed -E 's/^s-r([0-9]+[kKmM]?)-f([0-9]+)$/\1x\2/')" ;;
+esac
+LOG=$OUT/race.log
+arms="A"; [ -n "$EB" ] && arms="A B"
+for r in $(seq 1 $REPS); do
+  for a in $arms; do
+    E=$EA; [ $a = B ] && E=$EB; [ "$E" = - ] && E=
+    d=$OUT/$a-$r; rm -rf $d; mkdir -p $d
+    env $E ANONLIB_BENCH_INSTALLED=0 PYTHONPATH=$PWD/python \
+      $VP $DRV race --lane $LANE --dataset $DS --data $DATA --arms ${AFC_ARM:-ours-fast} \
+      --rounds $ROUNDS --out $d/res --work $d/work $XARGS > $d/race.txt 2>&1
+    rm -rf $d/work
+    m=$(grep -o "$PFX lane=.*" $d/race.txt | grep -o 'median_ms=[0-9.]*' | tail -1 | cut -d= -f2)
+    st=$(grep -o "$PFX lane=.*" $d/race.txt | grep -o 'status=[A-Za-z_]*' | tail -1 | cut -d= -f2)
+    q=$(grep -o "$PFX lane=.*" $d/race.txt | grep -o 'quality=.*' | tail -1 | cut -c1-200)
+    g=$(grep -o 'digest=[0-9a-f]*' $d/race.txt | tail -1 | cut -d= -f2 | cut -c1-16)
+    echo "AFC-AB $TAG arm=$a rep=$r lane=$LANE ds=$DS$SHP status=${st:-none} median_ms=${m:-none} digest=${g:-none} env='$E' $q" | tee -a $LOG
+    [ -z "$m" ] && { echo "AFC-FAIL $TAG arm=$a B=${B:-none} VP=$VP DATA=$DATA"; grep -E -m 5 'Error|error|REFUSED|SKIPPED|Traceback' $d/race.txt; tail -n 4 $d/race.txt; } | cut -c1-300 | tee -a $LOG
+  done
+done
+for a in $arms; do
+  ms=$(grep "AFC-AB $TAG arm=$a rep=[0-9]* lane=$LANE ds=$DS " $LOG | grep -o 'median_ms=[0-9.]*' | cut -d= -f2 | sort -n | tr '\n' ' ')
+  md=$(echo $ms | tr ' ' '\n' | grep . | awk '{v[NR]=$1} END{if(NR==0)print "none"; else if(NR%2)print v[(NR+1)/2]; else print (v[NR/2]+v[NR/2+1])/2}')
+  dg=$(grep "AFC-AB $TAG arm=$a rep=[0-9]* lane=$LANE ds=$DS " $LOG | grep -o 'digest=[0-9a-f]*' | sort -u | tr '\n' ' ')
+  echo "AFC-AB-SUMMARY $TAG arm=$a lane=$LANE ds=$DS$SHP median_of_medians_ms=$md runs=[$ms] $dg" | tee -a $LOG
+done

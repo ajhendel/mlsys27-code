@@ -1,0 +1,13 @@
+diff --git a/x_ann/ivf_pq_core.mojo b/x_ann/ivf_pq_core.mojo
+index b9155ab06..0755065f1 100644
+--- a/x_ann/ivf_pq_core.mojo
++++ b/x_ann/ivf_pq_core.mojo
+@@ -124,7 +124,7 @@ def pq_probe_takes(d: Float32, l: Int, prev_d: Float32, prev_l: Int, best_d: Flo
+     best_l) in the total order (distance, list id). `pq_next_probe` and the
+     device walk (`x_ann/ivf_scan_device.mojo::probe_kernel`) both use it."""
+     var after = prev_l < 0 or d > prev_d or (d == prev_d and l > prev_l)
+-    return after and (best_l < 0 or d < best_d or (d == best_d and l < best_l))
++    return after and (best_l < 0 or d < best_d or (d == best_d and l > best_l))
+ 
+ 
+ @always_inline

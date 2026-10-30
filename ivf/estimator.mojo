@@ -1,0 +1,244 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 the authors. Part of anonlib, DOI-WITHHELD
+"""Host-pointer surface for IVF-FLAT: what `bindings/` will call.
+
+**NOT YET WIRED** into `bindings/_anonlib*.mojo` or `python/anonlib/` --
+those directories are not this lane's. `ivf/README.md`'s WHAT IS OWED names
+the Python surface; this file is the entry it should reach, shaped like
+`kde/estimator.mojo::kde_score_samples_host` and
+`neighbors/estimator.mojo::knn_search`.
+
+Nothing here is an implementation. `ivf/impl/` implements the cuVS reference
+behavior. This file is host-side policy cuVS has no counterpart for,
+in the same category as `checks/`.
+
+THE POLICY CHOICES
+------------------
+
+1. **`n_probes` HAS NO DEFAULT AT THIS BOUNDARY.** cuVS defaults it to 20
+   (`ivf_flat.hpp:78`) and this file makes the caller say it, because
+   DEVIATION 1787 makes it a NUMERIC parameter: it decides which vectors
+   are summed over, so it is part of the answer. A defaulted numeric
+   parameter is an answer nobody chose. `IvfFlatSearchParams.default()`
+   still carries their 20 for anyone implementing against their surface.
+
+2. **`n_probes > n_lists` RAISES; THE REFERENCE CLAMPS.**
+   `ivf_flat_search.cuh:331` does `std::min(params.n_probes,
+   index.n_lists())`. Under policy 1 a clamp would mean two callers who
+   wrote different numbers get one answer and no card can say which
+   computation ran. See `ivf_search_params_validate`.
+
+3. **THE CARD IS PER CALL, AND A BUILD PLUS A SEARCH IS ONE CARD.**
+   `core/identity_trace.mojo` requires `seq` to increase by one across a
+   whole file and `tools/identity_trace_diff.py` refuses a file whose
+   sequence restarts. A build and a search are two calls and would be two
+   `seq 0`s, so `ivf_flat_build_and_search_host` exists and is what
+   `ivf_main.mojo` and every gate use when a card is wanted. This is
+   DEVIATION 1795 and it is the same shape as DEVIATION 544 for the k-NN
+   classifier.
+
+4. **THE METRIC IS L2, THE DEFAULT IS `L2Expanded`, AND THE ROOT IS THE
+   CALLER'S CHOICE.** `METRIC_L2_EXPANDED` returns SQUARED distances (what
+   the benchmark and the checks compare) and `METRIC_L2_SQRT_EXPANDED`
+   returns Euclidean ones (what scikit-learn's `kneighbors` returns). ON
+   ONE INDEX the two differ by one `identical_sqrt` per returned element:
+   both score and select on the squared distance and the root is taken
+   over the `k` kept (`ivf_common.mojo::postprocess_distances`), so the
+   ids and their order are the same and
+   `check_l2_sqrt_is_the_root_of_l2` asserts it. A BUILD under each metric
+   is not one index: the quantizer is `cluster/`'s k-means with the
+   metric passed through (cuVS does the same, `ivf_flat_build.cuh:434`),
+   whose reduction roots the min distance under L2SqrtExpanded, so its
+   inertia, its stopping iteration and the centroids can differ, and at
+   `n_probes < n_lists` so can the answer (corrected 2026-09-14; this
+   paragraph used to say the set and the order are the same either way).
+
+5. **NO WORKSPACE CAP AND NO QUERY BATCHING.**
+   `neighbors/estimator.mojo` caps its distance tile because that tile is
+   `query_tile x n_index`; the largest thing here is the candidate
+   workspace at `n_rows x dim`, which is the index itself. Their own query
+   batching (`ivf_flat_search.cuh:343-353`) comes from
+   `get_workspace_free_bytes` and is refused for the reason DEVIATION 1798
+   gives: a device memory number that decides how the query set is cut is a
+   number an identical column may not read. If a shape ever needs cutting,
+   the cut has to be a pure function of the shape and `check_launch_
+   invariance`'s batch arm is the gate it would have to pass.
+"""
+
+from max.gpu.host import DeviceContext
+
+from cluster.impl.kmeans_params import METRIC_L2_EXPANDED
+from core.identity_trace import IdentityTrace
+from ivf.impl.neighbors.ivf_flat.ivf_flat_build import (
+    IvfFlatBuildDevice,
+    ivf_flat_build,
+    ivf_flat_build_resident,
+    ivf_flat_extend,
+)
+from ivf.impl.neighbors.ivf_flat.ivf_flat_index import (
+    IvfFlatIndex,
+    IvfFlatIndexParams,
+    IvfFlatSearchParams,
+    ivf_refuse_algorithm,
+)
+from ivf.impl.neighbors.ivf_flat.ivf_flat_search import (
+    IVF_EXPAND_TPB,
+    IvfSearchResult,
+    ivf_flat_search_traced,
+)
+from neighbors.checks.pinned_distance_tile import PINNED_TILE_TPB
+
+
+def ivf_flat_build_host(
+    ctx: DeviceContext,
+    x: List[Float32],
+    n_rows: Int,
+    dim: Int,
+    n_lists: Int,
+    kmeans_n_iters: Int = 20,
+    metric: Int = METRIC_L2_EXPANDED,
+    seed: UInt64 = 0,
+    with_list_data: Bool = True,
+    train_rows_per_list: Int = 0,
+) raises -> IvfFlatIndex:
+    """`ivf_flat::build`, host list in, index out. `with_list_data = False`
+    leaves `list_data` empty (`ivf_flat_build`; the x_ann indexes).
+    `train_rows_per_list > 0` sets the quantizer's training-row count
+    (`IvfFlatIndexParams.train_rows_per_list`; release-0845, IVFSQIndex
+    max_train_points_per_cluster); 0 keeps the build's rule.
+
+    **WITH `ANONLIB_IDENTITY_TRACE` SET, PREFER
+    `ivf_flat_build_and_search_host`.** This entry constructs its own
+    trace, so a build here followed by a search there appends two records
+    numbered `seq 0` to one file and the differ refuses it. Policy 3.
+    """
+    ivf_refuse_algorithm(String("ivf_flat"))
+    var params = IvfFlatIndexParams.default()
+    params.n_lists = n_lists
+    params.kmeans_n_iters = kmeans_n_iters
+    params.kmeans_trainset_fraction = Float64(1.0)
+    params.metric = metric
+    params.seed = seed
+    params.train_rows_per_list = train_rows_per_list
+    var trace = IdentityTrace()
+    return ivf_flat_build(ctx, trace, params, x, n_rows, dim, with_list_data)
+
+
+def ivf_flat_build_resident_host(
+    ctx: DeviceContext,
+    x: List[Float32],
+    x_addr: Int,
+    n_rows: Int,
+    dim: Int,
+    n_lists: Int,
+    kmeans_n_iters: Int,
+    metric: Int,
+    seed: UInt64,
+    mut dev: IvfFlatBuildDevice,
+) raises -> IvfFlatIndex:
+    """`ivf_flat_build_host` with the index left on the device (lane gap-ivf,
+    2026-10-08; `ivf_flat_build_resident`): the same parameters, the same
+    statements, the vectors and the device CSR in `dev`. `x` may be empty
+    when the rows are read from `x_addr` (`IVF_BUILD_FROM_POINTER`)."""
+    ivf_refuse_algorithm(String("ivf_flat"))
+    var params = IvfFlatIndexParams.default()
+    params.n_lists = n_lists
+    params.kmeans_n_iters = kmeans_n_iters
+    params.kmeans_trainset_fraction = Float64(1.0)
+    params.metric = metric
+    params.seed = seed
+    var trace = IdentityTrace()
+    return ivf_flat_build_resident(ctx, trace, params, x, x_addr, n_rows, dim, dev)
+
+
+def ivf_flat_search_host(
+    ctx: DeviceContext,
+    index: IvfFlatIndex,
+    queries: List[Float32],
+    n_queries: Int,
+    k: Int,
+    n_probes: Int,
+    tile_tpb: Int = PINNED_TILE_TPB,
+    expand_tpb: Int = IVF_EXPAND_TPB,
+    partial_storage: Bool = False,
+    keep: List[Int32] = List[Int32](),
+) raises -> IvfSearchResult:
+    """`ivf_flat::search`, host list in, distances and ORIGINAL ids out.
+
+    `n_probes` is required (policy 1). `keep` is the sample filter (empty:
+    none; `ivf_flat_search_traced`). See `ivf_flat_build_host` for the
+    trace caveat.
+    """
+    var sp = IvfFlatSearchParams(n_probes)
+    var trace = IdentityTrace()
+    return ivf_flat_search_traced(
+        ctx, trace, index, sp, queries, n_queries, k, tile_tpb, expand_tpb, partial_storage, keep
+    )
+
+
+def ivf_flat_build_and_search_host(
+    ctx: DeviceContext,
+    x: List[Float32],
+    n_rows: Int,
+    dim: Int,
+    n_lists: Int,
+    queries: List[Float32],
+    n_queries: Int,
+    k: Int,
+    n_probes: Int,
+    kmeans_n_iters: Int = 20,
+    metric: Int = METRIC_L2_EXPANDED,
+    seed: UInt64 = 0,
+    tile_tpb: Int = PINNED_TILE_TPB,
+    expand_tpb: Int = IVF_EXPAND_TPB,
+) raises -> IvfSearchResult:
+    """One build and one search under ONE identity card. Policy 3.
+
+    The card's stages, in order: `ivf.quantizer.*` (the coarse k-means fit,
+    written under that prefix by `kmeans_fit_main_traced`), then
+    `ivf.centers`, `ivf.center_norms`, `ivf.assign`, `ivf.list_offsets`,
+    `ivf.list_indices`, `ivf.list_data` from the build, then
+    `ivf.query_norm`, `ivf.coarse_dist`, `ivf.probe_dist`,
+    `ivf.probe_lists`, `ivf.cand_counts`, `ivf.cand_idx`, `ivf.cand_dist`,
+    `ivf.out_dist`, `ivf.out_idx` from the search.
+
+    A cross-vendor run that diverges therefore has an ADDRESS, and the
+    addresses partition the way the lane's identity table does:
+    `ivf.quantizer.*` is `cluster/`'s and its status is
+    `IDENTITY_PATHS.md`'s; `ivf.assign` through `ivf.list_data` is
+    hazards 1, 2 and 3; `ivf.probe_lists` is hazard 1 on the query side;
+    `ivf.cand_idx` is hazard 3's carry; and `ivf.out_idx` diverging while
+    `ivf.out_dist` agrees is the tie class and nothing else -- which is
+    exactly the split `knn.out_dist` / `knn.out_idx` was separated for.
+    """
+    ivf_refuse_algorithm(String("ivf_flat"))
+    var params = IvfFlatIndexParams.default()
+    params.n_lists = n_lists
+    params.kmeans_n_iters = kmeans_n_iters
+    params.kmeans_trainset_fraction = Float64(1.0)
+    params.metric = metric
+    params.seed = seed
+    var sp = IvfFlatSearchParams(n_probes)
+
+    var trace = IdentityTrace()
+    var index = ivf_flat_build(ctx, trace, params, x, n_rows, dim)
+    return ivf_flat_search_traced(
+        ctx, trace, index, sp, queries, n_queries, k, tile_tpb, expand_tpb
+    )
+
+
+def ivf_flat_extend_host(
+    ctx: DeviceContext,
+    index: IvfFlatIndex,
+    new_x: List[Float32],
+    n_new: Int,
+) raises -> IvfFlatIndex:
+    """`ivf_flat::extend`, host list in, extended index out
+    (lane/inference-embedding-ivf-cholesky, 2026-09-15). The new rows are
+    assigned to the FIXED centres by the build's own `predict` launch and
+    appended to their lists under the ids `n_rows, n_rows + 1, ...`, so one
+    call over a set of rows and several calls over the same rows in the same
+    order give the same index bytes. See `ivf_flat_build.mojo::ivf_flat_extend`.
+    """
+    ivf_refuse_algorithm(String("ivf_flat"))
+    return ivf_flat_extend(ctx, index, new_x, n_new)

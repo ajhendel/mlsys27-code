@@ -1,0 +1,44 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 the authors. Part of anonlib, DOI-WITHHELD
+"""Load and run Hugging Face-format causal language models.
+
+Reads ``.safetensors`` checkpoints (single file or sharded) and their
+``config.json``, maps the weights onto anonlib's transformer blocks, and
+runs them on the GPU.
+
+- :class:`CausalLM`: embedding, decoder blocks, final norm and head built
+  from a checkpoint, with ``forward``, ``allocate_state``, ``step`` and greedy
+  ``generate``.
+- :class:`Tokenizer`: ``Tokenizer.from_pretrained`` over ``tokenizer.json``
+  for byte-level BPE tokenizers, with the pre-tokenization pattern
+  (``PATTERNS``: GPT-2, Llama 3, Qwen 2) as a parameter.
+- :class:`HFConfig`, :func:`plan_for`, ``FAMILIES``: which ``model_type``
+  values are supported (Llama 2/3 and SmolLM, Mistral, Qwen 2, Qwen 3, ...),
+  how config fields map onto block options, and which fields are refused by
+  name with :class:`UnsupportedModel`.
+- :class:`Checkpoint`, :class:`SafetensorsFile`: the ``.safetensors``
+  reader; tensors come back as ``anonlib.Array``.
+
+Examples
+--------
+>>> from anonlib import Array
+>>> from anonlib.models import CausalLM, Tokenizer
+>>> lm = CausalLM.load("path/to/model", weight_format="bfloat16")
+>>> tok = Tokenizer.from_pretrained("path/to/model")
+>>> ids = tok.encode("The capital of France is")
+>>> out = lm.generate(Array.from_list([ids], "<i4"), 8)
+"""
+# The option matrix (known model_types, config-field mapping, tensor names,
+# refusals by name) is in README.md beside this file and in config.py.
+from .config import FAMILIES, HFConfig, ModelPlan, UnsupportedModel, plan_for
+from .safetensors import Checkpoint, SafetensorsFile
+from .causal_lm import CausalLM, CausalLMState
+from .parallel_causal_lm import ParallelCausalLM
+from .tokenizer import PATTERNS, Tokenizer
+# catalog / verify_catalog_entry: listed in docs-site/api_exclude.txt until the first verified catalog
+# entry lands; then add them to the docstring above and drop those two lines.
+from ._catalog import catalog, verify_catalog_entry
+
+__all__ = ["ParallelCausalLM", "CausalLM", "CausalLMState", "Checkpoint", "FAMILIES", "HFConfig", "ModelPlan",
+           "PATTERNS", "SafetensorsFile", "Tokenizer", "UnsupportedModel", "catalog", "plan_for",
+           "verify_catalog_entry"]

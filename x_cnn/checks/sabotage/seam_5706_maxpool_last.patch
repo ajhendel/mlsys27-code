@@ -1,0 +1,11 @@
+--- a/x_cnn/ops.mojo
++++ b/x_cnn/ops.mojo
+@@ -326,7 +326,7 @@
+             var v = ftz(x.unsafe_load(base + h * W + w))
+             comptime if RELU:
+                 v = relu_val(v)
+-            if bi < 0 or v > best or v != v:
++            if bi < 0 or v >= best or v != v:
+                 best = v
+                 bi = h * W + w
+     dst.unsafe_store(i, best)

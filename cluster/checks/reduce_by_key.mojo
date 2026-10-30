@@ -1,0 +1,1349 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 the authors. Part of anonlib, DOI-WITHHELD
+"""Weighted sums per cluster, which is the whole update half of Lloyd.
+
+DOES NOT FOLLOW cuVS. Their two calls are
+`raft::linalg::reduce_rows_by_key` and `raft::linalg::reduce_cols_by_key`
+(`raft/linalg/reduce_rows_by_key.cuh` and `reduce_cols_by_key.cuh`, called
+from `update_centroids`, `detail/kmeans.cuh:300-318`), and RAFT is a
+separate library this tree does not mirror file for file. The CALL SITES,
+their order, and their accumulate-versus-reset semantics are theirs and are
+copied in `cluster/impl/detail/kmeans_common.mojo`.
+
+THE ACCUMULATOR IS THE INTERESTING PART, AND IT IS NOT A NEW PROBLEM
+--------------------------------------------------------------------
+Summing rows into their cluster is a scatter-add: many rows land on one
+centroid and the order they arrive in is not fixed. RAFT does it with float
+atomics on NVIDIA. This file quantizes into `Int32` through
+**`checks/fixed_point.mojo`** instead, and the reason is REPRODUCIBILITY,
+not capability.
+
+**A float `atomicAdd` does work on Metal.** Probed on this M4: 1024 threads
+each adding 1.0 return exactly 1024.0. Earlier notes here, and the ones that
+described this as a hardware wall, were wrong, and a design resting on a false
+constraint has to be re-argued rather than annotated. The argument that
+survives is point 1 below: float atomics sum in whatever order the hardware
+delivers, so the same fit gives different last bits run to run and device to
+device, while an integer accumulator is exactly order-independent. That is
+worth one quantization per element here.
+
+**The overflow bound transfers word for word, with one noun changed.** That
+file's argument is "any leaf's rows are a subset of all rows, so a scale that
+keeps the global sum of magnitudes inside `Int32` keeps every partial sum
+inside `Int32`". Here it is "any CLUSTER's rows are a subset of all rows",
+and the rest is identical. One host pass over the weighted data per fit
+yields a scale that makes overflow impossible for every cluster at every
+iteration.
+
+Two things follow, and the second is why this file was worth writing before
+any optimization:
+
+1. Cluster sums are order-independent, so two runs agree, and Metal, CUDA and
+   HIP agree. The centroid update is exactly reproducible, for free, at the
+   cost of one quantization per element.
+2. **This answers the question `PLAN.md` said k-means existed to answer.**
+   The shared substrate is genuinely shared: the fixed-point accumulator was
+   built for histograms and needed no change to serve a clustering algorithm
+   that has no histogram in it. `core/` is not secretly tree-shaped, and the
+   evidence is that this file imports it and adds nothing.
+
+It also gives `checks/fixed_point.mojo` its first reader. `archive/plans/UNWIRED.md`
+listed it as verified in isolation and used by no kernel.
+"""
+
+from checks.kernel_matrix import (
+    K_LIB_REDUCE_BY_KEY,
+    TARGET_COLUMN,
+    column_shared_limit,
+    lib_block_size_for,
+)
+from checks.hardware_matrix import gpu_cores_for, max_active_blocks_for
+
+from cluster.impl.distance.fused_distance_nn.simt_kernel import (
+    fused_veclen_for,
+)
+
+from max.gpu.host import DeviceBuffer, DeviceContext
+from std.atomic import Atomic
+from std.gpu import block_dim, block_idx, grid_dim, thread_idx
+from max.gpu.memory import AddressSpace
+from core.pinned_reduce import pinned_block_sum
+from checks.numerics import ftz, GLOBAL_NUMERIC_MODE, NUMERIC_FAST, NUMERIC_IDENTICAL
+from max.gpu.sync import barrier
+from std.memory import stack_allocation
+from std.sys.compile import is_defined
+from std.sys.info import has_apple_gpu_accelerator
+
+
+# READ FROM THE MATRIX, not restated here. `checks/kernel_matrix.mojo`
+# owns every tunable in this tree; changing TARGET_COLUMN there rebuilds
+# this kernel for another vendor with no edit in this file.
+comptime REDUCE_BY_KEY_TPB = lib_block_size_for[
+    K_LIB_REDUCE_BY_KEY, TARGET_COLUMN
+]()
+
+#: Threadgroup-private accumulator cells (Int32) for the privatized arm.
+#: RAFT sizes its shared cache DYNAMICALLY at launch and guards the arm with
+#: "the cache fits in shared memory" -- `cache_size <= 49152ull`, the full
+#: default CUDA shared budget (`raft/linalg/detail/reduce_cols_by_key.cuh:
+#: 125-126`). Mojo's `stack_allocation` is comptime-sized, so the cap is
+#: pinned here instead, from the matrix's per-block shared limit: HALF the
+#: target's budget, in Int32 cells (4,096 cells / 16 KB on the Apple
+#: column's 32 KB). Half rather than all of it so the launch never sits on
+#: the validity wall; k-means' shipped shape (k=64 x d=32 = 2,048 cells,
+#: 8 KB) fits with headroom, exactly as the SCOREBOARD's privatization case
+#: priced it.
+comptime PRIVATE_ACC_CELLS = column_shared_limit(TARGET_COLUMN) // 8
+
+#: RAFT's "input is large enough to be worth the flush" guard, copied:
+#: `nrows * ncols >= IdxType{8192}` (`reduce_cols_by_key.cuh:126`, with
+#: their own comment: cached is slightly slower for small inputs, orders of
+#: magnitude faster for large ones).
+comptime PRIVATE_MIN_WORK = 8192
+
+
+def accumulate_centroid_sums_kernel(
+    sums_i32: MutPointer[Int32, MutAnyOrigin],
+    x: MutPointer[Float32, MutAnyOrigin],
+    labels: MutPointer[UInt32, MutAnyOrigin],
+    weights: MutPointer[Float32, MutAnyOrigin],
+    n_rows_in: Int32,
+    n_features_in: Int32,
+    scale_in: Float32,
+):
+    """`reduce_rows_by_key`, as a quantized scatter-add.
+
+    This is the arm the reference dispatch takes at k-means' nkeys: the
+    small-nkeys kernel is gated `nkeys <= 4`, everything else falls to
+    `sum_rows_by_key_large_nkeys_rowmajor` (`raft/linalg/detail/
+    reduce_rows_by_key.cuh:354-363`). Measured contention-bound at the 4M
+    x 32 k=64 shape, so the SHIPPED dispatch (`launch_accumulate_centroid_
+    sums`) now prefers the bit-identical privatized kernel below and keeps
+    this one as the guard's fallback arm.
+
+    **The atomic scatter-add itself is faithful, not a substitution gap.**
+    RAFT's `reduce_rows_by_key.cuh:287` (`raft::myAtomicAdd`) also lands its
+    contributions with a
+    global atomic add rather than a vendor segmented reduce, so there is
+    nothing here to swap `cub::DeviceSegmentedReduce` into (and that is
+    NOT FOUND anyway; see archive/reference/VENDOR_LIBRARIES.md). The only thing we change is
+    the accumulator TYPE, and the module docstring says why: not because
+    Metal lacks a float atomic, which it does not, but because an integer
+    accumulator is order-independent and a float one is not.
+
+    The indexing is theirs too: a FLAT grid-stride over `n_rows * n_features`
+    cells, matching their `gid = threadIdx.x + blockDim.x * blockIdx.x`
+    (`reduce_rows_by_key.cuh:280`, in
+    `sum_rows_by_key_large_nkeys_kernel_rowmajor`). The earlier shape here strided rows on
+    grid x and features on the threads, which idles `REDUCE_BY_KEY_TPB -
+    n_features` threads of every block whenever `n_features < 128` and reads
+    `x` in short runs. Flat indexing keeps all 128 threads on 128 consecutive
+    elements of `x`.
+
+    That change cannot move a number: every `(row, feature)` cell is still
+    visited exactly once, and the accumulator is fixed point, so the sum is
+    order-independent by construction. Bit-identical, which is the only
+    reason it was safe to make without a measurement.
+    """
+    var n_rows = Int(n_rows_in)
+    var n_features = Int(n_features_in)
+    var total = n_rows * n_features
+
+    var gid = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    var stride = Int(grid_dim.x) * Int(block_dim.x)
+    while gid < total:
+        var row = gid // n_features
+        var f = gid - row * n_features
+
+        var label = Int(labels.unsafe_load(row))
+        var w = weights.unsafe_load(row)
+        var q = Int32(x.unsafe_load(gid) * w * scale_in)
+        _ = Atomic.fetch_add(sums_i32.unsafe_offset(label * n_features + f), q)
+
+        gid += stride
+
+
+def accumulate_weight_per_cluster_kernel(
+    weight_i32: MutPointer[Int32, MutAnyOrigin],
+    labels: MutPointer[UInt32, MutAnyOrigin],
+    weights: MutPointer[Float32, MutAnyOrigin],
+    n_rows_in: Int32,
+    scale_in: Float32,
+):
+    """`reduce_cols_by_key` over a single row of weights -- their DIRECT arm
+    (`reduce_cols_by_key_direct_kernel`, `raft/linalg/detail/
+    reduce_cols_by_key.cuh:35-47`).
+
+    Their call passes `nrows = 1` and the weight vector as the matrix
+    (`cuvs/src/cluster/detail/kmeans.cuh:312-318`), so this is the
+    denominator of the centroid update and the empty-cluster test in one
+    array. NOTE: at the fit's shape their dispatch takes the CACHED arm, not
+    this one; see `accumulate_weight_per_cluster_privatized_kernel`.
+    """
+    var n_rows = Int(n_rows_in)
+    var row = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if row < n_rows:
+        var label = Int(labels.unsafe_load(row))
+        var q = Int32(weights.unsafe_load(row) * scale_in)
+        _ = Atomic.fetch_add(weight_i32.unsafe_offset(label), q)
+
+
+def accumulate_centroid_sums_privatized_kernel[
+    veclen: Int
+](
+    sums_i32: MutPointer[Int32, MutAnyOrigin],
+    x: MutPointer[Float32, MutAnyOrigin],
+    labels: MutPointer[UInt32, MutAnyOrigin],
+    weights: MutPointer[Float32, MutAnyOrigin],
+    n_rows_in: Int32,
+    n_features_in: Int32,
+    n_clusters_in: Int32,
+    scale_in: Float32,
+):
+    """The SMEM-privatized arm: block-local partials, one flush per block.
+
+    DEVIATION, and a measured one. RAFT's `reduce_rows_by_key` dispatch at
+    nkeys=64 takes `sum_rows_by_key_large_nkeys_kernel_rowmajor` -- the
+    small-nkeys arm is gated `nkeys <= 4` (`raft/linalg/detail/
+    reduce_rows_by_key.cuh:354-363`) -- which is exactly the direct global
+    scatter-add `accumulate_centroid_sums_kernel` above mirrors. Measured
+    here (SCOREBOARD_2026-08-19 item 1, 4M x 32, k=64) that arm is
+    contention-bound at 56 ms against a 15-20 ms traffic floor: 128M global
+    atomics landing on 2,048 cells.
+
+    The privatization STRUCTURE is still theirs, not invented: RAFT ships it
+    twice in the same two files, as `sum_rows_by_key_large_nkeys_kernel_
+    colmajor` (`reduce_rows_by_key.cuh:196-242`: `__shared__ local_sums`,
+    accumulate with shared atomics, flush non-zero cells to global atomics)
+    and as `reduce_cols_by_key_cached_kernel` (`reduce_cols_by_key.cuh:
+    51-81`, same three phases) -- the arm THEIR `reduce_cols_by_key`
+    dispatch takes for this fit's WEIGHT reduction. This kernel applies that
+    scheme to the row-major sums, walking the direct arm's flat cell
+    order `veclen` cells per thread step.
+
+    THE `veclen`-WIDE X READ IS A SECOND DELIBERATE DEVIATION BEYOND
+    THE REFERENCE. RAFT's rowmajor kernel reads ONE element per
+    thread (`SumsT val = d_A[j + lda * i]`, `reduce_rows_by_key.cuh:285`;
+    no `TxN_t`/`ldg` anywhere in that file) and loses nothing by it on
+    NVIDIA, where a warp's 32 scalar reads coalesce into full
+    transactions. On this Apple device the same scalar-to-vector swap was
+    MEASURED 3x on the assignment kernel (63 -> 21 ms/iter, re-verdict
+    2026-08-20), so the hardware premise the reference's scalar reads rest on
+    does not hold here. The instantiation contract is the SAME ladder the
+    assignment implementation dispatches on (`fused_veclen_for`, their
+    `fused_distance_nn-inl.cuh:107-110` selection, fed x's base address
+    for both pointer terms): it guarantees `n_features % veclen == 0`, so
+    a chunk of `veclen` cells never straddles a row (one label and one
+    weight read serve the whole chunk), and a `4 * veclen`-byte aligned
+    load that starts in bounds ends in bounds. `veclen = 1` IS the old
+    scalar body, and it is the arm the dispatch takes whenever the ladder
+    says the row length or alignment forbids wider. A vector load returns
+    the same bits as `veclen` scalar loads and each lane's quantization
+    is the identical scalar fp32 expression, so bit-identity is untouched
+    -- proven by `check_privatized_accumulate` (veclen=4 pinned) and
+    `check_accumulate_veclen_dispatch` (veclen=1 at d=33, veclen=2 at
+    d=34), each held bitwise to the direct scatter-add oracle.
+
+    DETERMINISM IS PRESERVED, BY THE SAME ARGUMENT THAT PICKED Int32.
+    The addends are the identical quantized `Int32` values the direct kernel
+    forms, and Int32 addition (two's-complement, wrapping) is associative
+    and commutative. Grouping them into per-block partials and adding the
+    partials atomically is a re-association of the same multiset of adds, so
+    the totals are BIT-IDENTICAL to the direct kernel's and to themselves
+    run to run, at any grid size, under any scheduling. A float accumulator
+    would lose exactly this property, which is why privatizing it would have
+    needed a numerics argument and this needs one comment.
+
+    Skipping zero partials in the flush is theirs (`reduce_rows_by_key.cuh:
+    235`, `reduce_cols_by_key.cuh:78`) and is safe under the same argument:
+    adding zero is the identity, in integers exactly.
+
+    Requires `n_clusters * n_features <= PRIVATE_ACC_CELLS`; the host
+    dispatch in `launch_accumulate_centroid_sums` guards it, as theirs does.
+    """
+    var n_rows = Int(n_rows_in)
+    var n_features = Int(n_features_in)
+    var used = Int(n_clusters_in) * n_features
+    var total = n_rows * n_features
+    var tid = Int(thread_idx.x)
+
+    var priv = stack_allocation[
+        PRIVATE_ACC_CELLS,
+        Scalar[DType.int32],
+        address_space = AddressSpace.SHARED,
+    ]()
+
+    # `for (local_key = threadIdx.x; ...) local_sums[local_key] = 0.0;`
+    var z = tid
+    while z < used:
+        priv.unsafe_store(z, Int32(0))
+        z += Int(block_dim.x)
+    barrier()
+
+    # The direct arm's flat grid-stride, walked `veclen` cells per step:
+    # ONE `SIMD[float32, veclen]` x read and one label/weight read per
+    # chunk (`n_features % veclen == 0` is the dispatch contract, so a
+    # chunk never straddles a row), then `veclen` atomics landing in the
+    # block's own threadgroup memory (their `raft::myAtomicAdd(
+    # &local_sums[...])`, shared-memory atomic, `reduce_rows_by_key.cuh:227`).
+    var chunks = total // veclen
+    var gid = Int(block_idx.x) * Int(block_dim.x) + tid
+    var stride = Int(grid_dim.x) * Int(block_dim.x)
+    while gid < chunks:
+        var base = gid * veclen
+        var row = base // n_features
+        var f = base - row * n_features
+        var label = Int(labels.unsafe_load(row))
+        var w = weights.unsafe_load(row)
+        var xv = x.unsafe_load[width=veclen](base)
+        comptime for j in range(veclen):
+            var q = Int32(xv[j] * w * scale_in)
+            _ = Atomic.fetch_add(
+                priv.unsafe_offset(label * n_features + f + j), q
+            )
+        gid += stride
+    barrier()
+
+    # One flush per block: `used` global atomics instead of one per element.
+    var c = tid
+    while c < used:
+        var v = priv.unsafe_load(c)
+        if v != Int32(0):
+            _ = Atomic.fetch_add(sums_i32.unsafe_offset(c), v)
+        c += Int(block_dim.x)
+
+
+def accumulate_weight_per_cluster_privatized_kernel(
+    weight_i32: MutPointer[Int32, MutAnyOrigin],
+    labels: MutPointer[UInt32, MutAnyOrigin],
+    weights: MutPointer[Float32, MutAnyOrigin],
+    n_rows_in: Int32,
+    n_clusters_in: Int32,
+    scale_in: Float32,
+):
+    """The weight denominator through the SAME privatization -- and for this
+    one it is not a deviation at all: the reference call IS
+    `raft::linalg::reduce_cols_by_key` (`cuvs/src/cluster/detail/
+    kmeans.cuh:312-318`, nrows=1, ncols=n_samples, nkeys=n_clusters), whose
+    dispatch at this fit's shape (cache 4*k bytes <= 49152, work
+    n_samples >= 8192) takes `reduce_cols_by_key_cached_kernel`
+    (`reduce_cols_by_key.cuh:125-133`) -- the shared-memory arm. The direct
+    `accumulate_weight_per_cluster_kernel` above matches the reference's OTHER arm.
+
+    Bit-identical to it anyway: same quantized Int32 addends, associative
+    and commutative, re-associated per block. See the sums kernel's comment.
+    """
+    var n_rows = Int(n_rows_in)
+    var used = Int(n_clusters_in)
+    var tid = Int(thread_idx.x)
+
+    var priv = stack_allocation[
+        PRIVATE_ACC_CELLS,
+        Scalar[DType.int32],
+        address_space = AddressSpace.SHARED,
+    ]()
+
+    var z = tid
+    while z < used:
+        priv.unsafe_store(z, Int32(0))
+        z += Int(block_dim.x)
+    barrier()
+
+    var row = Int(block_idx.x) * Int(block_dim.x) + tid
+    var stride = Int(grid_dim.x) * Int(block_dim.x)
+    while row < n_rows:
+        var label = Int(labels.unsafe_load(row))
+        var q = Int32(weights.unsafe_load(row) * scale_in)
+        _ = Atomic.fetch_add(priv.unsafe_offset(label), q)
+        row += stride
+    barrier()
+
+    var c = tid
+    while c < used:
+        var v = priv.unsafe_load(c)
+        if v != Int32(0):
+            _ = Atomic.fetch_add(weight_i32.unsafe_offset(c), v)
+        c += Int(block_dim.x)
+
+
+def accumulate_grid_blocks(work_items: Int, smem_bytes: Int) raises -> Int:
+    """Grid for the accumulate kernels, FROM THE MATRIX, replacing the magic
+    `min(1024, ...)` cap the launch site used to carry.
+
+    RAFT sizes the cached arm's grid from a runtime occupancy query:
+    `target_nblks = 4 * getMultiProcessorCount(); nblks = min(target_nblks,
+    ceildiv(work, TPB))` (`reduce_cols_by_key.cuh:127-131`). Metal exposes
+    no such query through Mojo, so the two factors are read from
+    `checks/hardware_matrix.mojo`'s target column the way every other
+    launch in this tree reads them: cores x resident blocks per core, then
+    capped by the work. Their literal `4` is their occupancy guess for their
+    kernel; ours is the table's computed one (`max_active_blocks_for`), so
+    the same call is honest per vendor column instead of pinned to CUDA's.
+
+    For the DIRECT sums arm RAFT launches one thread per cell with no cap
+    (`reduce_rows_by_key.cuh:304-307`). That kernel here grid-strides
+    instead -- a recorded launch-shape deviation, same arithmetic and same
+    atomic targets -- and this function now sizes that grid too (pass
+    `smem_bytes = 0`), so no launch below restates a hardware number. The
+    direct WEIGHT kernel is one-thread-per-row like theirs and keeps its
+    ceildiv grid.
+    """
+    var per_core = max_active_blocks_for[TARGET_COLUMN](
+        REDUCE_BY_KEY_TPB, smem_bytes
+    )
+    var target = gpu_cores_for[TARGET_COLUMN]() * per_core
+    var by_work = (work_items + REDUCE_BY_KEY_TPB - 1) // REDUCE_BY_KEY_TPB
+    var blocks = target if by_work > target else by_work
+    if blocks < 1:
+        blocks = 1
+    return blocks
+
+
+def _enqueue_privatized_sums[
+    veclen: Int
+](
+    ctx: DeviceContext,
+    mut sums_i32: DeviceBuffer[DType.int32],
+    mut x: DeviceBuffer[DType.float32],
+    mut labels: DeviceBuffer[DType.uint32],
+    mut weights: DeviceBuffer[DType.float32],
+    n_samples: Int,
+    n_features: Int,
+    n_clusters: Int,
+    sum_scale: Float32,
+) raises:
+    """One privatized-arm launch, bound at a comptime `veclen`. Exists so
+    `launch_accumulate_centroid_sums`' runtime ladder result can meet the
+    kernel's comptime parameter without repeating the argument list three
+    times (the shape `min_cluster_distance_compute.mojo`'s `_launch_fused`
+    uses for the same reason)."""
+    comptime kern = accumulate_centroid_sums_privatized_kernel[veclen]
+    ctx.enqueue_function[kern](
+        sums_i32.unsafe_ptr(),
+        x.unsafe_ptr(),
+        labels.unsafe_ptr(),
+        weights.unsafe_ptr(),
+        Int32(n_samples),
+        Int32(n_features),
+        Int32(n_clusters),
+        sum_scale,
+        grid_dim=(
+            accumulate_grid_blocks(
+                (n_samples * n_features) // veclen, PRIVATE_ACC_CELLS * 4
+            ),
+            1,
+            1,
+        ),
+        block_dim=(REDUCE_BY_KEY_TPB, 1, 1),
+    )
+
+
+def launch_accumulate_centroid_sums(
+    ctx: DeviceContext,
+    mut sums_i32: DeviceBuffer[DType.int32],
+    mut x: DeviceBuffer[DType.float32],
+    mut labels: DeviceBuffer[DType.uint32],
+    mut weights: DeviceBuffer[DType.float32],
+    n_samples: Int,
+    n_features: Int,
+    n_clusters: Int,
+    sum_scale: Float32,
+) raises:
+    """The dispatch, shaped like RAFT's (`reduce_cols_by_key.cuh:125-139`):
+    privatized when the block-local cache fits and the input is large enough
+    to amortize the flush, direct scatter-add otherwise. The privatized
+    arm's X read width comes from the same selection ladder the assignment
+    launcher dispatches on (`fused_veclen_for`, fed x's address for both
+    pointer terms because this kernel reads one matrix).
+    Both arms -- and every `veclen` instantiation of the privatized one --
+    produce bit-identical Int32 totals (see the kernels), so this selector
+    is SCHEDULING: it can change the time, never the model.
+    """
+    var cells = n_samples * n_features
+    if (
+        n_clusters * n_features <= PRIVATE_ACC_CELLS
+        and cells >= PRIVATE_MIN_WORK
+    ):
+        var vl = fused_veclen_for(
+            n_features, Int(x.unsafe_ptr()), Int(x.unsafe_ptr())
+        )
+        if vl == 4:
+            _enqueue_privatized_sums[4](
+                ctx, sums_i32, x, labels, weights,
+                n_samples, n_features, n_clusters, sum_scale,
+            )
+        elif vl == 2:
+            _enqueue_privatized_sums[2](
+                ctx, sums_i32, x, labels, weights,
+                n_samples, n_features, n_clusters, sum_scale,
+            )
+        else:
+            _enqueue_privatized_sums[1](
+                ctx, sums_i32, x, labels, weights,
+                n_samples, n_features, n_clusters, sum_scale,
+            )
+    else:
+        ctx.enqueue_function[accumulate_centroid_sums_kernel](
+            sums_i32.unsafe_ptr(),
+            x.unsafe_ptr(),
+            labels.unsafe_ptr(),
+            weights.unsafe_ptr(),
+            Int32(n_samples),
+            Int32(n_features),
+            sum_scale,
+            grid_dim=(accumulate_grid_blocks(cells, 0), 1, 1),
+            block_dim=(REDUCE_BY_KEY_TPB, 1, 1),
+        )
+
+
+def launch_accumulate_weight_per_cluster(
+    ctx: DeviceContext,
+    mut weight_i32: DeviceBuffer[DType.int32],
+    mut labels: DeviceBuffer[DType.uint32],
+    mut weights: DeviceBuffer[DType.float32],
+    n_samples: Int,
+    n_clusters: Int,
+    weight_scale: Float32,
+) raises:
+    """Same dispatch for the denominator; the reference's own is
+    `reduce_cols_by_key` at nrows=1, so the guard terms are `n_clusters`
+    cells and `n_samples` work items."""
+    if n_clusters <= PRIVATE_ACC_CELLS and n_samples >= PRIVATE_MIN_WORK:
+        ctx.enqueue_function[accumulate_weight_per_cluster_privatized_kernel](
+            weight_i32.unsafe_ptr(),
+            labels.unsafe_ptr(),
+            weights.unsafe_ptr(),
+            Int32(n_samples),
+            Int32(n_clusters),
+            weight_scale,
+            grid_dim=(
+                accumulate_grid_blocks(n_samples, PRIVATE_ACC_CELLS * 4),
+                1,
+                1,
+            ),
+            block_dim=(REDUCE_BY_KEY_TPB, 1, 1),
+        )
+    else:
+        ctx.enqueue_function[accumulate_weight_per_cluster_kernel](
+            weight_i32.unsafe_ptr(),
+            labels.unsafe_ptr(),
+            weights.unsafe_ptr(),
+            Int32(n_samples),
+            weight_scale,
+            grid_dim=(
+                (n_samples + REDUCE_BY_KEY_TPB - 1) // REDUCE_BY_KEY_TPB,
+                1,
+                1,
+            ),
+            block_dim=(REDUCE_BY_KEY_TPB, 1, 1),
+        )
+
+
+def finalize_centroids_kernel(
+    new_centroids: MutPointer[Float32, MutAnyOrigin],
+    old_centroids: MutPointer[Float32, MutAnyOrigin],
+    sums_i32: MutPointer[Int32, MutAnyOrigin],
+    weight_i32: MutPointer[Int32, MutAnyOrigin],
+    n_clusters_in: Int32,
+    n_features_in: Int32,
+    sum_scale_in: Float32,
+    weight_scale_in: Float32,
+):
+    """`finalize_centroids` (`kmeans_common.cuh`), both arms.
+
+    Theirs is a `div_checkzero_op` followed by a `gather_if` that copies the
+    OLD centroid back wherever the cluster weight is zero. Fused here into
+    one pass because the two are a single branch per cell and their split
+    exists only because RAFT has no primitive for the pair.
+
+    **Keeping the old centroid for an empty cluster is a real decision, not a
+    fallback.** scikit-learn instead relocates an empty cluster onto the
+    point furthest from its centroid. Two implementations that disagree here
+    diverge permanently on the same seed, so a validation harness has to
+    compare inertia and not centroid identity. See `cluster/tools/
+    sklearn_reference.py`.
+    """
+    var n_clusters = Int(n_clusters_in)
+    var n_features = Int(n_features_in)
+    var idx = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if idx < n_clusters * n_features:
+        var cluster = idx // n_features
+        # Two quotients and a divide, every one of them a seam another
+        # kernel reads: flushed under IDENTICAL (IDENTITY_PATHS row 10).
+        # The DIVIDENDS are exact integers, so nothing here can differ
+        # between vendors except through the denormal policy -- which is
+        # precisely what a centroid of a near-empty cluster can produce.
+        var w = ftz(Float32(weight_i32.unsafe_load(cluster)) / weight_scale_in)
+        if w == Float32(0.0):
+            new_centroids.unsafe_store(idx, old_centroids.unsafe_load(idx))
+        else:
+            var s = ftz(Float32(sums_i32.unsafe_load(idx)) / sum_scale_in)
+            new_centroids.unsafe_store(idx, ftz(s / w))
+
+
+comptime SUM_MODE_PLAIN = 0
+comptime SUM_MODE_PRODUCT = 1
+comptime SUM_MODE_SQDIFF = 2
+
+
+def sum_partials_kernel(
+    out_partial: MutPointer[Float32, MutAnyOrigin],
+    a: MutPointer[Float32, MutAnyOrigin],
+    b: MutPointer[Float32, MutAnyOrigin],
+    n_in: Int32,
+    mode_in: Int32,
+):
+    """One partial sum per block; a second kernel folds the partials.
+
+    The MAP IS INSIDE THE REDUCTION, which is theirs. Both call sites in the
+    Lloyd loop are a `map`-then-`sum` in cuVS and neither materializes the
+    mapped array:
+
+    - the centroid shift is `raft::linalg::mapThenSumReduce(sqrdNorm, ...,
+      raft::sqdiff_op{}, ..., centroids, newCentroids)`
+      (`detail/kmeans.cuh:453-459`) -> `SUM_MODE_SQDIFF`;
+    - the weighted cluster cost is `computeClusterCost(..., raft::value_op{},
+      raft::add_op{})` over `minClusterAndDistance` whose `.value` was already
+      multiplied by the sample weight (`:516-535`) -> `SUM_MODE_PRODUCT`.
+
+    An earlier version of this implementation wrote the squared differences to a
+    `n_clusters * n_features` scratch buffer with a separate
+    `centroid_shift_kernel` and then summed it. That kernel is gone: it was a
+    launch cuVS does not have.
+
+    **This is a float sum and therefore NUMERIC.** The block count changes
+    the order and moves the last bits of inertia, which is exactly the trap
+    `checks/numerics.mojo` is about: a grid size looks like scheduling and
+    is not. It does not affect WHICH cluster a point joins, only the reported
+    cost and the convergence ratio, so a fit can converge one iteration
+    earlier or later on a different backend while producing the same
+    assignment. Say that plainly rather than claiming determinism this path
+    does not have.
+    """
+    var n = Int(n_in)
+    var tid = Int(thread_idx.x)
+    var mode = Int(mode_in)
+
+    var acc = Float32(0.0)
+    var i = Int(block_idx.x) * REDUCE_BY_KEY_TPB + tid
+    var stride = Int(grid_dim.x) * REDUCE_BY_KEY_TPB
+    while i < n:
+        var v = a.unsafe_load(i)
+        if mode == SUM_MODE_PRODUCT:
+            v = ftz(ftz(v) * ftz(b.unsafe_load(i)))
+        elif mode == SUM_MODE_SQDIFF:
+            var d = ftz(ftz(v) - ftz(b.unsafe_load(i)))
+            v = ftz(d * d)
+        acc = ftz(acc + v)
+        i += stride
+
+    # `cub::BlockReduce`'s counterpart from
+    # `max.gpu.primitives.block`. The hand-written shared-memory tree
+    # reduction this replaced is gone: same arithmetic, one call, and
+    # the reduction shape is Modular's to tune rather than ours to
+    # guess. See archive/reference/VENDOR_LIBRARIES.md.
+    var s0 = pinned_block_sum[REDUCE_BY_KEY_TPB](acc)
+    if tid == 0:
+        out_partial.unsafe_store(Int(block_idx.x), s0)
+
+
+def zero_i32_kernel(
+    a: MutPointer[Int32, MutAnyOrigin],
+    n_in: Int32,
+):
+    """`raft::matrix::fill(0)` on the two accumulators, every iteration."""
+    var idx = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if idx < Int(n_in):
+        a.unsafe_store(idx, Int32(0))
+
+
+def copy_f32_kernel(
+    dst: MutPointer[Float32, MutAnyOrigin],
+    src: MutPointer[Float32, MutAnyOrigin],
+    n_in: Int32,
+):
+    """Device to device copy of the centroid buffer.
+
+    This is theirs: cuVS moves the freshly finalized centroids back over the
+    working set with a device-to-device `raft::copy`
+    (`detail/kmeans.cuh:465-466`), after the shift has been measured between
+    the two buffers and before the next iteration reads them. It is a copy in
+    their code too, not a pointer swap. A kernel is how a `DeviceBuffer` to
+    `DeviceBuffer` copy is spelled here, and 'k x d' is small.
+
+    It is also the second time this tree has needed one: see `archive/plans/UNWIRED.md` on
+    `enqueue_copy(dst_buf=, src_ptr=device)` being a silent no-op.
+    """
+    var idx = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if idx < Int(n_in):
+        dst.unsafe_store(idx, src.unsafe_load(idx))
+
+
+def finish_sum_kernel(
+    out_scalar: MutPointer[Float32, MutAnyOrigin],
+    partials: MutPointer[Float32, MutAnyOrigin],
+    n_blocks_in: Int32,
+):
+    """Second stage: fold the block partials into ONE device scalar.
+
+    Exists so the Lloyd loop never has to bring a sum to the host. The first
+    version of this implementation summed the partials in a host loop, which cost a
+    drain and a transfer per iteration for a number the host only needed in
+    order to make a decision the DEVICE can make. See
+    `archive/reference/HOST_AND_DEVICE.md`.
+
+    One block, because `n_blocks` is at most 256 by construction.
+    """
+    var n_blocks = Int(n_blocks_in)
+    var tid = Int(thread_idx.x)
+
+    var acc = Float32(0.0)
+    var i = tid
+    while i < n_blocks:
+        acc = ftz(acc + partials.unsafe_load(i))
+        i += REDUCE_BY_KEY_TPB
+
+    # `cub::BlockReduce`'s counterpart from
+    # `max.gpu.primitives.block`. The hand-written shared-memory tree
+    # reduction this replaced is gone: same arithmetic, one call, and
+    # the reduction shape is Modular's to tune rather than ours to
+    # guess. See archive/reference/VENDOR_LIBRARIES.md.
+    var s0 = pinned_block_sum[REDUCE_BY_KEY_TPB](acc)
+    if tid == 0:
+        out_scalar.unsafe_store(0, s0)
+
+
+# ---------------------------------------------------------------------------
+# DEVIATION 3080 (2026-09-17, lane kmeans-linear-speed): THE ROW-BLOCK
+# ACCUMULATOR. NO ATOMICS, NO SHARED MEMORY, THE SAME Int32 TOTALS.
+#
+# WHAT WAS MEASURED FIRST. One Lloyd iteration, split with a synchronize at
+# every phase (`cluster/tools/kmeans_linear_stage_probe_main.mojo`, RTX 4090,
+# IDENTICAL, k = 64): at Istella-S 2,043,304 x 220 the fused assignment is
+# 9.3 ms and THIS FILE'S sums reduction is 660 to 697 ms; at taxi 4,000,000
+# x 11 the assignment is 1.8 ms, the sums 36 to 41 ms and the weights 5 to
+# 6 ms. The update half of Lloyd, not the distance half, is the fit.
+#
+# WHY. `launch_accumulate_centroid_sums` privatizes only when `n_clusters *
+# n_features <= PRIVATE_ACC_CELLS` (6,144 cells on the NVIDIA column). 64 x
+# 220 is 14,080, so Istella-S takes the DIRECT arm: 449.5 million global
+# `Atomic.fetch_add`s landing on 14,080 cells per iteration. Taxi takes the
+# privatized arm and still pays one threadgroup atomic per element.
+#
+# THE ARM. Rows are cut into blocks of `BLOCK_ACC_ROWS`. Thread `(b, f)`
+# OWNS the `n_clusters` table cells `table[b][c][f]`: it zeroes them, walks
+# its block's rows in order and adds each row's quantized value into the
+# cell its label names. No other thread ever touches those cells, so the
+# adds are plain loads and stores. A second launch gives every output cell
+# `(c, f)` one thread that adds the `n_blocks` table entries and adds that
+# total into `sums_i32`.
+#
+# WHY NO BIT MOVES. The addend is formed by the IDENTICAL scalar fp32
+# expression the two existing kernels use, `Int32(x * w * scale)`, from the
+# same three loads, once per `(row, feature)` cell. Int32 addition is
+# associative and commutative, and `choose_scale` bounds the magnitude of
+# the sum over ANY subset of rows inside Int32, so no grouping of these
+# addends can wrap. The totals are therefore the direct arm's totals, which
+# is the argument the privatized arm already rests on, with "per GPU block"
+# replaced by "per row block". `check_blocked_accumulate` holds all three
+# arms bitwise equal; the sabotage define drops the first row of every
+# block so that check and the identity lanes are seen to fail.
+#
+# OFF BY DEFAULT: `-D ANONLIB_EXPERIMENTAL_KMEANS_BLOCK_ACC=1` selects it
+# in `cluster/impl/detail/kmeans.mojo`.
+# ---------------------------------------------------------------------------
+
+#: Rows per accumulator block. The table is `ceil(n / rows) * k * d` Int32
+#: cells, `k / BLOCK_ACC_ROWS` of the design's own size.
+#:
+#: fam2-cluster arms. 256 rows is the DEFAULT since idn-promote (2026-10-05):
+#: box-run-2 timed it against 1024 at af93ebe0a (kmeans taxi fit, NVIDIA RTX
+#: 4090 15.89 -> 10.05 ms, AMD MI325X 58.66 -> 44.35 ms, digest 0454b9f3 equal
+#: to 1024's and the host column's on both; evidence
+#: bench/results/box-run-2-20261005/candidate/). For skinny data (d about 10)
+#: only `n / 1024 * d` threads are busy at 1024; 256 quadruples the busy
+#: threads and the table (`n / 256 * k * d` Int32 cells).
+#: `-D ANONLIB_IDN_KMEANS_ACC_ROWS_256_OFF=1` (or `ANONLIB_IDN_ALL_OFF`)
+#: restores 1024. `-D ANONLIB_IDN_KMEANS_ACC_ROWS_4096=1` stays an opt-in
+#: candidate for wide data and wins over the default. The old opt-in
+#: `-D ANONLIB_IDN_KMEANS_ACC_ROWS_256=1` is now a no-op. Int32 totals: no
+#: bit moves at any block size (the banner's associativity argument).
+# A08 AMD LOSERS, 2026-10-06:1024/current256=1.205,1.210,1.426;
+# 4096/current256=2.853,2.843,4.447 on generated fits100000x32,100001x33,65537x17.
+# Full production KMeans, one in-process warmup+score, MI325X, timing source
+# 4252d8155; identity assumed prevalidated. No default change: NVIDIA and
+# named-dataset full harness still pending. Evidence:
+# anonlib-evidence/overnight-ab-20261006/amd/live/repair-summary.json.
+# A08 NVIDIA L40S 2026-10-06 representative kmeans caller LOSS for4096
+# rows: candidate3.267/3.637/6.730 ms vs default256 1.086/1.272/1.503 ms.
+# Old1024 also loses(1.413/1.639/2.416 ms). Cases100000x32,100001x33,
+# 65537x17,k32; one warmup/score. Existing256 default retained.
+# Evidence: overnight-ab-20261006/nvidia/default-repair-normalized-measurements.json.
+# AFCL-G06: NEVER RUN — PENDING MEASUREMENT; uncompiled and unverified.
+# Half-sized row chunks expose more independent per-feature accumulators,
+# doubling the partial table versus the current 256-row arm. Integer totals
+# and scale selection are unchanged. Keep the existing experimental blocked
+# accumulator enabled in BOTH arms; this does not promote it on Apple.
+comptime AFCL_G06 = (
+    GLOBAL_NUMERIC_MODE == NUMERIC_FAST and has_apple_gpu_accelerator()
+    and is_defined["ANONLIB_AFCL_G06"]()
+)
+comptime BLOCK_ACC_ROWS_BASELINE = (
+    4096
+    if (
+        # A08 AMD loser on stated fits; retained as an explicit experimental arm.
+        is_defined["ANONLIB_IDN_KMEANS_ACC_ROWS_4096"]()
+        and not is_defined["ANONLIB_IDN_ALL_OFF"]()
+    )
+    else (
+        1024
+        if (
+            # A08 AMD loser on stated fits; retained as an explicit experimental arm.
+            is_defined["ANONLIB_IDN_KMEANS_ACC_ROWS_256_OFF"]()
+            or is_defined["ANONLIB_IDN_ALL_OFF"]()
+        )
+        else 256
+    )
+)
+
+comptime BLOCK_ACC_ROWS = 128 if AFCL_G06 else BLOCK_ACC_ROWS_BASELINE
+
+comptime BLOCK_ACC_TPB = 256
+
+
+def blocked_acc_blocks(n_samples: Int) -> Int:
+    var b = (n_samples + BLOCK_ACC_ROWS - 1) // BLOCK_ACC_ROWS
+    return b if b > 0 else 1
+
+
+def blocked_acc_table_cells(n_samples: Int, n_features: Int, n_clusters: Int) -> Int:
+    """Int32 cells the caller's scratch table must hold for the sums (pass
+    `n_features = 1` for the weights); IDN_KMEANS_CENTROID_FOLD adds its
+    group partials behind the block rows."""
+    var blocks = blocked_acc_blocks(n_samples)
+    return blocks * n_clusters * n_features + centroid_fold_scratch_cells(blocks, n_clusters * n_features)
+
+
+# lane/classical-structural (2026-10-07), IDENTICAL only. `fold_block_table_kernel` gives one
+# thread per output cell a serial chain over EVERY row block: k*d threads (a
+# single block on one SM at small k*d) each walk n/BLOCK_ACC_ROWS dependent
+# loads, twice per iteration (sums, weights), and on a multi-die part those
+# loads cross the fabric from one die. Here the fold is a two-level parallel
+# fold: level 1 is a grid of (32-cell tile x group) blocks, each of whose
+# 32 x 8 threads sums a fixed strided subset of the row blocks (coalesced
+# across the 32 cells) and folds its 8 lane partials through shared memory
+# in a fixed halving order into ONE partial per (group, cell), written into
+# the table's scratch tail; level 2 is one thread per cell over the groups
+# in ascending order. Cost reasoning: with G groups the longest chain is
+# n_blocks / (8 G) loads instead of n_blocks, and tiles x G blocks cover the
+# machine's SMs for any k*d; G is capped so level 2 stays a short chain.
+# Bits: the table holds Int32 fixed-point addends and Int32 (two's-complement,
+# wrapping) addition is associative and commutative, so every grouping of
+# the row blocks yields the SAME words (the host twin `host_accumulate`
+# already folds 8192-row chunks in a different grouping from the device's
+# 256-row blocks and matches today). No bit moves; the host column is
+# unchanged. The table is never modified (the gated arms refold an untouched
+# table past convergence), only its scratch tail is written.
+# PROMOTED to the IDENTICAL default (lane/grid-flips-1, 2026-10-08, the author
+# 13:00Z "flip all of these"). Grid run ge123e6f9 (NVIDIA L40S sm_89 + AMD
+# MI325X gfx942, full board data, one scored run per arm), serial -> parallel fold:
+#   ivf taxi      NV 225.5 -> 204.1 ms (0.905x)  AMD 243.3 -> 226.8 ms (0.932x)
+#   ivf istella   NV 2259 -> 2138 ms (0.947x)    AMD 1562 -> 1514 ms (0.969x)
+#   gmm taxi      NV 35.18 -> 32.46 ms (0.922x)  AMD 63.30 -> 54.50 ms (0.861x)
+#   gmm istella   NV 578.2 -> 573.2 ms (0.991x)  AMD 543.0 -> 538.4 ms (0.992x)
+#   kmeans taxi   AMD 705.2 -> 209.2 ms (0.297x); kmeans istella AMD 541.0 ->
+#                 412.9 ms (0.763x); the NV kmeans cells were not measured.
+#   Geometric mean 0.939x. Quality SAME; no bits change (Int32 sums).
+# `-D ANONLIB_IDN_KMEANS_CENTROID_FOLD_OFF` restores the serial
+# per-cell chain (the grid's "off" arm). The old opt-in define is refused in
+# core/six_lane_experiment_guards.mojo.
+comptime IDN_KMEANS_CENTROID_FOLD = (
+    GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL and not is_defined["ANONLIB_IDN_KMEANS_CENTROID_FOLD_OFF"]()
+)
+comptime CF_COLS = 32  # cells per level-1 tile: one coalesced 128-byte row of the table
+comptime CF_LANES = 8  # row-block lanes per tile (CF_COLS * CF_LANES = 256 threads)
+# Group cap: 64 groups x 8 lanes = 512 concurrent chains per cell tile, enough
+# in-flight loads to cover memory latency on any GPU of this class, and the
+# level-2 chain stays at most 64 loads.
+comptime CF_GROUPS_MAX = 64
+
+
+def centroid_fold_groups(n_blocks: Int) -> Int:
+    var g = n_blocks if n_blocks < CF_GROUPS_MAX else CF_GROUPS_MAX
+    return g if g > 0 else 1
+
+
+def centroid_fold_scratch_cells(n_blocks: Int, cells: Int) -> Int:
+    """Int32 cells the fold's level-1 partials need behind the row blocks
+    (0 when the arm is compiled out)."""
+    comptime if IDN_KMEANS_CENTROID_FOLD:
+        return centroid_fold_groups(n_blocks) * cells
+    else:
+        return 0
+
+
+def centroid_fold_part_kernel(
+    part: MutPointer[Int32, MutAnyOrigin],
+    table: MutPointer[Int32, MutAnyOrigin],
+    n_blocks_in: Int32,
+    cells_in: Int32,
+    groups_in: Int32,
+):
+    """Level 1 of IDN_KMEANS_CENTROID_FOLD. Block (tile, group), threads
+    (tx: cell in tile, ty: lane): lane ty sums row blocks
+    `b = group + groups * (ty + CF_LANES * q)`, q = 0, 1, ...; the 8 lane
+    partials fold `s[ty] += s[ty + step]`, step = 4, 2, 1; lane 0 writes
+    `part[group * cells + cell]`."""
+    var n_blocks = Int(n_blocks_in)
+    var cells = Int(cells_in)
+    var groups = Int(groups_in)
+    var tx = Int(thread_idx.x)
+    var ty = Int(thread_idx.y)
+    var cell = Int(block_idx.x) * CF_COLS + tx
+    var g = Int(block_idx.y)
+    var acc = Int32(0)
+    if cell < cells:
+        var b = g + groups * ty
+        while b < n_blocks:
+            acc += table.unsafe_load(b * cells + cell)
+            b += groups * CF_LANES
+    var s = stack_allocation[
+        CF_COLS * CF_LANES,
+        Scalar[DType.int32],
+        address_space = AddressSpace.SHARED,
+    ]()
+    s.unsafe_store(ty * CF_COLS + tx, acc)
+    barrier()
+    var step = CF_LANES // 2
+    while step > 0:
+        if ty < step:
+            s.unsafe_store(
+                ty * CF_COLS + tx,
+                s.unsafe_load(ty * CF_COLS + tx) + s.unsafe_load((ty + step) * CF_COLS + tx),
+            )
+        barrier()
+        step //= 2
+    if ty == 0 and cell < cells:
+        part.unsafe_store(g * cells + cell, s.unsafe_load(tx))
+
+
+def centroid_fold_final_kernel[
+    store: Bool = False
+](
+    out_i32: MutPointer[Int32, MutAnyOrigin],
+    part: MutPointer[Int32, MutAnyOrigin],
+    groups_in: Int32,
+    cells_in: Int32,
+):
+    """Level 2 of IDN_KMEANS_CENTROID_FOLD: thread `cell` folds the group
+    partials in ascending group order; `store` as in
+    `fold_block_table_kernel`."""
+    var groups = Int(groups_in)
+    var cells = Int(cells_in)
+    var cell = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if cell >= cells:
+        return
+    var acc = Int32(0)
+    for g in range(groups):
+        acc += part.unsafe_load(g * cells + cell)
+    comptime if store:
+        out_i32.unsafe_store(cell, acc)
+    else:
+        out_i32.unsafe_store(cell, out_i32.unsafe_load(cell) + acc)
+
+
+def launch_block_table_fold[
+    store: Bool = False
+](
+    ctx: DeviceContext,
+    out_i32: MutPointer[Int32, MutAnyOrigin],
+    table: MutPointer[Int32, MutAnyOrigin],
+    n_blocks: Int,
+    cells: Int,
+) raises:
+    """`out (+)= sum over row blocks of table[b][cell]`: the serial per-cell
+    fold, or under IDN_KMEANS_CENTROID_FOLD the two-level parallel fold whose
+    level-1 partials live in the table's scratch tail (every table is sized
+    by `blocked_acc_table_cells` / `kmeans_fused_table_cells`, which include
+    it)."""
+    comptime if IDN_KMEANS_CENTROID_FOLD:
+        var groups = centroid_fold_groups(n_blocks)
+        var part = table + n_blocks * cells
+        ctx.enqueue_function[centroid_fold_part_kernel](
+            part,
+            table,
+            Int32(n_blocks),
+            Int32(cells),
+            Int32(groups),
+            grid_dim=((cells + CF_COLS - 1) // CF_COLS, groups, 1),
+            block_dim=(CF_COLS, CF_LANES, 1),
+        )
+        comptime final_kern = centroid_fold_final_kernel[store]
+        ctx.enqueue_function[final_kern](
+            out_i32,
+            part,
+            Int32(groups),
+            Int32(cells),
+            grid_dim=((cells + BLOCK_ACC_TPB - 1) // BLOCK_ACC_TPB, 1, 1),
+            block_dim=(BLOCK_ACC_TPB, 1, 1),
+        )
+    else:
+        comptime fold_kern = fold_block_table_kernel[store]
+        ctx.enqueue_function[fold_kern](
+            out_i32,
+            table,
+            Int32(n_blocks),
+            Int32(cells),
+            grid_dim=((cells + BLOCK_ACC_TPB - 1) // BLOCK_ACC_TPB, 1, 1),
+            block_dim=(BLOCK_ACC_TPB, 1, 1),
+        )
+
+
+def accumulate_centroid_sums_blocked_kernel[
+    sabotage: Bool
+](
+    table: MutPointer[Int32, MutAnyOrigin],
+    x: MutPointer[Float32, MutAnyOrigin],
+    labels: MutPointer[UInt32, MutAnyOrigin],
+    weights: MutPointer[Float32, MutAnyOrigin],
+    n_rows_in: Int32,
+    n_features_in: Int32,
+    n_clusters_in: Int32,
+    scale_in: Float32,
+):
+    """Thread `(b, f)`: block `b`'s rows of feature `f` into `table[b][*][f]`.
+    DEVIATION 3080, see the banner above. Body: `_acc_sums_blocked_body`."""
+    _acc_sums_blocked_body[sabotage](
+        table, x, labels, weights, n_rows_in, n_features_in, n_clusters_in,
+        scale_in,
+    )
+
+
+def accumulate_centroid_sums_blocked_gated_kernel[
+    sabotage: Bool
+](
+    gate: MutPointer[Int32, MutAnyOrigin],
+    table: MutPointer[Int32, MutAnyOrigin],
+    x: MutPointer[Float32, MutAnyOrigin],
+    labels: MutPointer[UInt32, MutAnyOrigin],
+    weights: MutPointer[Float32, MutAnyOrigin],
+    n_rows_in: Int32,
+    n_features_in: Int32,
+    n_clusters_in: Int32,
+    scale_in: Float32,
+):
+    """fam2-cluster, `IDN_KMEANS_DEVICE_CONV`: the same kernel behind the
+    Lloyd loop's device flag. `gate[0] != 0` returns before the table is
+    touched, so the table keeps the converged iteration's partials and the
+    (ungated, `k x d`) fold reproduces the converged sums."""
+    if gate.unsafe_load(0) != Int32(0):
+        return
+    _acc_sums_blocked_body[sabotage](
+        table, x, labels, weights, n_rows_in, n_features_in, n_clusters_in,
+        scale_in,
+    )
+
+
+@always_inline
+def _acc_sums_blocked_body[
+    sabotage: Bool
+](
+    table: MutPointer[Int32, MutAnyOrigin],
+    x: MutPointer[Float32, MutAnyOrigin],
+    labels: MutPointer[UInt32, MutAnyOrigin],
+    weights: MutPointer[Float32, MutAnyOrigin],
+    n_rows_in: Int32,
+    n_features_in: Int32,
+    n_clusters_in: Int32,
+    scale_in: Float32,
+):
+    var n_rows = Int(n_rows_in)
+    var n_features = Int(n_features_in)
+    var n_clusters = Int(n_clusters_in)
+    var gid = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    var b = gid // n_features
+    var f = gid - b * n_features
+    var r0 = b * BLOCK_ACC_ROWS
+    if r0 >= n_rows:
+        return
+    var r1 = r0 + BLOCK_ACC_ROWS
+    if r1 > n_rows:
+        r1 = n_rows
+    var base = b * n_clusters * n_features + f
+    for c in range(n_clusters):
+        table.unsafe_store(base + c * n_features, Int32(0))
+    comptime if sabotage:
+        r0 += 1
+    for row in range(r0, r1):
+        var label = Int(labels.unsafe_load(row))
+        var w = weights.unsafe_load(row)
+        var q = Int32(x.unsafe_load(row * n_features + f) * w * scale_in)
+        var cell = base + label * n_features
+        table.unsafe_store(cell, table.unsafe_load(cell) + q)
+
+
+def accumulate_weight_blocked_kernel(
+    table: MutPointer[Int32, MutAnyOrigin],
+    labels: MutPointer[UInt32, MutAnyOrigin],
+    weights: MutPointer[Float32, MutAnyOrigin],
+    n_rows_in: Int32,
+    n_clusters_in: Int32,
+    scale_in: Float32,
+):
+    """Thread `b`: block `b`'s quantized weights into `table[b][*]`."""
+    _acc_weight_blocked_body(
+        table, labels, weights, n_rows_in, n_clusters_in, scale_in
+    )
+
+
+def accumulate_weight_blocked_gated_kernel(
+    gate: MutPointer[Int32, MutAnyOrigin],
+    table: MutPointer[Int32, MutAnyOrigin],
+    labels: MutPointer[UInt32, MutAnyOrigin],
+    weights: MutPointer[Float32, MutAnyOrigin],
+    n_rows_in: Int32,
+    n_clusters_in: Int32,
+    scale_in: Float32,
+):
+    """fam2-cluster, `IDN_KMEANS_DEVICE_CONV`: the weights twin of
+    `accumulate_centroid_sums_blocked_gated_kernel`."""
+    if gate.unsafe_load(0) != Int32(0):
+        return
+    _acc_weight_blocked_body(
+        table, labels, weights, n_rows_in, n_clusters_in, scale_in
+    )
+
+
+@always_inline
+def _acc_weight_blocked_body(
+    table: MutPointer[Int32, MutAnyOrigin],
+    labels: MutPointer[UInt32, MutAnyOrigin],
+    weights: MutPointer[Float32, MutAnyOrigin],
+    n_rows_in: Int32,
+    n_clusters_in: Int32,
+    scale_in: Float32,
+):
+    var n_rows = Int(n_rows_in)
+    var n_clusters = Int(n_clusters_in)
+    var b = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    var r0 = b * BLOCK_ACC_ROWS
+    if r0 >= n_rows:
+        return
+    var r1 = r0 + BLOCK_ACC_ROWS
+    if r1 > n_rows:
+        r1 = n_rows
+    var base = b * n_clusters
+    for c in range(n_clusters):
+        table.unsafe_store(base + c, Int32(0))
+    for row in range(r0, r1):
+        var label = Int(labels.unsafe_load(row))
+        var q = Int32(weights.unsafe_load(row) * scale_in)
+        table.unsafe_store(base + label, table.unsafe_load(base + label) + q)
+
+
+def fold_block_table_kernel[
+    store: Bool = False
+](
+    out_i32: MutPointer[Int32, MutAnyOrigin],
+    table: MutPointer[Int32, MutAnyOrigin],
+    n_blocks_in: Int32,
+    cells_in: Int32,
+):
+    """Thread `cell`: `out[cell] += sum over blocks of table[b][cell]`. One
+    thread per output cell, so the add into `out` needs no atomic, and it is
+    an ADD because the two launchers accumulate into a buffer the caller
+    zeroed, as the atomic arms do.
+
+    `store = True` (fam-cluster, `IDN_KMEANS_FOLD_STORE`): the total is
+    STORED, so the caller need not zero `out` first. Same Int32 value."""
+    var n_blocks = Int(n_blocks_in)
+    var cells = Int(cells_in)
+    var cell = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if cell >= cells:
+        return
+    var acc = Int32(0)
+    for b in range(n_blocks):
+        acc += table.unsafe_load(b * cells + cell)
+    comptime if store:
+        out_i32.unsafe_store(cell, acc)
+    else:
+        out_i32.unsafe_store(cell, out_i32.unsafe_load(cell) + acc)
+
+
+def launch_accumulate_centroid_sums_blocked[
+    sabotage: Bool = False, store: Bool = False
+](
+    ctx: DeviceContext,
+    mut sums_i32: DeviceBuffer[DType.int32],
+    mut table: DeviceBuffer[DType.int32],
+    mut x: DeviceBuffer[DType.float32],
+    mut labels: DeviceBuffer[DType.uint32],
+    mut weights: DeviceBuffer[DType.float32],
+    n_samples: Int,
+    n_features: Int,
+    n_clusters: Int,
+    sum_scale: Float32,
+) raises:
+    """DEVIATION 3080. `table` holds at least `blocked_acc_table_cells(
+    n_samples, n_features, n_clusters)` Int32 cells; its contents on entry
+    do not matter."""
+    var n_blocks = blocked_acc_blocks(n_samples)
+    var threads = n_blocks * n_features
+    comptime kern = accumulate_centroid_sums_blocked_kernel[sabotage]
+    ctx.enqueue_function[kern](
+        table.unsafe_ptr(),
+        x.unsafe_ptr(),
+        labels.unsafe_ptr(),
+        weights.unsafe_ptr(),
+        Int32(n_samples),
+        Int32(n_features),
+        Int32(n_clusters),
+        sum_scale,
+        grid_dim=((threads + BLOCK_ACC_TPB - 1) // BLOCK_ACC_TPB, 1, 1),
+        block_dim=(BLOCK_ACC_TPB, 1, 1),
+    )
+    var cells = n_clusters * n_features
+    launch_block_table_fold[store](
+        ctx, sums_i32.unsafe_ptr().unsafe_origin_cast[MutAnyOrigin](),
+        table.unsafe_ptr().unsafe_origin_cast[MutAnyOrigin](), n_blocks, cells)
+
+
+def launch_accumulate_weight_per_cluster_blocked[
+    store: Bool = False
+](
+    ctx: DeviceContext,
+    mut weight_i32: DeviceBuffer[DType.int32],
+    mut table: DeviceBuffer[DType.int32],
+    mut labels: DeviceBuffer[DType.uint32],
+    mut weights: DeviceBuffer[DType.float32],
+    n_samples: Int,
+    n_clusters: Int,
+    weight_scale: Float32,
+) raises:
+    """DEVIATION 3080, the denominator. `table` holds at least
+    `blocked_acc_table_cells(n_samples, 1, n_clusters)` cells."""
+    var n_blocks = blocked_acc_blocks(n_samples)
+    ctx.enqueue_function[accumulate_weight_blocked_kernel](
+        table.unsafe_ptr(),
+        labels.unsafe_ptr(),
+        weights.unsafe_ptr(),
+        Int32(n_samples),
+        Int32(n_clusters),
+        weight_scale,
+        grid_dim=((n_blocks + BLOCK_ACC_TPB - 1) // BLOCK_ACC_TPB, 1, 1),
+        block_dim=(BLOCK_ACC_TPB, 1, 1),
+    )
+    launch_block_table_fold[store](
+        ctx, weight_i32.unsafe_ptr().unsafe_origin_cast[MutAnyOrigin](),
+        table.unsafe_ptr().unsafe_origin_cast[MutAnyOrigin](), n_blocks, n_clusters)
+
+
+def copy_f32_gated_kernel(
+    gate: MutPointer[Int32, MutAnyOrigin],
+    dst: MutPointer[Float32, MutAnyOrigin],
+    src: MutPointer[Float32, MutAnyOrigin],
+    n_in: Int32,
+):
+    """fam2-cluster, `IDN_KMEANS_DEVICE_CONV`: `copy_f32_kernel` behind the
+    Lloyd loop's device flag, so the working centroids are frozen once the
+    flag is set (the copy of the converging iteration itself still runs: the
+    flag is set by the launch AFTER it)."""
+    if gate.unsafe_load(0) != Int32(0):
+        return
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if i < Int(n_in):
+        dst.unsafe_store(i, src.unsafe_load(i))
+
+
+def kmeans_conv_step_kernel(
+    state: MutPointer[Int32, MutAnyOrigin],
+    shift: MutPointer[Float32, MutAnyOrigin],
+    thresh: Float32,
+    it: Int32,
+):
+    """fam2-cluster, `IDN_KMEANS_DEVICE_CONV`: the stopping rule on the
+    device. One thread. `state[0]` is the done flag, `state[1]` the iteration
+    that converged. `thresh` is the host's Float64 `tol` rounded UP to Float32
+    (`kmeans_shift_threshold`), so `shift < thresh` here is exactly the
+    host's `Float64(shift) < tol` for every Float32 `shift`, NaN included
+    (false both ways). One comparison of two Float32 values: the same bit on
+    every vendor."""
+    if Int(block_idx.x) != 0 or Int(thread_idx.x) != 0:
+        return
+    if state.unsafe_load(0) != Int32(0):
+        return
+    if shift.unsafe_load(0) < thresh:
+        state.unsafe_store(1, it)
+        state.unsafe_store(0, Int32(1))
+
+
+def launch_accumulate_centroid_sums_blocked_gated[
+    sabotage: Bool, store: Bool
+](
+    ctx: DeviceContext,
+    mut gate: DeviceBuffer[DType.int32],
+    mut sums_i32: DeviceBuffer[DType.int32],
+    mut table: DeviceBuffer[DType.int32],
+    mut x: DeviceBuffer[DType.float32],
+    mut labels: DeviceBuffer[DType.uint32],
+    mut weights: DeviceBuffer[DType.float32],
+    n_samples: Int,
+    n_features: Int,
+    n_clusters: Int,
+    sum_scale: Float32,
+) raises:
+    """`launch_accumulate_centroid_sums_blocked` with the `n x d` table pass
+    gated on `gate[0]`. The `k x d` fold is not gated: past convergence it
+    refolds the untouched table into the same totals (with `store = False`
+    the caller still zeroes `sums_i32` first, as before)."""
+    var n_blocks = blocked_acc_blocks(n_samples)
+    var threads = n_blocks * n_features
+    comptime kern = accumulate_centroid_sums_blocked_gated_kernel[sabotage]
+    ctx.enqueue_function[kern](
+        gate.unsafe_ptr(),
+        table.unsafe_ptr(),
+        x.unsafe_ptr(),
+        labels.unsafe_ptr(),
+        weights.unsafe_ptr(),
+        Int32(n_samples),
+        Int32(n_features),
+        Int32(n_clusters),
+        sum_scale,
+        grid_dim=((threads + BLOCK_ACC_TPB - 1) // BLOCK_ACC_TPB, 1, 1),
+        block_dim=(BLOCK_ACC_TPB, 1, 1),
+    )
+    var cells = n_clusters * n_features
+    launch_block_table_fold[store](
+        ctx, sums_i32.unsafe_ptr().unsafe_origin_cast[MutAnyOrigin](),
+        table.unsafe_ptr().unsafe_origin_cast[MutAnyOrigin](), n_blocks, cells)
+
+
+def launch_accumulate_weight_per_cluster_blocked_gated[
+    store: Bool
+](
+    ctx: DeviceContext,
+    mut gate: DeviceBuffer[DType.int32],
+    mut weight_i32: DeviceBuffer[DType.int32],
+    mut table: DeviceBuffer[DType.int32],
+    mut labels: DeviceBuffer[DType.uint32],
+    mut weights: DeviceBuffer[DType.float32],
+    n_samples: Int,
+    n_clusters: Int,
+    weight_scale: Float32,
+) raises:
+    """The weights twin of `launch_accumulate_centroid_sums_blocked_gated`."""
+    var n_blocks = blocked_acc_blocks(n_samples)
+    ctx.enqueue_function[accumulate_weight_blocked_gated_kernel](
+        gate.unsafe_ptr(),
+        table.unsafe_ptr(),
+        labels.unsafe_ptr(),
+        weights.unsafe_ptr(),
+        Int32(n_samples),
+        Int32(n_clusters),
+        weight_scale,
+        grid_dim=((n_blocks + BLOCK_ACC_TPB - 1) // BLOCK_ACC_TPB, 1, 1),
+        block_dim=(BLOCK_ACC_TPB, 1, 1),
+    )
+    launch_block_table_fold[store](
+        ctx, weight_i32.unsafe_ptr().unsafe_origin_cast[MutAnyOrigin](),
+        table.unsafe_ptr().unsafe_origin_cast[MutAnyOrigin](), n_blocks, n_clusters)

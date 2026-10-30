@@ -1,0 +1,565 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 the authors. Part of anonlib, DOI-WITHHELD
+"""tools/bench_board_params.py: the same-seed, same-parameters check.
+
+    .pixi/envs/test/bin/python -m pytest tools/test_bench_board_params.py
+
+Stub estimators only (no anonlib, no opponent library): a scikit-learn-shaped
+class per library, placed in a module named after the library so the check
+reads the library the way it does on a box.
+"""
+import importlib.util
+import io
+import json
+import os
+import types
+
+import pytest
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+_spec = importlib.util.spec_from_file_location("bench_board_params",
+                                               os.path.join(HERE, "bench_board_params.py"))
+BP = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(BP)
+
+
+def _est(library, cls_name, **params):
+    """A get_params() object whose class lives in module `library`."""
+    mod = types.ModuleType(library)
+
+    def get_params(self, deep=True):
+        return dict(self._p)
+
+    cls = type(cls_name, (), {"get_params": get_params, "__module__": library})
+    obj = cls()
+    obj._p = params
+    return obj
+
+
+def test_covariance_pca_inactive_controls_are_conditional_and_retained():
+    a = _est("anonlib.decomposition", "PCA", svd_solver="covariance_eigh",
+             iterated_power="auto", n_oversamples=10, power_iteration_normalizer="auto")
+    b = _est("cuml.decomposition", "PCA", svd_solver="full", iterated_power=15)
+    report = BP.check("pca", {"ours": a, "cuml-gpu": b})
+    assert report["verdict"] == "MATCHED"
+    assert report["arms"]["ours"]["raw_params"]["n_oversamples"] == 10
+    assert len(report["exceptions"]) == 3
+    b._p["svd_solver"] = "jacobi"
+    assert BP.check("pca", {"ours": a, "cuml-gpu": b})["verdict"] == "REFUSED"
+
+
+def test_hipvs_kmeans_reads_native_names_without_waiving_hierarchy():
+    a = _est("anonlib.cluster", "KMeans", n_clusters=8, init="k-means++",
+             metric="euclidean", init_centroids=None, oversampling_factor=0.)
+    b = {"__library__": "cuvs", "n_clusters": 8, "init_method": "KMeansPlusPlus",
+         "metric": "sqeuclidean", "hierarchical": False, "hierarchical_n_iters": 20,
+         "oversampling_factor": 0.}
+    assert BP.check("kmeans", {"ours": a, "hipvs-gpu": b})["verdict"] == "MATCHED"
+    b["hierarchical"] = True
+    assert BP.check("kmeans", {"ours": a, "hipvs-gpu": b})["verdict"] == "REFUSED"
+    b["hierarchical"] = False; b["oversampling_factor"] = 2.
+    assert BP.check("kmeans", {"ours": a, "hipvs-gpu": b})["verdict"] == "REFUSED"
+
+
+def test_fixed_brute_kde_controls_do_not_waive_active_parameters():
+    a = _est("anonlib.density", "KernelDensity", bandwidth=1.0, metric="euclidean",
+             algorithm="auto", atol=0., rtol=0., breadth_first=True, leaf_size=40, metric_params=None)
+    b = _est("cuml.neighbors", "KernelDensity", bandwidth=1.0, metric="euclidean", metric_params=None)
+    assert BP.check("kde", {"ours": a, "cuml-gpu": b})["verdict"] == "MATCHED"
+    for key, value in (("bandwidth", 2.), ("atol", .1), ("algorithm", "kd_tree")):
+        old = a._p[key]; a._p[key] = value
+        assert BP.check("kde", {"ours": a, "cuml-gpu": b})["verdict"] == "REFUSED"
+        a._p[key] = old
+
+
+def test_in_memory_kmeans_does_not_waive_subsampling_or_model_changes():
+    a = _est("anonlib.cluster", "KMeans", n_clusters=8, metric="euclidean", init_centroids=None)
+    b = _est("cuml.cluster", "KMeans", n_clusters=8, device_buffer_samples=0,
+             init_size=0, max_samples_per_batch=32768)
+    assert BP.check("kmeans", {"ours": a, "cuml-gpu": b})["verdict"] == "MATCHED"
+    b._p["device_buffer_samples"] = 100
+    assert BP.check("kmeans", {"ours": a, "cuml-gpu": b})["verdict"] == "REFUSED"
+    b._p["device_buffer_samples"] = 0; b._p["n_clusters"] = 9
+    assert BP.check("kmeans", {"ours": a, "cuml-gpu": b})["verdict"] == "REFUSED"
+    b._p["n_clusters"] = 8; a._p["init_size"] = 99
+    assert BP.check("kmeans", {"ours": a, "cuml-gpu": b})["verdict"] == "REFUSED"
+
+
+@pytest.mark.parametrize("lane", ["knn", "knn-clf", "knn-reg"])
+def test_brute_knn_tiling_is_not_a_model_parameter_but_k_is(lane):
+    a = _est("anonlib.neighbors", "NearestNeighbors", n_neighbors=10, algorithm="brute", query_tile=0)
+    b = _est("cuml.neighbors", "NearestNeighbors", n_neighbors=10, algorithm="brute",
+             algo_params=None, metric_params=None, radius=1.0)
+    assert BP.check(lane, {"ours": a, "cuml-gpu": b})["verdict"] == "MATCHED"
+    b._p["n_neighbors"] = 11
+    assert BP.check(lane, {"ours": a, "cuml-gpu": b})["verdict"] == "REFUSED"
+    b._p["n_neighbors"] = 10
+    b._p["metric_params"] = {"p": 3}
+    assert BP.check(lane, {"ours": a, "cuml-gpu": b})["verdict"] == "REFUSED"
+
+
+def test_cuml_scheduling_and_inactive_kernel_options_preserve_work_checks():
+    a = _est("anonlib.svm", "LinearSVC", C=1., loss="squared_hinge")
+    b = _est("cuml.svm", "LinearSVC", C=1., loss="squared_hinge", n_streams=1)
+    assert BP.check("linearsvc", {"ours": a, "cuml-gpu": b})["verdict"] == "MATCHED"
+    b._p["C"] = 2.
+    assert BP.check("linearsvc", {"ours": a, "cuml-gpu": b})["verdict"] == "REFUSED"
+    a = _est("anonlib.kernel_ridge", "KernelRidge", kernel="rbf", gamma=.1)
+    b = _est("cuml.kernel_ridge", "KernelRidge", kernel="rbf", gamma=.1, kernel_params=None)
+    assert BP.check("kernel-ridge", {"ours": a, "cuml-gpu": b})["verdict"] == "MATCHED"
+    b._p["kernel_params"] = {"gamma": .2}
+    assert BP.check("kernel-ridge", {"ours": a, "cuml-gpu": b})["verdict"] == "REFUSED"
+
+
+def test_clustering_fixed_controls_do_not_allow_caps_caches_or_approximation():
+    ours = dict(__library__="anonlib", eps=.5, max_iterations=None,
+                prediction_data=False, max_mbytes_per_batch=None)
+    other = dict(__library__="cuml", eps=.5, calc_core_sample_indices=True,
+                 max_mbytes_per_batch=None)
+    assert BP.check("dbscan", {"ours": ours, "cuml-gpu": other})["verdict"] == "MATCHED"
+    for key, value in [("max_iterations", 100), ("prediction_data", True), ("eps", .7)]:
+        assert BP.check("dbscan", {"ours": dict(ours, **{key: value}), "cuml-gpu": other})["verdict"] == "REFUSED"
+    assert BP.check("dbscan", {"ours": ours, "cuml-gpu": dict(other, calc_core_sample_indices=False)})["verdict"] == "REFUSED"
+    ours = dict(__library__="anonlib", metric="euclidean", min_cluster_size=5)
+    other = dict(__library__="cuml", metric="euclidean", min_cluster_size=5,
+                 build_algo="brute_force", build_kwds=None, device_ids=None, gen_min_span_tree=False, p=None)
+    assert BP.check("hdbscan", {"ours": ours, "cuml-gpu": other})["verdict"] == "MATCHED"
+    for key, value in [("build_algo", "nn_descent"), ("build_kwds", {"knn_n_clusters": 2}),
+                       ("device_ids", "all"), ("gen_min_span_tree", True), ("min_cluster_size", 6)]:
+        assert BP.check("hdbscan", {"ours": ours, "cuml-gpu": dict(other, **{key: value})})["verdict"] == "REFUSED"
+
+
+def test_cuml_minmax_fixed_behavior_remains_parameter_checked():
+    ours = _est("anonlib.preprocessing", "MinMaxScaler", feature_range=(0, 1), clip=False)
+    theirs = _est("cuml.preprocessing", "MinMaxScaler", feature_range=(0, 1))
+    record = BP.arm_record(theirs)
+    assert record["params"]["clip"] is False
+    assert "fixed unclipped" in record["source"]
+    arms = {"ours": ours, "cuml-gpu": record}
+    assert BP.check("algos/minmax-scaler", arms)["verdict"] == "MATCHED"
+    ours._p["clip"] = True
+    assert BP.check("algos/minmax-scaler", arms)["verdict"] == "REFUSED"
+    ours._p["clip"] = False
+    ours._p["feature_range"] = (-1, 1)
+    assert BP.check("algos/minmax-scaler", arms)["verdict"] == "REFUSED"
+    # If a future cuML exposes the option, preserve its actual read-back.
+    theirs._p["clip"] = True
+    assert BP.arm_record(theirs)["params"]["clip"] is True
+
+
+@pytest.mark.parametrize("cls,key,value,changed", [("Binarizer", "threshold", 0., 1.),
+                                                  ("Normalizer", "norm", "l2", "l1")])
+def test_cuml_preprocessor_readback_uses_actual_constructor_attributes(cls, key, value, changed):
+    obj = _est("cuml.preprocessing", cls)
+    setattr(obj, key, value)
+    obj.copy = True
+    record = BP.arm_record(obj)
+    assert record["params"][key] == value
+    assert record["params"]["copy"] is True
+    setattr(obj, key, changed)
+    assert BP.arm_record(obj)["params"][key] == changed
+    delattr(obj, key)
+    assert key not in BP.arm_record(obj)["params"]
+
+
+def _matched():
+    ours = _est("anonlib.ensemble", "GradientBoosting", n_estimators=100, max_depth=6,
+                learning_rate=0.1, l2_leaf_reg=1.0, border_count=254, random_state=7,
+                numeric_mode="identical")
+    fast = _est("anonlib.ensemble", "GradientBoosting", n_estimators=100, max_depth=6,
+                learning_rate=0.1, l2_leaf_reg=1.0, border_count=254, random_state=7,
+                numeric_mode="fast")
+    cat = _est("catboost.core", "CatBoostClassifier", iterations=100, depth=6,
+               learning_rate=0.1, l2_leaf_reg=1.0, border_count=254, random_seed=7,
+               thread_count=-1)
+    xgb = _est("xgboost.sklearn", "XGBClassifier", n_estimators=100, max_depth=6,
+               learning_rate=0.1, reg_lambda=1.0, max_bin=255, random_state=7, n_jobs=-1)
+    # Complete, explicit read-back on all fake arms; omitted work settings must
+    # fail now, even when an old intersection-only checker ignored them.
+    for obj in (ours, fast, cat, xgb):
+        obj._p.update(min_data_in_leaf=1, max_leaves=64, grow_policy="Depthwise",
+                      bootstrap_type="No", subsample=1.0, random_strength=0.0,
+                      boosting_type="Plain")
+    return {"ours": ours, "ours-fast": fast, "catboost-cpu": cat, "xgboost-cpu": xgb}
+
+
+@pytest.mark.parametrize("lane,decoupled", [("adam", False), ("adamw", True)])
+def test_optimizer_implementation_choices_do_not_waive_algorithm_changes(lane, decoupled):
+    # ours' read-back carries the math flags its implementation fixes (preflight-smoke, 2026-10-14)
+    own = dict(__library__="anonlib", lr=.001, betas=(.9, .999), eps=1e-8, weight_decay=.01,
+               amsgrad=False, maximize=False, decoupled_weight_decay=decoupled)
+    lib = dict(own, __library__="torch", foreach=True, fused=None, capturable=False,
+               differentiable=False, amsgrad=False, maximize=False, decoupled_weight_decay=decoupled)
+    arms = {"ours": own, "torch-eager-fp32": lib}
+    result = BP.check("algos/" + lane, arms)
+    assert result["verdict"] == "MATCHED"
+    assert result["arms"]["torch-eager-fp32"]["raw_params"]["foreach"] is True
+    for key, value in (("amsgrad", True), ("maximize", True), ("differentiable", True),
+                       ("decoupled_weight_decay", not decoupled), ("lr", .002), ("unknown", False)):
+        changed = dict(lib, **{key: value})
+        assert BP.check("algos/" + lane, {"ours": own, "torch-eager-fp32": changed})["verdict"] == "REFUSED"
+    assert BP.check("unrelated", arms)["verdict"] == "REFUSED"
+    assert BP.check("algos/" + lane, {"ours": dict(own, amsgrad=True),
+                                     "torch-eager-fp32": lib})["verdict"] == "REFUSED"
+
+
+@pytest.mark.parametrize("lane", ["algos/adamw", "mlp-train-step", "lm-train-step", "samba-train-step"])
+def test_math_flags_missing_from_ours_read_back_still_refuse(lane):
+    """Implementation-only torch flags are exceptions; the math flags must come from ours' read-back."""
+    own = dict(__library__="anonlib", lr=.001, betas=(.9, .999), eps=1e-8, weight_decay=.01)
+    lib = dict(own, __library__="torch", foreach=None, fused=None, capturable=False, differentiable=False,
+               amsgrad=False, maximize=False, decoupled_weight_decay=True)
+    got = BP.check(lane, {"ours": own, "torch-eager-fp32": lib})
+    assert got["verdict"] == "REFUSED"
+    assert {p.split(": ")[1].split(" ")[0] for p in got["problems"]} == {"amsgrad", "maximize", "decoupled_weight_decay"}
+    full = dict(own, amsgrad=False, maximize=False, decoupled_weight_decay=True)
+    got = BP.check(lane, {"ours": full, "torch-eager-fp32": lib})
+    assert got["verdict"] == "MATCHED", got["problems"]
+    waived = {e["param"] for e in got["exceptions"]}
+    assert waived == {"foreach", "fused", "capturable", "differentiable"}
+
+
+@pytest.mark.parametrize("lane,decoupled", [("algos/adam", False), ("algos/adamw", True), ("mlp-train-step", True)])
+def test_torch_without_a_decoupled_argument_matches_only_its_class_choice(lane, decoupled):
+    own = dict(__library__="anonlib", lr=.001, amsgrad=False, maximize=False, decoupled_weight_decay=decoupled)
+    lib = dict(__library__="torch", lr=.001, amsgrad=False, maximize=False, foreach=None)
+    assert BP.check(lane, {"ours": own, "torch-eager-fp32": lib})["verdict"] == "MATCHED"
+    wrong = dict(own, decoupled_weight_decay=not decoupled)
+    assert BP.check(lane, {"ours": wrong, "torch-eager-fp32": lib})["verdict"] == "REFUSED"
+
+
+def test_matched_race_passes_and_maps_names():
+    buf = io.StringIO()
+    rep = BP.enforce("gbdt-depthwise", _matched(), family="trees", stream=buf)
+    assert rep["verdict"] == "MATCHED"
+    # aliases resolved: CatBoost depth/iterations/border_count, XGBoost max_bin
+    cat = rep["arms"]["catboost-cpu"]["params"]
+    assert cat["max_depth"] == 6 and cat["n_estimators"] == 100 and cat["max_bin"] == 255
+    assert rep["arms"]["xgboost-cpu"]["params"]["reg_lambda"] == 1.0
+    # execution-only settings are not compared
+    assert "n_jobs" not in rep["arms"]["xgboost-cpu"]["params"]
+    assert "numeric_mode" not in rep["arms"]["ours-fast"]["params"]
+    line = buf.getvalue().splitlines()[0]
+    assert line.startswith(BP.MARK + " {")
+    assert BP.parse_lines(buf.getvalue())[0]["verdict"] == "MATCHED"
+
+
+def test_planted_parameter_mismatch_is_refused():
+    arms = _matched()
+    arms["xgboost-cpu"]._p["max_depth"] = 8               # the plant
+    buf = io.StringIO()
+    with pytest.raises(BP.ParamsRefused, match="max_depth"):
+        BP.enforce("gbdt-depthwise", arms, stream=buf)
+    assert BP.MARK_REFUSED in buf.getvalue()
+
+
+@pytest.mark.parametrize("ours,theirs", [
+    ({"new_option": 1}, {}), ({}, {"new_option": 1}),
+    ({"new_option": 1}, {"new_option": 2}),
+    ({"new_option": None}, {"new_option": None}),
+    ({"copy": True}, {"copy": False}),
+    ({"warm_start": False}, {"warm_start": True}),
+])
+def test_every_work_parameter_requires_audited_equivalence(ours, theirs):
+    records = {"ours": _est("anonlib", "Model", **ours),
+               "lib-gpu": _est("library", "Model", **theirs)}
+    assert BP.check("unknown", records)["verdict"] == "REFUSED"
+
+
+def test_conflicting_aliases_are_not_silently_overwritten():
+    with pytest.raises(BP.ParamsRefused):
+        BP.canonical("xgboost", {"random_state": 7, "seed": 8})
+
+
+def test_planted_seed_mismatch_is_refused():
+    arms = _matched()
+    arms["catboost-cpu"]._p["random_seed"] = 0
+    with pytest.raises(BP.ParamsRefused, match="seed"):
+        BP.enforce("gbdt-depthwise", arms, stream=io.StringIO())
+
+
+def test_library_default_is_not_a_match():
+    arms = _matched()
+    arms["xgboost-cpu"]._p["learning_rate"] = None        # left to XGBoost's default
+    with pytest.raises(BP.ParamsRefused, match="learning_rate is 0.1 on ours and unset"):
+        BP.enforce("gbdt-depthwise", arms, stream=io.StringIO())
+
+
+def test_arm_without_seed_argument_is_recorded_deterministic():
+    arms = {"ours": _est("anonlib", "IVF", nlist=1024, random_state=7),
+            "faiss-ivf": {"__library__": "faiss", "nlist": 1024}}
+    rep = BP.enforce("zz-no-row", arms, stream=io.StringIO())
+    assert rep["verdict"] == "MATCHED"
+    assert rep["arms"]["faiss-ivf"]["params"]["seed"] == BP.NO_SEED_ARGUMENT
+    assert rep["seed_none_deterministic"] == ["faiss-ivf"]
+    # a third-party arm that draws without a seed argument: its row's reason is recorded
+    rep = BP.enforce("zz-no-row", arms, stream=io.StringIO(),
+                     extra_exceptions=[("seed", "faiss-ivf", "faiss IVF-Flat training draws; no seed")])
+    assert rep["verdict"] == "MATCHED"
+    assert rep["exceptions"][0]["reason"].startswith("faiss")
+    assert rep["arms"]["faiss-ivf"]["params"]["seed"] == BP.NO_SEED_DRAWS
+
+
+def test_seed_argument_lost_in_read_back_is_refused():
+    class Lost:
+        __module__ = "sklearn.fake"
+
+        def __init__(self, random_state=7):
+            pass
+
+        def get_params(self, deep=True):
+            return {"n_estimators": 100}
+    arms = {"ours": _matched()["ours"], "sk": Lost()}
+    with pytest.raises(BP.ParamsRefused, match="takes a seed but none was read back"):
+        BP.enforce("gbdt-depthwise", arms, stream=io.StringIO())
+
+
+def test_seed_argument_left_none_is_refused():
+    arms = _matched()
+    arms["sk"] = {"__library__": "sklearn", "random_state": None}
+    with pytest.raises(BP.ParamsRefused, match="seed is None"):
+        BP.enforce("gbdt-depthwise", arms, stream=io.StringIO())
+
+
+def test_lane_seed_is_the_harness_seed():
+    assert BP.seed_for("spectral") == 42 and BP.seed_for("kmeans") == 7
+    arms = {"ours": _est("anonlib.cluster", "SpectralClustering", random_state=42),
+            "sk": _est("sklearn.cluster", "SpectralClustering", random_state=42)}
+    assert BP.enforce("spectral", arms, stream=io.StringIO())["verdict"] == "MATCHED"
+    arms["sk"]._p["random_state"] = 7
+    with pytest.raises(BP.ParamsRefused, match="seed is 7"):
+        BP.enforce("spectral", arms, stream=io.StringIO())
+
+
+def test_scale_pos_weight_matches_class_weights():
+    ours = _est("anonlib.ensemble", "GradientBoosting", random_state=7, class_weights=[1.0, 4.0])
+    xgb = _est("xgboost.sklearn", "XGBClassifier", random_state=7, scale_pos_weight=4.0)
+    rep = BP.enforce("gbdt-depthwise", {"ours": ours, "xgboost-cpu": xgb}, stream=io.StringIO())
+    assert rep["arms"]["ours"]["params"]["scale_pos_weight"] == 4.0
+    xgb._p["scale_pos_weight"] = 2.0
+    with pytest.raises(BP.ParamsRefused, match="scale_pos_weight"):
+        BP.enforce("gbdt-depthwise", {"ours": ours, "xgboost-cpu": xgb}, stream=io.StringIO())
+
+
+def test_exception_table_names_lane_param_and_arm(monkeypatch):
+    arms = _matched()
+    arms["xgboost-cpu"]._p["max_depth"] = 8
+    monkeypatch.setattr(BP, "EXCEPTIONS", [("gbdt-depth*", "max_depth", "xgboost-*", "planted")])
+    rep = BP.enforce("gbdt-depthwise", arms, stream=io.StringIO())
+    assert rep["verdict"] == "MATCHED" and rep["exceptions"][0]["param"] == "max_depth"
+    # the same exception does not cover another lane
+    with pytest.raises(BP.ParamsRefused):
+        BP.enforce("gbdt-lossguide", arms, stream=io.StringIO())
+
+
+def test_torch_optimizer_defaults_are_read():
+    opt = type("AdamW", (), {"__module__": "torch.optim.adamw"})()
+    opt.defaults = {"lr": 1e-3, "betas": (0.9, 0.999), "eps": 1e-8, "weight_decay": 0.01}
+    opt.param_groups = []
+    lib, source, got = BP.read_params(opt)
+    assert (lib, source) == ("torch", "optimizer.defaults")
+    canon = BP.canonical(lib, got)
+    assert canon["learning_rate"][0] == 1e-3 and canon["betas"][0] == [0.9, 0.999]
+
+
+def test_worker_records_are_checked_like_objects():
+    arms = {n: BP.arm_record(o) for n, o in _matched().items()}
+    assert BP.enforce("gbdt-depthwise", arms, stream=io.StringIO())["verdict"] == "MATCHED"
+    arms["catboost-cpu"]["params"]["depth"] = 4
+    with pytest.raises(BP.ParamsRefused, match="max_depth"):
+        BP.enforce("gbdt-depthwise", arms, stream=io.StringIO())
+
+
+def test_cuml_pca_full_is_covariance_eigh_and_its_tol_is_an_exception():
+    ours = _est("anonlib.decomposition", "PCA", n_components=10, svd_solver="covariance_eigh",
+                tol=0.0, whiten=False, random_state=7)
+    cuml = _est("cuml.decomposition.pca", "PCA", n_components=10, svd_solver="full", tol=1e-7,
+                whiten=False)
+    rep = BP.enforce("pca", {"ours": ours, "cuml-gpu": cuml}, family="classical",
+                     stream=io.StringIO())
+    assert rep["verdict"] == "MATCHED"
+    assert rep["arms"]["cuml-gpu"]["params"]["svd_solver"] == "covariance_eigh"
+    assert "tol" in json.dumps(rep["exceptions"])
+    # jacobi is another algorithm: still refused
+    cuml._p["svd_solver"] = "jacobi"
+    with pytest.raises(BP.ParamsRefused, match="svd_solver"):
+        BP.enforce("pca", {"ours": ours, "cuml-gpu": cuml}, family="classical",
+                   stream=io.StringIO())
+
+
+def test_cuml_tsvd_full_solver_ignores_n_iter_and_tol():
+    ours = _est("anonlib.decomposition", "TruncatedSVD", n_components=10, algorithm="covariance_eigh",
+                n_iter=5, tol=0.0, random_state=7)
+    cuml = _est("cuml.decomposition.tsvd", "TruncatedSVD", n_components=10, algorithm="full",
+                n_iter=15, tol=1e-7, random_state=7)
+    rep = BP.enforce("tsvd", {"ours": ours, "cuml-gpu": cuml}, family="classical2",
+                     stream=io.StringIO())
+    assert rep["verdict"] == "MATCHED"
+    cuml._p["n_components"] = 12                           # a real difference still refuses
+    with pytest.raises(BP.ParamsRefused, match="n_components"):
+        BP.enforce("tsvd", {"ours": ours, "cuml-gpu": cuml}, family="classical2",
+                   stream=io.StringIO())
+
+
+def test_holt_winters_add_is_additive():
+    ours = _est("anonlib.forecast", "ExponentialSmoothing", seasonal="additive",
+                seasonal_periods=24, eps=0.00224, start_periods=2)
+    cuml = _est("cuml.tsa.holtwinters", "ExponentialSmoothing", seasonal="add",
+                seasonal_periods=24, eps=0.00224, start_periods=2)
+    rep = BP.enforce("ets", {"ours": ours, "cuml-gpu": cuml}, family="classical2",
+                     stream=io.StringIO())
+    assert rep["verdict"] == "MATCHED"
+    cuml._p["seasonal"] = "mul"
+    with pytest.raises(BP.ParamsRefused, match="seasonal"):
+        BP.enforce("ets", {"ours": ours, "cuml-gpu": cuml}, family="classical2",
+                   stream=io.StringIO())
+
+
+def _hdbscan_arms(sk_min_samples, cuml_min_samples=10):
+    common = dict(min_cluster_size=100, metric="euclidean", cluster_selection_method="eom",
+                  cluster_selection_epsilon=0.0, alpha=1.0, allow_single_cluster=False)
+    ours = _est("anonlib.hdbscan", "HDBSCAN", min_samples=10, max_cluster_size=0, **common)
+    cuml = _est("cuml.cluster.hdbscan", "HDBSCAN", min_samples=cuml_min_samples, max_cluster_size=0,
+                **common)
+    sk = _est("sklearn.cluster._hdbscan.hdbscan", "HDBSCAN", min_samples=sk_min_samples,
+              max_cluster_size=None, n_jobs=-1, **common)
+    return {"ours": ours, "cuml-gpu": cuml, "sklearn-cpu": sk}
+
+
+def test_hdbscan_min_samples_counts_the_point_in_sklearn_only():
+    """scikit-learn's HDBSCAN counts the point itself in min_samples; ours and
+    cuML's do not. scikit-learn 11 selects ours' 10th neighbour: MATCHED."""
+    rep = BP.enforce("hdbscan", _hdbscan_arms(11), family="classical", stream=io.StringIO())
+    assert rep["verdict"] == "MATCHED"
+    assert rep["arms"]["sklearn-cpu"]["params"]["min_samples"] == 10
+    assert rep["arms"]["cuml-gpu"]["params"]["min_samples"] == 10
+
+
+def test_hdbscan_same_number_is_a_different_k_and_refuses():
+    """The same NUMBER on scikit-learn is a different neighbour: refused."""
+    with pytest.raises(BP.ParamsRefused):
+        BP.enforce("hdbscan", _hdbscan_arms(10), family="classical", stream=io.StringIO())
+
+
+def test_hdbscan_cuml_takes_no_transform():
+    """cuML passes min_samples straight to runner.h, which adds 1 as ours does."""
+    with pytest.raises(BP.ParamsRefused):
+        BP.enforce("hdbscan", _hdbscan_arms(11, cuml_min_samples=11), family="classical",
+                   stream=io.StringIO())
+
+
+def test_sklearn_dbscan_min_samples_is_not_transformed():
+    """Only scikit-learn's HDBSCAN is keyed: its DBSCAN counts the point, as ours does."""
+    assert BP.library_of(_est("sklearn.cluster._dbscan", "DBSCAN", min_samples=2)) == "sklearn"
+    assert BP.library_of(_est("sklearn.cluster._hdbscan.hdbscan", "HDBSCAN")) == "sklearn/HDBSCAN"
+
+
+def test_paired_lane_compares_each_opponent_with_its_own_configuration():
+    # smoke-fixes r13 (the author 2026-10-14, tools/board_pairing.py): on gbdt-lossguide CatBoost GPU is
+    # checked against `ours` (min_split_gain None, no gain check) and XGBoost against `ours-gain0`
+    # (0.0, a strictly positive gain, its gamma 0); neither against the other configuration.
+    arms = _matched()
+    for obj in arms.values():
+        obj._p["grow_policy"] = "Lossguide"
+    gain0 = _est("anonlib.ensemble", "GradientBoosting", **dict(arms["ours"]._p, min_split_gain=0.0))
+    arms["ours"]._p["min_split_gain"] = None
+    arms["xgboost-cpu"]._p["gamma"] = 0.0
+    arms = {"ours": arms["ours"], "ours-gain0": gain0, "catboost-gpu": arms["catboost-cpu"],
+            "xgboost-gpu": arms["xgboost-cpu"]}
+    pairing = {"ours": ["catboost-gpu"], "ours-gain0": ["xgboost-*"]}
+    rep = BP.check("gbdt-lossguide", arms, pairing=pairing)
+    assert rep["references"] == {"catboost-gpu": "ours", "xgboost-gpu": "ours-gain0"}
+    assert not [p for p in rep["problems"] if "min_split_gain" in p], rep["problems"]
+    row = next(r for r in rep["compared"] if r["arm"] == "xgboost-gpu" and r["param"] == "min_split_gain")
+    assert (row["ours"], row["theirs"], row["same"], row["reference"]) == (0.0, 0.0, True, "ours-gain0")
+    gap = next(r for r in rep["exceptions"] if r["arm"] == "catboost-gpu" and r["param"] == "min_split_gain")
+    assert gap["ours"] is None and gap["reference"] == "ours"
+    # without the pairing XGBoost meets ours' None (and CatBoost would meet 0.0): refused by name
+    rep = BP.check("gbdt-lossguide", arms)
+    assert [p for p in rep["problems"] if p.startswith("xgboost-gpu: min_split_gain")], rep["problems"]
+
+
+def _prebinned_pair(record_ours, record_theirs):
+    arms = _matched()
+    ours = _est("anonlib.ensemble", "GradientBoosting",
+                **dict(arms["ours"]._p, feature_border_type="GreedyLogSum", border_build_max_samples=0))
+    xgb = arms["xgboost-cpu"]
+    for obj, rec in ((ours, record_ours), (xgb, record_theirs)):
+        if rec is not None:
+            obj._board_input_binning = rec
+    return {"ours": arms["ours"], "ours-prebinned": ours, "xgboost-gpu": xgb}
+
+
+def test_prebinned_xgboost_pairing_maps_border_fields_only_on_the_same_bins():
+    # smoke-fixes r13 (the author 2026-10-14, DECISIONS.md decision 1): XGBoost has no
+    # feature_border_type / border_build_max_samples; on gbdt-depthwise/-lossguide they are mapped
+    # only when both arms read back the same pre-binned input record (its bins' sha256 inside)
+    pairing = {"ours": ["catboost-*"], "ours-prebinned": ["xgboost-*"]}
+    rec = "pre-binned input on both arms (GreedyLogSum, 254 borders); bins sha256 " + "ab" * 32
+    rep = BP.check("gbdt-depthwise", _prebinned_pair(rec, rec), pairing=pairing)
+    assert rep["references"] == {"xgboost-gpu": "ours-prebinned"}
+    assert rep["arms"]["xgboost-gpu"]["params"]["input_binning"] == rec
+    assert not [p for p in rep["problems"] if "border" in p or "input_binning" in p], rep["problems"]
+    mapped = {r["param"] for r in rep["exceptions"] if r["arm"] == "xgboost-gpu"}
+    assert {"feature_border_type", "border_build_max_samples"} <= mapped
+    row = next(r for r in rep["compared"] if r["param"] == "input_binning")
+    assert row["same"] and row["reference"] == "ours-prebinned"
+    # other bins: the record itself differs and the border fields stay unmapped
+    other = rec.replace("ab" * 32, "cd" * 32)
+    rep = BP.check("gbdt-depthwise", _prebinned_pair(rec, other), pairing=pairing)
+    assert [p for p in rep["problems"] if p.startswith("xgboost-gpu: input_binning")]
+    assert [p for p in rep["problems"] if "feature_border_type missing" in p]
+    # raw input on both: still refused by name
+    rep = BP.check("gbdt-depthwise", _prebinned_pair(None, None), pairing=pairing)
+    assert [p for p in rep["problems"] if "feature_border_type missing" in p]
+    assert [p for p in rep["problems"] if "border_build_max_samples missing" in p]
+
+
+
+def test_als_every_arm_runs_cg_and_use_gpu_maps_only_on_the_same_solver():
+    # smoke-fixes 2026-10-14: implicit-gpu has only CG (3 steps); ours and implicit-cpu now set use_cg=True
+    import bench_board_params as BP
+    base = dict(alpha=1.0, calculate_training_loss=False, factors=64, iterations=15, random_state=7,
+                regularization=0.01)
+    ours = dict(base, __library__="anonlib", use_cg=True, cg_steps=3)
+    gpu = dict(base, __library__="implicit", use_gpu=True, use_cg=True, cg_steps=3)
+    rep = BP.check("algos/als", {"ours": ours, "implicit-gpu": gpu}, family="algos")
+    assert rep["verdict"] == "MATCHED", rep["problems"]
+    rep = BP.check("algos/als", {"ours": dict(ours, use_cg=False), "implicit-gpu": gpu}, family="algos")
+    assert rep["verdict"] == "REFUSED" and any("use_cg" in p for p in rep["problems"])
+
+
+def test_ets_heuristic_start_maps_to_cuml_and_estimated_does_not():
+    import bench_board_params as BP
+    import bench_board_more as M
+    assert M.ets_initialization({"race_arms": ["ours", "cuml-gpu"]}) == "heuristic"
+    assert M.ets_initialization({"race_arms": ["ours", "statsmodels-cpu"]}) == "estimated"
+    assert M.ets_initialization({}) == "estimated"
+
+
+@pytest.mark.parametrize('lane,loss', [('gbdt-rank-pairlogit', 'PairLogit'), ('gbdt-rank-yetirank', 'YetiRank')])
+def test_querywise_gpu_searcher_equivalence_requires_actual_matching_algorithm(lane, loss):
+    ours = dict(loss=loss, grow_policy='SymmetricTree', boosting_type='Plain',
+                leaf_estimation_method='Newton', cat_features=None, use_pointwise_searcher=True)
+    theirs = dict(loss=loss, grow_policy='SymmetricTree', boosting_type='Plain',
+                  leaf_estimation_method='Newton', data_partition='DocParallel')
+    for param in ['use_pointwise_searcher', 'data_partition']:
+        assert BP._semantic_querywise_pointwise(lane, param, 'catboost-gpu', ours, theirs, 'catboost')
+        assert BP._semantic_querywise_pointwise(lane, param, 'catboost-cpu', ours, theirs, 'catboost') is None
+        assert BP._semantic_querywise_pointwise(lane, param, 'catboost-gpu', dict(ours, use_pointwise_searcher=False), theirs, 'catboost') is None
+        assert BP._semantic_querywise_pointwise(lane, param, 'catboost-gpu', ours, dict(theirs, data_partition='FeatureParallel'), 'catboost') is None
+        assert BP._semantic_querywise_pointwise(lane, param, 'catboost-gpu', dict(ours, leaf_estimation_method='Simple'), dict(theirs, leaf_estimation_method='Simple'), 'catboost') is None
+        assert BP._semantic_querywise_pointwise(lane, param, 'catboost-gpu', dict(ours, cat_features=[0]), theirs, 'catboost') is None
+
+
+@pytest.mark.parametrize('lane,loss', [('gbdt-rank-pairlogit', 'PairLogit'), ('gbdt-rank-yetirank', 'YetiRank')])
+def test_querywise_preflight_records_equivalence_and_refuses_old_false_route(lane, loss):
+    ours = dict(__library__='anonlib', loss=loss, grow_policy='SymmetricTree', boosting_type='Plain',
+                leaf_estimation_method='Newton', cat_features=None, use_pointwise_searcher=True)
+    theirs = dict(__library__='catboost', loss=loss, grow_policy='SymmetricTree', boosting_type='Plain',
+                  leaf_estimation_method='Newton', data_partition='DocParallel')
+    result = BP.check(lane, {'ours': ours, 'catboost-gpu': theirs})
+    assert result['verdict'] == 'MATCHED'
+    assert {'data_partition', 'use_pointwise_searcher'} <= {row['param'] for row in result['exceptions']}
+    assert BP.check(lane, {'ours': dict(ours, use_pointwise_searcher=False), 'catboost-gpu': theirs})['verdict'] == 'REFUSED'
+    assert BP.check(lane, {'ours': ours, 'catboost-gpu': dict(theirs, data_partition='FeatureParallel')})['verdict'] == 'REFUSED'

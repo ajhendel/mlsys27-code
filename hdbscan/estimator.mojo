@@ -1,0 +1,286 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 the authors. Part of anonlib, DOI-WITHHELD
+"""Host-pointer surface for the hdbscan section.
+
+The shape is `hierarchy/estimator.mojo`'s and `dbscan/estimator.mojo`'s:
+host pointers in, device buffers owned here for exactly one call, results
+read back, nothing retained. The implemented entry is
+`hdbscan/impl/runner.mojo::fit_hdbscan` (cuML `runner.h:152-234`)
+and this file re-decides none of it.
+
+**THIS IS NOT WIRED TO `bindings/` AND THERE IS NO PYTHON CLASS YET.**
+Nothing under `bindings/` or `python/` calls it, which makes it an
+`archive/plans/UNWIRED.md` row until the maintainer wires it; the lane README's
+HAND-OFF section says what a `anonlib.HDBSCAN` would have to map.
+
+THIS PATH DOES EMIT AN IDENTITY CARD, unlike `hierarchy`'s. `fit_hdbscan`
+takes a live `IdentityTrace` and records every stage itself, so a fit
+through this surface writes the SAME card `hdbscan_main.mojo` writes, from
+the same call, with no re-run of any stage. That closes for this lane the
+gap `hierarchy/estimator.mojo`'s header records as owed for its own.
+
+X IS ROW-MAJOR. cuML's `HDBSCAN.fit` takes `order='C'` and every distance
+step here reads the dense design row by row.
+
+WHAT IS REFUSED, AND WHERE
+  metric != L2SqrtExpanded (1)          `fit_hdbscan`, their RAFT_EXPECTS
+  build_algo != BRUTE_FORCE_KNN         `fit_hdbscan` (NN_DESCENT, rung 2)
+  cluster_selection_method not in {0,1} `fit_hdbscan`
+  min_samples < 1, min_samples > n_rows `runner.mojo`
+  min_cluster_size < 2 or > n_rows      `build_condensed_hierarchy`
+  alpha <= 0 or non-finite              `build_mr_linkage`
+  n_rows < 2                            `build_mr_linkage` (past 46340 rows
+                                        the sparse arm, DEVIATION 1620)
+  a NaN or infinite anywhere            DEVIATION 1607
+  the SPARSE mutual reachability graph  `reachability.mojo` (DEVIATION 1600)
+"""
+
+from max.gpu.host import DeviceContext
+
+from core.identity_trace import IdentityTrace
+from hdbscan.impl.detail.predict import approximate_predict
+from hdbscan.impl.detail.soft_clustering import (
+    all_points_membership_vectors,
+    membership_vector,
+)
+from hdbscan.impl.prediction_data import PredictionData
+from hdbscan.impl.runner import (
+    GRAPH_BUILD_BRUTE_FORCE_KNN,
+    HDBSCANOutput,
+    HDBSCANParams,
+    fit_hdbscan,
+)
+from hdbscan.impl.detail.select import CLUSTER_SELECTION_EOM
+from hierarchy.impl.cluster.detail.connectivities import (
+    DISTANCE_L2_SQRT_EXPANDED,
+)
+
+
+def hdbscan_fit_host(
+    ctx: DeviceContext,
+    x_ptr: MutPointer[Float32, MutUntrackedOrigin],
+    labels_ptr: MutPointer[Int32, MutUntrackedOrigin],
+    core_dists_ptr: MutPointer[Float32, MutUntrackedOrigin],
+    info_ptr: MutPointer[Int32, MutUntrackedOrigin],
+    n_rows: Int,
+    n_cols: Int,
+    min_samples: Int = 5,
+    min_cluster_size: Int = 5,
+    max_cluster_size: Int = 0,
+    alpha: Float32 = Float32(1.0),
+    allow_single_cluster: Bool = False,
+    cluster_selection_method: Int = CLUSTER_SELECTION_EOM,
+    cluster_selection_epsilon: Float32 = Float32(0.0),
+    metric: Int = DISTANCE_L2_SQRT_EXPANDED,
+) raises -> Int:
+    """Cluster host-resident ROW-MAJOR data. Returns the cluster count.
+
+    `x_ptr` is `n_rows x n_cols` Float32, row-major.
+    `labels_ptr` receives `n_rows` Int32 in `0 .. n_clusters-1`, or `-1`
+    for NOISE. The numbering is cuML's: ascending condensed cluster id
+    through `label_map` (`runner.h:226-233`), which is the same rule
+    scikit-learn-contrib's `hdbscan` uses and is NOT an arbitrary choice
+    this surface makes.
+    `core_dists_ptr` receives `n_rows` Float32, the distance to the
+    `min_samples`-th nearest neighbour EXCLUDING self (their
+    `min_samples + 1` adjustment, `runner.h:68-80`).
+    `info_ptr` receives FOUR Int32:
+        [0] n_clusters                (the return value, read back)
+        [1] n_outliers                (points labelled -1)
+        [2] Boruvka round count       (an integer card stage)
+        [3] n_condensed_clusters      (the condensed tree's cluster count,
+                                       which is the length `stabilities`
+                                       and `is_cluster` would have)
+    """
+    var out = hdbscan_fit_host_output(
+        ctx, x_ptr, n_rows, n_cols, min_samples, min_cluster_size,
+        max_cluster_size, alpha, allow_single_cluster,
+        cluster_selection_method, cluster_selection_epsilon, metric,
+    )
+    for i in range(n_rows):
+        labels_ptr.unsafe_store(i, out.labels[i])
+        core_dists_ptr.unsafe_store(i, out.core_dists[i])
+    info_ptr.unsafe_store(0, Int32(out.n_clusters))
+    info_ptr.unsafe_store(1, Int32(out.n_outliers))
+    info_ptr.unsafe_store(2, Int32(out.n_boruvka_rounds))
+    info_ptr.unsafe_store(3, Int32(out.condensed.n_clusters))
+    return out.n_clusters
+
+
+def hdbscan_fit_host_output(
+    ctx: DeviceContext,
+    x_ptr: MutPointer[Float32, MutUntrackedOrigin],
+    n_rows: Int,
+    n_cols: Int,
+    min_samples: Int = 5,
+    min_cluster_size: Int = 5,
+    max_cluster_size: Int = 0,
+    alpha: Float32 = Float32(1.0),
+    allow_single_cluster: Bool = False,
+    cluster_selection_method: Int = CLUSTER_SELECTION_EOM,
+    cluster_selection_epsilon: Float32 = Float32(0.0),
+    metric: Int = DISTANCE_L2_SQRT_EXPANDED,
+) raises -> HDBSCANOutput:
+    """`hdbscan_fit_host`'s body, returning the whole `HDBSCANOutput` (the
+    condensed tree and `inverse_label_map` included) so the binding can
+    hand `prediction_data=True` what `generate_prediction_data` reads. The
+    fit is the same call either way; this split moved no stage."""
+    if n_rows < 2:
+        raise Error(
+            "hdbscan_fit_host needs n_rows >= 2, got " + String(n_rows)
+        )
+    if n_cols < 1:
+        raise Error(
+            "hdbscan_fit_host needs n_cols >= 1, got " + String(n_cols)
+        )
+
+    var x_host = List[Float32](capacity=n_rows * n_cols)
+    for i in range(n_rows * n_cols):
+        x_host.append(x_ptr.unsafe_load(i))
+
+    var x = ctx.enqueue_create_buffer[DType.float32](n_rows * n_cols)
+    ctx.synchronize()
+    ctx.enqueue_copy(dst_buf=x, src_ptr=x_ptr)
+    ctx.synchronize()
+
+    var params = HDBSCANParams(
+        min_samples,
+        min_cluster_size,
+        max_cluster_size,
+        cluster_selection_epsilon,
+        allow_single_cluster,
+        alpha,
+        cluster_selection_method,
+        GRAPH_BUILD_BRUTE_FORCE_KNN,
+    )
+    var trace = IdentityTrace()
+    var out = fit_hdbscan(
+        ctx, trace, x_host, x, n_rows, n_cols, metric, params
+    )
+
+    # [[mojo-buffer-freed-at-last-use]]: every buffer outlives the queue.
+    _ = x^
+    _ = x_host^
+    return out^
+
+
+def hdbscan_approximate_predict_host(
+    ctx: DeviceContext,
+    x_train: List[Float32],
+    m: Int,
+    n: Int,
+    core_dists: List[Float32],
+    labels: List[Int32],
+    tree_lambdas: List[Float32],
+    n_edges: Int,
+    n_clusters: Int,
+    deaths: List[Float32],
+    selected_clusters: List[Int32],
+    index_into_children: List[Int32],
+    queries: List[Float32],
+    n_prediction_points: Int,
+    min_samples: Int,
+    labels_out: MutPointer[Int32, MutUntrackedOrigin],
+    probs_out: MutPointer[Float32, MutUntrackedOrigin],
+) raises:
+    """`approximate_predict` (cuML `hdbscan.pyx:1264`, `predict.cuh:220-262`)
+    through `hdbscan/impl/detail/predict.mojo`. The fitted state arrives as
+    the host arrays `prediction_data=True` kept; the exemplar arrays are not
+    read by this pass and are not passed."""
+    var n_selected = len(selected_clusters)
+    var pd = PredictionData(
+        n_rows_leaves(m), n_edges, n_clusters, n_selected, 0,
+        deaths.copy(), List[Int32](), List[Int32](), selected_clusters.copy(),
+        index_into_children.copy(),
+    )
+    var trace = IdentityTrace()
+    var out = approximate_predict(
+        ctx, trace, x_train, m, n, core_dists, labels, tree_lambdas, pd,
+        queries, n_prediction_points, min_samples,
+    )
+    for i in range(n_prediction_points):
+        labels_out.unsafe_store(i, out.labels[i])
+        probs_out.unsafe_store(i, out.probabilities[i])
+
+
+def hdbscan_membership_vector_host(
+    ctx: DeviceContext,
+    x_train: List[Float32],
+    m: Int,
+    n: Int,
+    core_dists: List[Float32],
+    labels: List[Int32],
+    parents: List[Int32],
+    tree_lambdas: List[Float32],
+    n_edges: Int,
+    n_clusters: Int,
+    deaths: List[Float32],
+    selected_clusters: List[Int32],
+    index_into_children: List[Int32],
+    exemplar_idx: List[Int32],
+    exemplar_label_offsets: List[Int32],
+    queries: List[Float32],
+    n_prediction_points: Int,
+    min_samples: Int,
+    out_ptr: MutPointer[Float32, MutUntrackedOrigin],
+) raises:
+    """`membership_vector` (cuML `hdbscan.pyx:1180`,
+    `soft_clustering.cuh:501-627`) through
+    `hdbscan/impl/detail/soft_clustering.mojo` (DEVIATION 1616). Writes
+    `n_prediction_points x n_selected` Float32 to `out`."""
+    var n_selected = len(selected_clusters)
+    var pd = PredictionData(
+        n_rows_leaves(m), n_edges, n_clusters, n_selected, len(exemplar_idx),
+        deaths.copy(), exemplar_idx.copy(), exemplar_label_offsets.copy(),
+        selected_clusters.copy(), index_into_children.copy(),
+    )
+    var trace = IdentityTrace()
+    var mv = membership_vector(
+        ctx, trace, x_train, m, n, core_dists, labels, parents, tree_lambdas,
+        pd, queries, n_prediction_points, min_samples,
+    )
+    for i in range(n_prediction_points * n_selected):
+        out_ptr.unsafe_store(i, mv[i])
+
+
+def hdbscan_all_points_membership_vectors_host(
+    ctx: DeviceContext,
+    x_train: List[Float32],
+    m: Int,
+    n: Int,
+    parents: List[Int32],
+    tree_lambdas: List[Float32],
+    n_edges: Int,
+    n_clusters: Int,
+    deaths: List[Float32],
+    selected_clusters: List[Int32],
+    index_into_children: List[Int32],
+    exemplar_idx: List[Int32],
+    exemplar_label_offsets: List[Int32],
+    row0: Int,
+    n_rows: Int,
+    out_ptr: MutPointer[Float32, MutUntrackedOrigin],
+) raises:
+    """`all_points_membership_vectors` (cuML `hdbscan.pyx:1114`,
+    `soft_clustering.cuh:385-482`) for training rows `row0 .. row0 + n_rows
+    - 1`. Writes `n_rows x n_selected` Float32 to `out`."""
+    var n_selected = len(selected_clusters)
+    var pd = PredictionData(
+        n_rows_leaves(m), n_edges, n_clusters, n_selected, len(exemplar_idx),
+        deaths.copy(), exemplar_idx.copy(), exemplar_label_offsets.copy(),
+        selected_clusters.copy(), index_into_children.copy(),
+    )
+    var trace = IdentityTrace()
+    var mv = all_points_membership_vectors(
+        ctx, trace, x_train, m, n, parents, tree_lambdas, pd, row0, n_rows,
+    )
+    for i in range(n_rows * n_selected):
+        out_ptr.unsafe_store(i, mv[i])
+
+
+def n_rows_leaves(m: Int) -> Int:
+    """The condensed tree's `n_leaves` is the training row count
+    (`condensed_hierarchy.cu:51-61`)."""
+    return m
+
+

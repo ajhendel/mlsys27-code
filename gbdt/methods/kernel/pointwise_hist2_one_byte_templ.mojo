@@ -1,0 +1,634 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 the authors. Part of anonlib, DOI-WITHHELD
+"""The one-byte DRIVER: which accumulator runs, on which features, and where
+the result goes.
+
+Reference: `catboost/cuda/methods/kernel/pointwise_hist2_one_byte_templ.cuh`
+(CatBoost `54a8143a`).
+
+The six accumulators know how to add a point. This file is everything else:
+
+    1. slice the feature array          `feature += (blockIdx.x / M) * 4`
+    2. pick the partition and the
+       histogram slot                   `ShiftPartAndBinSumsPtr`
+    3. REFUSE if this block's features
+       do not belong to this bit width  `GetMaxBinCount` + the bounds
+    4. choose the load width            `TLoadEntriesTrait`
+    5. run the loop
+    6. write 4 x folds x 2 floats out   atomicAdd or a plain store
+
+STEP 3 IS THE ONE THAT LOOKS WRONG AND IS NOT. Every bit width's kernel is
+launched over EVERY non-binary feature block, and each one returns
+immediately unless the block's widest feature falls in its range
+(`:180-184`):
+
+    upperBound = 1 << BITS
+    lowerBound = BITS > 5 ? upperBound / 2 : 15
+    if (maxBinCount <= lowerBound || maxBinCount > upperBound) return;
+
+so the four kernels partition the blocks between them at RUNTIME, on data the
+host does not consult. Note `lowerBound` is 15 and not 16 at 5 bits, so a
+feature with exactly 16 folds is handled by the 5-bit kernel; and note that a
+block is claimed by its WIDEST feature, so four features of 3, 5, 40 and 200
+folds all go to the 8-bit kernel together.
+
+DEVIATION (arch): their `TLoadEntriesTrait` and `TUnrollsTrait` are
+`__CUDA_ARCH__` ladders. This implementation takes the modern arm of each, the same
+choice `hist_2_one_byte_base.mojo` records for the other family:
+
+    5, 6, 7 bit     FourElements, outer unroll 1, both passes
+    8 bit           TwoElements on a full pass, OneElement on a partial one,
+                    which is theirs at every arch and not an arch choice
+
+Scheduling, not numeric: the same points are added in the same per-lane
+order, and `checks/pointwise_hist2_check.mojo` A5 holds all four widths
+identical across all four load widths.
+
+DEVIATION 93's consequence, and it is why this file has a `comptime if`
+CatBoost does not need: the 8-bit accumulator holds Int32 fixed point, so its
+scratch is `Int32` and its writeback divides by the scale. The other three
+hold float and write straight through. Everything else -- the slicing, the
+bounds, the loop choice, the guard -- is shared, which is the point of
+keeping them in one function rather than two.
+
+`WriteThrough` (`:141`) is `__stwt`, a store with a cache-eviction hint. It
+becomes a plain store here: Mojo exposes no non-temporal store, and the hint
+changes no value.
+"""
+
+from std.gpu import block_dim, block_idx, grid_dim, thread_idx
+from std.math import abs
+from std.memory import stack_allocation, bitcast
+from std.atomic import Atomic, Ordering
+from max.gpu.memory import AddressSpace
+from max.gpu.sync import barrier
+
+from checks.kernel_matrix import (
+    TARGET_COLUMN,
+    pointwise_one_byte_fixed_for,
+)
+from checks.numerics import GLOBAL_NUMERIC_MODE, NUMERIC_IDENTICAL
+
+from gbdt.methods.kernel.compute_point_hist2_loop import (
+    compute_histogram,
+    compute_histogram_2,
+    compute_histogram_4,
+)
+from gbdt.methods.kernel.split_properties_helpers import (
+    PW_PRIVATE_DOC_SLOTS,
+    PointwisePartOffsetsHelper,
+    pw_private_doc_slot,
+    shift_part_and_bin_sums_ptr,
+)
+from gbdt.methods.kernel.compute_point_hist2_loop import _hist_doc_key
+from gbdt.methods.greedy_subsets_searcher.kernel.histogram_utils import (
+    hist2_dither,
+    hist2_quantize,
+)
+from gbdt.trees_identical_switches import ORD_HIST_FOLD_SKIP
+from gbdt.methods.kernel.pointwise_hist2_one_byte_5bit import (
+    PW_HIST2_BLOCK,
+    PW_HIST2_FLOAT_BLOCK,
+    PW_HIST2_FLOAT_SMEM_FLOATS,
+    PW_HIST2_SMEM_FLOATS,
+    PointHist5,
+)
+from gbdt.methods.kernel.pointwise_hist2_one_byte_6bit import PointHist6
+from gbdt.methods.kernel.pointwise_hist2_one_byte_7bit import PointHist7
+from gbdt.methods.kernel.pointwise_hist2_one_byte_8bit import PointHist8
+
+
+#: `abs(val) > 1e-20f` (`:139`). Not an epsilon on a comparison -- it is a
+#: SKIP on a write, so a cell that rounds to nothing costs no global traffic.
+comptime PW_WRITE_EPS = Float32(1e-20)
+
+#: Features per block for the non-binary kernels (`:165`).
+comptime PW_NB_FEATURES_PER_BLOCK = 4
+
+
+@always_inline
+def pass_inner_bits[bits: Int]() -> Int:
+    """`TDeclarePassInnerOuterBitsTrait<BITS - 5>::Inner()`.
+
+        5 -> <0> 0    6 -> <1> 1    7 -> <2> 2    8 -> <3> 1
+    """
+    comptime if bits == 5:
+        return 0
+    elif bits == 6:
+        return 1
+    elif bits == 7:
+        return 2
+    else:
+        return 1
+
+
+@always_inline
+def pass_outer_bits[bits: Int]() -> Int:
+    """`TDeclarePassInnerOuterBitsTrait<BITS - 5>::Outer()`.
+
+        5 -> 0    6 -> 0    7 -> 0    8 -> 2
+
+    The 8-bit entry is the odd one and it is what makes that accumulator a
+    different design: a non-zero OUTER count quadruples the warp slice, so
+    fewer slices fit and warps have to share them. See
+    `pointwise_hist2_one_byte_8bit.mojo`.
+    """
+    comptime if bits == 8:
+        return 2
+    else:
+        return 0
+
+
+@always_inline
+def pw_max_fold_count[bits: Int]() -> Int:
+    """`1 << (5 + INNER_HIST_BITS_COUNT + OUTER_HIST_BITS_COUNT)` (`:124`).
+
+        5 -> 32    6 -> 64    7 -> 128    8 -> 256
+
+    which is also the number of folds each accumulator's `Reduce` lays out,
+    so the writeback below and the accumulators cannot disagree without one
+    of them changing this function.
+    """
+    return 1 << (5 + pass_inner_bits[bits]() + pass_outer_bits[bits]())
+
+
+@always_inline
+def get_max_bin_count[
+    origin: MutOrigin, //
+](
+    feature_folds: MutPointer[UInt32, MutAnyOrigin],
+    f_count: Int,
+    smem: MutPointer[UInt32, origin, address_space = AddressSpace.SHARED],
+) -> UInt32:
+    """`GetMaxBinCount` (`split_properties_helpers.cuh:25-45`), copied.
+
+    HELD BACK FROM `split_properties_helpers.mojo` UNTIL NOW, deliberately,
+    because it reduces over exactly FOUR shared slots while every thread in
+    the block writes one -- so it is only correct when the caller puts at
+    most four features in a block, and reading it without its call site
+    tells you nothing about that. `ComputeSplitPropertiesNBImpl` is the call
+    site: `fCount = min(fCount - (blockIdx.x / M) * 4, 4)`.
+
+    Their reduction is a two-step max over indices 0..3:
+
+        if (threadIdx.x < 2) smem[tid] = max(smem[tid], smem[tid + 2]);
+        if (threadIdx.x < 1) smem[tid] = max(smem[tid], smem[tid + 1]);
+
+    Every `__syncthreads()` is OUTSIDE the `if`, which is what keeps it
+    legal under a threadgroup barrier.
+
+    It borrows the histogram scratch, which is why it must run and finish
+    BEFORE the accumulator is constructed -- the constructor zeroes that
+    same memory.
+    """
+    var tid = Int(thread_idx.x)
+    var bin_count = UInt32(0)
+    if tid < f_count:
+        bin_count = feature_folds.unsafe_load(tid)
+    smem.unsafe_store(tid, bin_count)
+    barrier()
+
+    if tid < 2:
+        var a = smem.unsafe_load(tid)
+        var b = smem.unsafe_load(tid + 2)
+        smem.unsafe_store(tid, a if a > b else b)
+    barrier()
+    if tid < 1:
+        var a = smem.unsafe_load(tid)
+        var b = smem.unsafe_load(tid + 1)
+        smem.unsafe_store(tid, a if a > b else b)
+    barrier()
+    var result = smem.unsafe_load(0)
+    barrier()
+    return result
+
+
+@always_inline
+def pw_bounds[bits: Int]() -> Tuple[Int, Int]:
+    """`lowerBound` and `upperBound` (`:180-181`).
+
+        upperBound = 1 << BITS
+        lowerBound = BITS > 5 ? upperBound / 2 : 15
+
+    NOTE THE 15. At 5 bits the lower bound is 15 and not 16, so a feature
+    with exactly 16 folds belongs to the 5-bit kernel -- the one whose
+    accumulator holds 32 bins. Writing `upperBound / 2` uniformly would move
+    16-fold features to the 6-bit kernel and leave nothing to handle them at
+    5, because both tests are strict on one side.
+    """
+    comptime upper = 1 << bits
+    # the Apple/IDENTICAL routing row widens the 8-bit kernel to accept
+    # every one-byte width; see `pointwise_one_byte_fixed_for`
+    comptime if bits == 8 and pointwise_one_byte_fixed_for[
+        TARGET_COLUMN, GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL
+    ]():
+        return (15, upper)
+    comptime lower = (upper // 2) if bits > 5 else 15
+    return (lower, upper)
+
+
+def compute_split_properties_nb_kernel[
+    bits: Int, full_pass: Bool, m: Int
+](
+    # `TCFeature*`, flattened to parallel arrays.
+    # `Mask` and `Shift` are absent because this family never reads them:
+    # a one-byte feature IS a byte of the word `Offset` selects.
+    feature_offset: MutPointer[UInt32, MutAnyOrigin],
+    feature_first_fold_index: MutPointer[UInt32, MutAnyOrigin],
+    feature_folds: MutPointer[UInt32, MutAnyOrigin],
+    f_count_in: Int32,
+    cindex: MutPointer[UInt32, MutAnyOrigin],
+    target: MutPointer[Float32, MutAnyOrigin],
+    weight: MutPointer[Float32, MutAnyOrigin],
+    indices: MutPointer[UInt32, MutAnyOrigin],
+    # `TDataPartition*` as `{Offset, Size}` pairs of UInt32
+    partition: MutPointer[UInt32, MutAnyOrigin],
+    bin_sums: MutPointer[Float32, MutAnyOrigin],
+    total_feature_count_in: Int32,
+    fixed_scale_p: MutPointer[Float32, MutAnyOrigin],
+    int_slot: Int32,
+    z_skip: Int32 = 0,
+    dither_ids: Optional[MutPointer[UInt32, MutAnyOrigin]] = None,
+):
+    """`ComputeSplitPropertiesNBImpl` (`:153-187`) with
+    `ComputeSplitPropertiesPass` (`:64-147`) inlined into it.
+
+    THEIRS ARE TWO FUNCTIONS AND THIS IS ONE, which is a deviation of shape
+    and not of content: their `ComputeSplitPropertiesPass` exists so that
+    the `DECLARE_PASS` macro can pass `TDeclarePassInnerOuterBitsTrait`'s
+    two values as template arguments. Here `bits` already carries that, and
+    splitting would mean handing a shared-memory pointer and an accumulator
+    across a boundary for no gain.
+    """
+    comptime max_fold_count = pw_max_fold_count[bits]()
+    comptime bounds = pw_bounds[bits]()
+    comptime is_fixed = bits == 8
+
+    # A ORD_HIST_FOLD_SKIP (trees_identical_switches.mojo): the leading
+    # `z_skip` fold partitions are histogrammed by
+    # `ord_small_fold_hist8_kernel`; this grid's blocks for them leave at
+    # entry, before any barrier (the whole block returns together).
+    # `z_skip` is 0 on every other call.
+    comptime if ORD_HIST_FOLD_SKIP:
+        if Int(block_idx.z) < Int(z_skip):
+            return
+
+    # T5 drain (cpu3-gbdt-a): the fixed-point scale is a device word
+    # (the ordered fit forms it on the device); every thread loads it
+    var fixed_scale = fixed_scale_p.unsafe_load(0)
+    var tid = Int(thread_idx.x)
+    var total_feature_count = Int(total_feature_count_in)
+
+    # --- their `ShiftPartAndBinSumsPtr` (`:167`) ---------------------
+    var shifted = shift_part_and_bin_sums_ptr(
+        partition,
+        UInt32(grid_dim.z),
+        UInt32(block_idx.y),
+        UInt32(block_idx.z),
+        UInt32(grid_dim.y),
+        UInt32(total_feature_count),
+        full_pass,
+        2,
+    )
+    var part = Int(shifted.partition_offset)
+    var bin_sums_base = Int(shifted.bin_sums_offset)
+
+    # --- their feature slicing (`:169-171`) --------------------------
+    var f_base = (Int(block_idx.x) // m) * PW_NB_FEATURES_PER_BLOCK
+    var f_count = Int(f_count_in) - f_base
+    if f_count > PW_NB_FEATURES_PER_BLOCK:
+        f_count = PW_NB_FEATURES_PER_BLOCK
+    if f_count <= 0:
+        return
+    var cindex_base = Int(feature_offset.unsafe_load(f_base))
+
+    # ONE allocation, read through a `bitcast` at each use. The 8-bit
+    # accumulator holds Int32 and the other three hold Float32 (DEVIATION
+    # 93); both are 4 bytes, so within one bit width only the
+    # interpretation changes. THE SIZE AND BLOCK ARE PER BIT WIDTH: the
+    # 8-bit accumulator takes the route-keyed geometry
+    # (`pw_hist2_block_size_for`), the float turn-taking accumulators
+    # ALWAYS take their dispatch's -- their slice offsets do not wrap, so
+    # only the 8-bit accumulator may ever run at a block its own row
+    # widens. The two currently resolve to the same value (the doubled
+    # fixed-route block was measured a no-op and reverted; the negative
+    # is on the row), and this split is what makes any future divergence
+    # land here instead of in a kernel.
+    comptime nb_smem = PW_HIST2_SMEM_FLOATS if bits == 8 else (
+        PW_HIST2_FLOAT_SMEM_FLOATS
+    )
+    comptime nb_block = PW_HIST2_BLOCK if bits == 8 else (
+        PW_HIST2_FLOAT_BLOCK
+    )
+    var smem = stack_allocation[
+        nb_smem,
+        Float32,
+        address_space = AddressSpace.SHARED,
+    ]()
+
+    # --- their `GetMaxBinCount` on the histogram scratch (`:174`) -----
+    # BEFORE the accumulator is built: its constructor zeroes this memory.
+    var max_bin_count = get_max_bin_count(
+        feature_folds.unsafe_offset(f_base),
+        f_count,
+        smem.unsafe_bitcast[UInt32](),
+    )
+    barrier()
+
+    # --- their runtime partition of blocks between bit widths (`:183`) -
+    if (
+        Int(max_bin_count) <= bounds[0]
+        or Int(max_bin_count) > bounds[1]
+    ):
+        return
+
+    var part_size = Int(partition.unsafe_load(2 * part + 1))
+    var part_offset = Int(partition.unsafe_load(2 * part))
+    if part_size == 0:
+        return
+
+    var ci = cindex.unsafe_offset(cindex_base)
+
+    comptime if is_fixed:
+        var hist = PointHist8(smem.unsafe_bitcast[Int32](), fixed_scale)
+        comptime if full_pass:
+            # `TLoadEntriesTrait<3, true>`: TwoElements
+            compute_histogram_2[nb_block, 1, 1, m](
+                hist, indices, UInt32(part_offset), UInt32(part_size),
+                target, weight, ci,
+                dither_ids=dither_ids,
+            )
+        else:
+            # `TLoadEntriesTrait<3, false>`: OneElement, outer unroll 2
+            compute_histogram[nb_block, 2, 1, 1, m](
+                hist, indices, UInt32(part_offset), UInt32(part_size),
+                target, weight, ci,
+                dither_ids=dither_ids,
+            )
+    elif bits == 5:
+        var hist = PointHist5(smem.unsafe_bitcast[Float32]())
+        compute_histogram_4[nb_block, 1, 1, m](
+            hist, indices, UInt32(part_offset), UInt32(part_size),
+            target, weight, ci,
+            dither_ids=dither_ids,
+        )
+    elif bits == 6:
+        var hist = PointHist6(smem.unsafe_bitcast[Float32]())
+        compute_histogram_4[nb_block, 1, 1, m](
+            hist, indices, UInt32(part_offset), UInt32(part_size),
+            target, weight, ci,
+            dither_ids=dither_ids,
+        )
+    else:
+        var hist = PointHist7(smem.unsafe_bitcast[Float32]())
+        compute_histogram_4[nb_block, 1, 1, m](
+            hist, indices, UInt32(part_offset), UInt32(part_size),
+            target, weight, ci,
+            dither_ids=dither_ids,
+        )
+
+    barrier()
+
+    # --- their writeback (`:122-146`) --------------------------------
+    # `fid = threadIdx.x / 64` and `fold` strides by 32 from
+    # `(threadIdx.x / 2) & 31`, so the 256 participating threads cover
+    # 4 features x 32 folds at a time and loop for wider ones.
+    var fid = tid // 64
+    var w = tid & 1
+    var feature_folds_here = 0
+    if fid < f_count:
+        feature_folds_here = Int(
+            feature_folds.unsafe_load(f_base + fid)
+        )
+    var feature_offset_in_smem = fid * max_fold_count * 2 + w
+
+    var fold = (tid // 2) & 31
+    while fold < feature_folds_here:
+        comptime if is_fixed and m > 1:
+            # lane/neural-pass123: the block's raw fixed-point counts into
+            # its private slot, every cell; `pw_fold_int_slots_kernel` adds
+            # the slots as integers (exact in any order) and converts and
+            # guards once, as the one-block writeback below does
+            if int_slot != 0:
+                if fid < f_count:
+                    var raw = smem.unsafe_bitcast[Int32]().unsafe_load(
+                        feature_offset_in_smem + 2 * fold
+                    )
+                    var at_i = (
+                        bin_sums_base
+                        + (
+                            Int(feature_first_fold_index.unsafe_load(f_base + fid))
+                            + fold
+                        )
+                        * 2
+                        + w
+                    )
+                    bin_sums.unsafe_store(
+                        pw_private_doc_slot[full_pass](
+                            at_i, Int(block_idx.x) % m, total_feature_count
+                        ),
+                        bitcast[DType.float32](raw),
+                    )
+                fold += 32
+                continue
+        if fid < f_count:
+            var val: Float32
+            comptime if is_fixed:
+                # DEVIATION 93: this accumulator's cells are fixed point,
+                # so the scale comes out HERE and not inside `Reduce` --
+                # dividing before the sibling subtraction would round twice
+                # and break `parent == child + sibling`.
+                val = Float32(
+                    Int(
+                        smem.unsafe_bitcast[Int32]().unsafe_load(
+                            feature_offset_in_smem + 2 * fold
+                        )
+                    )
+                ) / fixed_scale
+            else:
+                val = smem.unsafe_bitcast[Float32]().unsafe_load(
+                    feature_offset_in_smem + 2 * fold
+                )
+
+            if abs(val) > PW_WRITE_EPS:
+                var at = (
+                    bin_sums_base
+                    + (
+                        Int(
+                            feature_first_fold_index.unsafe_load(
+                                f_base + fid
+                            )
+                        )
+                        + fold
+                    )
+                    * 2
+                    + w
+                )
+                comptime if m > 1 and PW_PRIVATE_DOC_SLOTS:
+                    # DEVIATION 2670 (opt-in): this document block's OWN
+                    # slot, a plain store; the launcher folds the M slots
+                    # into `binSums` in block order
+                    bin_sums.unsafe_store(
+                        pw_private_doc_slot[full_pass](
+                            at, Int(block_idx.x) % m, total_feature_count
+                        ),
+                        val,
+                    )
+                elif m > 1:
+                    # several document blocks per feature, so the writes
+                    # collide; theirs is a global float atomicAdd
+                    # DEVIATION 1898: the reference's atomicAdd is relaxed; the non-
+                    # Apple Mojo default is seq_cst.
+                    _ = Atomic.fetch_add[ordering = Ordering.RELAXED](
+                        bin_sums.unsafe_offset(at), val
+                    )
+                else:
+                    # `WriteThrough`, a store with an eviction hint that
+                    # Mojo does not expose. A plain store moves the same
+                    # value.
+                    bin_sums.unsafe_store(at, val)
+        fold += 32
+
+
+# ================= lane fg-gbdt-ordered, A ORD_HIST_FOLD_SKIP =================
+# NOT COMPILED — NOT TESTED — IDENTITY NOT VERIFIED — NOT MEASURED.
+# The small fold partitions of the Ordered fold layout, histogrammed without a
+# shared-memory accumulator. Each cell the 8-bit one-block path writes is
+#
+#     val = Float32(Int(sum_d q(d))) / scale,  stored when abs(val) > 1e-20
+#
+# where the sum runs over the documents of the cell's (part, fold partition)
+# whose feature byte equals the cell's bin, `q` is `hist2_quantize(stat,
+# scale, hist2_dither(key))` with the key `_hist_doc_key(index, dither_ids)`,
+# and the Int32 sum wraps (PointHist8 folds its shared counters as Int32).
+# Integer addition is exact in any order, so the cell does not depend on who
+# adds: here every document adds its two values per feature with a global
+# Int32 atomic straight into the cell, read as Int32 (the cell is +0.0 = Int32
+# 0 before this level writes it: the calcer zeroes the histogram per tree and
+# a pass writes only slots no earlier level wrote, which the one-block guarded
+# store relies on too), and `ord_small_fold_convert_kernel` then rewrites each
+# such cell with the statement above (an all-zero cell becomes +0.0, the
+# value the guarded store leaves). The layout statements restate
+# `compute_split_properties_nb_kernel` + PointHist8: four features per block
+# from one compressed word (`feature_offset[f_base]`), feature j's byte at
+# shift 24 - 8 j, weight in the cell's even slot and target in the odd slot,
+# only bins below the feature's fold count written, the block claimed by the
+# 8-bit width only when its widest feature is inside `pw_bounds[8]`, and the
+# partial pass's smaller child filed under the right child's slot
+# (`shift_part_and_bin_sums_ptr` with the regular grid's `grid_y`).
+
+#: threads per small-fold block
+comptime ORD_SMALL_FOLD_BLOCK = 256
+#: blocks per (feature block, fold partition) along the part axis; block g
+#: takes parts g, g + groups, ... (a fixed schedule; the cells are order-free)
+comptime ORD_SMALL_FOLD_PART_GROUPS = 8
+
+
+def ord_small_fold_hist8_kernel[
+    full_pass: Bool
+](
+    feature_offset: MutPointer[UInt32, MutAnyOrigin],
+    feature_first_fold_index: MutPointer[UInt32, MutAnyOrigin],
+    feature_folds: MutPointer[UInt32, MutAnyOrigin],
+    f_count_in: Int32,
+    cindex: MutPointer[UInt32, MutAnyOrigin],
+    target: MutPointer[Float32, MutAnyOrigin],
+    weight: MutPointer[Float32, MutAnyOrigin],
+    indices: MutPointer[UInt32, MutAnyOrigin],
+    partition: MutPointer[UInt32, MutAnyOrigin],
+    bin_sums: MutPointer[Float32, MutAnyOrigin],
+    total_feature_count_in: Int32,
+    fold_count_in: Int32,
+    grid_y_in: Int32,
+    fixed_scale_p: MutPointer[Float32, MutAnyOrigin],
+    dither_ids: Optional[MutPointer[UInt32, MutAnyOrigin]] = None,
+):
+    """Grid (feature blocks, small fold partitions, part groups): block
+    (x, z, g) adds the documents of fold partition z's parts g, g + G, ...
+    for features 4x .. 4x + 3 into their cells as raw Int32 counts."""
+    var fixed_scale = fixed_scale_p.unsafe_load(0)
+    var f_base = Int(block_idx.x) * PW_NB_FEATURES_PER_BLOCK
+    var f_count = Int(f_count_in) - f_base
+    if f_count > PW_NB_FEATURES_PER_BLOCK:
+        f_count = PW_NB_FEATURES_PER_BLOCK
+    if f_count <= 0:
+        return
+    # the regular kernel's width claim (`get_max_bin_count` + `pw_bounds`)
+    comptime bounds = pw_bounds[8]()
+    var max_bin_count = 0
+    for j in range(f_count):
+        var c = Int(feature_folds.unsafe_load(f_base + j))
+        if c > max_bin_count:
+            max_bin_count = c
+    if max_bin_count <= bounds[0] or max_bin_count > bounds[1]:
+        return
+    var ci = cindex.unsafe_offset(Int(feature_offset.unsafe_load(f_base)))
+    var cells = bin_sums.unsafe_bitcast[Int32]()
+    var z = UInt32(block_idx.y)
+    var fold_count = UInt32(fold_count_in)
+    var grid_y = Int(grid_y_in)
+    var total_feature_count = UInt32(total_feature_count_in)
+    var y = Int(block_idx.z)
+    while y < grid_y:
+        var shifted = shift_part_and_bin_sums_ptr(
+            partition, fold_count, UInt32(y), z, UInt32(grid_y),
+            total_feature_count, full_pass, 2,
+        )
+        var part = Int(shifted.partition_offset)
+        var base = Int(shifted.bin_sums_offset)
+        var part_offset = Int(partition.unsafe_load(2 * part))
+        var part_size = Int(partition.unsafe_load(2 * part + 1))
+        var i = Int(thread_idx.x)
+        while i < part_size:
+            var index = indices.unsafe_load(part_offset + i)
+            var word = ci.unsafe_load(Int(index))
+            var w = weight.unsafe_load(part_offset + i)
+            var t = target.unsafe_load(part_offset + i)
+            var u = hist2_dither(Int(_hist_doc_key(index, dither_ids)))
+            var qw = hist2_quantize(w, fixed_scale, u)
+            var qt = hist2_quantize(t, fixed_scale, u)
+            for j in range(f_count):
+                var b = Int((word >> UInt32(24 - 8 * j)) & 255)
+                if b < Int(feature_folds.unsafe_load(f_base + j)):
+                    var at = base + (
+                        Int(feature_first_fold_index.unsafe_load(f_base + j)) + b
+                    ) * 2
+                    _ = Atomic.fetch_add[ordering = Ordering.RELAXED](
+                        cells.unsafe_offset(at), qw
+                    )
+                    _ = Atomic.fetch_add[ordering = Ordering.RELAXED](
+                        cells.unsafe_offset(at + 1), qt
+                    )
+            i += Int(block_dim.x)
+        y += Int(grid_dim.z)
+
+
+def ord_small_fold_convert_kernel[
+    full_pass: Bool
+](
+    bin_sums: MutPointer[Float32, MutAnyOrigin],
+    total_feature_count_in: Int32,
+    fold_count_in: Int32,
+    grid_y_in: Int32,
+    fixed_scale_p: MutPointer[Float32, MutAnyOrigin],
+):
+    """Grid (line chunks, small fold partitions, parts): every cell of
+    fold partition z's slot for part y (the right child's on a partial
+    pass), raw Int32 -> `Float32(Int(raw)) / scale` under the 1e-20 guard,
+    +0.0 otherwise -- the one-block writeback's value."""
+    var fixed_scale = fixed_scale_p.unsafe_load(0)
+    var line = 2 * Int(total_feature_count_in)
+    var c = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if c >= line:
+        return
+    var helper = PointwisePartOffsetsHelper(UInt32(fold_count_in))
+    var y = UInt32(block_idx.z)
+    comptime if not full_pass:
+        y = UInt32(grid_y_in) | y
+    var at = Int(helper.histogram_offset(y, UInt32(block_idx.y))) * line + c
+    var raw = bitcast[DType.int32](bin_sums.unsafe_load(at))
+    var val = Float32(Int(raw)) / fixed_scale
+    if abs(val) > PW_WRITE_EPS:
+        bin_sums.unsafe_store(at, val)
+    else:
+        bin_sums.unsafe_store(at, Float32(0.0))

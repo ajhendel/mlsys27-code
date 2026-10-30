@@ -1,0 +1,2567 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 the authors. Part of anonlib, DOI-WITHHELD
+"""The M-step: the weighted moments, and the precision Cholesky that can fail.
+
+NO REFERENCE FILE. See `mixture/checks/estep.mojo`'s header for the reference
+finding: cuML, cuVS and RAFT have no Gaussian mixture model at their pins, so
+`CONTRIBUTING.md` (Algorithms and references) points at nothing here and
+`sklearn/mixture/_gaussian_mixture.py` is the SEMANTICS ORACLE only.
+
+WHAT SCIKIT-LEARN DOES, AND IN WHAT ORDER
+------------------------------------------
+`_estimate_gaussian_parameters` (`:282-320`) followed by
+`_compute_precision_cholesky` (`:323-385`), which `_m_step` (`:883-901`) and
+`_initialize` (`:849-881`) both call:
+
+    nk    = sum(resp, axis=0) + 10 * finfo(dtype).eps        # `:316`
+    means = (resp.T @ X) / nk[:, newaxis]                     # `:317`
+    diff  = X - means[k]                                      # `:194`
+    cov_k = ((resp[:, k] * diff.T) @ diff) / nk[k]            # `:195`
+    cov_k[j][j] += reg_covar                                  # `:196`
+    weights /= n_samples        (initialize)                  # `:864`
+    weights /= sum(weights)     (m_step)                      # `:898`
+    L_k   = cholesky(cov_k, lower=True)   -> ValueError on failure
+    P_k   = solve_triangular(L_k, I, lower=True).T            # `:368-370`
+
+Every one of those lines is reproduced below in that order. Every place this
+file departs from it carries a DEVIATION number, and the reason is never "we
+think this is better".
+
+THE FOUR PINS IN THIS FILE
+----------------------------
+**(a) `nk`'s fold** (`nk_kernel`). One thread per component, sample axis
+ASCENDING, `ftz` at every seam. `nk` divides both the mean and the
+covariance, so its last bit is in every parameter. DEVIATION 1731.
+
+**(b) The weighted covariance accumulation.** `sum_i resp[i][k] * diff[i]
+outer diff[i]` is a matrix product and its k-axis is the SAMPLE axis, which
+makes it the largest summation order in the lane -- `n` terms per cell,
+against `d` in the Mahalanobis fold and `K` in the logsumexp. It goes through
+`identical_gemm_into` at `OP_TN`, profile `anonlib.identical.gemm.fp32.v1`,
+and `linalg.matmul` is REFUSED. The fold shape is therefore the gemm lane's,
+already gated at 62 shapes across eight execution plans with six sabotages,
+and this lane inherits that certificate rather than re-earning it.
+DEVIATION 1729.
+
+**(c) `reg_covar` is added AFTER the division, on the diagonal only.**
+scikit-learn's `:195` then `:196`. Adding it before, or adding it to every
+cell, or scaling it by anything, is a different matrix. DEVIATION 1736.
+
+**(d) The precision Cholesky routes through the `cholesky/` lane, entirely.**
+`potrf_lower` for the factorization, `trsm_lower` for the inverse,
+`chol_logdet` for the log determinant. Nothing is re-implemented here. See
+`mixture/README.md`'s WHAT THIS LANE REUSES RATHER THAN REWRITES.
+
+============ DEVIATION 1723 (2026-08-25): A COLLAPSED COMPONENT RAISES BY
+============ NAME, AND THE DECISION TO FAIL IS ITSELF PINNED ==============
+REFERENCE (`_compute_precision_cholesky:363-367`): `np.linalg.LinAlgError` from
+`scipy.linalg.cholesky` is caught and re-raised as a `ValueError` reading
+"Fitting the mixture model failed because some components have ill-defined
+empirical covariance (for instance caused by singleton or collapsed samples).
+Try to decrease the number of components, increase reg_covar, or scale the
+input data."
+
+HERE: the same refusal, by name, carrying the ITERATION, the COMPONENT and
+LAPACK's `info`. The component is NOT silently reset, NOT re-seeded, and NOT
+given a fallback covariance. `GMM_SAB_COLLAPSE_RESET` is the arm that does
+reset it, and it exists so the gate can be shown to see the difference.
+
+WHY: **a fit that succeeds on one vendor and fails on another is the worst
+outcome this lane can produce.** The failure is decided by a float
+comparison against a pivot -- `cholesky/checks/potrf.mojo`'s DEVIATION
+1634 -- and that comparison is pinned in both halves there: the value is
+`ftz`-flushed and folded ascending through `identical_mul_add`, and the test
+is `not (s > 0.0)`, so NaN fails, both zeros fail, and a flushed subnormal
+fails on every column. This lane inherits that pin rather than restating it,
+which is the whole reason `potrf_lower` was written before this file existed.
+A silent reset would take a DECISION that is currently identical on three
+vendors and turn it into a VALUE that is not.
+==========================================================================
+
+============ DEVIATION 1726 (2026-08-25): log_det_chol COMES FROM
+============ chol_logdet, NOT FROM THE PRECISION DIAGONAL =================
+REFERENCE (`_compute_log_det_cholesky:470-476`): `sum_j log(P[k][j][j])` over
+the precision Cholesky's own diagonal, which for `covariance_type="full"`
+they extract with a stride-`(d + 1)` slice of the flattened matrix.
+HERE: `-0.5 * chol_logdet(L_k)`, where `chol_logdet` is the Cholesky lane's
+pinned single-thread ascending fold through `identical_log`.
+WHY: the two are the same quantity -- `P[j][j] = 1 / L[j][j]`, so
+`sum log(1/L_jj) = -sum log(L_jj) = -0.5 * (2 sum log L_jj)` -- and they are
+NOT the same float32, because `log(1/x)` and `-log(x)` round differently.
+Given two spellings of one number, the rule in this repository is to use the
+one that already has an owner: `chol_logdet`'s own docstring says it exists
+so that "a GP, a KRR and a GMM cannot each invent one", and this is the GMM.
+Taking the diagonal spelling instead would put a second `log` fold in the
+tree (IDENTITY_PATHS rows 12 and 21) for a quantity that already has a pinned
+one. `GMM_SAB_LOGDET_FROM_DIAG` drives their spelling so the check can show
+that the choice moves bits and is therefore a decision rather than a
+preference.
+==========================================================================
+"""
+
+from experiments.classical_identical_ideas.stats_controls import C53_CENTER4
+from std.gpu import WARP_SIZE, block_dim, block_idx, thread_idx
+from std.gpu.primitives.warp import shuffle_xor
+from std.memory import stack_allocation
+from max.gpu.memory import AddressSpace
+from max.gpu.sync import barrier
+from max.gpu.host import DeviceBuffer, DeviceContext
+
+from cholesky.checks.potrf import (
+    CHOL_ELEM_TPB,
+    CHOL_NB_PINNED,
+    CHOL_PANEL_TPB,
+    add_jitter,
+    chol_logdet,
+    chol_workspace_floats,
+    potrf_lower,
+)
+from cholesky.checks.trsm import CHOL_SOLVE_TPB, trsm_lower
+from core.identity_trace import IdentityTrace
+from core.gram_splitk import gemm_tn_splitk_into, gram_splitk_applies
+from std.math import log, sqrt
+from std.sys.compile import is_defined
+from std.os import getenv
+from std.time import perf_counter_ns
+from std.sys.info import has_apple_gpu_accelerator, is_apple_gpu
+from std.sys import llvm_intrinsic
+from checks.numerics import pinned_mul_f32
+from mixture.ff_fast import GF, gf_add, gf_add_f, gf_div, gf_f32, gf_mul, gf_of, gf_rn_add, gf_sqrt, gf_sub, gf_two_prod, gf_two_sum
+from gemm.checks.gemm_identical import (
+    identical_gemm_into,
+    identical_gemm_workspace_max_floats,
+)
+from gemm.contract import OP_TN
+from mixture.chol_order import (
+    GMM_IDN_CHOL_TPB,
+    IDN_GMM_FUSED_CHOL,
+    gmm_idn_chol_applies,
+)
+from mixture.nk_order import (
+    GMM_NK_CHUNK,
+    IDN_GMM_NK_LEVELS,
+    gmm_nk_levels_floats,
+)
+from mixture.checks.estep import (
+    GMM_COMP_TPB,
+    GMM_ELEM_TPB,
+    gmm_comp_tag,
+    gmm_ten_eps,
+    set_identity_kernel,
+    transpose_square_kernel,
+)
+from mixture.checks.gmm_sabotage import (
+    GMM_SAB_COLLAPSE_RESET,
+    GMM_SAB_COV_PRESCALE,
+    GMM_SAB_LOGDET_FROM_DIAG,
+    GMM_SAB_NK_DESCENDING,
+    GMM_SAB_NONE,
+    GMM_SAB_NO_FTZ_RESP,
+    sabotage_center_scale_kernel,
+    sabotage_logdet_from_diag_kernel,
+    sabotage_nk_kernel,
+    sabotage_resp_exp_kernel,
+)
+from checks.numerics import (
+    GLOBAL_NUMERIC_MODE,
+    NUMERIC_FAST,
+    NUMERIC_IDENTICAL,
+    ftz,
+    identical_div,
+    identical_exp,
+    identical_log,
+    identical_mul,
+    identical_mul_add,
+    identical_sqrt,
+)
+
+
+#: **NUMERIC. DEVIATION 1737.** The ridge handed to the Cholesky lane, which
+#: is `+0.0`, because `reg_covar` IS this lane's ridge and it has already
+#: been added to the covariance's diagonal by `cov_finish_kernel` exactly
+#: where scikit-learn adds it.
+#:
+#: Adding `cholesky/`'s own `CHOL_JITTER_PINNED` on top would be a SECOND
+#: ridge that the caller never asked for and that no scikit-learn parameter
+#: names, so `reg_covar = 0` would stop meaning what scikit-learn's
+#: `reg_covar = 0` means -- which `mixture/README.md`'s semantics table
+#: forbids. `add_jitter` is still CALLED with this value rather than skipped,
+#: because it also flushes the diagonal through `ftz`, and a diagonal that
+#: one column's hardware would keep as a subnormal and another's would flush
+#: is the divergent-outcome failure one step before the pivot test.
+comptime GMM_CHOL_JITTER = Float32(0.0)
+
+
+@fieldwise_init
+struct GmmMStepRun(Copyable, Movable):
+    """What one M-step actually did, READ BACK FROM THE RUN.
+
+    `info` and `failed_component` are not diagnostics. They are the
+    DATA-DEPENDENT decision DEVIATION 1723 is about, and
+    `check_collapse_is_identical` compares them between two runs and against
+    the oracle before it compares any parameter.
+    """
+
+    var info: Int
+    """LAPACK's `info` from the FIRST component whose Cholesky failed, or 0.
+    `k > 0` means the leading minor of order `k` of that component's
+    covariance was not positive definite."""
+
+    var failed_component: Int
+    """Which component that was, or `-1`. Components are attempted in
+    ASCENDING order and the first failure stops the step, so this is a
+    function of the data and of nothing else -- not of a launch, not of a
+    schedule, not of which component happened to be scanned first."""
+
+
+# ===========================================================================
+# THE KERNELS
+# ===========================================================================
+
+
+def resp_exp_kernel(
+    logresp: MutPointer[Float32, MutAnyOrigin],
+    resp: MutPointer[Float32, MutAnyOrigin],
+    n_in: Int32,
+    ncomp_in: Int32,
+):
+    """`resp = exp(log_resp)`, one thread per cell. `_m_step:896`'s
+    `xp.exp(log_resp)`.
+
+    **DEVIATION 1742: this is RECOMPUTED on the device from `log_resp` and
+    recorded as a card stage, rather than being kept from the E-step.** The
+    E-step never forms it -- `_estimate_log_prob_resp` returns logs -- so
+    there is nothing to keep, and materializing it here means the M-step's
+    actual input is a hashed stage. A card whose first divergent stage is
+    `resp` and whose `logresp` matched localizes the difference to this one
+    `exp`, which is IDENTITY_PATHS row 12's site and is exactly the kind of
+    one-ulp vendor difference the instrument exists to find.
+
+    `ftz` on the result matters more here than almost anywhere else in the
+    lane: **a responsibility is an exponential of a large negative number, so
+    this is where subnormals are manufactured.** A component a point does not
+    belong to gets a `log_resp` of a few hundred negative, and `exp` of that
+    lands in the subnormal range before it reaches zero. On a
+    denormal-honoring column those values survive into `nk` and into the
+    covariance; on a flushing one they are zero. `GMM_SAB_NO_FTZ_RESP` is the
+    arm, and it is expected INERT on Apple and to move bits on NVIDIA and
+    AMD, which is recorded rather than claimed.
+    """
+    var n = Int(n_in)
+    var ncomp = Int(ncomp_in)
+    var idx = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if idx >= n * ncomp:
+        return
+    resp.unsafe_store(idx, ftz(identical_exp(ftz(logresp.unsafe_load(idx)))))
+
+
+#: Operands of this many `nk_kernel` steps are loaded before the steps run
+#: (execution only). `-D ANONLIB_GMM_NK_AHEAD_OFF` = 1.
+comptime GMM_NK_AHEAD = 1 if is_defined["ANONLIB_GMM_NK_AHEAD_OFF"]() else 32
+#: lane cluster-apple2 (2026-09-28), IDENTICAL on Apple: nk's chains read
+#: a transposed copy of `resp` (K x n, `resp_transpose_kernel`), so each
+#: component's thread takes its operands in contiguous vector loads; the
+#: adds and their order are `nk_kernel`'s. `-D ANONLIB_GMM_NK_T_OFF=1`
+#: reverts.
+comptime GMM_NK_T = (
+    GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL
+    and has_apple_gpu_accelerator()
+    and not is_defined["ANONLIB_GMM_NK_T_OFF"]()
+)
+
+
+def resp_transpose_kernel(
+    resp: MutPointer[Float32, MutAnyOrigin],
+    resp_t: MutPointer[Float32, MutAnyOrigin],
+    n_in: Int32,
+    ncomp_in: Int32,
+):
+    """`resp_t[k][i] = resp[i][k]` (a copy)."""
+    var n = Int(n_in)
+    var ncomp = Int(ncomp_in)
+    var idx = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if idx >= n * ncomp:
+        return
+    var k = idx // n
+    var i = idx % n
+    resp_t.unsafe_store(idx, resp.unsafe_load(i * ncomp + k))
+
+
+def nk_t_kernel(
+    resp_t: MutPointer[Float32, MutAnyOrigin],
+    nk: MutPointer[Float32, MutAnyOrigin],
+    n_in: Int32,
+    ncomp_in: Int32,
+    ten_eps: Float32,
+):
+    """`nk_kernel` over the transposed copy: the same adds in the same order
+    (samples ascending, one thread per component, `ftz` at every seam)."""
+    var n = Int(n_in)
+    var ncomp = Int(ncomp_in)
+    var k = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if k >= ncomp:
+        return
+    var row = resp_t.unsafe_offset(k * n)
+    var acc = Float32(0.0)
+    comptime U = 32
+    var i = 0
+    while i + U <= n:
+        var v = SIMD[DType.float32, U](0.0)
+        comptime for u in range(U):
+            v[u] = row.unsafe_load(i + u)
+        comptime for u in range(U):
+            acc = ftz(acc + ftz(v[u]))
+        i += U
+    while i < n:
+        acc = ftz(acc + ftz(row.unsafe_load(i)))
+        i += 1
+    nk.unsafe_store(k, ftz(acc + ten_eps))
+
+
+# fam-cluster (2026-10-04): nk in chunked levels (`mixture/nk_order.mojo`),
+# one thread a chunk of GMM_NK_CHUNK rows a component per level, then one
+# thread a component folds the last <= GMM_NK_CHUNK partials and adds 10 eps.
+# The host columns fold the same levels.
+def nk_level1_kernel(
+    resp: MutPointer[Float32, MutAnyOrigin],
+    dst: MutPointer[Float32, MutAnyOrigin],
+    dst_off: Int32,
+    n_in: Int32,
+    ncomp_in: Int32,
+):
+    """Level one: thread `(chunk b, component k)` folds rows `[b * CHUNK,
+    ...)` of column k of the row-major `resp` into `dst[dst_off + k * p +
+    b]`, `p` the chunk count. Neighbouring threads read neighbouring
+    components of the same rows."""
+    var n = Int(n_in)
+    var ncomp = Int(ncomp_in)
+    var gid = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    var b = gid // ncomp
+    var k = gid - b * ncomp
+    var lo = b * GMM_NK_CHUNK
+    if lo >= n:
+        return
+    var hi = min(lo + GMM_NK_CHUNK, n)
+    var p = (n + GMM_NK_CHUNK - 1) // GMM_NK_CHUNK
+    var acc = Float32(0.0)
+    for i in range(lo, hi):
+        acc = ftz(acc + ftz(resp.unsafe_load(i * ncomp + k)))
+    dst.unsafe_store(Int(dst_off) + k * p + b, acc)
+
+
+def nk_level_kernel(
+    buf: MutPointer[Float32, MutAnyOrigin],
+    src_off: Int32,
+    dst_off: Int32,
+    cnt_in: Int32,
+    ncomp_in: Int32,
+):
+    """A later level, inside the scratch: thread `(component k, chunk b)`
+    folds `buf[src_off + k * cnt + ...]` into `buf[dst_off + k * p + b]`."""
+    var cnt = Int(cnt_in)
+    var ncomp = Int(ncomp_in)
+    var p = (cnt + GMM_NK_CHUNK - 1) // GMM_NK_CHUNK
+    var gid = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    var k = gid // p
+    var b = gid - k * p
+    if k >= ncomp:
+        return
+    var lo = b * GMM_NK_CHUNK
+    var hi = min(lo + GMM_NK_CHUNK, cnt)
+    var base = Int(src_off) + k * cnt
+    var acc = Float32(0.0)
+    for i in range(lo, hi):
+        acc = ftz(acc + ftz(buf.unsafe_load(base + i)))
+    buf.unsafe_store(Int(dst_off) + k * p + b, acc)
+
+
+def nk_finish_kernel(
+    src: MutPointer[Float32, MutAnyOrigin],
+    src_off: Int32,
+    cnt_in: Int32,
+    row_major: Int32,
+    nk: MutPointer[Float32, MutAnyOrigin],
+    ncomp_in: Int32,
+    ten_eps: Float32,
+):
+    """The last level (cnt <= GMM_NK_CHUNK values a component) and the
+    `+ 10 eps`. `row_major != 0` reads `resp` itself (`src[i * ncomp + k]`,
+    n within one chunk); otherwise the scratch's `src[src_off + k * cnt +
+    i]`."""
+    var cnt = Int(cnt_in)
+    var ncomp = Int(ncomp_in)
+    var k = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if k >= ncomp:
+        return
+    var acc = Float32(0.0)
+    if Int(row_major) != 0:
+        for i in range(cnt):
+            acc = ftz(acc + ftz(src.unsafe_load(i * ncomp + k)))
+    else:
+        var base = Int(src_off) + k * cnt
+        for i in range(cnt):
+            acc = ftz(acc + ftz(src.unsafe_load(base + i)))
+    nk.unsafe_store(k, ftz(acc + ten_eps))
+
+
+def gmm_nk_levels_launch(
+    ctx: DeviceContext,
+    mut resp: DeviceBuffer[DType.float32],
+    mut nk: DeviceBuffer[DType.float32],
+    mut scratch: DeviceBuffer[DType.float32],
+    n: Int,
+    ncomp: Int,
+) raises:
+    """`nk` in the chunked levels. `scratch` holds at least
+    `gmm_nk_levels_floats(n, ncomp)` floats that nothing in the stream still
+    reads. Asynchronous: `scratch` must outlive the caller's next drain."""
+    if len(scratch) < gmm_nk_levels_floats(n, ncomp):
+        raise Error("gmm_nk_levels_launch: scratch below gmm_nk_levels_floats")
+    var grid_k = (ncomp + 255) // 256
+    if n <= GMM_NK_CHUNK:
+        ctx.enqueue_function[nk_finish_kernel](
+            resp.unsafe_ptr(), Int32(0), Int32(n), Int32(1), nk.unsafe_ptr(),
+            Int32(ncomp), gmm_ten_eps(),
+            grid_dim=(grid_k, 1, 1), block_dim=(256, 1, 1),
+        )
+        return
+    var p1 = (n + GMM_NK_CHUNK - 1) // GMM_NK_CHUNK
+    ctx.enqueue_function[nk_level1_kernel](
+        resp.unsafe_ptr(), scratch.unsafe_ptr(), Int32(0), Int32(n),
+        Int32(ncomp),
+        grid_dim=((p1 * ncomp + 255) // 256, 1, 1), block_dim=(256, 1, 1),
+    )
+    var src_off = 0
+    var off = p1 * ncomp
+    var cnt = p1
+    while cnt > GMM_NK_CHUNK:
+        var p = (cnt + GMM_NK_CHUNK - 1) // GMM_NK_CHUNK
+        ctx.enqueue_function[nk_level_kernel](
+            scratch.unsafe_ptr(), Int32(src_off), Int32(off), Int32(cnt),
+            Int32(ncomp),
+            grid_dim=((p * ncomp + 255) // 256, 1, 1), block_dim=(256, 1, 1),
+        )
+        src_off = off
+        off += p * ncomp
+        cnt = p
+    ctx.enqueue_function[nk_finish_kernel](
+        scratch.unsafe_ptr(), Int32(src_off), Int32(cnt), Int32(0),
+        nk.unsafe_ptr(), Int32(ncomp), gmm_ten_eps(),
+        grid_dim=(grid_k, 1, 1), block_dim=(256, 1, 1),
+    )
+
+
+def nk_kernel(
+    resp: MutPointer[Float32, MutAnyOrigin],
+    nk: MutPointer[Float32, MutAnyOrigin],
+    n_in: Int32,
+    ncomp_in: Int32,
+    ten_eps: Float32,
+):
+    """`nk[k] = sum_i resp[i][k] + 10 eps`, ONE THREAD PER COMPONENT.
+
+    `_estimate_gaussian_parameters:316`. **DEVIATION 1731: the sample axis
+    walks ASCENDING and the whole sum lives in one thread's register.** No
+    block fold, no warp primitive, no atomic, so the order is a pure function
+    of `n` and of nothing about the launch.
+
+    `10 * finfo(float32).eps` is added AFTER the sum, not seeded before it,
+    which is scikit-learn's order and is not the same number: seeding would
+    put the constant through every one of the `n` roundings. It is a NUMBER
+    IN THE ANSWER rather than a guard -- it divides the mean and the
+    covariance of every component, including components with real mass -- so
+    it is pinned by bits as `GMM_TEN_EPS_BITS` (DEVIATION 1730).
+
+    ONE THREAD PER COMPONENT rather than one per sample plus a reduction, for
+    the same reason `meanll_kernel` is one thread: `K` is small, the work is
+    `n` adds, and a fold shape is a summation order that would then have to
+    be pinned, checked and sabotaged. A lane that needs zero fold shapes
+    should have zero.
+    """
+    var n = Int(n_in)
+    var ncomp = Int(ncomp_in)
+    var k = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if k >= ncomp:
+        return
+    var acc = Float32(0.0)
+    comptime if GMM_NK_AHEAD > 1:
+        # The same adds in the same order; the next GMM_NK_AHEAD operands
+        # are loaded first so the chain waits on the add, not on each load.
+        comptime U = GMM_NK_AHEAD
+        var i = 0
+        while i + U <= n:
+            var v = SIMD[DType.float32, U](0.0)
+            comptime for u in range(U):
+                v[u] = resp.unsafe_load((i + u) * ncomp + k)
+            comptime for u in range(U):
+                acc = ftz(acc + ftz(v[u]))
+            i += U
+        while i < n:
+            acc = ftz(acc + ftz(resp.unsafe_load(i * ncomp + k)))
+            i += 1
+    else:
+        for i in range(n):
+            acc = ftz(acc + ftz(resp.unsafe_load(i * ncomp + k)))
+    nk.unsafe_store(k, ftz(acc + ten_eps))
+
+
+def nk_total_kernel(
+    nk: MutPointer[Float32, MutAnyOrigin],
+    out_scalar: MutPointer[Float32, MutAnyOrigin],
+    ncomp_in: Int32,
+):
+    """`sum_k nk[k]`, in ONE THREAD, ascending. `_m_step:898`'s
+    `xp.sum(self.weights_)`.
+
+    **This is NOT `n_samples`, and the difference is deliberate.**
+    `sum_k nk[k]` is `n + K * 10 * eps` in exact arithmetic and something
+    within a rounding of it in float32, and scikit-learn's `_m_step` divides
+    by THIS while `_initialize` divides by `n_samples` (`:864`). Two
+    divisors, two code paths, one estimator. Following that exactly is what
+    `mixture/README.md`'s semantics table promises, and computing it here
+    rather than assuming `n` is what keeps the promise.
+    """
+    if Int(block_idx.x) != 0 or Int(thread_idx.x) != 0:
+        return
+    var ncomp = Int(ncomp_in)
+    var acc = Float32(0.0)
+    for k in range(ncomp):
+        acc = ftz(acc + ftz(nk.unsafe_load(k)))
+    out_scalar.unsafe_store(0, acc)
+
+
+def weights_kernel(
+    nk: MutPointer[Float32, MutAnyOrigin],
+    denom: MutPointer[Float32, MutAnyOrigin],
+    weights: MutPointer[Float32, MutAnyOrigin],
+    log_weights: MutPointer[Float32, MutAnyOrigin],
+    ncomp_in: Int32,
+):
+    """`weights = nk / denom` and `log_weights = log(weights)`, one thread
+    per component.
+
+    `denom` is a DEVICE SCALAR rather than a kernel argument so that the two
+    call sites -- `n_samples` at initialization, `sum(nk)` in the loop -- go
+    through one kernel and one spelling. A host float passed as an argument
+    would have been simpler and would have meant the loop's divisor made a
+    round trip to the host and back every iteration for no reason.
+
+    `identical_div` and never a multiply by a reciprocal: two roundings where
+    a divide is one, the same argument `cholesky/checks/trsm.mojo`'s
+    DEVIATION 1643 makes.
+
+    `log(weights)` is computed HERE rather than in the E-step, because it is
+    a per-component quantity that the E-step would otherwise recompute for
+    every one of `n * K` cells. `identical_log` at IDENTITY_PATHS row 12.
+    A weight is strictly positive -- `nk` carries `10 eps` and `denom` is a
+    sum of such -- so `identical_log`'s `-inf` and NaN branches are
+    unreachable from a state this kernel can be called in.
+    """
+    var ncomp = Int(ncomp_in)
+    var k = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if k >= ncomp:
+        return
+    var w = ftz(identical_div(ftz(nk.unsafe_load(k)), ftz(denom.unsafe_load(0))))
+    weights.unsafe_store(k, w)
+    log_weights.unsafe_store(k, ftz(identical_log(w)))
+
+
+def means_divide_kernel(
+    raw: MutPointer[Float32, MutAnyOrigin],
+    nk: MutPointer[Float32, MutAnyOrigin],
+    means: MutPointer[Float32, MutAnyOrigin],
+    ncomp_in: Int32,
+    d_in: Int32,
+):
+    """`means[k][j] = (resp^T X)[k][j] / nk[k]`, one thread per cell.
+    `_estimate_gaussian_parameters:317`, second half."""
+    var ncomp = Int(ncomp_in)
+    var d = Int(d_in)
+    var idx = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if idx >= ncomp * d:
+        return
+    var k = idx // d
+    means.unsafe_store(
+        idx, ftz(identical_div(ftz(raw.unsafe_load(idx)), ftz(nk.unsafe_load(k))))
+    )
+
+
+# I21 pair staging shares each X load between two components. Canonical
+# subtraction/multiply and covariance GEMMs retain their original order.
+# 2026-10-06 center-pair LOSS/near-neutral, frozen source 5b467815b51b:
+# complete generated COV_FULL fits, k=9, rows/features=10000/17,10001/18,
+# 32769/9. Candidate/incumbent ratios AMD 1.042/1.108/1.203 and NVIDIA
+# L40S 1.023/1.018/1.003. All fixtures fit the 1<<20-cell pair-buffer cap;
+# IDENTICAL has no FAST Gram path, so the source guard admits pair staging.
+# No runtime pair counter was emitted. One excluded same-context fit and one
+# scored fit per binary; all recorded converged=True and rc=0. Prior identity
+# evidence reused without revalidation. Center-pair alone remains OFF.
+# Combined component+center-pair, same freeze/cases: AMD candidate/incumbent
+# 1.204/1.190/1.196 (all LOSS), NVIDIA 1.648/1.632/0.930 (two losses,
+# one scoped WIN at 32769/9). This enables both admitted schedules; it is
+# bundle evidence, not an isolated-toggle comparison. Both switches remain
+# OFF because AMD regresses and NVIDIA is mixed; synthetic fits also lack
+# full-board qualification. All combined executions converged=True, rc=0,
+# with the same one excluded warmup/one score protocol.
+# Existing fused-Cholesky stays ON: all six fused_cholesky_off rollbacks lose
+# (see mixture/chol_order.mojo). Both-off also loses on AMD (2.051/1.913/
+# 1.471) and NVIDIA L40S (2.140/2.221/1.705). Isolated one-drain-off is
+# AMD 0.987/1.000/1.010 (mixed near-neutral), NVIDIA 1.010/1.020/1.532
+# (losses), same cases/protocol; see estimator.mojo. Both existing defaults
+# remain ON. Full-board qualification remains separate from these fits.
+# Evidence: experiments/performance_ideas/measurements/20261006/index.json.
+comptime GMM_CENTER_PAIR = GLOBAL_NUMERIC_MODE == NUMERIC_IDENTICAL and is_defined["ANONLIB_IDN_GMM_CENTER_PAIR"]() and not is_defined["ANONLIB_IDN_ALL_OFF"]()
+comptime GMM_CENTER_PAIR_MAX_CELLS = 1 << 20  # four Float32 planes <=16 MiB
+# C53 uses four component planes under the SAME 16 MiB live-byte budget.
+# NOT COMPILED — NOT TESTED — IDENTITY NOT VERIFIED — QUALITY NOT VERIFIED — NOT MEASURED.
+comptime GMM_CENTER_GROUP = 4 if C53_CENTER4 else 2
+comptime GMM_CENTER_CELLS = (16 * 1024 * 1024) // (2 * GMM_CENTER_GROUP * 4)
+
+@always_inline
+def _center_scale_values(x: Float32,mean: Float32,r: Float32) -> Tuple[Float32,Float32]:
+    var diff=ftz(ftz(x)-ftz(mean))
+    return (diff,ftz(identical_mul(ftz(r),diff)))
+
+def center_pair_kernel[GROUP: Int = GMM_CENTER_GROUP](x: MutPointer[Float32,MutAnyOrigin],means: MutPointer[Float32,MutAnyOrigin],resp: MutPointer[Float32,MutAnyOrigin],diff: MutPointer[Float32,MutAnyOrigin],scaled: MutPointer[Float32,MutAnyOrigin],n_in: Int32,d_in: Int32,first_in: Int32,total_in: Int32,count_in: Int32):
+    var cell=Int(block_idx.x)*Int(block_dim.x)+Int(thread_idx.x)
+    var d=Int(d_in)
+    var cells=Int(n_in)*d
+    if cell>=cells:
+        return
+    var xvalue=x[cell]
+    var row=cell//d
+    var feature=cell%d
+    comptime for local in range(GROUP):
+        if local<Int(count_in):
+            var component=Int(first_in)+local
+            var values=_center_scale_values(xvalue,means[component*d+feature],resp[row*Int(total_in)+component])
+            diff[local*cells+cell]=values[0]
+            scaled[local*cells+cell]=values[1]
+
+def center_scale_kernel(
+    x: MutPointer[Float32, MutAnyOrigin],
+    means: MutPointer[Float32, MutAnyOrigin],
+    resp: MutPointer[Float32, MutAnyOrigin],
+    diff: MutPointer[Float32, MutAnyOrigin],
+    scaled: MutPointer[Float32, MutAnyOrigin],
+    n_in: Int32,
+    d_in: Int32,
+    kcomp_in: Int32,
+    ncomp_in: Int32,
+):
+    """`diff = X - means[k]` and `scaled = resp[:, k] * diff`, one thread per
+    cell. `_estimate_gaussian_covariances_full:194-195`, the two operands of
+    their product.
+
+    Their `(resp[:, k] * diff.T) @ diff` scales `diff.T`, which is `d x n`,
+    so the broadcast runs along the SAMPLE axis: cell `(a, i)` of the scaled
+    operand is `resp[i][k] * diff[i][a]`. Written row-major here, that is
+    `scaled[i][a]`, which is why this kernel produces an `n x d` array and
+    the product below is `OP_TN` rather than `OP_NN`. The transposition is an
+    ADDRESSING difference and reaches no arithmetic.
+
+    `identical_mul` rather than a bare `*`: DEVIATION 826's argument, a
+    multiply no codegen may contract into the neighbouring add of the
+    accumulation that follows.
+    """
+    var d = Int(d_in)
+    var kc = Int(kcomp_in)
+    var ncomp = Int(ncomp_in)
+    var idx = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if idx >= Int(n_in) * d:
+        return
+    var i = idx // d
+    var j = idx % d
+    var values=_center_scale_values(x.unsafe_load(idx),means.unsafe_load(kc*d+j),resp.unsafe_load(i*ncomp+kc))
+    diff.unsafe_store(idx,values[0])
+    scaled.unsafe_store(idx,values[1])
+
+
+comptime GMM_FAST_GRAM = (
+    GLOBAL_NUMERIC_MODE == NUMERIC_FAST
+    and not is_defined["ANONLIB_GMM_FAST_PINNED_COV"]()
+)
+"""FAST only: each component's covariance is the split-K Gram `y^T y` of
+`y = sqrt(resp_k) * (X - mean_k)` (`center_sqrt_scale_kernel`,
+`core/gram_splitk`) instead of the pinned `(resp_k * diff)^T diff` GEMM,
+whose million-deep reduction ran in one threadgroup on Apple (about 30 ms
+per component at 1M x 16 on the M4). The same matrix up to rounding; FAST
+promises no bits. `-D ANONLIB_GMM_FAST_PINNED_COV` restores the pinned
+product."""
+
+
+comptime GMM_FAST_COLS = 32
+"""The widest `d` the FAST column-sum kernel holds in registers."""
+comptime GMM_FAST_CHUNKS = 64
+comptime GMM_FAST_TPB = 256
+
+
+def fast_resp_colsums_partial_kernel(
+    x: MutPointer[Float32, MutAnyOrigin],
+    resp: MutPointer[Float32, MutAnyOrigin],
+    partial: MutPointer[Float32, MutAnyOrigin],
+    n_in: Int32,
+    d_in: Int32,
+    ncomp_in: Int32,
+):
+    """GMM_FAST_GRAM: block (k, c) sums `resp[i, k] * x[i, j]` for every j
+    and `resp[i, k]` over its chunk of rows into
+    `partial[(k * CHUNKS + c) * (d + 1) + j]` (j == d is the mass). Warp
+    shuffles, then one barrier and a fold over the warps."""
+    comptime N_WARPS = GMM_FAST_TPB // WARP_SIZE
+    var n = Int(n_in)
+    var d = Int(d_in)
+    var ncomp = Int(ncomp_in)
+    var k = Int(block_idx.x)
+    var c = Int(block_idx.y)
+    var acc = SIMD[DType.float32, GMM_FAST_COLS](0)
+    var mass = Float32(0)
+    var i = c * GMM_FAST_TPB + Int(thread_idx.x)
+    var stride = GMM_FAST_CHUNKS * GMM_FAST_TPB
+    while i < n:
+        var r = resp[unsafe_offset = i * ncomp + k]
+        mass += r
+        comptime for j in range(GMM_FAST_COLS):
+            if j < d:
+                acc[j] += r * x[unsafe_offset = i * d + j]
+        i += stride
+    var sh = stack_allocation[
+        N_WARPS * (GMM_FAST_COLS + 1), Scalar[DType.float32],
+        address_space = AddressSpace.SHARED,
+    ]()
+    var warp = Int(thread_idx.x) // WARP_SIZE
+    var lane = Int(thread_idx.x) % WARP_SIZE
+    comptime for j in range(GMM_FAST_COLS + 1):
+        var v = mass if j == GMM_FAST_COLS else acc[j]
+        comptime for step in range(8):
+            comptime off = WARP_SIZE >> (step + 1)
+            comptime if off > 0:
+                v += shuffle_xor(v, UInt32(off))
+        if lane == 0:
+            sh[warp * (GMM_FAST_COLS + 1) + j] = v
+    barrier()
+    var t = Int(thread_idx.x)
+    if t <= d:
+        var col = GMM_FAST_COLS if t == d else t
+        var tot = Float32(0)
+        for w in range(N_WARPS):
+            tot += sh[w * (GMM_FAST_COLS + 1) + col]
+        partial[unsafe_offset = (k * GMM_FAST_CHUNKS + c) * (d + 1) + t] = tot
+
+
+def fast_resp_colsums_finish_kernel(
+    partial: MutPointer[Float32, MutAnyOrigin],
+    raw: MutPointer[Float32, MutAnyOrigin],
+    nk: MutPointer[Float32, MutAnyOrigin],
+    d_in: Int32,
+    ncomp_in: Int32,
+    ten_eps: Float32,
+):
+    """Fold the chunks: `raw[k, j]` (the means' numerators) and
+    `nk[k] = mass + 10 eps` (the constant after the sum, as `nk_kernel`)."""
+    var d = Int(d_in)
+    var idx = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if idx >= Int(ncomp_in) * (d + 1):
+        return
+    var k = idx // (d + 1)
+    var j = idx % (d + 1)
+    var tot = Float32(0)
+    for c in range(GMM_FAST_CHUNKS):
+        tot += partial[unsafe_offset = (k * GMM_FAST_CHUNKS + c) * (d + 1) + j]
+    if j == d:
+        nk[unsafe_offset=k] = tot + ten_eps
+    else:
+        raw[unsafe_offset = k * d + j] = tot
+
+
+comptime GMM_FUSED_COV = (
+    GMM_FAST_GRAM
+    and has_apple_gpu_accelerator()
+    and not is_defined["ANONLIB_GMM_FAST_FUSED_COV_OFF"]()
+)
+"""FAST on Apple: every component's covariance in ONE pass over X
+(`fused_cov_partial_kernel`) instead of a center-and-scale write plus a
+split-K Gram per component. `-D ANONLIB_GMM_FAST_FUSED_COV_OFF` keeps the
+per-component Grams."""
+comptime GMM_FUSED_TPB = 256
+comptime GMM_FUSED_TILE = 4096
+comptime GMM_FUSED_BLOCKS = 512
+comptime GMM_FUSED_MAX_CD = 512
+
+
+def _gmm_fused_dp(d: Int) -> Int:
+    """`d` padded to a multiple of the 4 x 4 register tile."""
+    return (d + 3) // 4 * 4
+
+
+def gmm_fused_cov_applies(n: Int, d: Int, ncomp: Int) -> Bool:
+    """The shapes the fused pass holds: `ncomp * dp` staged values per row
+    fit the tile and the mean cache, the 4 x 4 cell groups fit one block,
+    and the partials fit the `n * d` scratch."""
+    var dp = _gmm_fused_dp(d)
+    var cdp = ncomp * dp
+    var groups = ncomp * (dp // 4) * (dp // 4)
+    return (
+        cdp <= GMM_FUSED_MAX_CD
+        and groups <= GMM_FUSED_TPB
+        and GMM_FUSED_BLOCKS * ncomp * d * d <= n * d
+    )
+
+
+def fused_cov_partial_kernel(
+    x: MutPointer[Float32, MutAnyOrigin],
+    means: MutPointer[Float32, MutAnyOrigin],
+    resp: MutPointer[Float32, MutAnyOrigin],
+    partials: MutPointer[Float32, MutAnyOrigin],
+    n_in: Int32,
+    d_in: Int32,
+    ncomp_in: Int32,
+):
+    """GMM_FUSED_COV: block b sums, over its slice of rows, every
+    component's `sqrt(r)(x - mu) (sqrt(r)(x - mu))^T`. A tile of rows is
+    staged as `sqrt(resp[r, c]) * (x[r, i] - means[c, i])` for all (c, i)
+    (zero-padded to `dp`); each thread owns one component's 4 x 4 block of
+    cells and one lane of the tile's rows, and the lanes fold at the end."""
+    var n = Int(n_in)
+    var d = Int(d_in)
+    var ncomp = Int(ncomp_in)
+    var dp = _gmm_fused_dp(d)
+    var cdp = ncomp * dp
+    var q4 = dp // 4
+    var groups = ncomp * q4 * q4
+    var lanes = GMM_FUSED_TPB // groups
+    var t = Int(thread_idx.x)
+    var b = Int(block_idx.x)
+    var g = t % groups
+    var lane = t // groups
+    var active = lane < lanes
+    var c = g // (q4 * q4)
+    var gi = (g % (q4 * q4)) // q4
+    var gj = g % q4
+    var oi = c * dp + 4 * gi
+    var oj = c * dp + 4 * gj
+    var rows_tile = GMM_FUSED_TILE // cdp
+    if rows_tile > GMM_FUSED_TPB // ncomp:
+        rows_tile = GMM_FUSED_TPB // ncomp
+    # staging: thread t stages (row st_r, component st_c) of the tile
+    var st_r = t // ncomp
+    var st_c = t % ncomp
+    var s = stack_allocation[
+        GMM_FUSED_TILE, Scalar[DType.float32], address_space = AddressSpace.SHARED
+    ]()
+    var mu = stack_allocation[
+        GMM_FUSED_MAX_CD, Scalar[DType.float32], address_space = AddressSpace.SHARED
+    ]()
+    var e0 = t
+    while e0 < cdp:
+        var cc = e0 // dp
+        var ii = e0 % dp
+        mu[e0] = means.unsafe_load(cc * d + ii) if ii < d else Float32(0)
+        e0 += GMM_FUSED_TPB
+    var chunk = (n + GMM_FUSED_BLOCKS - 1) // GMM_FUSED_BLOCKS
+    var r0 = b * chunk
+    var r1 = r0 + chunk
+    if r1 > n:
+        r1 = n
+    var acc = SIMD[DType.float32, 16](0.0)
+    barrier()
+    var base = r0
+    while base < r1:
+        var nr = r1 - base
+        if nr > rows_tile:
+            nr = rows_tile
+        if st_r < nr:
+            var row = base + st_r
+            var w = resp.unsafe_load(row * ncomp + st_c)
+            var sw = sqrt(w) if w > Float32(0) else Float32(0)
+            var so = st_r * cdp + st_c * dp
+            for ii in range(dp):
+                var v = Float32(0)
+                if ii < d:
+                    v = sw * (x.unsafe_load(row * d + ii) - mu[st_c * dp + ii])
+                s[so + ii] = v
+        barrier()
+        if active:
+            var r = lane
+            while r < nr:
+                var a = SIMD[DType.float32, 4](
+                    s[r * cdp + oi], s[r * cdp + oi + 1],
+                    s[r * cdp + oi + 2], s[r * cdp + oi + 3],
+                )
+                var bb = SIMD[DType.float32, 4](
+                    s[r * cdp + oj], s[r * cdp + oj + 1],
+                    s[r * cdp + oj + 2], s[r * cdp + oj + 3],
+                )
+                comptime for u in range(4):
+                    comptime for v in range(4):
+                        acc[u * 4 + v] += a[u] * bb[v]
+                r += lanes
+        barrier()
+        base += nr
+    # fold the row lanes through the (now free) tile
+    if active:
+        comptime for u in range(16):
+            s[t * 16 + u] = acc[u]
+    barrier()
+    if lane == 0:
+        var tot = acc
+        for l in range(1, lanes):
+            comptime for u in range(16):
+                tot[u] += s[(l * groups + g) * 16 + u]
+        comptime for u in range(4):
+            comptime for v in range(4):
+                var i = 4 * gi + u
+                var jj = 4 * gj + v
+                if i < d and jj < d:
+                    partials.unsafe_store(
+                        (b * ncomp + c) * d * d + i * d + jj, tot[u * 4 + v]
+                    )
+
+
+def fused_cov_finish_kernel(
+    partials: MutPointer[Float32, MutAnyOrigin],
+    nk: MutPointer[Float32, MutAnyOrigin],
+    cov: MutPointer[Float32, MutAnyOrigin],
+    d_in: Int32,
+    ncomp_in: Int32,
+    reg_covar: Float32,
+):
+    """GMM_FUSED_COV: sum the blocks' partials, then `cov_finish_kernel`'s
+    `raw / nk[k]` and diagonal `+ reg_covar`, for every component."""
+    var d = Int(d_in)
+    var dd = d * d
+    var cells = Int(ncomp_in) * dd
+    var cell = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if cell >= cells:
+        return
+    var v = Float32(0.0)
+    for b in range(GMM_FUSED_BLOCKS):
+        v += partials.unsafe_load(b * cells + cell)
+    var kc = cell // dd
+    var rem = cell % dd
+    v = ftz(v)
+    v = ftz(identical_div(v, ftz(nk.unsafe_load(kc))))
+    if rem // d == rem % d:
+        v = ftz(v + reg_covar)
+    cov.unsafe_store(cell, v)
+
+
+comptime GMM_FUSED_CHOL = (
+    GLOBAL_NUMERIC_MODE == NUMERIC_FAST
+    and has_apple_gpu_accelerator()
+    and not is_defined["ANONLIB_GMM_FAST_FUSED_CHOL_OFF"]()
+)
+"""FAST on Apple: every component's Cholesky, inverse factor and log
+determinant in ONE launch (`fused_precision_cholesky_kernel`, a threadgroup
+per component) with one readback of the pivot flags, instead of about five
+drains per component. `-D ANONLIB_GMM_FAST_FUSED_CHOL_OFF` keeps the
+per-component potrf / trsm."""
+comptime GMM_CHOL_MAX_D = 32
+comptime GMM_CHOL_TPB = 256
+
+
+def fused_precision_cholesky_kernel(
+    cov: MutPointer[Float32, MutAnyOrigin],
+    chol_l: MutPointer[Float32, MutAnyOrigin],
+    linv: MutPointer[Float32, MutAnyOrigin],
+    prec: MutPointer[Float32, MutAnyOrigin],
+    log_det_chol: MutPointer[Float32, MutAnyOrigin],
+    info: MutPointer[Int32, MutAnyOrigin],
+    d_in: Int32,
+):
+    """GMM_FUSED_CHOL, block k = component k: `L L^T = cov_k` (right-
+    looking, in threadgroup memory; `info = j + 1` at the first pivot that
+    is not positive), `linv = L^{-1}` by forward substitution one column per
+    thread, `prec = linv^T`, and `log_det_chol = -sum log L_jj`."""
+    var d = Int(d_in)
+    var dd = d * d
+    var k = Int(block_idx.x)
+    var t = Int(thread_idx.x)
+    var a = stack_allocation[
+        GMM_CHOL_MAX_D * GMM_CHOL_MAX_D, Scalar[DType.float32],
+        address_space = AddressSpace.SHARED,
+    ]()
+    var xinv = stack_allocation[
+        GMM_CHOL_MAX_D * GMM_CHOL_MAX_D, Scalar[DType.float32],
+        address_space = AddressSpace.SHARED,
+    ]()
+    var flag = stack_allocation[
+        1, Scalar[DType.int32], address_space = AddressSpace.SHARED
+    ]()
+    var e = t
+    while e < dd:
+        var v = cov.unsafe_load(k * dd + e)
+        if e // d == e % d:
+            v = ftz(v + GMM_CHOL_JITTER)
+        a[e] = v
+        e += GMM_CHOL_TPB
+    if t == 0:
+        flag[0] = 0
+    barrier()
+    for j in range(d):
+        if t == 0:
+            var p = a[j * d + j]
+            if p > Float32(0):
+                a[j * d + j] = sqrt(p)
+            else:
+                flag[0] = Int32(j + 1)
+        barrier()
+        if flag[0] != 0:
+            break
+        var pj = a[j * d + j]
+        var i = j + 1 + t
+        while i < d:
+            a[i * d + j] = a[i * d + j] / pj
+            i += GMM_CHOL_TPB
+        barrier()
+        # trailing update of the lower triangle, cells (r, c), j < c <= r
+        var m = d - 1 - j
+        var cell = t
+        while cell < m * m:
+            var r = j + 1 + cell // m
+            var c = j + 1 + cell % m
+            if c <= r:
+                a[r * d + c] = a[r * d + c] - a[r * d + j] * a[c * d + j]
+            cell += GMM_CHOL_TPB
+        barrier()
+    var bad = flag[0]
+    if t == 0:
+        info.unsafe_store(k, bad)
+    if bad != 0:
+        return
+    if t < d:
+        var c = t
+        for i in range(d):
+            var v = Float32(0.0)
+            if i == c:
+                v = Float32(1.0) / a[i * d + i]
+            elif i > c:
+                for m2 in range(c, i):
+                    v -= a[i * d + m2] * xinv[m2 * d + c]
+                v = v / a[i * d + i]
+            xinv[i * d + c] = v
+    barrier()
+    e = t
+    while e < dd:
+        var r = e // d
+        var c = e % d
+        var lv = a[e] if c <= r else Float32(0)
+        chol_l.unsafe_store(k * dd + e, lv)
+        var xv = xinv[e] if c <= r else Float32(0)
+        linv.unsafe_store(k * dd + e, xv)
+        prec.unsafe_store(k * dd + c * d + r, xv)
+        e += GMM_CHOL_TPB
+    if t == 0:
+        var sl = Float32(0)
+        for j in range(d):
+            sl += log(a[j * d + j])
+        log_det_chol.unsafe_store(k, -sl)
+
+
+# ===========================================================================
+# lane/apple-fast-linear (2026-10-02): THE ISTELLA SHAPE (d = 200, K = 8)
+# ===========================================================================
+#
+# One build define, FAST + Apple only (BIG_CHOL, default on). Both arms above
+# (`fused_cov_partial_kernel`, `fused_precision_cholesky_kernel`) stop at
+# d = 32 (taxi, d = 16, takes them); Istella's 100,000 x 200 falls to:
+#
+#   -D ANONLIB_GMM_FAST_BIG_CHOL=1   the precision Cholesky. Cause:
+#       `gmm_precision_cholesky`'s per-component chain at d > 32: a copy,
+#       `potrf_lower` at CHOL_NB_PINNED = 32 (seven panels, each reading
+#       `info` home), `chol_logdet` (a readback), `set_identity`, `trsm_lower`
+#       (d right-hand sides), a transpose -- some ten drains a component,
+#       eighty an iteration, each one serialising the queue. Here every
+#       component is one block of `gmm_big_chol_kernel`, the fused kernel's
+#       algorithm with the matrix in device memory (its own `chol_l` slot)
+#       behind a device-memory barrier, and ONE readback of the pivot flags.
+#       d <= GMM_CHOL_TPB (a thread per column of L^{-1}).
+
+
+comptime GMM_FAST_FF_COV = (
+    GMM_FUSED_COV and GMM_FUSED_CHOL and not is_defined["ANONLIB_GMM_FAST_FF_COV_OFF"]()
+)
+# lane apple-holes (2026-10-12), FAST + Apple, d <= GMM_CHOL_MAX_D: the
+# covariance accumulated and the precision Cholesky factored in float-float
+# (mixture/ff_fast.mojo), the ridge added exactly. Cause: GaussianMixture
+# FAST refused taxi ("ill-defined empirical covariance") where IDENTICAL fits
+# (mean log-likelihood 12.81, 29 iterations). Every float32 step above loses
+# what reg_covar = 1e-6 is there to add: `ftz(v + reg_covar)` drops the
+# ridge outright once a variance is >= 8 (half an ulp of 8 is 4.8e-7), the
+# Gram's float32 folds carry ~1e-7 relative error per cell, and the float32
+# pivot `a_jj - l_j . l_j` of two (near-)collinear standardized features
+# cancels to that noise, so a component whose covariance + ridge is positive
+# definite in real arithmetic (scikit-learn's float64) fails its pivot. Here
+# the staged sqrt(r)(x - mu) products are summed with exact products and
+# compensated sums (Ogita, Rump and Oishi's Dot2), the blocks and the
+# division by nk are float-float, the ridge is added to the float-float
+# diagonal, and the factor and L^{-1} are float-float: the matrix factored is
+# the staged rows' Gram plus the ridge to ~1e-14, which is positive definite.
+# The covariance a caller reads is that value rounded once to float32 (its
+# residual goes to the Cholesky through `cov_lo`). FAST promises no bits.
+# `-D ANONLIB_GMM_FAST_FF_COV_OFF` restores the float32 kernels above.
+# A/B owed (M3: gmm taxi + istella, speed and mean log-likelihood).
+
+
+def gmm_ff_cov_blocks(n: Int, d: Int, ncomp: Int) -> Int:
+    """The row blocks of `fused_cov_partial_ff_kernel`: GMM_FUSED_BLOCKS, or
+    fewer when their hi and lo partials (2 * blocks * ncomp * d * d floats)
+    would not fit the M-step's `diff` + `scaled` scratch (2 * n * d)."""
+    var per = ncomp * d * d
+    if per <= 0:
+        return 0
+    var cap = (n * d) // per
+    return cap if cap < GMM_FUSED_BLOCKS else GMM_FUSED_BLOCKS
+
+
+def gmm_zero_f32_kernel(p: MutPointer[Float32, MutAnyOrigin], count: Int32):
+    var i = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if i < Int(count):
+        p.unsafe_store(i, Float32(0))
+
+
+def fused_cov_partial_ff_kernel(
+    x: MutPointer[Float32, MutAnyOrigin],
+    means: MutPointer[Float32, MutAnyOrigin],
+    resp: MutPointer[Float32, MutAnyOrigin],
+    partials: MutPointer[Float32, MutAnyOrigin],
+    n_in: Int32,
+    d_in: Int32,
+    ncomp_in: Int32,
+    nblk_in: Int32,
+):
+    """`fused_cov_partial_kernel` (the same tile, staging and 4 x 4 cell
+    groups) with every cell summed in float-float: Dot2's exact product
+    `two_prod(a, b)`, the running hi by `two_sum`, both error terms into lo.
+    The row lanes fold through the tile in two passes (hi, then lo).
+    Block b writes hi at `(b * ncomp + c) * d * d + cell` and lo at
+    `nblk * ncomp * d * d` past it."""
+    var n = Int(n_in)
+    var d = Int(d_in)
+    var ncomp = Int(ncomp_in)
+    var nblk = Int(nblk_in)
+    var dp = _gmm_fused_dp(d)
+    var cdp = ncomp * dp
+    var q4 = dp // 4
+    var groups = ncomp * q4 * q4
+    var lanes = GMM_FUSED_TPB // groups
+    var t = Int(thread_idx.x)
+    var b = Int(block_idx.x)
+    var g = t % groups
+    var lane = t // groups
+    var active = lane < lanes
+    var c = g // (q4 * q4)
+    var gi = (g % (q4 * q4)) // q4
+    var gj = g % q4
+    var oi = c * dp + 4 * gi
+    var oj = c * dp + 4 * gj
+    var rows_tile = GMM_FUSED_TILE // cdp
+    if rows_tile > GMM_FUSED_TPB // ncomp:
+        rows_tile = GMM_FUSED_TPB // ncomp
+    var st_r = t // ncomp
+    var st_c = t % ncomp
+    var s = stack_allocation[
+        GMM_FUSED_TILE, Scalar[DType.float32], address_space = AddressSpace.SHARED
+    ]()
+    var mu = stack_allocation[
+        GMM_FUSED_MAX_CD, Scalar[DType.float32], address_space = AddressSpace.SHARED
+    ]()
+    var e0 = t
+    while e0 < cdp:
+        var cc = e0 // dp
+        var ii = e0 % dp
+        mu[e0] = means.unsafe_load(cc * d + ii) if ii < d else Float32(0)
+        e0 += GMM_FUSED_TPB
+    var chunk = (n + nblk - 1) // nblk
+    var r0 = b * chunk
+    var r1 = r0 + chunk
+    if r1 > n:
+        r1 = n
+    var acc_hi = SIMD[DType.float32, 16](0.0)
+    var acc_lo = SIMD[DType.float32, 16](0.0)
+    barrier()
+    var base = r0
+    while base < r1:
+        var nr = r1 - base
+        if nr > rows_tile:
+            nr = rows_tile
+        if st_r < nr:
+            var row = base + st_r
+            var w = resp.unsafe_load(row * ncomp + st_c)
+            var sw = sqrt(w) if w > Float32(0) else Float32(0)
+            var so = st_r * cdp + st_c * dp
+            for ii in range(dp):
+                var v = Float32(0)
+                if ii < d:
+                    v = pinned_mul_f32(sw, gf_rn_add(x.unsafe_load(row * d + ii), -mu[st_c * dp + ii]))
+                s[so + ii] = v
+        barrier()
+        if active:
+            var r = lane
+            while r < nr:
+                comptime for u in range(4):
+                    var au = s[r * cdp + oi + u]
+                    comptime for v in range(4):
+                        var p = gf_two_prod(au, s[r * cdp + oj + v])
+                        var q = gf_two_sum(acc_hi[u * 4 + v], p.hi)
+                        acc_hi[u * 4 + v] = q.hi
+                        acc_lo[u * 4 + v] = gf_rn_add(acc_lo[u * 4 + v], gf_rn_add(q.lo, p.lo))
+                r += lanes
+        barrier()
+        base += nr
+    # fold the row lanes through the (now free) tile: hi, then lo
+    var tot_hi = acc_hi
+    var tot_lo = acc_lo
+    if active:
+        comptime for u in range(16):
+            s[t * 16 + u] = acc_hi[u]
+    barrier()
+    if lane == 0:
+        for l in range(1, lanes):
+            comptime for u in range(16):
+                var q = gf_add_f(GF(tot_hi[u], tot_lo[u]), s[(l * groups + g) * 16 + u])
+                tot_hi[u] = q.hi
+                tot_lo[u] = q.lo
+    barrier()
+    if active:
+        comptime for u in range(16):
+            s[t * 16 + u] = acc_lo[u]
+    barrier()
+    if lane == 0:
+        for l in range(1, lanes):
+            comptime for u in range(16):
+                var q = gf_add_f(GF(tot_hi[u], tot_lo[u]), s[(l * groups + g) * 16 + u])
+                tot_hi[u] = q.hi
+                tot_lo[u] = q.lo
+        var lo_off = nblk * ncomp * d * d
+        comptime for u in range(4):
+            comptime for v in range(4):
+                var i = 4 * gi + u
+                var jj = 4 * gj + v
+                if i < d and jj < d:
+                    var at = (b * ncomp + c) * d * d + i * d + jj
+                    partials.unsafe_store(at, tot_hi[u * 4 + v])
+                    partials.unsafe_store(lo_off + at, tot_lo[u * 4 + v])
+
+
+def fused_cov_finish_ff_kernel(
+    partials: MutPointer[Float32, MutAnyOrigin],
+    nk: MutPointer[Float32, MutAnyOrigin],
+    cov: MutPointer[Float32, MutAnyOrigin],
+    cov_lo: MutPointer[Float32, MutAnyOrigin],
+    d_in: Int32,
+    ncomp_in: Int32,
+    nblk_in: Int32,
+    reg_covar: Float32,
+):
+    """The blocks' float-float partials summed, divided by nk[k] and the
+    ridge added on the diagonal, all in float-float; `cov` gets the value
+    rounded once, `cov_lo` its residual (the Cholesky reads both)."""
+    var d = Int(d_in)
+    var dd = d * d
+    var cells = Int(ncomp_in) * dd
+    var nblk = Int(nblk_in)
+    var cell = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if cell >= cells:
+        return
+    var lo_off = nblk * cells
+    var v = GF(Float32(0), Float32(0))
+    for b in range(nblk):
+        v = gf_add(v, GF(partials.unsafe_load(b * cells + cell), partials.unsafe_load(lo_off + b * cells + cell)))
+    var kc = cell // dd
+    var rem = cell % dd
+    v = gf_div(v, gf_of(nk.unsafe_load(kc)))
+    if rem // d == rem % d:
+        v = gf_add_f(v, reg_covar)
+    var r = gf_f32(v)
+    cov.unsafe_store(cell, r)
+    cov_lo.unsafe_store(cell, gf_f32(gf_sub(v, gf_of(r))))
+
+
+def fused_precision_cholesky_ff_kernel(
+    cov: MutPointer[Float32, MutAnyOrigin],
+    cov_lo: MutPointer[Float32, MutAnyOrigin],
+    chol_l: MutPointer[Float32, MutAnyOrigin],
+    linv: MutPointer[Float32, MutAnyOrigin],
+    prec: MutPointer[Float32, MutAnyOrigin],
+    log_det_chol: MutPointer[Float32, MutAnyOrigin],
+    info: MutPointer[Int32, MutAnyOrigin],
+    d_in: Int32,
+):
+    """`fused_precision_cholesky_kernel` in float-float on cov + cov_lo:
+    the same right-looking steps, pivot test, forward substitution and
+    outputs (each rounded once to float32); log_det_chol = -sum log L_jj
+    with log(hi + lo) = log(hi) + lo / hi."""
+    var d = Int(d_in)
+    var dd = d * d
+    var k = Int(block_idx.x)
+    var t = Int(thread_idx.x)
+    var ah = stack_allocation[
+        GMM_CHOL_MAX_D * GMM_CHOL_MAX_D, Scalar[DType.float32],
+        address_space = AddressSpace.SHARED,
+    ]()
+    var al = stack_allocation[
+        GMM_CHOL_MAX_D * GMM_CHOL_MAX_D, Scalar[DType.float32],
+        address_space = AddressSpace.SHARED,
+    ]()
+    var xh = stack_allocation[
+        GMM_CHOL_MAX_D * GMM_CHOL_MAX_D, Scalar[DType.float32],
+        address_space = AddressSpace.SHARED,
+    ]()
+    var xl = stack_allocation[
+        GMM_CHOL_MAX_D * GMM_CHOL_MAX_D, Scalar[DType.float32],
+        address_space = AddressSpace.SHARED,
+    ]()
+    var flag = stack_allocation[
+        1, Scalar[DType.int32], address_space = AddressSpace.SHARED
+    ]()
+    var e = t
+    while e < dd:
+        var q = gf_two_sum(cov.unsafe_load(k * dd + e), cov_lo.unsafe_load(k * dd + e))
+        ah[e] = q.hi
+        al[e] = q.lo
+        e += GMM_CHOL_TPB
+    if t == 0:
+        flag[0] = 0
+    barrier()
+    for j in range(d):
+        if t == 0:
+            var p = GF(ah[j * d + j], al[j * d + j])
+            if p.hi > Float32(0):
+                var r = gf_sqrt(p)
+                ah[j * d + j] = r.hi
+                al[j * d + j] = r.lo
+            else:
+                flag[0] = Int32(j + 1)
+        barrier()
+        if flag[0] != 0:
+            break
+        var pj = GF(ah[j * d + j], al[j * d + j])
+        var i = j + 1 + t
+        while i < d:
+            var q = gf_div(GF(ah[i * d + j], al[i * d + j]), pj)
+            ah[i * d + j] = q.hi
+            al[i * d + j] = q.lo
+            i += GMM_CHOL_TPB
+        barrier()
+        var m = d - 1 - j
+        var cell = t
+        while cell < m * m:
+            var r = j + 1 + cell // m
+            var cc = j + 1 + cell % m
+            if cc <= r:
+                var q = gf_sub(
+                    GF(ah[r * d + cc], al[r * d + cc]),
+                    gf_mul(GF(ah[r * d + j], al[r * d + j]), GF(ah[cc * d + j], al[cc * d + j])),
+                )
+                ah[r * d + cc] = q.hi
+                al[r * d + cc] = q.lo
+            cell += GMM_CHOL_TPB
+        barrier()
+    var bad = flag[0]
+    if t == 0:
+        info.unsafe_store(k, bad)
+    if bad != 0:
+        return
+    if t < d:
+        var c = t
+        for i in range(d):
+            var v = GF(Float32(0.0), Float32(0.0))
+            var lii = GF(ah[i * d + i], al[i * d + i])
+            if i == c:
+                v = gf_div(gf_of(Float32(1.0)), lii)
+            elif i > c:
+                for m2 in range(c, i):
+                    v = gf_sub(v, gf_mul(GF(ah[i * d + m2], al[i * d + m2]), GF(xh[m2 * d + c], xl[m2 * d + c])))
+                v = gf_div(v, lii)
+            xh[i * d + c] = v.hi
+            xl[i * d + c] = v.lo
+    barrier()
+    e = t
+    while e < dd:
+        var r = e // d
+        var c = e % d
+        var lv = gf_f32(GF(ah[e], al[e])) if c <= r else Float32(0)
+        chol_l.unsafe_store(k * dd + e, lv)
+        var xv = gf_f32(GF(xh[e], xl[e])) if c <= r else Float32(0)
+        linv.unsafe_store(k * dd + e, xv)
+        prec.unsafe_store(k * dd + c * d + r, xv)
+        e += GMM_CHOL_TPB
+    if t == 0:
+        var sl = Float32(0)
+        for j in range(d):
+            var h = ah[j * d + j]
+            sl += log(h) + al[j * d + j] / h
+        log_det_chol.unsafe_store(k, -sl)
+
+
+@always_inline
+def _gmm_dev_barrier():
+    """A block barrier that also orders DEVICE memory (Apple's `barrier()`
+    orders threadgroup memory only; x_linear/team.mojo `team_barrier`)."""
+    comptime if is_apple_gpu():
+        llvm_intrinsic["llvm.air.wg.barrier", NoneType](Int32(3), Int32(1))
+    else:
+        barrier()
+
+
+# GMM_FAST_BIG_CHOL: default on (FAST + Apple) since the M3 A/B (istella
+# n=1: GMM 6,560 -> 5,894 ms, bic same). `-D ANONLIB_GMM_FAST_BIG_CHOL_OFF`
+# keeps the per-component chain; the old `-D ANONLIB_GMM_FAST_BIG_CHOL`
+# name is harmless. The opt-in GMM_FAST_GRID_COV covariance arm was
+# DROPPED-slower (lane/apple-fast-linear @ 1c7c213f8).
+comptime GMM_FAST_BIG_CHOL = GMM_FUSED_CHOL and not is_defined["ANONLIB_GMM_FAST_BIG_CHOL_OFF"]()
+
+
+def gmm_big_chol_kernel(
+    cov: MutPointer[Float32, MutAnyOrigin],
+    chol_l: MutPointer[Float32, MutAnyOrigin],
+    linv: MutPointer[Float32, MutAnyOrigin],
+    prec: MutPointer[Float32, MutAnyOrigin],
+    log_det_chol: MutPointer[Float32, MutAnyOrigin],
+    info: MutPointer[Int32, MutAnyOrigin],
+    d_in: Int32,
+):
+    """ANONLIB_GMM_FAST_BIG_CHOL, block k = component k:
+    `fused_precision_cholesky_kernel`'s algorithm with the working matrix in
+    chol_l[k] (device memory) and the inverse built in linv[k], for d up to
+    GMM_CHOL_TPB: `L L^T = cov_k` right-looking (`info = j + 1` at the first
+    pivot that is not positive), `linv = L^{-1}` one column a thread,
+    `prec = linv^T`, `log_det_chol = -sum log L_jj`."""
+    var d = Int(d_in)
+    var dd = d * d
+    var k = Int(block_idx.x)
+    var t = Int(thread_idx.x)
+    var base = k * dd
+    var flag = stack_allocation[
+        1, Scalar[DType.int32], address_space = AddressSpace.SHARED
+    ]()
+    var e = t
+    while e < dd:
+        var v = cov[base + e]
+        if e // d == e % d:
+            v = ftz(v + GMM_CHOL_JITTER)
+        chol_l[base + e] = v
+        e += GMM_CHOL_TPB
+    if t == 0:
+        flag[0] = 0
+    _gmm_dev_barrier()
+    for j in range(d):
+        if t == 0:
+            var pv = chol_l[base + j * d + j]
+            if pv > Float32(0):
+                chol_l[base + j * d + j] = sqrt(pv)
+            else:
+                flag[0] = Int32(j + 1)
+        _gmm_dev_barrier()
+        if flag[0] != 0:
+            break
+        var pj = chol_l[base + j * d + j]
+        var i = j + 1 + t
+        while i < d:
+            chol_l[base + i * d + j] = chol_l[base + i * d + j] / pj
+            i += GMM_CHOL_TPB
+        _gmm_dev_barrier()
+        var m = d - 1 - j
+        var cell = t
+        while cell < m * m:
+            var r = j + 1 + cell // m
+            var c = j + 1 + cell % m
+            if c <= r:
+                chol_l[base + r * d + c] = (
+                    chol_l[base + r * d + c] - chol_l[base + r * d + j] * chol_l[base + c * d + j]
+                )
+            cell += GMM_CHOL_TPB
+        _gmm_dev_barrier()
+    var bad = flag[0]
+    if t == 0:
+        info[k] = bad
+    if bad != 0:
+        return
+    if t < d:
+        # column t of L^{-1} by forward substitution; this thread alone
+        # writes and reads its column
+        var c = t
+        for i in range(d):
+            var v = Float32(0.0)
+            if i == c:
+                v = Float32(1.0) / chol_l[base + i * d + i]
+            elif i > c:
+                for m2 in range(c, i):
+                    v -= chol_l[base + i * d + m2] * linv[base + m2 * d + c]
+                v = v / chol_l[base + i * d + i]
+            linv[base + i * d + c] = v
+    _gmm_dev_barrier()
+    e = t
+    while e < dd:
+        var r = e // d
+        var c = e - r * d
+        if c > r:
+            chol_l[base + e] = Float32(0)
+        prec[base + c * d + r] = linv[base + e]
+        e += GMM_CHOL_TPB
+    if t == 0:
+        var sl = Float32(0)
+        for j in range(d):
+            sl += log(chol_l[base + j * d + j])
+        log_det_chol[k] = -sl
+
+
+def idn_precision_cholesky_kernel(
+    cov: MutPointer[Float32, MutAnyOrigin],
+    chol_l: MutPointer[Float32, MutAnyOrigin],
+    linv: MutPointer[Float32, MutAnyOrigin],
+    prec: MutPointer[Float32, MutAnyOrigin],
+    log_det_chol: MutPointer[Float32, MutAnyOrigin],
+    info: MutPointer[Int32, MutAnyOrigin],
+    d_in: Int32,
+):
+    """fam2-cluster, `IDN_GMM_FUSED_CHOL` (IDENTICAL, every column): block k
+    = component k, the working matrix in `chol_l[k]` and the inverse built
+    in `linv[k]` (device memory, so d may reach the block size), every
+    operation and its order as `mixture/chol_order.mojo` states them. Launch
+    `grid_dim = ncomp`, `block_dim = GMM_IDN_CHOL_TPB`.
+
+    Each trailing cell `(r, c)` is owned by one thread per column step and
+    takes ONE pinned fma per step, so its chain is ascending in j whatever
+    the thread count; the three phases of a step are separated by block
+    barriers that order device memory (`_gmm_dev_barrier`)."""
+    var d = Int(d_in)
+    var dd = d * d
+    var k = Int(block_idx.x)
+    var t = Int(thread_idx.x)
+    var base = k * dd
+    var flag = stack_allocation[
+        1, Scalar[DType.int32], address_space = AddressSpace.SHARED
+    ]()
+    var e = t
+    while e < dd:
+        var v = cov.unsafe_load(base + e)
+        if e // d == e % d:
+            v = ftz(ftz(v) + GMM_CHOL_JITTER)
+        chol_l.unsafe_store(base + e, v)
+        e += GMM_IDN_CHOL_TPB
+    if t == 0:
+        flag[0] = Int32(0)
+    _gmm_dev_barrier()
+    for j in range(d):
+        if t == 0:
+            var pv = chol_l.unsafe_load(base + j * d + j)
+            if pv > Float32(0.0):
+                chol_l.unsafe_store(
+                    base + j * d + j, ftz(identical_sqrt(pv))
+                )
+            else:
+                flag[0] = Int32(j + 1)
+        _gmm_dev_barrier()
+        if flag[0] != Int32(0):
+            break
+        var pj = chol_l.unsafe_load(base + j * d + j)
+        var i = j + 1 + t
+        while i < d:
+            chol_l.unsafe_store(
+                base + i * d + j,
+                ftz(identical_div(chol_l.unsafe_load(base + i * d + j), pj)),
+            )
+            i += GMM_IDN_CHOL_TPB
+        _gmm_dev_barrier()
+        # trailing update of the lower triangle, cells (r, c), j < c <= r
+        var m = d - 1 - j
+        var cell = t
+        while cell < m * m:
+            var r = j + 1 + cell // m
+            var c = j + 1 + cell % m
+            if c <= r:
+                chol_l.unsafe_store(
+                    base + r * d + c,
+                    ftz(
+                        identical_mul_add(
+                            -chol_l.unsafe_load(base + r * d + j),
+                            chol_l.unsafe_load(base + c * d + j),
+                            chol_l.unsafe_load(base + r * d + c),
+                        )
+                    ),
+                )
+            cell += GMM_IDN_CHOL_TPB
+        _gmm_dev_barrier()
+    var bad = flag[0]
+    if t == 0:
+        info.unsafe_store(k, bad)
+    if bad != Int32(0):
+        return
+    if t < d:
+        # column t of L^{-1} by forward substitution; this thread alone
+        # writes and reads its column of `linv`
+        var c = t
+        for i in range(d):
+            var v = Float32(0.0)
+            if i == c:
+                v = ftz(
+                    identical_div(
+                        Float32(1.0), chol_l.unsafe_load(base + i * d + i)
+                    )
+                )
+            elif i > c:
+                for m2 in range(c, i):
+                    v = ftz(
+                        identical_mul_add(
+                            -chol_l.unsafe_load(base + i * d + m2),
+                            linv.unsafe_load(base + m2 * d + c),
+                            v,
+                        )
+                    )
+                v = ftz(
+                    identical_div(v, chol_l.unsafe_load(base + i * d + i))
+                )
+            linv.unsafe_store(base + i * d + c, v)
+    _gmm_dev_barrier()
+    e = t
+    while e < dd:
+        var r = e // d
+        var c = e - r * d
+        if c > r:
+            chol_l.unsafe_store(base + e, Float32(0.0))
+        prec.unsafe_store(base + c * d + r, linv.unsafe_load(base + e))
+        e += GMM_IDN_CHOL_TPB
+    if t == 0:
+        var sl = Float32(0.0)
+        for j in range(d):
+            sl = ftz(
+                sl
+                + ftz(identical_log(chol_l.unsafe_load(base + j * d + j)))
+            )
+        log_det_chol.unsafe_store(k, -sl)
+
+
+def center_sqrt_scale_kernel(
+    x: MutPointer[Float32, MutAnyOrigin],
+    means: MutPointer[Float32, MutAnyOrigin],
+    resp: MutPointer[Float32, MutAnyOrigin],
+    y: MutPointer[Float32, MutAnyOrigin],
+    n_in: Int32,
+    d_in: Int32,
+    kcomp_in: Int32,
+    ncomp_in: Int32,
+):
+    """GMM_FAST_GRAM: `y = sqrt(resp[:, k]) * (X - means[k])`, one thread
+    per cell, so `y^T y` is component k's weighted scatter."""
+    var d = Int(d_in)
+    var kc = Int(kcomp_in)
+    var idx = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if idx >= Int(n_in) * d:
+        return
+    var i = idx // d
+    var j = idx % d
+    var r = resp.unsafe_load(i * Int(ncomp_in) + kc)
+    var w = sqrt(r) if r > Float32(0) else Float32(0)
+    y.unsafe_store(idx, w * (x.unsafe_load(idx) - means.unsafe_load(kc * d + j)))
+
+
+def cov_finish_kernel(
+    raw: MutPointer[Float32, MutAnyOrigin],
+    nk: MutPointer[Float32, MutAnyOrigin],
+    cov: MutPointer[Float32, MutAnyOrigin],
+    d_in: Int32,
+    kcomp_in: Int32,
+    reg_covar: Float32,
+    divide_in: Int32,
+):
+    """`cov_k = raw / nk[k]`, then `+ reg_covar` on the DIAGONAL ONLY.
+    `_estimate_gaussian_covariances_full:195-196`, in their order.
+
+    **DEVIATION 1736: the order is theirs and it is not interchangeable.**
+    Adding `reg_covar` before the division would scale it by `1/nk`, so the
+    same nominal `reg_covar` would mean a different ridge in a component with
+    a lot of mass than in one with little -- and `reg_covar` would stop
+    meaning what scikit-learn's `reg_covar` means. Adding it to every cell
+    rather than the diagonal is a different matrix entirely.
+
+    `divide_in` is 0 only for `GMM_SAB_COV_PRESCALE`, which moves the
+    division into the responsibility before the accumulation. It is a kernel
+    ARGUMENT rather than a second kernel because the arm changes WHICH
+    roundings happen and not which cells are written, and a second copy of
+    this kernel would have to be kept in step with this one by hand.
+    """
+    var d = Int(d_in)
+    var kc = Int(kcomp_in)
+    var idx = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if idx >= d * d:
+        return
+    var a = idx // d
+    var b = idx % d
+    var v = ftz(raw.unsafe_load(idx))
+    if Int(divide_in) != 0:
+        v = ftz(identical_div(v, ftz(nk.unsafe_load(kc))))
+    if a == b:
+        v = ftz(v + reg_covar)
+    cov.unsafe_store(kc * d * d + idx, v)
+
+
+# Tried 2026-10-08 (ANONLIB_IDN_GMM_COV_SYM, run ge123e6f9): covariance as a two-GEMM cover of the upper triangle, mirrored;
+# NV/AMD gmm taxi 1.838/1.452, istella 0.966/0.978; taxi mean log-likelihood -0.78% -> slower and worse, deleted.
+# Code recoverable at main ad7ed2370; row in docs/apple-fast/EXPERIMENTS.md.
+def cov_reset_identity_kernel(
+    cov: MutPointer[Float32, MutAnyOrigin],
+    d_in: Int32,
+    kcomp_in: Int32,
+):
+    """`GMM_SAB_COLLAPSE_RESET`'s kernel: overwrite a collapsed component's
+    covariance with the identity and carry on.
+
+    There is NO production counterpart, on purpose. This is the thing a
+    library does when it wants its fit never to fail, and DEVIATION 1723 is
+    the decision not to. It lives here so the check can drive it and show
+    that a fit which refuses on one set of pivots and succeeds on another is
+    a fit whose OUTCOME is data-dependent in a way no downstream bitwise gate
+    would ever see -- because the two runs would not have the same stages to
+    compare.
+    """
+    var d = Int(d_in)
+    var kc = Int(kcomp_in)
+    var idx = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if idx >= d * d:
+        return
+    var i = idx // d
+    var j = idx % d
+    cov.unsafe_store(
+        kc * d * d + idx, Float32(1.0) if i == j else Float32(0.0)
+    )
+
+
+# ===========================================================================
+# THE WORKSPACES
+# ===========================================================================
+
+
+# Tried 2026-10-08 (ANONLIB_IDN_GMM_COV_SYM, run ge123e6f9): covariance as a two-GEMM cover of the upper triangle, mirrored;
+# NV/AMD gmm taxi 1.838/1.452, istella 0.966/0.978; taxi mean log-likelihood -0.78% -> slower and worse, deleted.
+# Code recoverable at main ad7ed2370; row in docs/apple-fast/EXPERIMENTS.md.
+def gmm_mstep_scratch_floats(n: Int, d: Int, ncomp: Int) -> Int:
+    """Floats the M-step needs beside its named buffers.
+
+        [0, n*d)                        `diff`  = X - means[k]
+        [n*d, 2*n*d)                    `scaled` = resp[:, k] * diff
+        [2*n*d, 2*n*d + max(ncomp*d, d*d))
+                                        the raw product, which is `K x d` for
+                                        the means and `d x d` for a
+                                        covariance -- one region, used by one
+                                        at a time
+        + 1                             `sum_k nk`, the loop's divisor
+    """
+    var raw = ncomp * d
+    if d * d > raw:
+        raw = d * d
+    return 2 * n * d + raw + 1
+
+
+def gmm_mstep_gemm_workspace_floats(n: Int, d: Int, ncomp: Int) -> Int:
+    """Floats `identical_gemm_into` may need for the M-step's two products:
+    `resp^T . X` (`K x d`, k-axis `n`) and `scaled^T . diff` (`d x d`, k-axis
+    `n`). The MAX of the two, never less than one, for the reason
+    `identical_gemm_into`'s docstring gives about a workspace with slack."""
+    var a = identical_gemm_workspace_max_floats(ncomp, d, n)
+    var b = identical_gemm_workspace_max_floats(d, d, n)
+    var w = a if a > b else b
+    if w < 1:
+        return 1
+    return w
+
+
+def gmm_chol_workspace_floats(d: Int) -> Int:
+    """Floats the per-component Cholesky needs, from the Cholesky lane's own
+    helper at this lane's pinned block size.
+
+    `chol_workspace_floats(d, CHOL_NB_PINNED)` and not a guess: the Cholesky
+    lane's `NB` is a NUMERIC parameter pinned under IDENTICAL (its DEVIATION
+    1630), a hint asking for anything else RAISES BY NAME, and the workspace
+    a smaller `nb` would need is BIGGER rather than smaller. Sizing this by
+    hand is the out-of-bounds write both that lane and the gemm lane record
+    having been bitten by.
+    """
+    var w = chol_workspace_floats(d, CHOL_NB_PINNED)
+    if w < 1:
+        return 1
+    return w
+
+
+def gmm_chol_dwork_floats(d: Int) -> Int:
+    """Floats `gmm_precision_cholesky` needs for its own three scratch
+    regions, laid out in `dwork`:
+
+        [0, d*d)                   the identity, then `L^{-1}` over it
+        [d*d, d*d + d + 1)         `chol_logdet`'s diagonal plus its scalar
+        [d*d + d + 1, 2*d*d + d + 1)
+                                   the working copy the factorization
+                                   overwrites in place
+
+    The working copy exists because `potrf_lower` factors IN PLACE and
+    `covariances_` is an OUTPUT of the fit that a caller reads. Factoring the
+    covariance itself would leave the estimator returning a triangular factor
+    where scikit-learn returns a covariance.
+    """
+    return 2 * d * d + d + 1
+
+
+# ===========================================================================
+# THE PRECISION CHOLESKY: THE ONE PLACE THIS LANE CAN FAIL
+# ===========================================================================
+
+
+def gmm_precision_cholesky(
+    ctx: DeviceContext,
+    mut cov: DeviceBuffer[DType.float32],
+    mut chol_l: DeviceBuffer[DType.float32],
+    mut linv: DeviceBuffer[DType.float32],
+    mut prec: DeviceBuffer[DType.float32],
+    mut log_det_chol: DeviceBuffer[DType.float32],
+    mut cws: DeviceBuffer[DType.float32],
+    mut dwork: DeviceBuffer[DType.float32],
+    d: Int,
+    ncomp: Int,
+    mut trace: IdentityTrace,
+    tag: String,
+    elem_tpb: Int = GMM_ELEM_TPB,
+    solve_tpb: Int = CHOL_SOLVE_TPB,
+    panel_tpb: Int = CHOL_PANEL_TPB,
+    chol_elem_tpb: Int = CHOL_ELEM_TPB,
+    sabotage: Int = GMM_SAB_NONE,
+    cov_lo_addr: Int = 0,
+) raises -> GmmMStepRun:
+    """`_compute_precision_cholesky` for `covariance_type="full"`
+    (`_gaussian_mixture.py:353-371`), component by component in ASCENDING
+    order.
+
+    For each `k`, in this order:
+
+      1. copy `covariances[k]` into a working `d x d` block, because
+         `potrf_lower` factors IN PLACE and the covariance is an output of
+         the fit that a caller reads;
+      2. `add_jitter(..., GMM_CHOL_JITTER)` -- a ridge of `+0.0`
+         (DEVIATION 1737), called for its `ftz` on the diagonal rather than
+         for a ridge;
+      3. `potrf_lower` -> `L_k`, and **`info != 0` STOPS EVERYTHING**
+         (DEVIATION 1723);
+      4. `chol_logdet(L_k)` -> `2 sum log L_jj`, and
+         `log_det_chol[k] = -0.5 *` that (DEVIATION 1726);
+      5. `trsm_lower(L_k, I)` -> `L_k^{-1}`;
+      6. transpose -> `P_k = (L_k^{-1})^T`, scikit-learn's `.T` at `:370`.
+
+    **THE CHOLESKY LANE'S OWN CARD STAGES ARE NOT EMITTED, AND THAT IS
+    DELIBERATE.** `potrf_lower` and `chol_logdet` record `chol.panelNNN.*`,
+    `chol.factor`, `chol.nb`, `chol.diag` and `chol.logdet` under tags they
+    hardcode, so calling them `K` times per iteration would violate
+    `IdentityTrace`'s tag-uniqueness invariant and raise on the second
+    component. They are therefore called with a DISABLED trace, and this
+    function records the OUTPUTS -- `<tag>.compKKK.cholesky`,
+    `.compKKK.precchol`, `<tag>.logdet` -- under its own tags instead.
+
+    That is also the right card. A `chol.panelNNN.trailing` moving is the
+    GEMM lane's certificate, and a `chol.panelNNN.factored` moving is the
+    Cholesky lane's; neither is this lane's to certify, and both are already
+    gated by `pixi run check-cholesky`. What this lane owes is that the
+    FACTOR it fed forward is the same factor. A `tag_prefix` argument on
+    `potrf_lower` and `chol_logdet` would let a caller nest their stages
+    inside a per-component card, and `mixture/README.md`'s WHAT THE
+    MAINTAINER MUST WIRE names it as a change the Cholesky lane could make.
+    It was NOT made here.
+
+    SYNCHRONIZES, once per component, twice: `potrf_lower` reads `info` back
+    per panel and `chol_logdet` reads its scalar back. At `d <= 32` that is
+    one panel, so it is two drains per component per iteration. Named rather
+    than hidden; `mixture/README.md`'s WHAT IS OWED carries it.
+    """
+    var dd = d * d
+    var need_dwork = gmm_chol_dwork_floats(d)
+    if len(dwork) < need_dwork:
+        raise Error(
+            "gmm_precision_cholesky: dwork holds "
+            + String(len(dwork))
+            + " floats, d="
+            + String(d)
+            + " needs "
+            + String(need_dwork)
+            + "; use gmm_chol_dwork_floats, not a guess"
+        )
+    if len(cws) < gmm_chol_workspace_floats(d):
+        raise Error(
+            "gmm_precision_cholesky: the Cholesky workspace holds "
+            + String(len(cws))
+            + " floats, d="
+            + String(d)
+            + " at the pinned block size needs "
+            + String(gmm_chol_workspace_floats(d))
+            + "; use gmm_chol_workspace_floats, not a guess"
+        )
+    var identity = dwork.create_sub_buffer[DType.float32](0, dd)
+    var scal = dwork.create_sub_buffer[DType.float32](dd, d + 1)
+    var work = dwork.create_sub_buffer[DType.float32](dd + d + 1, dd)
+    var quiet = IdentityTrace.disabled()
+    var logdet_host = List[Float32]()
+
+    var grid_dd = (dd + elem_tpb - 1) // elem_tpb
+
+    comptime if IDN_GMM_FUSED_CHOL:
+        # fam2-cluster: every component in one launch, one readback of the
+        # pivot flags (`mixture/chol_order.mojo`). The sabotage arms keep the
+        # per-component chain they were written against.
+        if sabotage == GMM_SAB_NONE and gmm_idn_chol_applies(d):
+            var d_info = ctx.enqueue_create_buffer[DType.int32](ncomp)
+            var h_info = ctx.enqueue_create_host_buffer[DType.int32](ncomp)
+            ctx.enqueue_function[idn_precision_cholesky_kernel](
+                cov.unsafe_ptr(), chol_l.unsafe_ptr(), linv.unsafe_ptr(),
+                prec.unsafe_ptr(), log_det_chol.unsafe_ptr(),
+                d_info.unsafe_ptr(), Int32(d),
+                grid_dim=(ncomp, 1, 1), block_dim=(GMM_IDN_CHOL_TPB, 1, 1),
+            )
+            ctx.enqueue_copy(dst_ptr=h_info.unsafe_ptr(), src_buf=d_info)
+            ctx.synchronize()
+            var fail_k = -1
+            var fail_info = 0
+            for kc in range(ncomp):
+                var inf_k = Int(h_info.unsafe_ptr().unsafe_load(kc))
+                if inf_k != 0 and fail_k < 0:
+                    fail_k = kc
+                    fail_info = inf_k
+            _ = d_info^
+            _ = h_info^
+            _ = identity^
+            _ = scal^
+            _ = work^
+            if trace.enabled:
+                # The per-component chain's tags, in its order: the
+                # components before the first failure, then the log
+                # determinants when none failed.
+                var upto = ncomp if fail_k < 0 else fail_k
+                for kc in range(upto):
+                    var ldst = chol_l.create_sub_buffer[DType.float32](
+                        kc * dd, dd
+                    )
+                    trace.record_device(
+                        ctx, gmm_comp_tag(tag, kc, "cholesky"), ldst, dd
+                    )
+                    var prec_k = prec.create_sub_buffer[DType.float32](
+                        kc * dd, dd
+                    )
+                    trace.record_device(
+                        ctx, gmm_comp_tag(tag, kc, "precchol"), prec_k, dd
+                    )
+                    _ = ldst^
+                    _ = prec_k^
+                if fail_k < 0:
+                    trace.record_device(
+                        ctx, tag + ".logdet", log_det_chol, ncomp
+                    )
+            return GmmMStepRun(fail_info, fail_k)
+    comptime if GMM_FUSED_CHOL:
+        if sabotage == GMM_SAB_NONE and not trace.enabled and d <= GMM_CHOL_MAX_D:
+            var d_info = ctx.enqueue_create_buffer[DType.int32](ncomp)
+            var h_info = ctx.enqueue_create_host_buffer[DType.int32](ncomp)
+            var ff_chol = False
+            comptime if GMM_FAST_FF_COV:
+                ff_chol = cov_lo_addr != 0
+            if ff_chol:
+                # GMM_FAST_FF_COV: float-float factor of cov + cov_lo (the
+                # residual is zero when the M-step took a float32 route)
+                ctx.enqueue_function[fused_precision_cholesky_ff_kernel](
+                    cov.unsafe_ptr(), MutPointer[Float32, MutAnyOrigin](unsafe_from_address=cov_lo_addr),
+                    chol_l.unsafe_ptr(), linv.unsafe_ptr(),
+                    prec.unsafe_ptr(), log_det_chol.unsafe_ptr(),
+                    d_info.unsafe_ptr(), Int32(d),
+                    grid_dim=(ncomp, 1, 1), block_dim=(GMM_CHOL_TPB, 1, 1),
+                )
+            else:
+                ctx.enqueue_function[fused_precision_cholesky_kernel](
+                    cov.unsafe_ptr(), chol_l.unsafe_ptr(), linv.unsafe_ptr(),
+                    prec.unsafe_ptr(), log_det_chol.unsafe_ptr(),
+                    d_info.unsafe_ptr(), Int32(d),
+                    grid_dim=(ncomp, 1, 1), block_dim=(GMM_CHOL_TPB, 1, 1),
+                )
+            ctx.enqueue_copy(dst_ptr=h_info.unsafe_ptr(), src_buf=d_info)
+            ctx.synchronize()
+            var fail_k = -1
+            var fail_info = 0
+            for kc in range(ncomp):
+                var inf_k = Int(h_info.unsafe_ptr().unsafe_load(kc))
+                if inf_k != 0 and fail_k < 0:
+                    fail_k = kc
+                    fail_info = inf_k
+            _ = d_info^
+            _ = h_info^
+            _ = identity^
+            _ = scal^
+            _ = work^
+            return GmmMStepRun(fail_info, fail_k)
+    comptime if GMM_FAST_BIG_CHOL:
+        # lane/apple-fast-linear: -D ANONLIB_GMM_FAST_BIG_CHOL, d > 32 (see
+        # gmm_big_chol_kernel's banner); one launch, one readback of info
+        if (
+            sabotage == GMM_SAB_NONE
+            and not trace.enabled
+            and d > GMM_CHOL_MAX_D
+            and d <= GMM_CHOL_TPB
+        ):
+            var d_info = ctx.enqueue_create_buffer[DType.int32](ncomp)
+            var h_info = ctx.enqueue_create_host_buffer[DType.int32](ncomp)
+            ctx.enqueue_function[gmm_big_chol_kernel](
+                cov.unsafe_ptr(), chol_l.unsafe_ptr(), linv.unsafe_ptr(),
+                prec.unsafe_ptr(), log_det_chol.unsafe_ptr(),
+                d_info.unsafe_ptr(), Int32(d),
+                grid_dim=(ncomp, 1, 1), block_dim=(GMM_CHOL_TPB, 1, 1),
+            )
+            ctx.enqueue_copy(dst_ptr=h_info.unsafe_ptr(), src_buf=d_info)
+            ctx.synchronize()
+            var fail_k = -1
+            var fail_info = 0
+            for kc in range(ncomp):
+                var inf_k = Int(h_info.unsafe_ptr().unsafe_load(kc))
+                if inf_k != 0 and fail_k < 0:
+                    fail_k = kc
+                    fail_info = inf_k
+            _ = d_info^
+            _ = h_info^
+            _ = identity^
+            _ = scal^
+            _ = work^
+            return GmmMStepRun(fail_info, fail_k)
+
+    for kc in range(ncomp):
+        # (1) the working copy
+        var src = cov.create_sub_buffer[DType.float32](kc * dd, dd)
+        # device-to-device copies and kernels are stream-ordered: no drain
+        # between them (lane/cluster-apple; the drains that stay are where
+        # the host reads: potrf's info, the log determinant)
+        ctx.enqueue_copy(dst_buf=work, src_buf=src)
+
+        # (2) the profile's diagonal flush, with no ridge
+        add_jitter(ctx, work, d, GMM_CHOL_JITTER, chol_elem_tpb)
+
+        # (3) the factorization, and the only failure this lane has
+        var run = potrf_lower(
+            ctx,
+            work,
+            cws,
+            d,
+            quiet,
+            CHOL_NB_PINNED,
+            panel_tpb,
+            chol_elem_tpb,
+        )
+        if run.info != 0:
+            if sabotage == GMM_SAB_COLLAPSE_RESET:
+                # ARM. See `cov_reset_identity_kernel`. The component's
+                # covariance is silently replaced and the loop continues, so
+                # the fit SUCCEEDS where DEVIATION 1723 refuses.
+                ctx.enqueue_function[cov_reset_identity_kernel](
+                    cov.unsafe_ptr(),
+                    Int32(d),
+                    Int32(kc),
+                    grid_dim=(grid_dd, 1, 1),
+                    block_dim=(elem_tpb, 1, 1),
+                )
+                ctx.synchronize()
+                var src2 = cov.create_sub_buffer[DType.float32](kc * dd, dd)
+                ctx.enqueue_copy(dst_buf=work, src_buf=src2)
+                ctx.synchronize()
+                add_jitter(ctx, work, d, GMM_CHOL_JITTER, chol_elem_tpb)
+                run = potrf_lower(
+                    ctx,
+                    work,
+                    cws,
+                    d,
+                    quiet,
+                    CHOL_NB_PINNED,
+                    panel_tpb,
+                    chol_elem_tpb,
+                )
+                _ = src2^
+                if run.info != 0:
+                    # The identity matrix failed to factor, which is
+                    # arithmetically impossible. Reported rather than looped
+                    # on, so a broken Cholesky cannot be mistaken for a
+                    # collapsed component even on the sabotage path.
+                    _ = src^
+                    _ = identity^
+                    _ = scal^
+                    _ = work^
+                    return GmmMStepRun(run.info, kc)
+            else:
+                _ = src^
+                _ = identity^
+                _ = scal^
+                _ = work^
+                return GmmMStepRun(run.info, kc)
+
+        # (4) log|Sigma_k| through the ONE pinned fold, halved and negated.
+        var ld = chol_logdet(ctx, work, scal, d, quiet, chol_elem_tpb)
+        logdet_host.append(ftz(identical_mul(Float32(-0.5), ld)))
+
+        # the factor, kept for the card and for the VENDOR_MATMUL arm
+        var ldst = chol_l.create_sub_buffer[DType.float32](kc * dd, dd)
+        ctx.enqueue_copy(dst_buf=ldst, src_buf=work)
+        trace.record_device(
+            ctx, gmm_comp_tag(tag, kc, "cholesky"), ldst, dd
+        )
+
+        # (5) L^{-1} by forward substitution against the identity
+        ctx.enqueue_function[set_identity_kernel](
+            identity.unsafe_ptr(),
+            Int32(d),
+            grid_dim=(grid_dd, 1, 1),
+            block_dim=(elem_tpb, 1, 1),
+        )
+        trsm_lower(
+            ctx, work, identity, d, d, quiet, "gmm.precision.trsm", solve_tpb
+        )
+        var linv_k = linv.create_sub_buffer[DType.float32](kc * dd, dd)
+        ctx.enqueue_copy(dst_buf=linv_k, src_buf=identity)
+
+        # (6) P_k = (L_k^{-1})^T
+        var prec_k = prec.create_sub_buffer[DType.float32](kc * dd, dd)
+        ctx.enqueue_function[transpose_square_kernel](
+            linv_k.unsafe_ptr(),
+            prec_k.unsafe_ptr(),
+            Int32(d),
+            grid_dim=(grid_dd, 1, 1),
+            block_dim=(elem_tpb, 1, 1),
+        )
+        trace.record_device(
+            ctx, gmm_comp_tag(tag, kc, "precchol"), prec_k, dd
+        )
+
+        if sabotage == GMM_SAB_LOGDET_FROM_DIAG:
+            # ARM: scikit-learn's own spelling, from the precision
+            # diagonal. Overwrites the value computed at (4).
+            ctx.enqueue_function[sabotage_logdet_from_diag_kernel](
+                prec_k.unsafe_ptr(),
+                log_det_chol.unsafe_ptr(),
+                Int32(d),
+                Int32(kc),
+                grid_dim=(1, 1, 1),
+                block_dim=(1, 1, 1),
+            )
+            ctx.synchronize()
+
+        _ = src^
+        _ = ldst^
+        _ = linv_k^
+        _ = prec_k^
+
+    if sabotage != GMM_SAB_LOGDET_FROM_DIAG:
+        var h = ctx.enqueue_create_host_buffer[DType.float32](ncomp)
+        for k in range(ncomp):
+            h.unsafe_ptr().unsafe_store(k, logdet_host[k])
+        ctx.enqueue_copy(dst_buf=log_det_chol, src_ptr=h.unsafe_ptr())
+        ctx.synchronize()
+        _ = h^
+    trace.record_device(ctx, tag + ".logdet", log_det_chol, ncomp)
+
+    _ = identity^
+    _ = scal^
+    _ = work^
+    return GmmMStepRun(0, -1)
+
+
+# ===========================================================================
+# THE MOMENTS
+# ===========================================================================
+
+
+def gmm_m_step(
+    ctx: DeviceContext,
+    mut x: DeviceBuffer[DType.float32],
+    mut logresp: DeviceBuffer[DType.float32],
+    mut resp: DeviceBuffer[DType.float32],
+    mut nk: DeviceBuffer[DType.float32],
+    mut weights: DeviceBuffer[DType.float32],
+    mut log_weights: DeviceBuffer[DType.float32],
+    mut means: DeviceBuffer[DType.float32],
+    mut cov: DeviceBuffer[DType.float32],
+    mut scratch: DeviceBuffer[DType.float32],
+    mut gws: DeviceBuffer[DType.float32],
+    n: Int,
+    d: Int,
+    ncomp: Int,
+    reg_covar: Float32,
+    divide_weights_by_n: Bool,
+    mut trace: IdentityTrace,
+    tag: String,
+    elem_tpb: Int = GMM_ELEM_TPB,
+    comp_tpb: Int = GMM_COMP_TPB,
+    sabotage: Int = GMM_SAB_NONE,
+    cov_lo_addr: Int = 0,
+) raises:
+    """**THE M-STEP'S MOMENTS.** `_estimate_gaussian_parameters` plus the
+    weight normalization, in scikit-learn's order.
+
+    `divide_weights_by_n` selects which of their two divisors to use:
+    `True` is `_initialize:864`'s `weights /= n_samples`, `False` is
+    `_m_step:898`'s `weights /= sum(weights)`. It is a required argument
+    rather than a defaulted one, because a default would let the choice be
+    made by not making it, and the two are different numbers.
+
+    **THE PRECISION CHOLESKY IS NOT HERE.** scikit-learn calls it at the end
+    of `_m_step`, and the driver in `mixture/estimator.mojo` calls
+    `gmm_precision_cholesky` right after this for the same reason -- but it
+    is a separate function because it is THE ONLY PLACE THIS LANE CAN FAIL,
+    and a step that can fail and a step that cannot should not be one call.
+
+    ASYNCHRONOUS except for the trace records. Stages, in order:
+
+        <tag>.resp         exp(log_resp), n x K
+        <tag>.nk           the component masses, K
+        <tag>.weights      the mixing weights, K
+        <tag>.means        K x d
+        <tag>.covariances  K x d x d
+    """
+    if n <= 0 or d <= 0 or ncomp <= 0:
+        raise Error(
+            "gmm_m_step: n, d and n_components must all be positive, got n="
+            + String(n)
+            + " d="
+            + String(d)
+            + " n_components="
+            + String(ncomp)
+        )
+    var need = gmm_mstep_scratch_floats(n, d, ncomp)
+    if len(scratch) < need:
+        raise Error(
+            "gmm_m_step: the scratch buffer holds "
+            + String(len(scratch))
+            + " floats, this shape needs "
+            + String(need)
+            + "; use gmm_mstep_scratch_floats, not a guess"
+        )
+
+    var raw_max = ncomp * d
+    if d * d > raw_max:
+        raw_max = d * d
+    var diff = scratch.create_sub_buffer[DType.float32](0, n * d)
+    var scaled = scratch.create_sub_buffer[DType.float32](n * d, n * d)
+    var raw = scratch.create_sub_buffer[DType.float32](2 * n * d, raw_max)
+    var denom = scratch.create_sub_buffer[DType.float32](
+        2 * n * d + raw_max, 1
+    )
+
+    var ph_on = String(getenv("ANONLIB_GMM_MSTEP_TIMES")) == "1"
+    var ph_t = 0
+    if ph_on:
+        ctx.synchronize()
+        ph_t = Int(perf_counter_ns())
+    var grid_cells = (n * ncomp + elem_tpb - 1) // elem_tpb
+    if sabotage == GMM_SAB_NO_FTZ_RESP:
+        ctx.enqueue_function[sabotage_resp_exp_kernel](
+            logresp.unsafe_ptr(),
+            resp.unsafe_ptr(),
+            Int32(n),
+            Int32(ncomp),
+            Int32(sabotage),
+            grid_dim=(grid_cells, 1, 1),
+            block_dim=(elem_tpb, 1, 1),
+        )
+    else:
+        ctx.enqueue_function[resp_exp_kernel](
+            logresp.unsafe_ptr(),
+            resp.unsafe_ptr(),
+            Int32(n),
+            Int32(ncomp),
+            grid_dim=(grid_cells, 1, 1),
+            block_dim=(elem_tpb, 1, 1),
+        )
+    trace.record_device(ctx, tag + ".resp", resp, n * ncomp)
+    if ph_on:
+        ctx.synchronize()
+        var now = Int(perf_counter_ns())
+        print("GMM_MSTEP resp_us=" + String((now - ph_t) // 1000))
+        ph_t = now
+
+    var grid_comp = (ncomp + comp_tpb - 1) // comp_tpb
+    var fast_sums = False
+    comptime if GMM_FAST_GRAM:
+        fast_sums = sabotage == 0 and d <= GMM_FAST_COLS
+    if fast_sums:
+        ctx.enqueue_function[fast_resp_colsums_partial_kernel](
+            x.unsafe_ptr(),
+            resp.unsafe_ptr(),
+            scaled.unsafe_ptr(),
+            Int32(n),
+            Int32(d),
+            Int32(ncomp),
+            grid_dim=(ncomp, GMM_FAST_CHUNKS, 1),
+            block_dim=(GMM_FAST_TPB, 1, 1),
+        )
+        ctx.enqueue_function[fast_resp_colsums_finish_kernel](
+            scaled.unsafe_ptr(),
+            raw.unsafe_ptr(),
+            nk.unsafe_ptr(),
+            Int32(d),
+            Int32(ncomp),
+            gmm_ten_eps(),
+            grid_dim=((ncomp * (d + 1) + 255) // 256, 1, 1),
+            block_dim=(256, 1, 1),
+        )
+    elif sabotage == GMM_SAB_NK_DESCENDING:
+        ctx.enqueue_function[sabotage_nk_kernel](
+            resp.unsafe_ptr(),
+            nk.unsafe_ptr(),
+            Int32(n),
+            Int32(ncomp),
+            gmm_ten_eps(),
+            Int32(sabotage),
+            grid_dim=(grid_comp, 1, 1),
+            block_dim=(comp_tpb, 1, 1),
+        )
+    elif IDN_GMM_NK_LEVELS:
+        # `scaled` is free until the covariance loop below writes it; a
+        # shape whose levels do not fit it gets its own scratch and a drain.
+        var nk_need = gmm_nk_levels_floats(n, ncomp)
+        if nk_need <= n * d:
+            gmm_nk_levels_launch(ctx, resp, nk, scaled, n, ncomp)
+        else:
+            var nk_scratch = ctx.enqueue_create_buffer[DType.float32](nk_need)
+            gmm_nk_levels_launch(ctx, resp, nk, nk_scratch, n, ncomp)
+            ctx.synchronize()
+            _ = nk_scratch^
+    elif GMM_NK_T:
+        var resp_t = ctx.enqueue_create_buffer[DType.float32](n * ncomp)
+        ctx.enqueue_function[resp_transpose_kernel](
+            resp.unsafe_ptr(), resp_t.unsafe_ptr(), Int32(n), Int32(ncomp),
+            grid_dim=((n * ncomp + 255) // 256, 1, 1), block_dim=(256, 1, 1),
+        )
+        ctx.enqueue_function[nk_t_kernel](
+            resp_t.unsafe_ptr(), nk.unsafe_ptr(), Int32(n), Int32(ncomp),
+            gmm_ten_eps(),
+            grid_dim=(grid_comp, 1, 1),
+            block_dim=(comp_tpb, 1, 1),
+        )
+        ctx.synchronize()
+        _ = resp_t^
+    else:
+        ctx.enqueue_function[nk_kernel](
+            resp.unsafe_ptr(),
+            nk.unsafe_ptr(),
+            Int32(n),
+            Int32(ncomp),
+            gmm_ten_eps(),
+            grid_dim=(grid_comp, 1, 1),
+            block_dim=(comp_tpb, 1, 1),
+        )
+    trace.record_device(ctx, tag + ".nk", nk, ncomp)
+    if ph_on:
+        ctx.synchronize()
+        var now_nk = Int(perf_counter_ns())
+        print("GMM_MSTEP nk_us=" + String((now_nk - ph_t) // 1000))
+        ph_t = now_nk
+
+    # THE DIVISOR. `_initialize:864` uses n_samples; `_m_step:898` uses
+    # sum(nk). One kernel, one spelling, two sources.
+    if divide_weights_by_n:
+        var hd = ctx.enqueue_create_host_buffer[DType.float32](1)
+        hd.unsafe_ptr().unsafe_store(0, Float32(n))
+        ctx.enqueue_copy(dst_buf=denom, src_ptr=hd.unsafe_ptr())
+        ctx.synchronize()
+        _ = hd^
+    else:
+        ctx.enqueue_function[nk_total_kernel](
+            nk.unsafe_ptr(),
+            denom.unsafe_ptr(),
+            Int32(ncomp),
+            grid_dim=(1, 1, 1),
+            block_dim=(1, 1, 1),
+        )
+    ctx.enqueue_function[weights_kernel](
+        nk.unsafe_ptr(),
+        denom.unsafe_ptr(),
+        weights.unsafe_ptr(),
+        log_weights.unsafe_ptr(),
+        Int32(ncomp),
+        grid_dim=(grid_comp, 1, 1),
+        block_dim=(comp_tpb, 1, 1),
+    )
+    trace.record_device(ctx, tag + ".weights", weights, ncomp)
+
+    # means = (resp^T . X) / nk.  OP_TN: A is `k x m` = `n x K`, B is
+    # `k x n_cols` = `n x d`, C is `K x d`. `linalg.matmul` is REFUSED here;
+    # DEVIATION 1729.
+    if not fast_sums:
+        identical_gemm_into(ctx, raw, resp, x, gws, ncomp, d, n, OP_TN)
+    var grid_md = (ncomp * d + elem_tpb - 1) // elem_tpb
+    ctx.enqueue_function[means_divide_kernel](
+        raw.unsafe_ptr(),
+        nk.unsafe_ptr(),
+        means.unsafe_ptr(),
+        Int32(ncomp),
+        Int32(d),
+        grid_dim=(grid_md, 1, 1),
+        block_dim=(elem_tpb, 1, 1),
+    )
+    trace.record_device(ctx, tag + ".means", means, ncomp * d)
+    if ph_on:
+        ctx.synchronize()
+        var now = Int(perf_counter_ns())
+        print("GMM_MSTEP sums_weights_means_us=" + String((now - ph_t) // 1000))
+        ph_t = now
+
+    var grid_nd = (n * d + elem_tpb - 1) // elem_tpb
+    var grid_dd = (d * d + elem_tpb - 1) // elem_tpb
+    var divide_after = Int32(0) if sabotage == GMM_SAB_COV_PRESCALE else Int32(1)
+    var fast_gram = False
+    var ncomp_loop = ncomp
+    comptime if GMM_FAST_GRAM:
+        fast_gram = sabotage == 0 and gram_splitk_applies(d, d, n)
+    comptime if GMM_FAST_FF_COV:
+        # the covariance's float-float residual for the precision Cholesky:
+        # zero unless the float-float pass below writes it (every other
+        # covariance route hands a plain float32 matrix)
+        if cov_lo_addr != 0 and ncomp * d * d > 0:
+            var cells0 = ncomp * d * d
+            ctx.enqueue_function[gmm_zero_f32_kernel](
+                MutPointer[Float32, MutAnyOrigin](unsafe_from_address=cov_lo_addr), Int32(cells0),
+                grid_dim=((cells0 + 255) // 256, 1, 1),
+                block_dim=(256, 1, 1),
+            )
+    comptime if GMM_FUSED_COV:
+        if fast_gram and divide_after != 0 and gmm_fused_cov_applies(n, d, ncomp):
+            var cells = ncomp * d * d
+            var ff_done = False
+            comptime if GMM_FAST_FF_COV:
+                var nblk = gmm_ff_cov_blocks(n, d, ncomp)
+                if cov_lo_addr != 0 and nblk >= 1 and d <= GMM_CHOL_MAX_D:
+                    # hi and lo partials over `diff` + `scaled` (2 n d floats;
+                    # `diff` is unused on this route)
+                    var both = scratch.create_sub_buffer[DType.float32](0, 2 * n * d)
+                    ctx.enqueue_function[fused_cov_partial_ff_kernel](
+                        x.unsafe_ptr(), means.unsafe_ptr(), resp.unsafe_ptr(),
+                        both.unsafe_ptr(), Int32(n), Int32(d), Int32(ncomp), Int32(nblk),
+                        grid_dim=(nblk, 1, 1),
+                        block_dim=(GMM_FUSED_TPB, 1, 1),
+                    )
+                    ctx.enqueue_function[fused_cov_finish_ff_kernel](
+                        both.unsafe_ptr(), nk.unsafe_ptr(), cov.unsafe_ptr(),
+                        MutPointer[Float32, MutAnyOrigin](unsafe_from_address=cov_lo_addr),
+                        Int32(d), Int32(ncomp), Int32(nblk), reg_covar,
+                        grid_dim=((cells + 255) // 256, 1, 1),
+                        block_dim=(256, 1, 1),
+                    )
+                    _ = both^
+                    ff_done = True
+            if not ff_done:
+                ctx.enqueue_function[fused_cov_partial_kernel](
+                    x.unsafe_ptr(), means.unsafe_ptr(), resp.unsafe_ptr(),
+                    scaled.unsafe_ptr(), Int32(n), Int32(d), Int32(ncomp),
+                    grid_dim=(GMM_FUSED_BLOCKS, 1, 1),
+                    block_dim=(GMM_FUSED_TPB, 1, 1),
+                )
+                ctx.enqueue_function[fused_cov_finish_kernel](
+                    scaled.unsafe_ptr(), nk.unsafe_ptr(), cov.unsafe_ptr(),
+                    Int32(d), Int32(ncomp), reg_covar,
+                    grid_dim=((cells + 255) // 256, 1, 1),
+                    block_dim=(256, 1, 1),
+                )
+            fast_gram = False
+            ncomp_loop = 0
+    var pair_buffers=List[DeviceBuffer[DType.float32]]()
+    var paired=False
+    comptime if GMM_CENTER_PAIR or C53_CENTER4:
+        paired=sabotage==0 and not fast_gram and ncomp_loop>0 and n>0 and d>0 and n<=GMM_CENTER_CELLS//d
+        if paired:
+            pair_buffers.append(ctx.enqueue_create_buffer[DType.float32](GMM_CENTER_GROUP*n*d))
+            pair_buffers.append(ctx.enqueue_create_buffer[DType.float32](GMM_CENTER_GROUP*n*d))
+    # Tried 2026-10-08 (ANONLIB_IDN_GMM_COV_SYM, run ge123e6f9): covariance as a two-GEMM cover of the upper triangle, mirrored;
+    # NV/AMD gmm taxi 1.838/1.452, istella 0.966/0.978; taxi mean log-likelihood -0.78% -> slower and worse, deleted.
+    # Code recoverable at main ad7ed2370; row in docs/apple-fast/EXPERIMENTS.md.
+    for kc in range(ncomp_loop):
+        if fast_gram:
+            ctx.enqueue_function[center_sqrt_scale_kernel](
+                x.unsafe_ptr(),
+                means.unsafe_ptr(),
+                resp.unsafe_ptr(),
+                diff.unsafe_ptr(),
+                Int32(n),
+                Int32(d),
+                Int32(kc),
+                Int32(ncomp),
+                grid_dim=(grid_nd, 1, 1),
+                block_dim=(elem_tpb, 1, 1),
+            )
+            gemm_tn_splitk_into(ctx, raw, diff, scaled, d, n)
+            ctx.enqueue_function[cov_finish_kernel](
+                raw.unsafe_ptr(),
+                nk.unsafe_ptr(),
+                cov.unsafe_ptr(),
+                Int32(d),
+                Int32(kc),
+                reg_covar,
+                divide_after,
+                grid_dim=(grid_dd, 1, 1),
+                block_dim=(elem_tpb, 1, 1),
+            )
+            continue
+        if paired:
+            if kc%GMM_CENTER_GROUP==0:
+                var pair_diff_ptr=pair_buffers[0].unsafe_ptr().unsafe_origin_cast[MutAnyOrigin]()
+                var pair_scaled_ptr=pair_buffers[1].unsafe_ptr().unsafe_origin_cast[MutAnyOrigin]()
+                ctx.enqueue_function[center_pair_kernel[GMM_CENTER_GROUP]](x.unsafe_ptr(),means.unsafe_ptr(),resp.unsafe_ptr(),pair_diff_ptr,pair_scaled_ptr,Int32(n),Int32(d),Int32(kc),Int32(ncomp),Int32(min(GMM_CENTER_GROUP,ncomp_loop-kc)),grid_dim=(grid_nd,1,1),block_dim=(elem_tpb,1,1))
+        elif sabotage == GMM_SAB_COV_PRESCALE:
+            ctx.enqueue_function[sabotage_center_scale_kernel](
+                x.unsafe_ptr(),
+                means.unsafe_ptr(),
+                resp.unsafe_ptr(),
+                nk.unsafe_ptr(),
+                diff.unsafe_ptr(),
+                scaled.unsafe_ptr(),
+                Int32(n),
+                Int32(d),
+                Int32(kc),
+                Int32(ncomp),
+                Int32(sabotage),
+                grid_dim=(grid_nd, 1, 1),
+                block_dim=(elem_tpb, 1, 1),
+            )
+        else:
+            ctx.enqueue_function[center_scale_kernel](
+                x.unsafe_ptr(),
+                means.unsafe_ptr(),
+                resp.unsafe_ptr(),
+                diff.unsafe_ptr(),
+                scaled.unsafe_ptr(),
+                Int32(n),
+                Int32(d),
+                Int32(kc),
+                Int32(ncomp),
+                grid_dim=(grid_nd, 1, 1),
+                block_dim=(elem_tpb, 1, 1),
+            )
+        # cov_raw = scaled^T . diff, the `d x d` weighted second moment.
+        # OP_TN, k-axis = n: THE LARGEST SUMMATION ORDER IN THE LANE, and it
+        # is the gemm profile's rather than one this file invents.
+        if paired:
+            var centered=pair_buffers[0].create_sub_buffer[DType.float32]((kc%GMM_CENTER_GROUP)*n*d,n*d)
+            var weighted=pair_buffers[1].create_sub_buffer[DType.float32]((kc%GMM_CENTER_GROUP)*n*d,n*d)
+            identical_gemm_into(ctx,raw,weighted,centered,gws,d,d,n,OP_TN)
+            _ = centered^; _ = weighted^
+        else:
+            identical_gemm_into(ctx,raw,scaled,diff,gws,d,d,n,OP_TN)
+        ctx.enqueue_function[cov_finish_kernel](
+            raw.unsafe_ptr(),
+            nk.unsafe_ptr(),
+            cov.unsafe_ptr(),
+            Int32(d),
+            Int32(kc),
+            reg_covar,
+            divide_after,
+            grid_dim=(grid_dd, 1, 1),
+            block_dim=(elem_tpb, 1, 1),
+        )
+    if paired:
+        ctx.synchronize()  # pending pair scratch must outlive the last GEMM
+    _ = pair_buffers^
+    trace.record_device(ctx, tag + ".covariances", cov, ncomp * d * d)
+    if ph_on:
+        ctx.synchronize()
+        var now = Int(perf_counter_ns())
+        print("GMM_MSTEP cov_us=" + String((now - ph_t) // 1000))
+
+    _ = diff^
+    _ = scaled^
+    _ = raw^
+    _ = denom^
